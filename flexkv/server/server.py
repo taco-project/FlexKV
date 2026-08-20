@@ -438,6 +438,7 @@ class KVServer:
             dp_client_id=req.dp_client_id,
             task_id=req.task_id,
             namespace=req.namespace,
+            swa_aware=req.swa_aware,
         )
 
     def _handle_launch_task_request(self, req: LaunchTaskRequest) -> None:

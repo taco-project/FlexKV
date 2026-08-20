@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests: KVTask state machine + SWA load-lock lifecycle at the engine level.
+"""Unit tests for KVTask lifecycle, transfer results, and SWA load locks.
 
-Two concerns, both cheap (no TransferManager subprocess, no GPU):
+The control-plane cases cover:
 
 1. The ``KVTask`` dataclass state machine: status transitions, is_completed,
    early-response cleanup, ``swa_slot_mapping``, and shed_heavy_resources.
 
-2. The SWA load-lock lifecycle on ``GlobalCacheEngine``: a GET pins the matched
+2. Per-block transfer-result aggregation and partial-load failure handling.
+
+3. The SWA load-lock lifecycle on ``GlobalCacheEngine``: a GET pins the matched
    CPU SWA node while building the GET plan, and the SWA H2D completion callback
    releases it (``_swa_release_load_lock``), leaving the
    node cached (dec_swa_lock_ref, NOT dec_swa_lock_only). This documents that
@@ -15,15 +17,28 @@ Two concerns, both cheap (no TransferManager subprocess, no GPU):
    in get()/put(), both released via the op/transfer callbacks) — so a fresh
    GET after a completed GET re-locks cleanly with no residual pin.
 
-Requires flexkv.c_ext for concern 2 (production CacheEngineAccel); concern 1 is
-pure Python.
+The SWA engine cases require ``flexkv.c_ext``; none starts a TransferManager
+subprocess or requires a GPU.
 """
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
 from flexkv.common.request import KVResponseStatus
-from flexkv.kvtask import KVTask, KVTaskEngine, TaskType, TaskStatus
+from flexkv.common.transfer import (
+    CompletedOp,
+    CompletionAwareCallback,
+    TransferType,
+)
+from flexkv.kvtask import (
+    KVTask,
+    KVTaskEngine,
+    KVTaskManager,
+    TaskStatus,
+    TaskType,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -50,6 +65,29 @@ class _FakeGraph:
     def __init__(self, graph_id=10, num_ops=2):
         self.graph_id = graph_id
         self.num_ops = num_ops
+
+
+class _FakeCpuCacheEngine:
+    """match_local stub used by _finalize_prefetch_return_mask when it rereads
+    the CPU tree post-commit. Yields the number of blocks the test wants to
+    pretend are on the tree after commit."""
+
+    def __init__(self, num_matched_blocks: int):
+        self._n = num_matched_blocks
+
+    def match_local(self, sequence_meta):
+        return SimpleNamespace(num_matched_blocks=self._n)
+
+
+class _FakeCacheEngine:
+    def __init__(self, num_matched_blocks: int):
+        self.cpu_cache_engine = _FakeCpuCacheEngine(num_matched_blocks)
+
+
+def _install_manager_cache_engine(manager, tree_blocks: int) -> None:
+    """Wire a KVTaskManager stub with a cache_engine that reports ``tree_blocks``
+    matched blocks. Prefetch finalize consumes this to size return_mask."""
+    manager.cache_engine = _FakeCacheEngine(tree_blocks)
 
 
 def _make_task_engine(task):
@@ -169,6 +207,821 @@ def test_completed_task_remains_observable_until_first_response():
     np.testing.assert_array_equal(response.return_mask, return_mask)
     assert task.request_returned is True
     assert task.task_id not in engine.tasks
+
+
+class _CompletedOpsHandle:
+    def __init__(self, completed_ops):
+        self.completed_ops = completed_ops
+
+    def wait(self, _timeout):
+        return self.completed_ops
+
+    def shutdown(self):
+        pass
+
+
+def test_multi_handle_block_results_are_combined_with_and():
+    """A block is reusable only when every transfer handle succeeded."""
+    graph_id, op_id = 41, 73
+    manager = object.__new__(KVTaskManager)
+    manager.transfer_handles = [
+        _CompletedOpsHandle([CompletedOp(
+            graph_id=graph_id,
+            op_id=op_id,
+            num_blocks=3,
+            block_results=(True, True, False),
+        )]),
+        _CompletedOpsHandle([CompletedOp(
+            graph_id=graph_id,
+            op_id=op_id,
+            num_blocks=3,
+            block_results=(True, False, True),
+        )]),
+    ]
+    manager.required_completed_count = 2
+    manager.uncompleted_ops = {}
+    manager.uncompleted_op_results = {}
+    manager.uncompleted_graphs = {}
+
+    assert manager._get_completed_ops(timeout=0) == [CompletedOp(
+        graph_id=graph_id,
+        op_id=op_id,
+        num_blocks=3,
+        block_results=(True, False, False),
+    )]
+    assert manager.uncompleted_ops == {}
+    assert manager.uncompleted_op_results == {}
+
+
+@pytest.mark.parametrize("second_results", [None, (True, True)])
+def test_multi_handle_invalid_block_results_fail_closed(second_results):
+    graph_id, op_id = 43, 76
+    manager = object.__new__(KVTaskManager)
+    manager.transfer_handles = [
+        _CompletedOpsHandle([CompletedOp(
+            graph_id=graph_id,
+            op_id=op_id,
+            num_blocks=3,
+            block_results=(True, True, True),
+        )]),
+        _CompletedOpsHandle([CompletedOp(
+            graph_id=graph_id,
+            op_id=op_id,
+            num_blocks=3,
+            block_results=second_results,
+        )]),
+    ]
+    manager.required_completed_count = 2
+    manager.uncompleted_ops = {}
+    manager.uncompleted_op_results = {}
+    manager.uncompleted_graphs = {}
+
+    assert manager._get_completed_ops(timeout=0) == [CompletedOp(
+        graph_id=graph_id,
+        op_id=op_id,
+        num_blocks=3,
+        block_results=(False, False, False),
+    )]
+
+
+def test_partial_remote2h_does_not_return_early_success():
+    graph_id, op_id, task_end_op_id = 42, 74, 75
+    completion = CompletedOp(
+        graph_id=graph_id,
+        op_id=op_id,
+        transfer_type=TransferType.REMOTE2H.value,
+        num_blocks=3,
+        block_results=(True, False, False),
+    )
+    seen = []
+    task = _make_task(
+        status=TaskStatus.RUNNING,
+        task_end_op_id=task_end_op_id,
+        graph=SimpleNamespace(graph_id=graph_id, num_ops=2, _op_map={}),
+        op_callback_dict={
+            op_id: CompletionAwareCallback(lambda result: seen.append(result))
+        },
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager._get_completed_ops = lambda _timeout: [completion]
+
+    manager._update_tasks(timeout=0)
+
+    assert task.transfer_failed is True
+    assert task.task_end_op_finished is False
+    assert seen == [completion]
+    assert manager.check_completed(task.task_id) is False
+
+    manager._get_completed_ops = lambda _timeout: [CompletedOp(
+        graph_id=graph_id,
+        op_id=task_end_op_id,
+        transfer_type=TransferType.H2D.value,
+    )]
+    manager._update_tasks(timeout=0)
+
+    assert task.task_end_op_finished is True
+    assert manager.check_completed(task.task_id) is False
+
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp.completed_graph(graph_id)
+    ]
+    manager._update_tasks(timeout=0)
+
+    assert task.status == TaskStatus.FAILED
+
+
+def test_prefetch_partial_remote2h_succeeds_with_narrowed_mask():
+    """Prefetch L>0 (no SWA): return_mask narrowed at graph_completed to [:L]."""
+    graph_id, op_id = 50, 80
+    tpb = 2
+    planned_blocks = 3
+    return_mask = np.zeros(planned_blocks * tpb, dtype=np.bool_)
+    return_mask[: planned_blocks * tpb] = True
+    graph_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1", "h2"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+
+    def _record(completed_op):
+        graph_op.block_results = completed_op.block_results
+
+    completion = CompletedOp(
+        graph_id=graph_id,
+        op_id=op_id,
+        transfer_type=TransferType.REMOTE2H.value,
+        num_blocks=3,
+        block_results=(True, True, False),
+    )
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=op_id,
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=1, _op_map={op_id: graph_op}
+        ),
+        return_mask=return_mask.copy(),
+        op_callback_dict={op_id: CompletionAwareCallback(_record)},
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [completion]
+
+    manager._update_tasks(timeout=0)
+
+    # Partial Full: no eager fail, mask is NOT narrowed yet — wait for graph_completed.
+    assert task.transfer_failed is False
+    assert int(np.sum(task.return_mask)) == planned_blocks * tpb
+
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp.completed_graph(graph_id)
+    ]
+    manager._update_tasks(timeout=0)
+
+    assert task.transfer_failed is False
+    assert int(np.sum(task.return_mask)) == 2 * tpb
+    np.testing.assert_array_equal(
+        task.return_mask, np.array([True, True, True, True, False, False])
+    )
+
+
+def test_prefetch_requires_graph_terminal_before_completed():
+    """Prefetch ignores early task_end; only graph terminal completes wait."""
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_finished=True,  # e.g. SWA REMOTE2H finished first
+        graph=_FakeGraph(graph_id=70, num_ops=2),
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.tasks = {task.task_id: task}
+    manager.graph_to_task = {}
+    # Empty graph short-circuit must not fire (num_ops > 0).
+    assert manager.check_completed(task.task_id) is False
+    assert manager.check_completed(task.task_id, completely=False) is False
+
+    task.status = TaskStatus.COMPLETED
+    assert manager.check_completed(task.task_id) is True
+
+
+def test_prefetch_joint_full_and_swa_narrow_to_j():
+    """Joint prefetch success: L_full==J and SWA ok → mask stays full J."""
+    graph_id, full_op_id, swa_op_id = 60, 90, 91
+    tpb = 2
+    J = 3
+    return_mask = np.ones(J * tpb, dtype=np.bool_)
+    full_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1", "h2"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+    swa_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=True,
+        mooncake_store_block_hashes=None,
+        mooncake_store_swa_block_hashes=["h2"],
+        block_results=None,
+    )
+
+    def _record_full(op):
+        full_op.block_results = op.block_results
+
+    def _record_swa(op):
+        swa_op.block_results = op.block_results
+
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=full_op_id,
+        token_ids=np.arange(J * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=2,
+            _op_map={full_op_id: full_op, swa_op_id: swa_op}),
+        return_mask=return_mask.copy(),
+        op_callback_dict={
+            full_op_id: CompletionAwareCallback(_record_full),
+            swa_op_id: CompletionAwareCallback(_record_swa),
+        },
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=full_op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=3, block_results=(True, True, True)),
+        CompletedOp(graph_id=graph_id, op_id=swa_op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=1, block_results=(True,)),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    assert task.transfer_failed is False
+    assert int(np.sum(task.return_mask)) == J * tpb
+
+
+def test_prefetch_joint_full_ok_swa_fail_reports_zero_mask():
+    """Joint prefetch: Full complete but SWA fail → report 0 to callers.
+
+    Tree may still mount Full[:J] and free the SWA slot, but swa_aware GET
+    cannot reuse the joint prefix, so storage_hit_length must be 0. Metric
+    bucket 'full_only_swa_lost' still records the Full-only mount case.
+    """
+    graph_id, full_op_id, swa_op_id = 61, 92, 93
+    tpb = 2
+    J = 3
+    return_mask = np.ones(J * tpb, dtype=np.bool_)
+    full_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1", "h2"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+    swa_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=True,
+        mooncake_store_block_hashes=None,
+        mooncake_store_swa_block_hashes=["h2"],
+        block_results=None,
+    )
+
+    def _record_full(op):
+        full_op.block_results = op.block_results
+
+    def _record_swa(op):
+        swa_op.block_results = op.block_results
+
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=full_op_id,
+        token_ids=np.arange(J * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=2,
+            _op_map={full_op_id: full_op, swa_op_id: swa_op}),
+        return_mask=return_mask.copy(),
+        op_callback_dict={
+            full_op_id: CompletionAwareCallback(_record_full),
+            swa_op_id: CompletionAwareCallback(_record_swa),
+        },
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=full_op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=3, block_results=(True, True, True)),
+        CompletedOp(graph_id=graph_id, op_id=swa_op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=1, block_results=(False,)),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    assert task.transfer_failed is False
+    assert task.prefetch_has_swa_remote is True
+    assert int(np.sum(task.return_mask)) == 0
+
+
+def test_prefetch_joint_partial_full_reports_zero_mask():
+    """Joint prefetch: Full partial (L<J) → report 0 (SWA cannot mount)."""
+    graph_id, full_op_id, swa_op_id = 62, 94, 95
+    tpb = 2
+    J = 3
+    return_mask = np.ones(J * tpb, dtype=np.bool_)
+    full_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1", "h2"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+    swa_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=True,
+        mooncake_store_block_hashes=None,
+        mooncake_store_swa_block_hashes=["h2"],
+        block_results=None,
+    )
+
+    def _record_full(op):
+        full_op.block_results = op.block_results
+
+    def _record_swa(op):
+        swa_op.block_results = op.block_results
+
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=full_op_id,
+        token_ids=np.arange(J * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=2,
+            _op_map={full_op_id: full_op, swa_op_id: swa_op}),
+        return_mask=return_mask.copy(),
+        op_callback_dict={
+            full_op_id: CompletionAwareCallback(_record_full),
+            swa_op_id: CompletionAwareCallback(_record_swa),
+        },
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=full_op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=3, block_results=(True, True, False)),
+        CompletedOp(graph_id=graph_id, op_id=swa_op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=1, block_results=(True,)),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    assert task.transfer_failed is False
+    assert task.prefetch_has_swa_remote is True
+    assert int(np.sum(task.return_mask)) == 0
+
+
+def test_prefetch_zero_success_prefix_still_fails():
+    graph_id, op_id = 51, 81
+    graph_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        mooncake_store_block_hashes=["h0", "h1"],
+        mooncake_store_swa_block_hashes=None,
+    )
+    completion = CompletedOp(
+        graph_id=graph_id,
+        op_id=op_id,
+        transfer_type=TransferType.REMOTE2H.value,
+        num_blocks=2,
+        block_results=(False, True),
+    )
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=1, _op_map={op_id: graph_op}
+        ),
+        return_mask=np.ones(4, dtype=np.bool_),
+        op_callback_dict={},
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=2)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [completion]
+
+    manager._update_tasks(timeout=0)
+
+    assert task.transfer_failed is True
+
+
+def test_prefetch_finalize_ignores_missing_graph_op_block_results():
+    """Finalize uses CompletedOp stash, not graph op.block_results."""
+    graph_id, full_op_id, swa_op_id = 63, 96, 97
+    tpb = 2
+    J = 2
+    return_mask = np.ones(J * tpb, dtype=np.bool_)
+    full_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,  # never written on task.graph
+    )
+    swa_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=True,
+        mooncake_store_block_hashes=None,
+        mooncake_store_swa_block_hashes=["h1"],
+        block_results=None,
+    )
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=full_op_id,
+        prefetch_has_swa_remote=True,
+        token_ids=np.arange(J * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=2,
+            _op_map={full_op_id: full_op, swa_op_id: swa_op}),
+        return_mask=return_mask.copy(),
+        op_callback_dict={},  # no callback writing onto graph ops
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=full_op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=2, block_results=(True, True)),
+        CompletedOp(graph_id=graph_id, op_id=swa_op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=1, block_results=(True,)),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    assert full_op.block_results is None
+    assert swa_op.block_results is None
+    assert task.prefetch_full_block_results == (True, True)
+    assert task.prefetch_swa_block_results == (True,)
+    assert int(np.sum(task.return_mask)) == J * tpb
+
+
+def test_prefetch_finalize_reports_remote_l_not_cpu_prefix():
+    """A: sum(return_mask) == remote success tokens, ignoring a local CPU gap.
+
+    Plan-time mask starts after f1 (remote_start=2 blocks). Tree would report
+    f1+L, but finalize must report only L from Full REMOTE2H bitmaps.
+    """
+    graph_id, op_id = 64, 98
+    tpb = 2
+    f1, L, f3 = 2, 1, 3
+    # Plan mask over remote interval only: blocks [2, 5)
+    return_mask = np.zeros((f1 + f3) * tpb, dtype=np.bool_)
+    return_mask[f1 * tpb:(f1 + f3) * tpb] = True
+    graph_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1", "h2"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=op_id,
+        token_ids=np.arange((f1 + f3) * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=1, _op_map={op_id: graph_op}),
+        return_mask=return_mask.copy(),
+        op_callback_dict={},
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    # Stub tree would claim f1+L=3 — must NOT drive return_mask.
+    _install_manager_cache_engine(manager, tree_blocks=f1 + L)
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=f3, block_results=(True, False, False)),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    assert int(np.sum(task.return_mask)) == L * tpb
+    expected = np.zeros((f1 + f3) * tpb, dtype=np.bool_)
+    expected[f1 * tpb:(f1 + L) * tpb] = True
+    np.testing.assert_array_equal(task.return_mask, expected)
+
+
+class _RecordingCollector:
+    """In-memory stub of FlexKVMetricsCollector for outcome-classification asserts."""
+
+    def __init__(self):
+        self.outcomes: list[str] = []
+        self.swa_slot_alloc_failures: int = 0
+
+    def record_joint_prefetch_outcome(self, outcome: str) -> None:
+        self.outcomes.append(outcome)
+
+    def record_joint_prefetch_swa_slot_alloc_failure(self) -> None:
+        self.swa_slot_alloc_failures += 1
+
+    # Other collector methods the update path may touch — no-op for tests.
+    def record_transfer_completed(self, *_a, **_kw) -> None:
+        pass
+
+    def record_cache_hit(self, *_a, **_kw) -> None:
+        pass
+
+    def record_cache_miss(self, *_a, **_kw) -> None:
+        pass
+
+    def record_allocation_failure(self, *_a, **_kw) -> None:
+        pass
+
+
+def _prefetch_task_with_ops(*, graph_id, full_op_id, swa_op_id, tpb, J,
+                             prefetch_has_swa_remote):
+    full_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=[f"h{i}" for i in range(J)],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+    swa_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=True,
+        mooncake_store_block_hashes=None,
+        mooncake_store_swa_block_hashes=[f"h{J-1}"],
+        block_results=None,
+    )
+    return _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=full_op_id,
+        prefetch_has_swa_remote=prefetch_has_swa_remote,
+        token_ids=np.arange(J * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=2,
+            _op_map={full_op_id: full_op, swa_op_id: swa_op}),
+        return_mask=np.ones(J * tpb, dtype=np.bool_),
+        op_callback_dict={},
+    ), full_op, swa_op
+
+
+# return_mask tokens: joint requires Full+SWA both OK; else 0. Outcome orthogonal.
+@pytest.mark.parametrize(
+    "full_mask,swa_mask,expected_outcome,expected_tokens",
+    [
+        ((True,  True,  True),  (True,),  "full_and_swa",       6),
+        ((True,  True,  True),  (False,), "full_only_swa_lost", 0),
+        ((True,  True,  False), (True,),  "partial_full",       0),
+        ((True,  True,  False), (False,), "partial_full",       0),
+        ((False, False, False), (True,),  "all_failed",         0),
+    ],
+)
+def test_joint_prefetch_outcome_metric_counts(
+        full_mask, swa_mask, expected_outcome, expected_tokens,
+        monkeypatch):
+    """G3: outcome bucket from mount; return_mask gated on Full+SWA both OK."""
+    recorder = _RecordingCollector()
+    monkeypatch.setattr(
+        "flexkv.kvtask.get_global_collector", lambda: recorder)
+
+    graph_id, full_op_id, swa_op_id = 70, 200, 201
+    tpb, J = 2, 3
+    task, _full_op, _swa_op = _prefetch_task_with_ops(
+        graph_id=graph_id, full_op_id=full_op_id, swa_op_id=swa_op_id,
+        tpb=tpb, J=J, prefetch_has_swa_remote=True)
+
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=full_op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=J, block_results=full_mask),
+        CompletedOp(graph_id=graph_id, op_id=swa_op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=1, block_results=swa_mask),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    assert recorder.outcomes == [expected_outcome]
+    assert int(np.sum(task.return_mask)) == expected_tokens
+
+
+def test_non_swa_prefetch_outcome_metric_reports_full_only(monkeypatch):
+    """Non-swa prefetch reports the ``full_only`` bucket (no joint verdict)."""
+    recorder = _RecordingCollector()
+    monkeypatch.setattr(
+        "flexkv.kvtask.get_global_collector", lambda: recorder)
+
+    graph_id, op_id = 71, 210
+    tpb = 2
+    graph_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1", "h2"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=op_id,
+        token_ids=np.arange(3 * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=1, _op_map={op_id: graph_op}
+        ),
+        return_mask=np.ones(3 * tpb, dtype=np.bool_),
+        op_callback_dict={},
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=3, block_results=(True, True, False)),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    assert recorder.outcomes == ["full_only"]
+    assert int(np.sum(task.return_mask)) == 2 * tpb
+
+
+def test_narrow_return_mask_helper():
+    engine = object.__new__(KVTaskManager)
+    engine.cache_config = SimpleNamespace(tokens_per_block=2)
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        return_mask=np.array([False, False, True, True, True, True, False]),
+    )
+    engine._narrow_return_mask_to_prefix_blocks(task, num_success_blocks=1)
+    np.testing.assert_array_equal(
+        task.return_mask,
+        np.array([False, False, True, True, False, False, False]),
+    )
+
+
+def test_prefetch_finalize_clamps_mask_to_deferred_publish():
+    """Transfer success + commit discard must not report a non-zero mask."""
+    from flexkv.cache.cache_engine import DeferredPublishResult
+    from flexkv.common.transfer import DeviceType
+
+    graph_id, op_id = 80, 240
+    tpb = 2
+    graph_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1", "h2"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+    publish_result = DeferredPublishResult()
+    publish_result.record(0, reason="insert_conflict")
+    pending = SimpleNamespace(
+        device_type=DeviceType.CPU,
+        publish_result=publish_result,
+    )
+
+    class _Callback:
+        def __init__(self):
+            self.keywords = {"deferred_inserts": [pending]}
+
+        def __call__(self):
+            return None
+
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=op_id,
+        token_ids=np.arange(3 * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=1, _op_map={op_id: graph_op}
+        ),
+        return_mask=np.ones(3 * tpb, dtype=np.bool_),
+        callback=_Callback(),
+        op_callback_dict={},
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=3, block_results=(True, True, True)),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    assert task.prefetch_full_block_results == (True, True, True)
+    assert int(np.sum(task.return_mask)) == 0
+    assert task.status == TaskStatus.COMPLETED
+
+
+def test_prefetch_finalize_clamps_to_shorter_publish_prefix():
+    """Published prefix shorter than transfer prefix wins."""
+    from flexkv.cache.cache_engine import DeferredPublishResult
+    from flexkv.common.transfer import DeviceType
+
+    graph_id, op_id = 81, 241
+    tpb = 2
+    graph_op = SimpleNamespace(
+        transfer_type=TransferType.REMOTE2H,
+        is_swa=False,
+        mooncake_store_block_hashes=["h0", "h1", "h2"],
+        mooncake_store_swa_block_hashes=None,
+        block_results=None,
+    )
+    publish_result = DeferredPublishResult()
+    publish_result.record(1, reason="ok")
+    pending = SimpleNamespace(
+        device_type=DeviceType.CPU,
+        publish_result=publish_result,
+    )
+
+    class _Callback:
+        def __init__(self):
+            self.keywords = {"deferred_inserts": [pending]}
+
+        def __call__(self):
+            return None
+
+    task = _make_task(
+        task_type=TaskType.PREFETCH,
+        status=TaskStatus.RUNNING,
+        task_end_op_id=op_id,
+        token_ids=np.arange(3 * tpb, dtype=np.int64),
+        graph=SimpleNamespace(
+            graph_id=graph_id, num_ops=1, _op_map={op_id: graph_op}
+        ),
+        return_mask=np.ones(3 * tpb, dtype=np.bool_),
+        callback=_Callback(),
+        op_callback_dict={},
+    )
+    manager = object.__new__(KVTaskManager)
+    manager.graph_to_task = {graph_id: task.task_id}
+    manager.tasks = {task.task_id: task}
+    manager.cache_config = SimpleNamespace(tokens_per_block=tpb)
+    manager._metrics_collector = None
+    manager._get_completed_ops = lambda _timeout: [
+        CompletedOp(graph_id=graph_id, op_id=op_id,
+                    transfer_type=TransferType.REMOTE2H.value,
+                    num_blocks=3, block_results=(True, True, False)),
+        CompletedOp.completed_graph(graph_id),
+    ]
+
+    manager._update_tasks(timeout=0)
+
+    # transfer L=2, publish=1 → report 1 block
+    assert int(np.sum(task.return_mask)) == 1 * tpb
 
 
 # --- M15/M16: SWA-aware get's core arithmetic (pure, mirrors kvtask logic) --- #

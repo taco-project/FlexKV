@@ -599,6 +599,7 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   auto last_ready_node = root;
   auto prefix_blocks_num = 0;
   auto ready_prefix_blocks_num = 0;
+  bool ready_prefix_open = true;
   auto last_node_matched_length = 0;
   auto physical_blocks_tensor = torch::empty({num_blocks}, torch::dtype(torch::kInt64));
   auto *pb_out = physical_blocks_tensor.data_ptr<int64_t>();
@@ -671,9 +672,11 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
           ni_out[ni_write++] = (*bnis)[i];
         }
         
-        if (current_node->is_ready()) {
+        if (ready_prefix_open && current_node->is_ready()) {
           last_ready_node = current_node;
           ready_prefix_blocks_num += matched;
+        } else if (matched > 0) {
+          ready_prefix_open = false;
         }
         
         prefix_blocks_num += matched;
@@ -702,7 +705,7 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
   auto node_ids = node_ids_tensor.narrow(0, 0, ni_write);
   
-  return std::make_shared<CMatchResult>(prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
+  return std::make_shared<CMatchResult>(ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
     last_ready_node, current_node, physical_blocks, node_ids);
 }
 

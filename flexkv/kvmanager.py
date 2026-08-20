@@ -276,19 +276,33 @@ class KVManager:
 
     def prefetch_async(self,
                        token_ids: np.ndarray,
-                       namespace: Optional[List[str]] = None) -> int:
+                       namespace: Optional[List[str]] = None,
+                       swa_aware: bool = False) -> int:
+        """Launch prefetch; return the task_id.
+
+        The prefetch is fire-and-forget at launch time. Callers poll progress
+        via ``try_wait``/``wait`` — the returned ``KVResponse.return_mask`` is
+        rewritten to the CPU-tree state at graph completion (post-commit), so
+        ``sum(return_mask)`` is the authoritative usable-token count.
+
+        ``swa_aware=True`` plans a joint Full+SWA REMOTE2H so the SWA snapshot
+        lands on the local CPU SWA pool alongside the Full-KV prefix. The tree
+        keeps the invariant "SWA present ⇒ Full ready up to this node" —
+        partial Full or SWA failure frees the SWA slot; only the Full prefix
+        (if any) stays on the tree.
+        """
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if self.server_client_mode:
-            task_id = self.dp_client.prefetch_async(token_ids, namespace=namespace)
-            return task_id, 0
+            task_id = self.dp_client.prefetch_async(
+                token_ids, namespace=namespace, swa_aware=swa_aware)
         else:
-            task_id, actual_prefetch_tokens = self.kv_task_engine.prefetch_async(
+            task_id = self.kv_task_engine.prefetch_async(
                 token_ids,
                 namespace=namespace,
+                swa_aware=swa_aware,
             )
-            flexkv_logger.info(f"[FlexKV] prefetch: task_id={task_id}, actual_prefetch_tokens={actual_prefetch_tokens}")
-        return task_id, actual_prefetch_tokens
+        return task_id
 
     def launch(self,
                task_ids: Union[int, List[int]],

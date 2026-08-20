@@ -380,6 +380,12 @@ class RadixTreeIndex:
         last_ready_node = self.root_node
         prefix_blocks_num = 0
         ready_prefix_blocks_num = 0
+        # ``num_ready_matched_blocks`` is a prefix length, not a count of ready
+        # blocks anywhere on the matched path.  A later child may become ready
+        # before an in-flight parent (for example after a concurrent branch
+        # split); once that happens, no descendant can extend the readable
+        # prefix until the parent is ready too.
+        ready_prefix_open = True
         last_node_matched_length = 0
         physical_blocks = np.array([], dtype=np.int64)
         # SWA: deepest fully-matched ready node carrying a live SWA slot.
@@ -399,7 +405,7 @@ class RadixTreeIndex:
                 current_node.hit_count += 1
             child_hash = sequence.get_hash(prefix_blocks_num + current_node.size())
             if child_hash in current_node.children:
-                if current_node.is_ready:
+                if ready_prefix_open and current_node.is_ready:
                     last_ready_node = current_node
                     ready_prefix_blocks_num += current_node.size()
                     # current_node is FULLY matched (whole size consumed): if it
@@ -408,6 +414,8 @@ class RadixTreeIndex:
                     if current_node.has_swa():
                         last_swa_node = current_node
                         swa_hit_blocks = ready_prefix_blocks_num
+                elif current_node.size() > 0:
+                    ready_prefix_open = False
                 prefix_blocks_num += current_node.size()
                 physical_blocks = np.concatenate([physical_blocks, current_node.physical_blocks])
                 current_node = current_node.children[child_hash]
@@ -426,7 +434,7 @@ class RadixTreeIndex:
                     physical_blocks = np.concatenate([physical_blocks, current_node.physical_blocks[:matched_length]])
                 else:
                     matched_length = 0
-                if current_node.is_ready:
+                if ready_prefix_open and current_node.is_ready:
                     last_ready_node = current_node
                     ready_prefix_blocks_num += matched_length
                     # Only a FULL node match (matched_length == size) exposes the
@@ -434,6 +442,8 @@ class RadixTreeIndex:
                     if matched_length == current_node.size() and current_node.has_swa():
                         last_swa_node = current_node
                         swa_hit_blocks = ready_prefix_blocks_num
+                elif matched_length > 0:
+                    ready_prefix_open = False
                 last_node_matched_length = matched_length
                 prefix_blocks_num += matched_length
                 break
@@ -479,7 +489,6 @@ class RadixTreeIndex:
         last_node = match_result.last_node
         assert last_node is not None
         last_node_matched_length = match_result.last_node_matched_length
-        assert last_node_matched_length != 0 or last_node.is_root()
 
         assert len(physical_block_ids) == num_insert_blocks - num_matched_blocks, \
             f"num_insert_blocks = {num_insert_blocks}, " \
@@ -489,6 +498,13 @@ class RadixTreeIndex:
         if num_matched_blocks >= num_insert_blocks:
             # not insert any new blocks
             return None
+
+        self._validate_insert_target(
+            sequence_meta,
+            last_node,
+            num_matched_blocks,
+            last_node_matched_length,
+        )
 
         now = time.time()
         new_node = RadixNode(
@@ -517,6 +533,60 @@ class RadixTreeIndex:
         self.leaf_nodes[new_node.head_hash()] = new_node
 
         return new_node
+
+    def _validate_insert_target(
+        self,
+        sequence_meta: SequenceMeta,
+        last_node: RadixNode,
+        num_matched_blocks: int,
+        last_node_matched_length: int,
+    ) -> None:
+        """Reject a stale insertion anchor before mutating the tree.
+
+        ``match_prefix`` results may outlive another insertion when this low-level
+        API is used directly.  In that case assigning ``children[head_hash]``
+        would silently orphan the existing subtree and its physical blocks.
+        Raising leaves both the radix tree and ``physical_block_ids`` untouched;
+        the caller still owns those blocks and may recycle them or rematch/retry.
+        """
+        conflict = "radix insert conflict: stale match result; rematch before retrying"
+        node_size = last_node.size()
+        anchor_root = last_node
+        while anchor_root.parent is not None:
+            anchor_root = anchor_root.parent
+        if anchor_root is not self.root_node:
+            raise RuntimeError(conflict)
+
+        if last_node.is_root():
+            if last_node_matched_length != 0 or num_matched_blocks != 0:
+                raise RuntimeError(conflict)
+        else:
+            parent = last_node.parent
+            if (parent is None
+                    or parent.children.get(last_node.head_hash()) is not last_node
+                    or last_node_matched_length <= 0
+                    or last_node_matched_length > node_size):
+                raise RuntimeError(conflict)
+
+            matched_start = num_matched_blocks - last_node_matched_length
+            if (matched_start < 0
+                    or not np.array_equal(
+                        last_node.block_hashes[:last_node_matched_length],
+                        sequence_meta.block_hashes[
+                            matched_start:num_matched_blocks])):
+                raise RuntimeError(conflict)
+
+        target_hash = sequence_meta.get_hash(num_matched_blocks)
+        assert target_hash is not None
+        if last_node_matched_length < node_size:
+            # A valid partial match diverges at the split point.  Equality means
+            # that the supplied match result no longer describes this node.
+            if last_node.block_hashes[last_node_matched_length] == target_hash:
+                raise RuntimeError(conflict)
+        elif target_hash in last_node.children:
+            raise RuntimeError(
+                "radix insert conflict: target child already exists; "
+                "rematch before retrying")
 
     def evict(self, num_evicted: int) -> Tuple[np.ndarray, np.ndarray]:
         candidates = []

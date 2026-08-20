@@ -49,6 +49,7 @@ from flexkv.transfer.layerwise import (
     LayerwiseTransferWorker,
     build_layerwise_eventfd_socket_path,
 )
+from flexkv.transfer.worker_op import WorkerTransferResult
 from flexkv.common.config import (
     CacheConfig, LayerGroupSpec, ModelConfig, GLOBAL_CONFIG_FROM_ENV,
 )
@@ -1168,15 +1169,28 @@ class TransferEngine:
                         while True:
                             try:
                                 payload = self.finished_ops_queue.get_nowait()
-                                # Payload: int (legacy) | (op_id, ok) |
-                                #          (op_id, ok, metrics_dict from worker).
+                                # Payload forms:
+                                #   WorkerTransferResult (partial block outcomes)
+                                #   int (legacy success)
+                                #   (op_id|WorkerTransferResult, ok)
+                                #   (op_id|WorkerTransferResult, ok, metrics)
                                 op_succeeded = True
                                 metrics = None
-                                if isinstance(payload, tuple):
+                                block_results = None
+                                if isinstance(payload, WorkerTransferResult):
+                                    op_id = payload.transfer_op_id
+                                    block_results = payload.block_results
+                                elif isinstance(payload, tuple):
                                     if len(payload) >= 3:
-                                        op_id, op_succeeded, metrics = payload[0], payload[1], payload[2]
+                                        first, op_succeeded, metrics = (
+                                            payload[0], payload[1], payload[2])
                                     else:
-                                        op_id, op_succeeded = payload
+                                        first, op_succeeded = payload[0], payload[1]
+                                    if isinstance(first, WorkerTransferResult):
+                                        op_id = first.transfer_op_id
+                                        block_results = first.block_results
+                                    else:
+                                        op_id = first
                                 else:
                                     op_id = payload
                                 if not op_succeeded:
@@ -1190,11 +1204,14 @@ class TransferEngine:
                                     # pending_count and finalize parent when all replicas done.
                                     parent_op_id = self._child_to_parent_op_id.pop(op_id)
                                     child_op = self._child_id_to_child.pop(op_id)
+                                    self._merge_block_results(child_op, block_results)
                                     free_op_from_buffer(child_op, self.pin_buffer)
                                     if op_id in self.op_id_to_nvtx_range:
                                         nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
                                     self._emit_xfer_trace(op_id, metrics)
                                     parent_op = self.op_id_to_op[parent_op_id]
+                                    self._merge_block_results(
+                                        parent_op, child_op.block_results)
                                     parent_op.pending_count -= 1
                                     if parent_op.pending_count == 0:
                                         self._finalize_or_discard(parent_op, finished_ops)
@@ -1203,6 +1220,7 @@ class TransferEngine:
                                         f"parent op {parent_op_id} pending_count={parent_op.pending_count}")
                                 else:
                                     op = self.op_id_to_op[op_id]
+                                    self._merge_block_results(op, block_results)
                                     op.pending_count -= 1
                                     self._emit_xfer_trace(op_id, metrics)
                                     if op.pending_count == 0:
@@ -1387,9 +1405,30 @@ class TransferEngine:
             transfer_type=transfer_type_str,
             num_blocks=num_blocks,
             num_bytes=num_bytes,
+            block_results=op.block_results,
         ))
         finished_ops.append(op)
         del self.op_id_to_op[op.op_id]
+
+    @staticmethod
+    def _merge_block_results(
+        op: TransferOp,
+        block_results: Optional[Tuple[bool, ...]],
+    ) -> None:
+        """Accumulate per-worker outcomes; every participating worker must win."""
+        if block_results is None:
+            return
+        normalized = tuple(bool(result) for result in block_results)
+        if len(normalized) != len(op.src_block_ids):
+            flexkv_logger.error(
+                f"Completion result length mismatch for op {op.op_id}: "
+                f"results={len(normalized)}, blocks={len(op.src_block_ids)}")
+            normalized = (False,) * len(op.src_block_ids)
+        if op.block_results is None:
+            op.block_results = normalized
+        else:
+            op.block_results = tuple(
+                old and new for old, new in zip(op.block_results, normalized))
 
     @staticmethod
     def _match_pp_siblings(

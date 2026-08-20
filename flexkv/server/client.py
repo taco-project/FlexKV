@@ -153,12 +153,14 @@ class KVDPClient:
         self,
         token_ids: np.ndarray,
         namespace: Optional[List[str]] = None,
+        swa_aware: bool = False,
     ) -> int:
         req = PrefetchRequest(
             dp_client_id=self.dp_client_id,
             token_ids=token_ids,
             task_id=self._get_task_id(),
             namespace=namespace,
+            swa_aware=swa_aware,
         )
         self.send_to_server.send_pyobj(req)
         return req.task_id

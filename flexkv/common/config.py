@@ -14,6 +14,21 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
 
 
+def assert_mooncake_prefetch_ready(cache_config, prefetch_enabled: bool) -> None:
+    """M0 gate: mooncake REMOTE2H is prefetch-only.
+
+    Serving stacks must enable prefetch (typically via enable_remote, which
+    mooncake already implies) before compute GET. Call from connectors after
+    computing ``prefetch_enabled``.
+    """
+    if (getattr(cache_config, "use_mooncake_store_backend", False)
+            and not prefetch_enabled):
+        raise RuntimeError(
+            "use_mooncake_store_backend requires prefetch. "
+            "So REMOTE2H runs in prefetch before compute GET."
+        )
+
+
 @dataclass
 class LayerGroupSpec:
     """One group of layers sharing the same KV cache shape.
@@ -697,9 +712,12 @@ class CacheConfig:
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
-        self.enable_remote = self.enable_3rd_remote or self.use_mooncake_store_backend
+        # Resolve mooncake flag from env BEFORE deriving enable_remote;
+        # otherwise FLEXKV_USE_MOONCAKE_STORE_BACKEND=1 leaves enable_remote
+        # False and trips the check below (FlexKVConfig default_factory path).
         self.use_mooncake_store_backend = self.use_mooncake_store_backend or bool(
             int(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', '0')))
+        self.enable_remote = self.enable_3rd_remote or self.use_mooncake_store_backend
         if self.use_mooncake_store_backend and self.mooncake_store_config_path is None:
             self.mooncake_store_config_path = os.getenv(
                 'FLEXKV_MOONCAKE_STORE_CONFIG_PATH', None)
@@ -707,6 +725,12 @@ class CacheConfig:
                 raise ValueError(
                     "Mooncake store config path not found; set "
                     "mooncake_store_config_path or FLEXKV_MOONCAKE_STORE_CONFIG_PATH")
+      
+        if self.use_mooncake_store_backend and not self.enable_remote:
+            raise ValueError(
+                "use_mooncake_store_backend requires enable_remote "
+                "(prefetch REMOTE2H path before compute GET)"
+            )
 
     def __str__(self) -> str:
         return (
@@ -1095,6 +1119,12 @@ def update_default_config_from_user_config(rank_info: RankInfo,
                                       cache_config.enable_3rd_remote)
     cache_config.enable_remote = (cache_config.enable_3rd_remote or
                                   cache_config.use_mooncake_store_backend)
+
+    if cache_config.use_mooncake_store_backend:
+        flexkv_logger.info(
+            "Mooncake store: REMOTE2H is prefetch-only; "
+            "compute GET will force ignore_remote"
+        )
 
     if cache_config.num_ssd_blocks % len(cache_config.ssd_cache_dir) != 0:
         cache_config.num_ssd_blocks = \

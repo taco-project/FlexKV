@@ -79,6 +79,8 @@ class PrefetchRequest:
     token_ids: np.ndarray
     task_id: int = -1
     namespace: Optional[List[str]] = None
+    # Joint Full+SWA prefetch (mooncake): plan SWA REMOTE2H alongside Full.
+    swa_aware: bool = False
 
 
 @dataclass

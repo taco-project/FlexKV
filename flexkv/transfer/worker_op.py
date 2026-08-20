@@ -1,9 +1,17 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
 from flexkv.common.transfer import TransferOp, TransferType, LayerwiseTransferOp
+
+
+@dataclass(frozen=True)
+class WorkerTransferResult:
+    """Worker-to-scheduler completion with optional per-block outcomes."""
+
+    transfer_op_id: int
+    block_results: Optional[Tuple[bool, ...]] = None
 
 
 @dataclass

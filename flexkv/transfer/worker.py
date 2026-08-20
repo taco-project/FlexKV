@@ -78,12 +78,17 @@ from flexkv.transfer.compression.common.strategy import (
     CompressionStrategy,
     NullCompressionStrategy,
 )
-from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
+from flexkv.transfer.worker_op import (
+    WorkerLayerwiseTransferOp,
+    WorkerTransferOp,
+    WorkerTransferResult,
+)
 from flexkv.transfer import trace
 trace.configure(GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace)
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.external.mooncake_store_keys import PoolKind, build_key
+from flexkv.external.mooncake_fault_inject import inject_mooncake_fault, is_mooncake_fault_inject_enabled
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.transfer.utils import (
@@ -113,6 +118,7 @@ except ImportError:
     transfer_kv_blocks_remote = None
     shared_transfer_kv_blocks_remote_read = None
 
+
 class TransferWorkerBase(ABC):
     _worker_id_counter = 0
     _worker_id_lock = threading.Lock()
@@ -133,7 +139,7 @@ class TransferWorkerBase(ABC):
                  op_buffer_tensor: torch.Tensor):
         self.worker_id = worker_id
         self.transfer_conn = transfer_conn  # receive end of pipe
-        self.finished_ops_queue: MPQueue[int] = finished_ops_queue
+        self.finished_ops_queue: MPQueue = finished_ops_queue
 
         self.op_buffer_tensor = op_buffer_tensor
         self._op_buffer_pinned = False
@@ -474,7 +480,9 @@ class TransferWorkerBase(ABC):
             )
 
     @abstractmethod
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+    def launch_transfer(
+        self, transfer_op: WorkerTransferOp
+    ) -> Union[bool, WorkerTransferResult]:
         pass
 
     def _handle_control(self, command: str, payload: Any) -> Any:
@@ -524,6 +532,11 @@ class TransferWorkerBase(ABC):
                 if not isinstance(op, dict):
                     op._received_ns = time.perf_counter_ns()
 
+                # Drain any already-queued ops into one batch, then process.
+                # The for-loop MUST sit outside the drain while: a single-op
+                # submit leaves poll() False immediately, and a while-else
+                # continue would otherwise drop the first op forever (which
+                # stalls D2H → H2REMOTE and leaves mooncake PutStart=0).
                 batch_ops = [op]
                 shutdown_after_batch = False
                 while self.transfer_conn.poll(timeout=0):
@@ -586,7 +599,14 @@ class TransferWorkerBase(ABC):
                         getattr(self, "kv_dim", 2),
                         is_h2d,
                     )
-                    if transfer_status:
+                    if isinstance(transfer_status, WorkerTransferResult):
+                        # Partial-capable backends report completion even when
+                        # zero blocks succeeded, so the graph can clean up and
+                        # the caller can fall back instead of hanging forever.
+                        # Carry metrics so FLEXKV_TRANSFER_TRACE still works.
+                        self.finished_ops_queue.put(
+                            (transfer_status, True, metrics))
+                    elif transfer_status:
                         self.finished_ops_queue.put(
                             (op.transfer_op_id, True, metrics))
                     else:
@@ -3931,30 +3951,78 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
             return int(cpu_kv_layout.get_block_stride())
         return int(cpu_kv_layout.get_elements_per_block() * dtype.itemsize)
 
-    def _transfer_impl(self, cpu_ptrs, block_sizes, keys, transfer_type: TransferType) -> None:
+    def _transfer_impl(self, cpu_ptrs, block_sizes, keys,
+                       transfer_type: TransferType) -> List[bool]:
         if transfer_type == TransferType.H2REMOTE:
             put_results = self.mooncake_client.batch_put(keys, cpu_ptrs, block_sizes)
             if not all(put_results):
-                flexkv_logger.error(f"Mooncake-store batch put partially failed: {put_results}")
+                flexkv_logger.warning(f"Mooncake-store batch put partially failed: {put_results}")
+            return put_results
         elif transfer_type == TransferType.REMOTE2H:
             get_results = self.mooncake_client.batch_get(keys, cpu_ptrs, block_sizes)
+
+            if is_mooncake_fault_inject_enabled():
+                get_results = inject_mooncake_fault(get_results, transfer_type)
+                flexkv_logger.info(f"Mooncake-store batch get results after fault injection: {get_results}")
+
             if not all(get_results):
-                flexkv_logger.error(f"Mooncake-store batch get partially failed: {get_results}")
+                flexkv_logger.warning(
+                    f"Mooncake-store batch get partially failed: {get_results}")
+            return get_results
         else:
             raise ValueError(
                 f"MooncakeStoreTransferWorker only supports H2REMOTE/REMOTE2H, got {transfer_type}")
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
-        if self.pool_kind == PoolKind.SWA:
-            cpu_ptrs, block_sizes, keys = self._preprocess_swa(transfer_op)
-        else:
-            cpu_ptrs, block_sizes, keys = self._preprocess_kv(transfer_op)
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> WorkerTransferResult:
+        expected_blocks = len(transfer_op.src_block_ids)
+        block_sizes: List[int] = []
         start_time = time.time()
-        self._transfer_impl(cpu_ptrs, block_sizes, keys, transfer_op.transfer_type)
+        try:
+            if self.pool_kind == PoolKind.SWA:
+                cpu_ptrs, block_sizes, keys = self._preprocess_swa(transfer_op)
+            else:
+                cpu_ptrs, block_sizes, keys = self._preprocess_kv(transfer_op)
+            if len(keys) != expected_blocks:
+                raise ValueError(
+                    "Mooncake key count does not match transfer block count: "
+                    f"keys={len(keys)}, blocks={expected_blocks}")
+            block_results = self._transfer_impl(
+                cpu_ptrs, block_sizes, keys, transfer_op.transfer_type)
+            if len(block_results) != expected_blocks:
+                raise ValueError(
+                    "Mooncake result count does not match transfer block count: "
+                    f"results={len(block_results)}, blocks={expected_blocks}")
+            normalized_results = tuple(bool(result) for result in block_results)
+        except Exception:
+            # A completed failure must still reach the scheduler. Otherwise the
+            # graph never completes and its reserved cache blocks remain leaked.
+            flexkv_logger.error(
+                "Mooncake transfer failed; reporting all blocks unsuccessful "
+                f"for op_id={transfer_op.transfer_op_id}",
+                exc_info=True,
+            )
+            normalized_results = (False,) * expected_blocks
         end_time = time.time()
-        transfer_size = sum(block_sizes)
-        self._log_transfer_performance(transfer_op, transfer_size, start_time, end_time)
-        return True
+        try:
+            transfer_size = sum(block_sizes)
+            self._log_transfer_performance(
+                transfer_op, transfer_size, start_time, end_time)
+        except Exception:
+            flexkv_logger.error(
+                "Mooncake transfer performance logging failed; reporting the "
+                f"operation unsuccessful for op_id={transfer_op.transfer_op_id}",
+                exc_info=True,
+            )
+            normalized_results = (False,) * expected_blocks
+        if not all(normalized_results):
+            flexkv_logger.warning(
+                "Mooncake transfer partially failed: "
+                f"op_id={transfer_op.transfer_op_id}, "
+                f"successful={sum(normalized_results)}/{len(normalized_results)}")
+        return WorkerTransferResult(
+            transfer_op_id=transfer_op.transfer_op_id,
+            block_results=normalized_results,
+        )
 
     def _preprocess_kv(self, transfer_op: WorkerTransferOp):
         cpu_block_ids = (

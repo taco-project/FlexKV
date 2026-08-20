@@ -579,7 +579,10 @@ class MooncakeStoreCacheEngine:
             return kv_matched, kv_matched, 0
 
         swa_keys = [self._build_pool_key(h, PoolKind.SWA) for h in block_hashes]
+        flexkv_logger.debug(f"[MooncakeStoreCacheEngine] _joint_match_length kv_keys: {kv_keys}")
+        flexkv_logger.debug(f"[MooncakeStoreCacheEngine] _joint_match_length swa_keys: {swa_keys}")
         raw = self.mooncake_store_client.batch_exists_impl(kv_keys + swa_keys)
+        flexkv_logger.debug(f"[MooncakeStoreCacheEngine] _joint_match_length raw: {raw}")
         kv_exists = raw[:n_blocks]
         swa_exists = raw[n_blocks:]
         kv_matched = self._longest_kv_prefix(kv_exists, n_blocks)

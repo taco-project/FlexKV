@@ -1,5 +1,5 @@
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from typing import ClassVar, List, Set, Dict, Callable, Tuple, Optional
 
@@ -24,6 +24,9 @@ class CompletedOp:
     transfer_type: Optional[str] = None
     num_blocks: int = 0
     num_bytes: int = 0
+    # Per-block completion status for backends that can partially succeed.
+    # ``None`` preserves the all-or-nothing contract of existing workers.
+    block_results: Optional[Tuple[bool, ...]] = None
     # True on the graph-level message that reports the graph terminated because
     # one of its ops failed. Defaults False so the message stays pickle- and
     # constructor-compatible with existing producers/consumers.
@@ -34,6 +37,21 @@ class CompletedOp:
 
     def is_graph_failed(self) -> bool:
         return self.op_id == -1 and self.failed
+
+    def slice_blocks(self, offset: int, count: int) -> 'CompletedOp':
+        """Return this completion restricted to one pre-merge op span."""
+        if self.block_results is None:
+            return self
+        end = offset + count
+        if offset < 0 or count < 0 or end > len(self.block_results):
+            raise ValueError(
+                f"Invalid completion slice [{offset}:{end}] for "
+                f"{len(self.block_results)} block results")
+        return replace(
+            self,
+            num_blocks=count,
+            block_results=self.block_results[offset:end],
+        )
 
     def to_tuple(self) -> Tuple[int, int]:
         return (self.graph_id, self.op_id)
@@ -49,6 +67,25 @@ class CompletedOp:
     @classmethod
     def failed_graph(cls, graph_id: int) -> 'CompletedOp':
         return cls(graph_id=graph_id, op_id=-1, failed=True)
+
+
+@dataclass(frozen=True)
+class CompletionAwareCallback:
+    """Opt-in wrapper for callbacks that consume a ``CompletedOp`` result."""
+
+    callback: Callable[[Optional[CompletedOp]], None]
+
+    def __call__(self, completed_op: Optional[CompletedOp] = None) -> None:
+        self.callback(completed_op)
+
+
+def invoke_op_callback(callback: Callable,
+                       completed_op: Optional[CompletedOp] = None) -> None:
+    """Invoke old zero-argument callbacks and result-aware callbacks uniformly."""
+    if isinstance(callback, CompletionAwareCallback):
+        callback(completed_op)
+    else:
+        callback()
 
 
 class DeviceType(IntEnum):
@@ -129,6 +166,8 @@ class TransferOp:
     mooncake_store_block_hashes: Optional[np.ndarray] = None
     # Tail-hash list for SWA mooncake REMOTE2H/H2REMOTE (one entry per SWA slot).
     mooncake_store_swa_block_hashes: Optional[List[str]] = None
+    # Filled by the scheduler as partial-capable worker completions arrive.
+    block_results: Optional[Tuple[bool, ...]] = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.transfer_type != TransferType.VIRTUAL and \
@@ -497,11 +536,23 @@ class TransferOpGraph:
         print(result)
         return result
 
-def _make_combined_callback(callbacks: List[Callable]) -> Callable:
-    def combined_callback(*args, **kwargs):
-        for cb in callbacks:
-            cb(*args, **kwargs)
-    return combined_callback
+def _make_combined_callback(
+    callbacks: List[Callable],
+    block_spans: Optional[List[Tuple[int, int]]] = None,
+) -> Callable:
+    """Combine callbacks, slicing merged per-block results when requested."""
+    if block_spans is not None and len(block_spans) != len(callbacks):
+        raise ValueError("callbacks and block_spans must have the same length")
+
+    def combined_callback(completed_op: Optional[CompletedOp]) -> None:
+        for idx, cb in enumerate(callbacks):
+            child_completion = completed_op
+            if completed_op is not None and block_spans is not None:
+                offset, count = block_spans[idx]
+                child_completion = completed_op.slice_blocks(offset, count)
+            invoke_op_callback(cb, child_completion)
+
+    return CompletionAwareCallback(combined_callback)
 
 
 def _attach_combined_callback(op: TransferOp,
@@ -513,6 +564,34 @@ def _attach_combined_callback(op: TransferOp,
         op_callback_dict[op.op_id] = callbacks[0]
     else:
         op_callback_dict[op.op_id] = _make_combined_callback(callbacks)
+
+
+def _attach_merged_callbacks(
+    merged_op: TransferOp,
+    source_ops: List[TransferOp],
+    callbacks: List[Tuple[TransferOp, Callable]],
+    op_callback_dict: Dict[int, Callable],
+) -> None:
+    """Attach callbacks with their per-source spans in the merged op."""
+    if not callbacks:
+        return
+
+    callback_by_op_id = {op.op_id: callback for op, callback in callbacks}
+    merged_callbacks: List[Callable] = []
+    block_spans: List[Tuple[int, int]] = []
+    offset = 0
+    for op in source_ops:
+        callback = callback_by_op_id.get(op.op_id)
+        if callback is not None:
+            merged_callbacks.append(callback)
+            block_spans.append((offset, len(op.src_block_ids)))
+        offset += len(op.src_block_ids)
+
+    if len(source_ops) == 1:
+        op_callback_dict[merged_op.op_id] = merged_callbacks[0]
+    else:
+        op_callback_dict[merged_op.op_id] = _make_combined_callback(
+            merged_callbacks, block_spans)
 
 
 def add_virtual_op_for_multiple_finished_ops(
@@ -540,7 +619,8 @@ def add_virtual_op_for_multiple_finished_ops(
 
 
 def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
-               graph: TransferOpGraph, callbacks: List[Callable],
+               graph: TransferOpGraph,
+               callbacks: List[Tuple[TransferOp, Callable]],
                op_callback_dict: Dict[int, Callable]) -> Optional[TransferOp]:
     """Merge main-KV ops. Concatenates block ids and ``mooncake_store_block_hashes``
     (H2REMOTE / REMOTE2H) in the same order. Rejects SWA ops (use ``_merge_swa_ops``)
@@ -580,16 +660,14 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
         dp_client_id=ops[0].dp_client_id,
         mooncake_store_block_hashes=merged_kv_hashes,
     )
-    if callbacks:
-        if len(callbacks) == 1:
-            op_callback_dict[merged_op.op_id] = callbacks[0]
-        else:
-            op_callback_dict[merged_op.op_id] = _make_combined_callback(callbacks)
+    _attach_merged_callbacks(
+        merged_op, ops, callbacks, op_callback_dict)
     return merged_op
 
 
 def _merge_swa_ops(ops: List[TransferOp], transfer_type: TransferType,
-                   graph: TransferOpGraph, callbacks: List[Callable],
+                   graph: TransferOpGraph,
+                   callbacks: List[Tuple[TransferOp, Callable]],
                    op_callback_dict: Dict[int, Callable]) -> Optional[TransferOp]:
     """Merge SWA-lane ops. Local lanes carry no mooncake hash. Remote lanes
     (H2REMOTE / REMOTE2H) concatenate ``mooncake_store_swa_block_hashes``.
@@ -634,11 +712,8 @@ def _merge_swa_ops(ops: List[TransferOp], transfer_type: TransferType,
         is_swa=True,
         mooncake_store_swa_block_hashes=merged_swa_hashes,
     )
-    if callbacks:
-        if len(callbacks) == 1:
-            op_callback_dict[merged_op.op_id] = callbacks[0]
-        else:
-            op_callback_dict[merged_op.op_id] = _make_combined_callback(callbacks)
+    _attach_merged_callbacks(
+        merged_op, ops, callbacks, op_callback_dict)
     return merged_op
 
 
@@ -705,11 +780,6 @@ def merge_to_batch_graph(batch_id: int,
         task_end_op_ids: List of end op IDs for each task (one per graph)
         op_callback_dict: Dict mapping old op_id -> callback
         layerwise_transfer: Whether to merge the graphs into a layerwise transfer op
-        fuse_swa_into_layerwise: When True (default / production), SWA/state
-            H2D block ids are carried on the fused LAYERWISE op (uniform SWA
-            via launch_swa_h2d_layer_, multi-group via launch_swa_mg_h2d_layer_).
-            When False, SWA/state ops stay as standalone predecessors
-            (legacy heterogeneous fallback for non-fused debugging).
 
     Returns:
         (merged_graph, batch_end_op_id, new_op_callback_dict)
@@ -730,9 +800,9 @@ def merge_to_batch_graph(batch_id: int,
     merged_graph = TransferOpGraph()
 
     ops_by_type: Dict[TransferType, List[TransferOp]] = {}
-    callbacks_by_type: Dict[TransferType, List[Callable]] = {}
+    callbacks_by_type: Dict[TransferType, List[Tuple[TransferOp, Callable]]] = {}
     swa_ops_by_type: Dict[TransferType, List[TransferOp]] = {}
-    swa_callbacks_by_type: Dict[TransferType, List[Callable]] = {}
+    swa_callbacks_by_type: Dict[TransferType, List[Tuple[TransferOp, Callable]]] = {}
     supported_types = {TransferType.DISK2H, TransferType.H2D,
                        TransferType.D2H, TransferType.H2DISK,
                        TransferType.H2REMOTE, TransferType.REMOTE2H}
@@ -756,12 +826,12 @@ def merge_to_batch_graph(batch_id: int,
                 swa_ops_by_type[op.transfer_type].append(op)
                 if op.op_id in op_callback_dict:
                     swa_callbacks_by_type[op.transfer_type].append(
-                        op_callback_dict[op.op_id])
+                        (op, op_callback_dict[op.op_id]))
             else:
                 ops_by_type[op.transfer_type].append(op)
                 if op.op_id in op_callback_dict:
                     callbacks_by_type[op.transfer_type].append(
-                        op_callback_dict[op.op_id])
+                        (op, op_callback_dict[op.op_id]))
 
     new_op_callback_dict: Dict[int, Callable] = {}
     # Layerwise folds local DISK2H/H2D into LAYERWISE: merge those ops with a
@@ -781,10 +851,9 @@ def merge_to_batch_graph(batch_id: int,
             raise ValueError("layerwise batch must contain GET ops")
         if has_put:
             raise ValueError("layerwise batch must not mix PUT ops")
-    else:
-        if has_get and has_put:
-            raise ValueError(
-                "batch merge cannot mix GET and PUT ops in the same batch")
+    elif has_get and has_put:
+        raise ValueError(
+            "batch merge cannot mix GET and PUT ops in the same batch")
 
     dp_client_id = _pick_dp_client_id(
         ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
@@ -859,10 +928,14 @@ def merge_to_batch_graph(batch_id: int,
                     layerwise_transfer_op.op_id, merged_swa_remote2h_op.op_id)
 
             layerwise_callbacks: List[Callable] = []
-            layerwise_callbacks.extend(callbacks_by_type[TransferType.DISK2H])
-            layerwise_callbacks.extend(callbacks_by_type[TransferType.H2D])
-            layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.DISK2H])
-            layerwise_callbacks.extend(swa_callbacks_by_type[TransferType.H2D])
+            layerwise_callbacks.extend(
+                callback for _, callback in callbacks_by_type[TransferType.DISK2H])
+            layerwise_callbacks.extend(
+                callback for _, callback in callbacks_by_type[TransferType.H2D])
+            layerwise_callbacks.extend(
+                callback for _, callback in swa_callbacks_by_type[TransferType.DISK2H])
+            layerwise_callbacks.extend(
+                callback for _, callback in swa_callbacks_by_type[TransferType.H2D])
             _attach_combined_callback(
                 layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
             batch_end_op_id = layerwise_transfer_op.op_id
