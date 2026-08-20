@@ -109,7 +109,7 @@ private:
   uint32_t hit_reward_seconds_ = 0;
   LockFreeQueue<QueuedNode> renew_lease_queue;
   bool refresh_started = false;
-  volatile bool refresh_should_stop = false;
+  std::atomic<bool> refresh_should_stop{false};
   pthread_t refresh_tid{};
   std::atomic<RefRadixTree *> c_index;
   std::atomic<RefRadixTree *> old_index;
@@ -140,6 +140,7 @@ public:
 
   bool start(RedisMetaChannel *channel);
   void stop();
+  void reset();
   RefRadixTree* remote_tree_refresh();
   std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,
     int num_blocks, bool update_cache_info = true);
@@ -151,5 +152,4 @@ public:
 };
 
 } // namespace flexkv
-
 

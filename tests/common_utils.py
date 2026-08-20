@@ -19,7 +19,7 @@ DEFAULT_MODEL_CONFIG = {
     'num_kv_heads': 32,
     'head_size': 128,
     'dtype': torch.float16,
-    'use_mla': False,
+    'kv_dim': 2,
     'tp_size': 1,
     'dp_size': 1,
 }
@@ -46,6 +46,13 @@ DEFAULT_TEST_CONFIG = {
     'initial_write_ratio': 0.4,
     'use_server_client': False,
 }
+
+GPU_LAYOUT_LAYERFIRST = 0
+GPU_LAYOUT_BLOCKFIRST = 1
+GPU_LAYOUT_SGLANG = 2
+GPU_LAYOUT_VLLM_LAYERBLOCK = 3
+GPU_LAYOUT_VLLM_PACKED = 4
+GPU_LAYOUT_VLLM_MLA = 5
 
 # Fixtures
 @pytest.fixture
@@ -99,14 +106,20 @@ def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_
     num_layers = model_config.num_layers
     num_kv_heads = model_config.num_kv_heads
     head_size = model_config.head_size
-    use_mla = model_config.use_mla
     tp_size = model_config.tp_size
     tokens_per_block = cache_config.tokens_per_block
 
-    if gpu_layout_type == 0 or gpu_layout_type == 2:
+    if gpu_layout_type in (
+        GPU_LAYOUT_LAYERFIRST,
+        GPU_LAYOUT_SGLANG,
+        GPU_LAYOUT_VLLM_PACKED,
+        GPU_LAYOUT_VLLM_MLA,
+    ):
         layout_type = KVCacheLayoutType.LAYERFIRST
-    elif gpu_layout_type == 1:
+    elif gpu_layout_type == GPU_LAYOUT_BLOCKFIRST:
         layout_type = KVCacheLayoutType.BLOCKFIRST
+    elif gpu_layout_type == GPU_LAYOUT_VLLM_LAYERBLOCK:
+        layout_type = KVCacheLayoutType.LAYERBLOCK
     else:
         raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
     tpgroup_gpu_kv_layout = KVCacheLayout(
@@ -116,9 +129,12 @@ def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_
         tokens_per_block=tokens_per_block,
         num_head=num_kv_heads,
         head_size=head_size,
-        is_mla=model_config.use_mla
+        kv_dim=model_config.kv_dim,
+        num_kv_heads=model_config.num_kv_heads,
     )
-    gpu_kv_layout = tpgroup_gpu_kv_layout.div_head(tp_size) if not use_mla else tpgroup_gpu_kv_layout
+    # When num_kv_heads > 1, heads are sharded across TP ranks (MHA path).
+    # When num_kv_heads == 1, the single head is shared across ranks (MLA).
+    gpu_kv_layout = tpgroup_gpu_kv_layout.div_head(tp_size) if model_config.num_kv_heads > 1 else tpgroup_gpu_kv_layout
     return gpu_kv_layout
 
 def skip_if_insufficient_gpus(required_gpus: int):
@@ -158,12 +174,13 @@ class GPUKVCacheVerifier:
             self.gpu_blocks = imported_gpu_blocks
         self.gpu_block_num = gpu_kv_layout.num_block
         self.tp_size = tp_size
-        self.is_mla = gpu_kv_layout.is_mla
+        self.kv_dim = gpu_kv_layout.kv_dim
+        self.num_kv_heads = gpu_kv_layout.num_kv_heads
         self.tokens_per_block = tokens_per_block
         self.dtype = dtype
 
 
-    def hash_all_values(self, layer_id, kv_id, token_ids, head_id):
+    def _combined_hash(self, layer_id, kv_id, token_ids, head_id):
         base_hash = hash((layer_id, kv_id, head_id))
 
         if isinstance(token_ids, torch.Tensor):
@@ -174,11 +191,38 @@ class GPUKVCacheVerifier:
         for i, token_id in enumerate(token_ids):
             token_hash += (token_id * (prime ** i)) % (2**31 - 1)
 
-        combined_hash = (base_hash + token_hash) % (2**31 - 1)
+        return (base_hash + token_hash) % (2**31 - 1)
+
+    def hash_all_values(self, layer_id, kv_id, token_ids, head_id):
+        combined_hash = self._combined_hash(
+            layer_id,
+            kv_id,
+            token_ids,
+            head_id,
+        )
+
+        if not self.dtype.is_floating_point:
+            return torch.tensor(combined_hash % 251 + 1, dtype=self.dtype).item()
 
         normalized_value = (combined_hash % 1000000) / 1000000.0
-
         return torch.tensor(normalized_value, dtype=self.dtype).item()
+
+    def _expected_values(self, layer_id, kv_id, token_ids, head_id, template):
+        hash_value = self.hash_all_values(layer_id, kv_id, token_ids, head_id)
+        if self.gpu_layout_type not in (
+            GPU_LAYOUT_VLLM_LAYERBLOCK,
+            GPU_LAYOUT_VLLM_PACKED,
+        ):
+            return torch.full_like(template, hash_value)
+
+        offsets = torch.arange(
+            template.numel(),
+            dtype=torch.int64,
+            device=template.device,
+        ).reshape(template.shape)
+        seed = self._combined_hash(layer_id, kv_id, token_ids, head_id)
+        values = (offsets + seed) % 251 + 1
+        return values.to(template.dtype)
 
     def fill_gpu_blocks(self, token_ids, block_ids):
         assert len(token_ids) == len(block_ids) * self.tokens_per_block
@@ -190,52 +234,75 @@ class GPUKVCacheVerifier:
             block_ids = torch.tensor(block_ids, dtype=torch.int64)
 
         for layer_id in range(self.num_layers):
-            kv_num = 2 if not self.is_mla else 1
+            kv_num = self.gpu_kv_layout.kv_dim
             for kv_id in range(kv_num):
                 for tp_id in range(self.tp_size):
-                    if self.gpu_layout_type == 0:
+                    if self.gpu_layout_type in (
+                        GPU_LAYOUT_LAYERFIRST,
+                        GPU_LAYOUT_VLLM_LAYERBLOCK,
+                        GPU_LAYOUT_VLLM_PACKED,
+                        GPU_LAYOUT_VLLM_MLA,
+                    ):
                         gpu_tensor = self.gpu_blocks[tp_id][layer_id]
-                    elif self.gpu_layout_type == 1:
+                    elif self.gpu_layout_type == GPU_LAYOUT_BLOCKFIRST:
                         gpu_tensor = self.gpu_blocks[tp_id][0]
-                    elif self.gpu_layout_type == 2:
+                    elif self.gpu_layout_type == GPU_LAYOUT_SGLANG:
                         gpu_tensor = self.gpu_blocks[tp_id][layer_id + self.num_layers * kv_id]
+                    else:
+                        raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
                     for head_id in range(self.gpu_kv_layout.num_head):
-                        actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if not self.is_mla else head_id
+                        actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if self.num_kv_heads > 1 else head_id
 
                         for block_idx, block_id in enumerate(block_ids):
                             start_token_idx = block_idx * self.tokens_per_block
                             end_token_idx = start_token_idx + self.tokens_per_block
-                            hash_value = self.hash_all_values(layer_id,
-                                                              kv_id,
-                                                              token_ids[start_token_idx:end_token_idx],
-                                                              actual_head_id)
+                            block_token_ids = token_ids[start_token_idx:end_token_idx]
                             # GPU tensor dim：[kv_dim, num_block, tokens_per_block, num_head, head_size]
-                            if self.gpu_layout_type == 0:
+                            if self.gpu_layout_type == GPU_LAYOUT_LAYERFIRST:
                                 # gpu_layout_type 0:
                                 #     [num_layer][kv_dim, num_block, tokens_per_block, num_head, head_size]
-                                gpu_tensor[kv_id, block_id, :, head_id, :] = hash_value
-                            elif self.gpu_layout_type == 1:
+                                target = gpu_tensor[kv_id, block_id, :, head_id, :]
+                            elif self.gpu_layout_type == GPU_LAYOUT_BLOCKFIRST:
                                 # gpu_layout_type 1:
                                 #     [tp_id][0][num_block, num_layer, kv_dim, tokens_per_block, num_head, head_size]
                                 # Need to get the first (and only) tensor from the list
-                                gpu_tensor[block_id, layer_id, kv_id, :, head_id, :] = hash_value
-                            elif self.gpu_layout_type == 2:
-                                gpu_tensor[block_id, :, head_id, :] = hash_value
+                                target = gpu_tensor[block_id, layer_id, kv_id, :, head_id, :]
+                            elif self.gpu_layout_type == GPU_LAYOUT_SGLANG:
+                                target = gpu_tensor[block_id, :, head_id, :]
+                            elif self.gpu_layout_type == GPU_LAYOUT_VLLM_LAYERBLOCK:
+                                target = gpu_tensor[block_id, kv_id, :, head_id, :]
+                            elif self.gpu_layout_type == GPU_LAYOUT_VLLM_PACKED:
+                                target = gpu_tensor[block_id, head_id, :, :]
+                            elif self.gpu_layout_type == GPU_LAYOUT_VLLM_MLA:
+                                target = gpu_tensor[block_id, :, :]
                             else:
                                 raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
+                            target.copy_(self._expected_values(
+                                layer_id,
+                                kv_id,
+                                block_token_ids,
+                                actual_head_id,
+                                target,
+                            ))
 
     def clear_gpu_blocks(self, block_ids):
         for layer_id in range(self.num_layers):
-            kv_num = 2 if not self.is_mla else 1
+            kv_num = self.gpu_kv_layout.kv_dim
             for kv_id in range(kv_num):
                 for tp_id in range(self.tp_size):
-                    if self.gpu_layout_type == 0:
+                    if self.gpu_layout_type == GPU_LAYOUT_LAYERFIRST:
                         self.gpu_blocks[tp_id][layer_id][kv_id, block_ids, :, :, :] = 0
-                    elif self.gpu_layout_type == 1:
+                    elif self.gpu_layout_type == GPU_LAYOUT_BLOCKFIRST:
                         self.gpu_blocks[tp_id][0][block_ids, layer_id, kv_id, :, :, :] = 0
-                    elif self.gpu_layout_type == 2:
+                    elif self.gpu_layout_type == GPU_LAYOUT_SGLANG:
                         self.gpu_blocks[tp_id][layer_id + self.num_layers * kv_id][block_ids, :, :, :] = 0
+                    elif self.gpu_layout_type == GPU_LAYOUT_VLLM_LAYERBLOCK:
+                        self.gpu_blocks[tp_id][layer_id][block_ids, kv_id, :, :, :] = 0
+                    elif self.gpu_layout_type == GPU_LAYOUT_VLLM_PACKED:
+                        self.gpu_blocks[tp_id][layer_id][block_ids, :, :, :] = 0
+                    elif self.gpu_layout_type == GPU_LAYOUT_VLLM_MLA:
+                        self.gpu_blocks[tp_id][layer_id][block_ids, :, :] = 0
                     else:
                         raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
@@ -251,49 +318,64 @@ class GPUKVCacheVerifier:
         errors = []
 
         for layer_id in range(self.num_layers):
-            kv_num = 2 if not self.is_mla else 1
+            kv_num = self.gpu_kv_layout.kv_dim
             for kv_id in range(kv_num):
                 for tp_id in range(self.tp_size):
-                    if self.gpu_layout_type == 0:
+                    if self.gpu_layout_type in (
+                        GPU_LAYOUT_LAYERFIRST,
+                        GPU_LAYOUT_VLLM_LAYERBLOCK,
+                        GPU_LAYOUT_VLLM_PACKED,
+                        GPU_LAYOUT_VLLM_MLA,
+                    ):
                         #if isinstance(self.gpu_blocks[0], list):
                         gpu_tensor = self.gpu_blocks[tp_id][layer_id]
-                    elif self.gpu_layout_type == 1:
+                    elif self.gpu_layout_type == GPU_LAYOUT_BLOCKFIRST:
                         gpu_tensor = self.gpu_blocks[tp_id][0]
-                    elif self.gpu_layout_type == 2:
+                    elif self.gpu_layout_type == GPU_LAYOUT_SGLANG:
                         gpu_tensor = self.gpu_blocks[tp_id][layer_id + self.num_layers * kv_id]
+                    else:
+                        raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
                     for head_id in range(self.gpu_kv_layout.num_head):
-                        actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if not self.is_mla else head_id
+                        actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if self.num_kv_heads > 1 else head_id
                         for block_idx, block_id in enumerate(block_ids):
                             start_token_idx = block_idx * self.tokens_per_block
                             end_token_idx = start_token_idx + self.tokens_per_block
-                            expected_hash_value = self.hash_all_values(layer_id, kv_id,
-                                                                      token_ids[start_token_idx:end_token_idx],
-                                                                      actual_head_id)
-                            if self.gpu_layout_type == 0:
+                            block_token_ids = token_ids[start_token_idx:end_token_idx]
+                            if self.gpu_layout_type == GPU_LAYOUT_LAYERFIRST:
                                 # gpu_layout_type 0:
                                 #     [num_layer][kv_dim, num_block, tokens_per_block, num_head, head_size]
                                 actual_values = gpu_tensor[kv_id, block_id, :, head_id, :]
-                            elif self.gpu_layout_type == 1:
+                            elif self.gpu_layout_type == GPU_LAYOUT_BLOCKFIRST:
                                 # gpu_layout_type 1:
                                 #     [tp_id][0][num_block, num_layer, kv_dim, tokens_per_block, num_head, head_size]
                                 # Need to get the first (and only) tensor from the list
                                 actual_values = gpu_tensor[block_id, layer_id, kv_id, :, head_id, :]
-                            elif self.gpu_layout_type == 2:
+                            elif self.gpu_layout_type == GPU_LAYOUT_SGLANG:
                                 actual_values = gpu_tensor[block_id, :, head_id, :]
+                            elif self.gpu_layout_type == GPU_LAYOUT_VLLM_LAYERBLOCK:
+                                actual_values = gpu_tensor[block_id, kv_id, :, head_id, :]
+                            elif self.gpu_layout_type == GPU_LAYOUT_VLLM_PACKED:
+                                actual_values = gpu_tensor[block_id, head_id, :, :]
+                            elif self.gpu_layout_type == GPU_LAYOUT_VLLM_MLA:
+                                actual_values = gpu_tensor[block_id, :, :]
                             else:
                                 raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
-                            expected_tensor = torch.full_like(actual_values, expected_hash_value)
+                            expected_tensor = self._expected_values(
+                                layer_id,
+                                kv_id,
+                                block_token_ids,
+                                actual_head_id,
+                                actual_values,
+                            )
                             if not torch.allclose(actual_values,
                                                 expected_tensor,
                                                 rtol=1e-5, atol=1e-6):
                                 # 对 fp8 做特判：转成 float32 再比较，避免 PyTorch 在 fp8 上缺少 mul_cuda 等算子
                                 if actual_values.dtype == getattr(torch, "float8_e4m3fn", None):
                                     actual_f32 = actual_values.to(torch.float32)
-                                    expected_f32 = torch.full_like(
-                                        actual_f32, float(expected_hash_value)
-                                    )
+                                    expected_f32 = expected_tensor.to(torch.float32)
                                     allclose_ok = torch.allclose(
                                         actual_f32,
                                         expected_f32,
@@ -303,7 +385,7 @@ class GPUKVCacheVerifier:
                                 else:
                                     allclose_ok = torch.allclose(
                                         actual_values,
-                                        torch.full_like(actual_values, expected_hash_value),
+                                        expected_tensor,
                                         rtol=1e-5,
                                         atol=1e-6,
                                     )
@@ -321,7 +403,8 @@ class GPUKVCacheVerifier:
                                 errors.append(
                                     f"Mismatch at layer={layer_id}, kv={kv_id}, tp={tp_id}, "
                                     f"head={head_id}, block={block_id}: "
-                                    f"expected={expected_hash_value}, got={mismatch_value} "
+                                    f"expected={expected_tensor[mismatch_idx[0], mismatch_idx[1]].item()}, "
+                                    f"got={mismatch_value} "
                                     f"at token={mismatch_idx[0].item()}, dim={mismatch_idx[1].item()}, "
                                     f"max_abs_diff={max_abs_diff}"
                                 )
@@ -392,7 +475,7 @@ def example_usage_gpu_kv_cache_verifier():
         num_layers=2,
         num_kv_heads=8,
         head_size=64,
-        use_mla=False,
+        kv_dim=2,
         dtype=torch.float16,
         tp_size=1,
         dp_size=1
@@ -410,7 +493,8 @@ def example_usage_gpu_kv_cache_verifier():
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla
+        kv_dim=model_config.kv_dim,
+        num_kv_heads=model_config.num_kv_heads,
     )
 
     # Create mock GPU blocks

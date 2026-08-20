@@ -22,10 +22,46 @@ from flexkv.transfer_manager import TransferManagerOnRemote
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata, KVConnectorRole)
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.v1.engine import FinishReason
 
 # KVConnectorStats: available since v0.11.0
 try:
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+
+    class _FlexKVConnectorStats(KVConnectorStats):
+        """Serializable vLLM stats snapshot for the FlexKV scheduler side."""
+
+        _RATIO_KEYS = {"get_gpu_match_ratio", "get_flexkv_match_ratio"}
+
+        def reset(self):
+            for key in self.data:
+                self.data[key] = 0
+
+        def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
+            if other.is_empty():
+                return self
+            for key, value in other.data.items():
+                if key not in self._RATIO_KEYS:
+                    self.data[key] = self.data.get(key, 0) + value
+            query_tokens = self.data.get("num_get_query_tokens", 0)
+            self.data["get_gpu_match_ratio"] = (
+                self.data.get("num_gpu_matched_tokens", 0) / query_tokens
+                if query_tokens else 0.0
+            )
+            self.data["get_flexkv_match_ratio"] = (
+                self.data.get("num_flexkv_matched_tokens", 0) / query_tokens
+                if query_tokens else 0.0
+            )
+            return self
+
+        def reduce(self) -> dict[str, int | float]:
+            return dict(self.data)
+
+        def is_empty(self) -> bool:
+            return not any(
+                value for key, value in self.data.items()
+                if key not in self._RATIO_KEYS
+            )
 
     class _FlexKVWorkerSentinelStats(KVConnectorStats):
         """Sentinel stats returned from the worker side so that
@@ -47,6 +83,7 @@ try:
 
 except ImportError:
     KVConnectorStats = None  # type: ignore[misc,assignment]
+    _FlexKVConnectorStats = None  # type: ignore[misc,assignment]
     _FlexKVWorkerSentinelStats = None  # type: ignore[misc,assignment]
 
 # KVConnectorOutput: available since v0.10.1
@@ -73,6 +110,39 @@ if TYPE_CHECKING:
 
 
 logger = flexkv_logger
+
+
+def _assert_token_major(kv_cache: torch.Tensor, token_dim: int,
+                        head_dim: int) -> None:
+    """Reject a KV cache whose heads outrank its tokens in memory.
+
+    A cache has the same logical shape under both of vLLM's cache layouts;
+    only the strides differ.  NHD stores it token-major, which is the order
+    FlexKV's workers assume, while HND stores it head-major.  Since the
+    workers derive addresses from KVCacheLayout's shape-implied strides and
+    never read ``tensor.stride()``, an HND cache would be read at the wrong
+    offsets and silently corrupt KV, so refuse it here.
+
+    Either extent being 1 makes the two layouts byte-identical, so those are
+    accepted -- a rank of a GQA model with one KV head is the common case.
+
+    Args:
+        kv_cache (torch.Tensor): one layer's KV cache.
+        token_dim (int): index of the tokens-per-block dimension.
+        head_dim (int): index of the KV-heads dimension.
+
+    Raises:
+        ValueError: if the cache is head-major (HND) rather than token-major.
+    """
+    if kv_cache.shape[head_dim] == 1 or kv_cache.shape[token_dim] == 1:
+        return
+    strides = kv_cache.stride()
+    if strides[head_dim] > strides[token_dim]:
+        raise ValueError(
+            "KV cache is head-major (HND); FlexKV addresses KV token-major. "
+            "Leave VLLM_KV_CACHE_LAYOUT unset to get the NHD default. "
+            f"shape={tuple(kv_cache.shape)} stride={strides}"
+        )
 
 
 @dataclass
@@ -214,6 +284,29 @@ class FlexKVSchedulerConnector:
         self.flexkv_manager.shutdown()
         if self.collector is not None:
             self.collector.close()
+
+    def reset_cache(self) -> bool:
+        """Invalidate the FlexKV cache: drop the radix tree + mempool on every
+        tier, so KV computed against stale weights can no longer be matched.
+
+        Invoked from vLLM's scheduler via reset_prefix_cache(reset_connector=True)
+        after a weight update. Safety relies only on the radix tree being
+        cleared (get_match can no longer hit stale KV); in-flight transfers need
+        not be drained.
+
+        We also clear this connector's own per-request bookkeeping. These dicts
+        map vLLM request_id -> flexkv task_id for requests currently in flight;
+        after a reset those task_ids reference dropped cache, so we clear them to
+        avoid dangling references (they are normally empty at a reset boundary).
+        """
+        self.flexkv_manager.reset()
+        self.req_id_to_task_dict.clear()
+        self.get_tasks.clear()
+        self.put_tasks.clear()
+        self.tasks_to_launch.clear()
+        self.tasks_to_cancel.clear()
+        self.failed_block_ids.clear()
+        return True
 
     ####################
     #### Get Method ####
@@ -414,20 +507,28 @@ class FlexKVSchedulerConnector:
         request: "Request",
         block_ids: list[int],
     ) -> bool:
-        """
+        """Handle a vLLM request before its KV cache blocks are freed.
+
         Args:
-            request: Request to put.
-            blocks: All block_ids of the request.
+            request: The vLLM scheduler request being finalized.
+            block_ids: IDs of all GPU KV cache blocks owned by the request.
 
         Returns:
-            bool: whether thire is unfinished task for this request.
+            True if a FlexKV transfer still needs the request's blocks and
+            vLLM must defer freeing them; False if the blocks can be freed.
         """
-        # Task not finished, can't free blocks
+        # An existing FlexKV task still owns these blocks, so keep them alive.
         if request.request_id in self.req_id_to_task_dict:
             return True
 
-        # Abnormal finished, don't put
-        if not (request.is_finished() and request.get_finished_reason() < 2):
+        finish_reason = request.get_finished_reason()
+        normal_finish = finish_reason in (FinishReason.STOP, FinishReason.LENGTH)
+        requested_abort_offload = (
+            finish_reason == FinishReason.ABORT
+            and bool(getattr(request, "offload_kv_on_finish", False))
+        )
+        should_put = request.is_finished() and (normal_finish or requested_abort_offload)
+        if not should_put:
             return False
 
         if self.maybe_skip_put and os.path.exists('/tmp/flexkv_skip_put'):
@@ -567,7 +668,7 @@ class FlexKVSchedulerConnector:
         if get_task_ids:
             launched_get_task_ids = self.flexkv_manager.launch(task_ids=get_task_ids,
                                        slot_mappings=get_slot_mappings,
-                                       as_batch=self.enable_batch)
+                                       as_batch=self.enable_batch and len(get_task_ids) > 1)
             if len(launched_get_task_ids) == 1 and len(get_tasks_to_launch) > 1:
                 self.get_tasks[launched_get_task_ids[0]] = get_tasks_to_launch
             elif len(launched_get_task_ids) == len(get_tasks_to_launch):
@@ -578,7 +679,7 @@ class FlexKVSchedulerConnector:
         if put_task_ids:
             launched_put_task_ids = self.flexkv_manager.launch(task_ids=put_task_ids,
                                        slot_mappings=put_slot_mappings,
-                                       as_batch=self.enable_batch)
+                                       as_batch=self.enable_batch and len(put_task_ids) > 1)
             if len(launched_put_task_ids) == 1 and len(put_tasks_to_launch) > 1:
                 self.put_tasks[launched_put_task_ids[0]] = put_tasks_to_launch
             elif len(launched_put_task_ids) == len(put_tasks_to_launch):
@@ -712,11 +813,14 @@ class FlexKVWorkerConnector:
             flexkv_config.gpu_register_port,
             dp_client_id=rank_info.dp_client_id,
             pp_rank=rank_info.pp_rank,
+            intra_client_id=rank_info.intra_client_id,
             device_id=rank_info.local_rank,
         )
         logger.info("Finish init FlexKVWorkerConnector")
 
-    def register_to_server(self, kv_caches: dict[str, torch.Tensor]):
+    def register_to_server(
+        self, kv_caches: dict[str, torch.Tensor], *, resume: bool = False
+    ):
         logger.info("Start register kv_caches")
 
         # Separate main KV caches from indexer caches by layer name.
@@ -728,20 +832,51 @@ class FlexKVWorkerConnector:
             else:
                 main_kv_caches[layer_name] = tensor
 
-        # Build main KV cache layout
+        # Build main KV cache layout.
+        #
+        # kv_dim / num_kv_heads are derived from the physical GPU tensor shape
+        # (the ground truth at registration time). The ModelConfig values set
+        # during post_init (from the framework's predicted cache_shape) are used
+        # only as a cross-check.
+        #   3D tensor      -> MLA       : kv_dim=1, num_kv_heads=1
+        #   4D tensor      -> packed MHA: kv_dim=1, num_kv_heads=H (per-rank)
+        #   5D tensor      -> plain MHA : kv_dim=2, num_kv_heads=H (per-rank)
         gpu_blocks = list(main_kv_caches.values())
         num_layer = len(main_kv_caches)
-        if self.flexkv_config.model_config.use_mla:
-            assert gpu_blocks[0].ndim == 3, (
-                f"expect kv cached tensor has 3 dim but get shape={gpu_blocks[0].shape}.")
+        if gpu_blocks[0].ndim == 3:
             gpu_layout_type = KVCacheLayoutType.LAYERFIRST
             num_blocks = gpu_blocks[0].shape[0]
             block_size = gpu_blocks[0].shape[1]
             num_kv_heads = 1
             head_size = gpu_blocks[0].shape[2]
+            kv_dim = 1
+        elif gpu_blocks[0].ndim == 4:
+            # Packed vLLM caches have no separate K/V axis. Regular backends
+            # use (num_blocks, H, block_size, 2 * D), while FlashInfer NVFP4
+            # uses (num_blocks, 2 * H, block_size, Dpacked). Preserve the
+            # backend's physical head count and width in both cases.
+            if self.flexkv_config.model_config.kv_dim != 1:
+                raise ValueError(
+                    "received a packed 4D vLLM KV cache but model_config.kv_dim "
+                    f"is not 1: kv_dim={self.flexkv_config.model_config.kv_dim}, "
+                    f"shape={tuple(gpu_blocks[0].shape)}")
+            _assert_token_major(gpu_blocks[0], token_dim=2, head_dim=1)
+            # LAYERFIRST [L, 1, B, T, H, D] and LAYERBLOCK [L, B, 1, T, H, D]
+            # then have identical layer, block, and chunk strides; only the
+            # unused kv_stride differs. Use LAYERFIRST as the canonical
+            # single-region representation, matching MLA and the packed
+            # tensor's physical NHD order.
+            gpu_layout_type = KVCacheLayoutType.LAYERFIRST
+            num_blocks = gpu_blocks[0].shape[0]
+            num_kv_heads = gpu_blocks[0].shape[1]
+            block_size = gpu_blocks[0].shape[2]
+            head_size = gpu_blocks[0].shape[3]
+            kv_dim = 1
         else:
             assert gpu_blocks[0].ndim == 5, (
-                f"expect kv cached tensor has 5 dim but get shape={gpu_blocks[0].shape}.")
+                f"expect kv cached tensor has 3, 4 or 5 dim "
+                f"but get shape={gpu_blocks[0].shape}.")
+            _assert_token_major(gpu_blocks[0], token_dim=2, head_dim=3)
             # Detect GPU layout from the kv dim position (which holds size 2):
             #   vLLM <= 0.21: (kv=2, num_blocks, ...)  -> LAYERFIRST
             #   vLLM >= 0.23: (num_blocks, kv=2, ...)  -> LAYERBLOCK
@@ -757,6 +892,7 @@ class FlexKVWorkerConnector:
             block_size = gpu_blocks[0].shape[2]
             num_kv_heads = gpu_blocks[0].shape[3]
             head_size = gpu_blocks[0].shape[4]
+            kv_dim = 2
         gpu_layout = KVCacheLayout(
             type=gpu_layout_type,
             num_layer=num_layer,
@@ -764,13 +900,15 @@ class FlexKVWorkerConnector:
             tokens_per_block=block_size,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=self.flexkv_config.model_config.use_mla,
+            kv_dim=kv_dim,
+            num_kv_heads=num_kv_heads,
         )
 
         if not indexer_kv_caches:
             self.tp_client.register_to_server(
                 kv_caches=gpu_blocks,
                 kv_layout=gpu_layout,
+                resume=resume,
             )
         else:
             indexer_buffers = list(indexer_kv_caches.values())
@@ -784,7 +922,10 @@ class FlexKVWorkerConnector:
                 tokens_per_block=first_indexer_buffer.shape[1],
                 num_head=1,
                 head_size=first_indexer_buffer.shape[2],
-                is_mla=True,
+                # Indexer is a single-region single-head sidecar (kv_dim=1,
+                # num_kv_heads=1), like MLA/SWA.
+                kv_dim=1,
+                num_kv_heads=1,
             )
 
             layer_groups = [
@@ -814,9 +955,19 @@ class FlexKVWorkerConnector:
                 layer_groups=layer_groups,
                 gpu_layouts=[gpu_layout, indexer_layout],
                 handles_per_group=[gpu_blocks, indexer_buffers],
+                resume=resume,
             )
 
         logger.info("Finish register kv_caches")
+        self._registered_kv_caches = dict(kv_caches)
+
+    def before_device_sleep(self) -> int:
+        return self.tp_client.suspend_gpu_mappings()
+
+    def after_device_wake(self) -> None:
+        if not hasattr(self, "_registered_kv_caches"):
+            raise RuntimeError("KV caches were not registered before wake")
+        self.register_to_server(self._registered_kv_caches, resume=True)
 
     def __del__(self):
         if hasattr(self, "remote_transfer_manager_process") and \
@@ -870,6 +1021,14 @@ class FlexKVConnectorV1Impl:
     def shutdown(self):
         if self.role == KVConnectorRole.SCHEDULER:
             self.connector.shutdown()
+
+    def reset_cache(self) -> Optional[bool]:
+        """Reset the FlexKV cache. Only meaningful on the scheduler side
+        (vLLM invokes connector.reset_cache() from the scheduler process).
+        """
+        if self.role == KVConnectorRole.SCHEDULER:
+            return self.connector.reset_cache()
+        return None
 
     # ==============================
     # Worker-side methods
@@ -956,6 +1115,14 @@ class FlexKVConnectorV1Impl:
             dictionary of layer names, kv cache
         """
         self.connector.register_to_server(kv_caches)
+
+    def before_device_sleep(self) -> None:
+        if self.role == KVConnectorRole.WORKER:
+            self.connector.before_device_sleep()
+
+    def after_device_wake(self) -> None:
+        if self.role == KVConnectorRole.WORKER:
+            self.connector.after_device_wake()
 
     # ==============================
     # Scheduler-side methods
@@ -1108,7 +1275,7 @@ class FlexKVConnectorV1Impl:
             "get_gpu_match_ratio": stats.get_gpu_match_ratio,
             "get_flexkv_match_ratio": stats.get_flexkv_match_ratio,
         }
-        return KVConnectorStats(data=data)
+        return _FlexKVConnectorStats(data=data)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         if self.role == KVConnectorRole.SCHEDULER:

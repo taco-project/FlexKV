@@ -611,7 +611,7 @@ void transfer_kv_blocks_gds(
     int64_t total_layers,
     bool is_read,
     bool verbose,
-    bool is_mla
+    int kv_dim
 ) {
     const int num_transfers = ssd_block_ids.size(0);
     
@@ -737,7 +737,7 @@ void transfer_kv_blocks_gds(
                         d_my_block_id,
                         1,  // num_blocks
                         num_layers,
-                        is_mla,
+                        kv_dim,
                         true,
                         slot_stream
                     );
@@ -754,7 +754,7 @@ void transfer_kv_blocks_gds(
                         d_my_block_id,
                         1,  // num_blocks
                         num_layers,
-                        is_mla,
+                        kv_dim,
                         false,
                         slot_stream
                     );
@@ -798,16 +798,16 @@ void transfer_kv_blocks_gds(
 template void transfer_kv_blocks_gds<BackendType::VLLM>(
     GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
     const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int, int, int64_t, bool, bool, bool);
+    int, int, int64_t, bool, bool, int);
 
 template void transfer_kv_blocks_gds<BackendType::TRTLLM>(
     GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
     const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int, int, int64_t, bool, bool, bool);
+    int, int, int64_t, bool, bool, int);
 
 template void transfer_kv_blocks_gds<BackendType::SGLANG>(
     GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
     const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int, int, int64_t, bool, bool, bool);
+    int, int, int64_t, bool, bool, int);
 
 }

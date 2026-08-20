@@ -91,7 +91,8 @@ class StorageEngine:
                 tokens_per_block=self._cache_config.tokens_per_block,
                 num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
-                is_mla=self._model_config.use_mla,
+                kv_dim=self._model_config.kv_dim,
+                num_kv_heads=self._model_config.num_kv_heads,
                 layer_groups=self._model_config.layer_groups,
                 tp_size=self._model_config.tp_size,
             )
@@ -111,7 +112,8 @@ class StorageEngine:
                 tokens_per_block=self._cache_config.tokens_per_block,
                 num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
-                is_mla=self._model_config.use_mla,
+                kv_dim=self._model_config.kv_dim,
+                num_kv_heads=self._model_config.num_kv_heads,
                 layer_groups=self._model_config.layer_groups,
                 tp_size=self._model_config.tp_size,
             )
@@ -139,7 +141,8 @@ class StorageEngine:
                     tokens_per_block=self._cache_config.tokens_per_block,
                     num_head=self._model_config.num_kv_heads_per_node,
                     head_size=self._model_config.head_size,
-                    is_mla=self._model_config.use_mla,
+                    kv_dim=self._model_config.kv_dim,
+                    num_kv_heads=self._model_config.num_kv_heads,
                     layer_groups=self._model_config.layer_groups,
                     tp_size=self._model_config.tp_size,
                 )
@@ -159,7 +162,7 @@ class StorageEngine:
         if swa_cfg is not None and swa_cfg.enabled:
             swa_tokens_per_block = self._cache_config.tokens_per_block
             if self._cache_config.enable_cpu:
-                # uint8, num_head=1, is_mla=True; per-token-per-layer bytes -> head_size.
+                # uint8, num_head=1, kv_dim=1, num_kv_heads=1; per-token-per-layer bytes -> head_size.
                 self._swa_cpu_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
                     num_layer=swa_cfg.num_swa_layers,
@@ -167,7 +170,8 @@ class StorageEngine:
                     tokens_per_block=swa_tokens_per_block,
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
-                    is_mla=True,
+                    kv_dim=1,
+                    num_kv_heads=1,
                     layer_groups=self._swa_layer_groups,
                     tp_size=self._model_config.tp_size,
                 )
@@ -197,7 +201,8 @@ class StorageEngine:
                     tokens_per_block=swa_tokens_per_block,
                     num_head=1,
                     head_size=swa_cfg.bytes_per_token_per_layer,
-                    is_mla=True,
+                    kv_dim=1,
+                    num_kv_heads=1,
                     layer_groups=self._swa_layer_groups,
                     tp_size=self._model_config.tp_size,
                 )
@@ -231,12 +236,13 @@ class StorageEngine:
                         num_layer=swa_cfg.num_swa_layers,
                         num_block=swa_cfg.num_remote_slots,
                         tokens_per_block=swa_tokens_per_block,
-                        num_head=1,
-                        head_size=swa_cfg.bytes_per_token_per_layer,
-                        is_mla=True,
-                        layer_groups=self._swa_layer_groups,
-                        tp_size=self._model_config.tp_size,
-                    )
+                    num_head=1,
+                    head_size=swa_cfg.bytes_per_token_per_layer,
+                    kv_dim=1,
+                    num_kv_heads=1,
+                    layer_groups=self._swa_layer_groups,
+                    tp_size=self._model_config.tp_size,
+                )
                     swa_remote_path = self._cache_config.remote_cache_path
                     if isinstance(swa_remote_path, str):
                         swa_remote_path = swa_remote_path + "_swa"

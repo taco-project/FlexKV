@@ -42,17 +42,17 @@ BENCH_ITERS = 20
 
 def make_tensors(num_layers, num_blocks, tpb, head_dim, num_gpus):
     heads_per_rank = 1
-    kv_dim = 1
+    kv_dim = 1  # MLA: K/V combined
     gpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=tpb, num_head=heads_per_rank,
-        head_size=head_dim, is_mla=True)
+        head_size=head_dim, kv_dim=kv_dim)
     cpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.BLOCKFIRST,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=tpb, num_head=1,
-        head_size=head_dim, is_mla=True)
+        head_size=head_dim, kv_dim=kv_dim)
 
     all_gpu = []
     for g in range(num_gpus):
@@ -66,7 +66,7 @@ def make_tensors(num_layers, num_blocks, tpb, head_dim, num_gpus):
 
 
 def make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
-                         is_mla=False, is_blockfirst=False):
+                         kv_dim=2, is_blockfirst=False):
     def strides_tensor(getter):
         return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
     ssd_files = {}
@@ -79,7 +79,7 @@ def make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
         strides_tensor(gpu_layout.get_layer_stride),
         strides_tensor(gpu_layout.get_chunk_size),
         0, 0, layer_eventfds_tensor, num_gpus,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
         is_blockfirst=is_blockfirst,
     )
 
@@ -99,7 +99,7 @@ def bench_one(num_layers, num_blocks, tpb, head_dim, num_gpus, use_ce,
 
     lw = make_layerwise_group(
         cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
-        is_mla=True, is_blockfirst=True,
+        kv_dim=1, is_blockfirst=True,
     )
 
     def run_once(group=lw):
@@ -125,9 +125,10 @@ def bench_one(num_layers, num_blocks, tpb, head_dim, num_gpus, use_ce,
             use_ce_transfer=use_ce,
             num_layers=num_layers,
             layer_granularity=1,
-            is_mla=True,
+            kv_dim=1,
+            num_kv_heads=1,
             counter_id=0,
-            mla_d2h_mode="sharded",
+            kv_shared_across_ranks_mode="sharded",
             notify_mode=notify_mode,
         )
 

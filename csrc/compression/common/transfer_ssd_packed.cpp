@@ -66,7 +66,7 @@ static int64_t transfer_kv_blocks_ssd_packed_impl(
     bool is_read, int num_blocks_per_file,
     int round_robin,
     int num_threads_per_device,
-    bool is_mla,
+    int kv_dim,
     // --- nvcomp packed-specific ---
     bool blockfirst, // true = BLOCKFIRST, false = LAYERFIRST
     int total_layers,
@@ -109,7 +109,6 @@ static int64_t transfer_kv_blocks_ssd_packed_impl(
                     : " requires a full-layer transfer starting at layer 0"));
   }
 
-  const int kv_dim = is_mla ? 1 : 2;
   // On-disk slot size per block.
   // BLOCKFIRST's block_stride already spans the whole block;
   // LAYERFIRST's block_stride is per-layer/kv, so scale it up.
@@ -219,7 +218,7 @@ int64_t transfer_kv_blocks_ssd_packed(
     bool is_read, int num_blocks_per_file,
     int round_robin,
     int num_threads_per_device,
-    bool is_mla,
+    int kv_dim,
     // --- nvcomp packed-specific ---
     const std::string &layout_type,
     int total_layers,
@@ -247,7 +246,7 @@ int64_t transfer_kv_blocks_ssd_packed(
       ioctx, cpu_layer_id_list, cpu_tensor_ptr, ssd_block_ids, cpu_block_ids,
       cpu_layer_stride_in_bytes, cpu_kv_stride_in_bytes, chunk_size_in_bytes,
       block_stride_in_bytes, is_read, num_blocks_per_file, round_robin,
-      num_threads_per_device, is_mla, blockfirst, total_layers,
+      num_threads_per_device, kv_dim, blockfirst, total_layers,
       cpu_size_table_base, cpu_size_table_block_stride,
       cpu_size_table_layer_stride, ssd_size_table_base,
       ssd_size_table_block_stride, ssd_size_table_layer_stride, tp_size,

@@ -221,6 +221,7 @@ class TransferEngine:
 
         self.num_gpu_groups = len(self.gpu_handle_groups)
         self._running = False
+        self._gpu_mappings_suspended = False
 
         self._child_id_to_child: Dict[int, TransferOp] = {}
         self._child_to_parent_op_id: Dict[int, int] = {}
@@ -1656,6 +1657,62 @@ class TransferEngine:
                 break
 
         return completed_ops
+
+    def suspend_gpu_mappings(self) -> int:
+        """Drain worker pipes and release imported vLLM VMM mappings."""
+        if self._gpu_mappings_suspended:
+            return 0
+        if GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+            raise NotImplementedError(
+                "GPU hot remap does not support layerwise transfer"
+            )
+        if self.model_config.layer_groups is not None:
+            raise NotImplementedError(
+                "GPU hot remap does not support multi-group KV layouts"
+            )
+        if self._has_swa:
+            raise NotImplementedError(
+                "GPU hot remap does not support SWA KV pools"
+            )
+        if self.op_id_to_op or not self.task_queue.empty():
+            raise RuntimeError(
+                "Cannot suspend GPU mappings with transfers in flight"
+            )
+        released = 0
+        for workers in (self.h2d_workers, self.d2h_workers):
+            for worker in workers.values():
+                released += int(worker.control("suspend_gpu"))
+        self._gpu_mappings_suspended = True
+        return released
+
+    def resume_gpu_mappings(
+        self, gpu_handle_groups: Dict[WorkerKey, List[StorageHandle]]
+    ) -> int:
+        """Import fresh post-wake VMM handles into existing workers."""
+        if not self._gpu_mappings_suspended:
+            raise RuntimeError("GPU mappings are not suspended")
+        if set(gpu_handle_groups) != set(self.gpu_handle_groups):
+            raise ValueError(
+                "GPU worker groups changed across sleep: "
+                f"old={set(self.gpu_handle_groups)}, "
+                f"new={set(gpu_handle_groups)}"
+            )
+        imported = 0
+        for worker_key, handles in gpu_handle_groups.items():
+            payload = (
+                handles[0].get_tensor_handle_list()
+                if self.model_config.effective_tp_size_per_node == 1
+                else [handle.get_tensor_handle_list() for handle in handles]
+            )
+            imported += int(
+                self.h2d_workers[worker_key].control("resume_gpu", payload)
+            )
+            imported += int(
+                self.d2h_workers[worker_key].control("resume_gpu", payload)
+            )
+        self.gpu_handle_groups = gpu_handle_groups
+        self._gpu_mappings_suspended = False
+        return imported
 
     def shutdown(self) -> None:
         """Shutdown the transfer engine"""

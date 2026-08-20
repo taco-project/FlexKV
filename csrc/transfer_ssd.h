@@ -1,9 +1,9 @@
 #pragma once
 #include <errno.h>
 #include <liburing.h>
-#include <linux/ioprio.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <fcntl.h>
 #include <torch/extension.h>
 #include <unistd.h>
 #include <vector>
@@ -329,7 +329,7 @@ void transfer_kv_blocks_ssd(
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_kv_stride_in_bytes, int64_t chunk_size_in_bytes,
     int64_t block_stride_in_bytes, bool is_read, int num_blocks_per_file,
-    int round_robin = 1, int num_threads_per_device = 16, bool is_mla = false,
-    bool ssd_io_opt = true);
+    int round_robin = 1, int num_threads_per_device = 16,
+    int kv_dim = 2, bool ssd_io_opt = true);
 
 } // namespace flexkv

@@ -607,7 +607,7 @@ class MooncakeStoreCacheEngine:
     def match_swa_from_result(self, match_result, sequence_meta, upper_bound_blocks: int,
                               lock_for_load: bool = False):
         """Mooncake REMOTE tier: SWA is keyed by tail hash, not a mounted slot."""
-        del lock_for_load
+        # lock_for_load is unused: Mooncake SWA is hash-keyed, so no slot lock is needed.
         swa_hit = int(getattr(match_result, "swa_hit_blocks", 0) or 0) if match_result else 0
         if swa_hit <= 0 or upper_bound_blocks <= 0:
             return 0, -1, None

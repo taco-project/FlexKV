@@ -1,101 +1,105 @@
-# SGLang FlexKV Connector Integration
+# Using FlexKV with SGLang
 
-> **WARNING: THIS INTEGRATION IS NOT YET COMPLETE AND HAS NOT BEEN TESTED.**
->
-> The patch was mechanically ported from the development branch and conflicts
-> were resolved manually. It has NOT been validated with runtime tests.
-> Please do NOT use in production until full testing is completed.
+[中文文档](README_zh.md)
 
-## Overview
+## Version compatibility
 
-This directory contains the patch to integrate FlexKV connector into SGLang. The patch adds KV cache sharing capabilities via FlexKV, supporting cross-node Tensor Parallelism (TP) and Pipeline Parallelism (PP).
+There are two different SGLang integration paths. Choose the one that matches
+your model.
 
-## Target SGLang Version
+> Status last checked: August 6, 2026.
 
-- **Repository**: https://github.com/sgl-project/sglang.git
-- **Branch**: `deepseek_v4`
-- **Base Commit**: `b69485ff4272b5a306045fa0cf7fc2c5692d391f` (small fix h200 docker)
-- **Based on Release**: v0.5.12.post1 + 68 commits (deepseek_v4 branch)
+| Use case | SGLang version | Patch required? |
+| --- | --- | --- |
+| Standard models | SGLang `v0.5.16` or later, or a recent `main` | No |
+| DeepSeek V4 | SGLang PR [#31781](https://github.com/sgl-project/sglang/pull/31781), pinned to commit [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac) | No local patch; use the pinned SGLang commit |
 
-## Patch File
+### Standard models: use upstream SGLang directly
 
-- `sglang_flexkv_connector.patch` — Combined patch containing all FlexKV connector changes
-
-## How to Apply
+The base FlexKV integration was merged into upstream SGLang by
+[sglang#29701](https://github.com/sgl-project/sglang/pull/29701) and is included
+in SGLang `v0.5.16` and later. Do **not** apply
+`sglang_flexkv_connector.patch` to these versions.
 
 ```bash
-# Clone and checkout the target branch
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-git checkout deepseek_v4
-git reset --hard b69485ff4272b5a306045fa0cf7fc2c5692d391f
-
-# Apply the patch
-git apply sglang_flexkv_connector.patch
-
-# Verify
-git status
+git checkout v0.5.16  # or use a newer release/main
 ```
 
-## Changes Included
+### DeepSeek V4: pin the unmerged SGLang adaptation
 
-### New Files (7)
+FlexKV's DeepSeek V4 support is present on FlexKV `main` (merged by
+[FlexKV#225](https://github.com/taco-project/FlexKV/pull/225)), but the matching
+SGLang adaptation has **not** been merged upstream yet. Until
+[sglang#31781](https://github.com/sgl-project/sglang/pull/31781) is merged, fetch
+the PR and pin the commit below instead of using an SGLang release or `main`
+alone:
+
+```bash
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git fetch origin pull/31781/head
+git checkout -b flexkv-dsv4 ee0465a09196421a6e4d53a3103eccdef1dd32ac
+```
+
+Use this with the current FlexKV `main` branch:
+
+```bash
+git clone https://github.com/taco-project/FlexKV.git
+cd FlexKV
+git checkout main
+```
+
+The PR is still under development, so check its status before updating the
+pinned SGLang commit. DeepSeek V4's unified-KV layout and `--enable-hisparse`
+are not supported by that commit.
+
+## Launch
+
+After installing SGLang and FlexKV, create a FlexKV configuration file. For
+example:
+
+```yaml
+# flexkv_config.yaml
+cpu_cache_gb: 16
+```
+
+Launch SGLang with the built-in FlexKV backend:
+
+```bash
+python -m sglang.launch_server \
+  --model-path <model> \
+  --enable-flexkv \
+  --flexkv-config-file /path/to/flexkv_config.yaml \
+  # ... other SGLang arguments
+```
+
+The equivalent explicit backend option is
+`--radix-cache-backend flexkv`. See SGLang's
+[`flexkv/README.md`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/flexkv/README.md)
+for detailed configuration and validation instructions.
+
+## Integration boundary
+
+The core FlexKV connector logic (`FlexKVComm` and `FlexKVConnector`) lives in
+this directory:
 
 | File | Description |
 |------|-------------|
-| `python/sglang/srt/mem_cache/storage/flexkv/flexkv_connector.py` | FlexKV connector main implementation (KV get/put, cross-node TP/PP) |
-| `python/sglang/srt/mem_cache/storage/flexkv/flexkv_comm.py` | FlexKV communication layer (RankInfo, sync groups, async reaper) |
-| `python/sglang/srt/mem_cache/extended_radix_cache.py` | Extended radix cache wrapping base cache with connector support |
-| `python/sglang/srt/mem_cache/kv_connector.py` | KV connector abstract base class and factory |
-| `python/sglang/srt/mem_cache/session_aware_cache.py` | Session-aware cache decorator for streaming session KV management |
-| `python/sglang/srt/mem_cache/allocator_ascend.py` | Ascend NPU allocator support |
-| `docs/advanced_features/kv_connector.md` | User-facing documentation for KV connector configuration |
+| `comm.py` | 3-axis (PP × CP × TP) cross-rank communication layer |
+| `connector.py` | `FlexKVConnector` wrapping `KVManager` for SGLang |
 
-### Modified Files (9)
+SGLang's `storage/flexkv/__init__.py` dynamically loads the connector from
+`flexkv.integration.sglang.connector` via `importlib`, so future FlexKV logic
+changes typically only require updating the FlexKV repo.
 
-| File | Change Summary |
-|------|----------------|
-| `python/sglang/srt/server_args.py` | Add `--kv-connector-cls` argument and related config |
-| `python/sglang/srt/managers/scheduler.py` | Integrate connector lifecycle: init, prefetch check, event loop, abort handling |
-| `python/sglang/srt/managers/scheduler_output_processor_mixin.py` | Add cache breakdown metrics (device/storage/connector) |
-| `python/sglang/srt/managers/schedule_batch.py` | Add `cached_tokens_extended_device` field and `update_connector_state` param |
-| `python/sglang/srt/managers/schedule_policy.py` | Adapt `init_load_back` call for connector integration |
-| `python/sglang/srt/mem_cache/base_prefix_cache.py` | Change `init_load_back` signature, rename `check_hicache_events` -> `check_kv_events` |
-| `python/sglang/srt/mem_cache/hiradix_cache.py` | Rename `check_hicache_events` -> `check_kv_events` |
-| `python/sglang/srt/layers/attention/nsa_backend.py` | Add FA3 import guard for FlexKV+Blackwell compatibility |
-| `python/sglang/srt/mem_cache/cpp_radix_tree/.clang-format` | Clang format config |
+Set `FLEXKV_ENABLE_COLLECTIVE_SYNC=0` to disable cross-rank sync
+(scatter/barrier/all_reduce). In deployments without Pipeline Parallelism (PP),
+disabling it reduces sync overhead and improves performance.
 
-## Features
+## About the patch in this directory
 
-- KV cache prefix matching and sharing across SGLang instances via FlexKV
-- Cross-node Tensor Parallelism (TP) support
-- Pipeline Parallelism (PP) support with decentralized control plane
-- Async prefetch with adaptive work reaper
-- Observability: cache hit metrics per request (device/storage breakdown)
-- Compatible with HiCache hierarchical caching
-
-## Configuration
-
-```bash
-# Launch SGLang with FlexKV connector
-python -m sglang.launch_server \
-    --model-path <model> \
-    --kv-connector-cls FlexKVConnector \
-    # ... other args
-```
-
-See `docs/advanced_features/kv_connector.md` (in the patched repo) for full configuration details.
-
-## Source Reference
-
-- **Development Repo**: https://github.com/zhuofan1123/sglang.git (branch: `taco_sglang`)
-- **Patch derived from**: 23 commits after `ac84702b6186bbcc2c92a8d8356af624a8c39bcc`
-
-## TODO
-
-- [ ] Runtime smoke test: single-node TP launch with FlexKV connector
-- [ ] Cross-node TP correctness validation
-- [ ] PP mode validation
-- [ ] Prefetch / async reaper stress test
-- [ ] Compatibility test with HiCache enabled
-- [ ] Performance regression check vs. baseline (no connector)
+`sglang_flexkv_connector.patch` is retained only as a legacy reference for the
+old pre-upstream integration. It is not required for supported SGLang releases,
+and it must not be used for the DeepSeek V4 path above.

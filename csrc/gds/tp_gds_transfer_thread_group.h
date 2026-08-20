@@ -45,8 +45,9 @@ public:
       const int64_t num_blocks_per_file,
       const bool is_read,  // true for SSD->GPU, false for GPU->SSD
       const int layer_id,
-      const int layer_granularity, 
-      const bool is_mla);
+      const int layer_granularity,
+      const int kv_dim,
+      const int num_kv_heads = 1);
 
 private:
   using Task = std::function<void()>;

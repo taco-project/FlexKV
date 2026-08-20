@@ -114,8 +114,9 @@ size_t TPTransferThreadGroup::tp_group_transfer_ans(
     const int64_t cpu_layer_stride_in_bytes,
     const int64_t cpu_block_stride_in_bytes,
     const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
-    const bool is_host_to_device, const bool use_ce_transfer,
-    const int layer_id, const int layer_granularity, const bool is_mla,
+    const bool is_host_to_device,     const bool use_ce_transfer,
+    const int layer_id, const int layer_granularity, const int kv_dim,
+    const int num_kv_heads,
     const int64_t cpu_size_table_tp_ptr,
     const int64_t cpu_size_table_tp_rank_stride,
     const int64_t cpu_size_table_block_stride,
@@ -125,7 +126,7 @@ size_t TPTransferThreadGroup::tp_group_transfer_ans(
 
   ensure_nvcomp_initialized();
   if (cpu_size_table_tp_ptr == 0 ||
-      (!is_mla && cpu_size_table_tp_rank_stride == 0) ||
+      (num_kv_heads > 1 && cpu_size_table_tp_rank_stride == 0) ||
       cpu_size_table_block_stride == 0 ||
       cpu_size_table_layer_stride == 0) {
     throw std::runtime_error(
@@ -176,7 +177,7 @@ size_t TPTransferThreadGroup::tp_group_transfer_ans(
                 nvcomp_state_->ans_contexts[i], cur_num_blocks, layer_id, layer_granularity,
                 cur_gpu_block_ids, gpu_tensor_handlers_[i], cur_cpu_block_ids,
                 cur_cpu_ptr, cur_cpu_kv_stride, cur_cpu_layer_stride,
-                cur_cpu_block_stride, cur_chunk_size, is_mla,
+                cur_cpu_block_stride, cur_chunk_size, kv_dim,
                 cur_size_table_base, cpu_size_table_block_stride,
                 cpu_size_table_layer_stride, streams_[i]);
           } else {
@@ -184,7 +185,7 @@ size_t TPTransferThreadGroup::tp_group_transfer_ans(
                 nvcomp_state_->ans_contexts[i], cur_num_blocks, layer_id, layer_granularity,
                 cur_gpu_block_ids, gpu_tensor_handlers_[i], cur_cpu_block_ids,
                 cur_cpu_ptr, cur_cpu_kv_stride, cur_cpu_layer_stride,
-                cur_cpu_block_stride, cur_chunk_size, is_mla,
+                cur_cpu_block_stride, cur_chunk_size, kv_dim,
                 cur_size_table_base, cpu_size_table_block_stride,
                 cpu_size_table_layer_stride, streams_[i]);
           }
@@ -193,7 +194,7 @@ size_t TPTransferThreadGroup::tp_group_transfer_ans(
           // sharded, each rank handles its own blocks. MLA H2D: every rank reads
           // the same canonical table and returns the identical full sum, so only
           // rank 0 contributes to avoid over-counting by N.
-          const bool skip_accumulate = is_mla && is_host_to_device && i != 0;
+          const bool skip_accumulate = num_kv_heads == 1 && is_host_to_device && i != 0;
           if (!skip_accumulate) {
             total_compressed_bytes.fetch_add(comp, std::memory_order_relaxed);
           }
@@ -231,8 +232,8 @@ size_t TPTransferThreadGroup::tp_group_transfer_ans(
           }
         };
 
-        if (is_mla) {
-          // MLA KV is replicated across TP ranks. One canonical compressed full
+        if (num_kv_heads == 1) {
+          // Shared KV is replicated across TP ranks. One canonical compressed full
           // chunk lives in the size table. D2H is distributed by cpu_block_id
           // owner so all ranks contribute without splitting the chunk; H2D fans out — every rank reads
           // the same canonical table.

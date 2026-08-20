@@ -36,6 +36,8 @@ from flexkv.server.request import (
     Response,
     StartRequest,
     ShutdownRequest,
+    UnregisterDPClientRequest,
+    ResetRequest,
     CheckRunningRequest,
     PrefetchRequest,
 )
@@ -201,6 +203,8 @@ class KVServer:
             CancelTaskRequest: self._handle_cancel_task_request,
             TryWaitRequest: self._handle_try_wait_request,
             ShutdownRequest: self._handle_shutdown_request,
+            UnregisterDPClientRequest: self._handle_unregister_dp_client_request,
+            ResetRequest: self._handle_reset_request,
         }
 
     def is_ready(self) -> bool:
@@ -479,6 +483,30 @@ class KVServer:
                            f"(dp_client_id={req.dp_client_id})")
         self._running = False
 
+    def _handle_unregister_dp_client_request(self, req: UnregisterDPClientRequest) -> None:
+        """Detach one client while leaving the shared server running."""
+        flexkv_logger.info(f"Received unregister request from DP client "
+                           f"(dp_client_id={req.dp_client_id})")
+        self.client_manager.delete_dp_client(req.dp_client_id)
+
+    def _handle_reset_request(self, req: ResetRequest) -> None:
+        """Handle cache-reset request: drop radix tree + mempool on all tiers.
+
+        Synchronous (mirrors _handle_is_ready_request): replies only after the
+        reset has completed, so the client's reset() blocks until done.
+        """
+        flexkv_logger.info(f"Received reset request from DP client "
+                           f"(dp_client_id={req.dp_client_id})")
+        error_msg = None
+        try:
+            self.kv_task_engine.reset_cache()
+        except Exception as e:  # noqa: BLE001
+            error_msg = str(e)
+            flexkv_logger.error(f"reset_cache failed on server: {error_msg}")
+        response = Response(dp_client_id=req.dp_client_id, error_msg=error_msg)
+        result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+        result_zmq.send_pyobj(response)
+
     def __del__(self) -> None:
         self.kv_task_engine.shutdown()
 
@@ -499,13 +527,14 @@ if __name__ == "__main__":
         tokens_per_block=tokens_per_block,
         num_head=num_kv_heads//tp_size,
         head_size=head_size,
-        is_mla=False
+        kv_dim=2,
+        num_kv_heads=num_kv_heads,
     )
 
     model_config = ModelConfig(num_layers=num_layers,
                                 num_kv_heads=num_kv_heads,
                                 head_size=head_size,
-                                use_mla=False,
+                                kv_dim=2,
                                 tp_size=tp_size,
                                 dtype=torch.float16)
 

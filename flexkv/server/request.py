@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -7,6 +7,9 @@ from flexkv.common.config import ModelConfig, LayerGroupSpec
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
 from flexkv.common.request import KVResponseStatus
+
+
+RegistrationKey = Tuple[int, int]
 
 
 @dataclass
@@ -20,6 +23,7 @@ class RegisterDPClientRequest:
 class RegisterTPClientRequest:
     dp_client_id: int
     pp_rank: int
+    intra_client_id: int
     device_id: int
     handles: List[TensorSharedHandle]
     gpu_layout: KVCacheLayout
@@ -38,6 +42,10 @@ class RegisterTPClientRequest:
     swa_layer_groups: Optional[List[LayerGroupSpec]] = None
     swa_gpu_layouts: Optional[List[KVCacheLayout]] = None
     swa_handles_per_group: Optional[List[List[TensorSharedHandle]]] = None
+
+    @property
+    def registration_key(self) -> RegistrationKey:
+        return (self.dp_client_id, self.intra_client_id)
 
 
 @dataclass
@@ -153,6 +161,16 @@ class StartRequest:
 
 @dataclass
 class ShutdownRequest:
+    dp_client_id: int
+
+
+@dataclass
+class UnregisterDPClientRequest:
+    dp_client_id: int
+
+
+@dataclass
+class ResetRequest:
     dp_client_id: int
 
 

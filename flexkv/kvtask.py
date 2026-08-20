@@ -525,6 +525,14 @@ class KVTaskManager:
                     completed_op.num_bytes,
                     operation,
                 )
+            if task.status == TaskStatus.CANCELLED and task.callback is None:
+                # Cache was reset while this task was in flight: reset_cache()
+                # cleared its callbacks and freed the radix nodes / mempool blocks
+                flexkv_logger.warning(
+                    f"task {task_id}: transfer op {completed_op.op_id} completed "
+                    "after reset_cache(), callback no longer exists and will be skipped."
+                )
+                continue
             has_callback = completed_op.op_id in task.op_callback_dict
             if has_callback:
                 try:
@@ -1434,3 +1442,47 @@ class KVTaskEngine(KVTaskManager):
 
     def _clear_cpu_cache(self) -> None:
         self.cache_engine.cpu_cache_engine.reset()
+
+    def reset_cache(self) -> None:
+        """Invalidate the cache across ALL tiers (CPU + SSD + remote): drop the
+        whole prefix tree and return every block to the mempool.
+
+        Used after a weight update (e.g. verl RL rollout) so that KV computed
+        against stale weights is never reused.
+
+        We do NOT drain or cancel in-flight transfers here. verl issues the
+        reset at a rollout/weight-update boundary where no new generation
+        requests are being served, so in practice no task is ongoing. If any
+        task IS still in flight we only warn: resetting the radix tree +
+        mempool is cheap and the stale-weight invalidation must not be blocked
+        on transfer completion. This mirrors vLLM's own reset_encoder_cache /
+        reset_mm_cache, which likewise only warn on has_unfinished_requests().
+        """
+        ongoing = sum(1 for t in list(self.tasks.values()) if not t.is_completed())
+        if ongoing:
+            flexkv_logger.warning(
+                f"reset_cache called while {ongoing} task(s) are still in flight; "
+                f"resetting anyway. In-flight transfers may target blocks that are "
+                f"being freed — ensure reset is issued at a quiesced boundary."
+            )
+
+        # Invalidate in-flight tasks' callbacks BEFORE dropping the cache. The
+        # callback / op_callback_dict partials close over the exact radix nodes
+        # and mempool blocks we are about to free; if a late transfer fired them
+        # after reset they would unlock/set_ready a deleted node, or recycle a
+        # block into the freshly-emptied mempool (which raises "already free").
+        # Clear them here so the dispatch in _update_tasks has nothing to fire.
+        # Note: reset_cache() runs on the same thread as the callback dispatch
+        # (_update_tasks), so no lock is needed. We keep the graph_to_task
+        # mapping so a late-completing op still resolves to its task and warns.
+        for task_id, task in list(self.tasks.items()):
+            if task.is_completed():
+                continue  # already-fired callbacks are harmless
+            task.callback = None
+            task.op_callback_dict = {}
+            task.status = TaskStatus.CANCELLED
+
+        # Drop index (radix tree) + mempool on every tier. CRadixTreeIndex (C++)
+        # and the pure-Python RadixTreeIndex both expose reset(); GlobalCacheEngine
+        # fans out to whichever tier engines are enabled.
+        self.cache_engine.reset()  # GlobalCacheEngine.reset()

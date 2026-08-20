@@ -1408,6 +1408,8 @@ class GlobalCacheEngine:
         ssd_node_to_unlock = ssd_matched_result.last_ready_node
         remote_node_to_unlock = remote_matched_result.last_ready_node
         cpu_blocks_to_free = np.array([], dtype=np.int64)
+        cpu_node_to_ready = None
+        ssd_node_to_ready = None
 
         if fragment23_num_blocks > 0:
             num_extra_required_blocks = fragment23_num_blocks
@@ -1433,6 +1435,8 @@ class GlobalCacheEngine:
             # Mooncake can partially fail after match. Keep its staging blocks
             # detached until graph completion; the callback will fresh-rematch
             # and publish only the successfully loaded prefix.
+            # Non-mooncake still inserts now (is_ready=False) and publishes via
+            # cpu_node_to_ready after the host-stage virtual join completes.
             if not defer_mooncake_commit:
                 if (cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
                         cpu_matched_result.num_ready_matched_blocks ==
@@ -1444,6 +1448,7 @@ class GlobalCacheEngine:
                         is_ready=False,
                         match_result=cpu_matched_result,
                     )
+                    cpu_node_to_ready = cpu_node_to_unlock
                 else:
                     cpu_blocks_to_free = fragment23_cpu_blocks
 
@@ -1527,6 +1532,51 @@ class GlobalCacheEngine:
                         is_ready=False,
                         match_result=ssd_matched_result,
                     )
+                    ssd_node_to_ready = ssd_node_to_unlock
+
+        # A prefetch has no H2D op, so its terminal op must be the host-stage
+        # transfer itself.  The global path also inserts REMOTE2H/DISK2H
+        # destinations into the CPU radix as ``is_ready=False``.  Publish that
+        # node only after every host-stage fragment is complete; otherwise the
+        # unready nodes accumulate, cannot be evicted, and eventually exhaust
+        # the CPU pool.  A virtual join preserves parallel SSD and remote IO.
+        # Mooncake insert-after skips plan-time insert, so cpu/ssd_node_to_ready
+        # stay None and these set_ready callbacks are not registered.
+        op_callback_dict = {}
+        host_finished_ops_ids = [
+            op.op_id for op in (op_disk2h, op_remote2h) if op is not None
+        ]
+        host_ready_op_id = -1
+        if host_finished_ops_ids:
+            transfer_graph, host_ready_op_id = add_virtual_op_for_multiple_finished_ops(
+                transfer_graph, host_finished_ops_ids, dp_client_id
+            )
+            if not enable_gpu:
+                finished_ops_ids.append(host_ready_op_id)
+        if cpu_node_to_ready is not None:
+            assert host_ready_op_id >= 0
+            self._append_op_callback(
+                op_callback_dict,
+                host_ready_op_id,
+                partial(
+                    self._op_callback,
+                    device_type=DeviceType.CPU,
+                    node_to_ready=cpu_node_to_ready,
+                    ready_length=cpu_node_to_ready.size(),
+                ),
+            )
+        if ssd_node_to_ready is not None:
+            assert op_h2disk is not None
+            self._append_op_callback(
+                op_callback_dict,
+                op_h2disk.op_id,
+                partial(
+                    self._op_callback,
+                    device_type=DeviceType.SSD,
+                    node_to_ready=ssd_node_to_ready,
+                    ready_length=ssd_node_to_ready.size(),
+                ),
+            )
         if enable_gpu:
             op_h2d = TransferOp(
                 graph_id = transfer_graph.graph_id,
@@ -1558,7 +1608,6 @@ class GlobalCacheEngine:
 
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
         num_gpu_blocks_to_transfer = len(fragment123_gpu_blocks) if enable_gpu else 0
-        op_callback_dict = {}
         deferred_inserts: List[DeferredCacheInsert] = []
 
         # construct the SWA op for joint prefetch

@@ -1083,13 +1083,24 @@ from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
 from flexkv.common.debug import flexkv_logger
 
-flexkv_logger.set_level("OFF")
+
+@pytest.fixture(autouse=True)
+def _silence_flexkv_logger():
+    """Silence FlexKV logger; restore after to avoid singleton pollution."""
+    prev_level = flexkv_logger.logger.level
+    prev_enabled = flexkv_logger.enabled
+    flexkv_logger.set_level("OFF")
+    yield
+    flexkv_logger.logger.setLevel(prev_level)
+    flexkv_logger.enabled = prev_enabled
+
+
 TPB = 16
 
 
 def _engine():
     mc = ModelConfig(num_layers=4, num_kv_heads=1, head_size=128,
-                     use_mla=True, dtype=torch.bfloat16, tp_size=1, dp_size=1)
+                     kv_dim=1, dtype=torch.bfloat16, tp_size=1, dp_size=1)
     cc = CacheConfig(tokens_per_block=TPB, enable_cpu=True, enable_ssd=False,
                      enable_remote=False, num_cpu_blocks=4096)
     cc.swa = SWAPoolConfig(

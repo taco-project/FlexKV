@@ -54,12 +54,8 @@ class ModelPreset:
     num_layers: int
     num_kv_heads: int
     head_size: int
-    is_mla: bool
+    kv_dim: int  # 1=K/V combined (MLA), 2=K/V separate (MHA)
     dtype: torch.dtype = torch.bfloat16
-
-    @property
-    def kv_dim(self) -> int:
-        return 1 if self.is_mla else 2
 
     @property
     def elem_size(self) -> int:
@@ -89,11 +85,11 @@ def build_presets(sizes: List[str], mla_modes: List[str]) -> Dict[str, ModelPres
             if mode == "MHA":
                 name = f"{size}-MHA"
                 presets[name] = ModelPreset(name, cfg["num_layers"], cfg["num_kv_heads"],
-                                            cfg["head_size"], is_mla=False)
+                                            cfg["head_size"], kv_dim=2)
             elif mode == "MLA":
                 name = f"{size}-MLA"
                 presets[name] = ModelPreset(name, cfg["num_layers"], 1,
-                                            cfg["head_size"], is_mla=True)
+                                            cfg["head_size"], kv_dim=1)
     return presets
 
 
@@ -105,7 +101,7 @@ def make_layout(layout_type: KVCacheLayoutType, preset: ModelPreset, num_blocks:
         tokens_per_block=TOKENS_PER_BLOCK,
         num_head=preset.num_kv_heads,
         head_size=preset.head_size,
-        is_mla=preset.is_mla,
+        kv_dim=preset.kv_dim,
     )
 
 
@@ -297,7 +293,7 @@ def run_single_transfer(ioctx, transfer_fn, cpu_tensor, preset, strides,
         num_blocks_per_file=len(ssd_block_ids),
         round_robin=1,
         num_threads_per_device=num_threads,
-        is_mla=preset.is_mla,
+        kv_dim=preset.kv_dim,
         ssd_io_opt=ssd_io_opt,
     )
     try:
@@ -388,7 +384,7 @@ def benchmark_case(preset, size_label, layout_type, num_blocks, block_order,
                 results.append(CaseResult(
                     size=size_label,
                     layout=layout_type.value, block_order=block_order,
-                    model=("MLA" if preset.is_mla else "MHA"), num_blocks=num_blocks,
+                    model=("MLA" if preset.kv_dim == 1 else "MHA"), num_blocks=num_blocks,
                     direction=direction,
                     baseline_ms=-1.0, opt_ms=-1.0,
                     opt_path=path, data_gb=data_gb,
@@ -405,7 +401,7 @@ def benchmark_case(preset, size_label, layout_type, num_blocks, block_order,
             results.append(CaseResult(
                 size=size_label,
                 layout=layout_type.value, block_order=block_order,
-                model=("MLA" if preset.is_mla else "MHA"), num_blocks=num_blocks,
+                model=("MLA" if preset.kv_dim == 1 else "MHA"), num_blocks=num_blocks,
                 direction=direction,
                 baseline_ms=base_ms, opt_ms=opt_ms,
                 opt_path=path, data_gb=data_gb,

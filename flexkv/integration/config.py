@@ -38,26 +38,21 @@ def nvfp4_kv_cache_full_dim(head_size: int) -> int:
 
 def _warn_nvfp4_unsupported_framework(dtype_str: Optional[str], framework: str) -> None:
     """Warn if NVFP4 KV cache is requested from a framework whose FlexKV adapter
-    has not yet implemented the nvfp4 packed-layout ``head_size`` fold.
+    has not yet implemented physical KV layout discovery.
 
-    Only the vLLM adapter (``post_init_from_vllm_config``) folds the packed width
-    ``head_size//2 + head_size//16`` into ``head_size`` so the CPU/SSD mirror
-    matches the framework's packed GPU tensor byte-for-byte. Without that fold the
-    CPU mirror is sized for the *logical* head_size and offload/reload would be
-    byte-misaligned. Until each framework's packed nvfp4 layout is verified we
-    only warn here rather than silently produce a corrupt mirror.
+    The vLLM adapter asks the selected attention backend for its actual cache
+    shape and mirrors the returned physical head count and width.  Until each
+    framework exposes and verifies equivalent layout metadata, only warn here
+    rather than silently produce a byte-misaligned CPU mirror.
     """
     if not _is_nvfp4_dtype_str(dtype_str):
         return
-    # TODO(nvfp4): implement + verify the nvfp4 packed head_size fold for the
-    # {framework} adapter (mirror post_init_from_vllm_config: guard non-MLA,
-    # set model_config.head_size = nvfp4_kv_cache_full_dim(head_size)). Confirm
-    # the framework stores nvfp4 KV as a single packed uint8 tensor with the same
-    # (head_size//2 + head_size//16) last-dim layout as vLLM before enabling.
+    # TODO(nvfp4): query and verify the framework's actual physical KV cache
+    # shape, then populate ModelConfig.num_kv_heads/head_size from that shape.
     logger.warning(
         f"[FlexKV {framework}] kv_cache_dtype='{dtype_str}' (NVFP4) requested, but "
-        f"the {framework} FlexKV adapter does NOT yet apply the nvfp4 packed "
-        f"head_size fold. The CPU/SSD mirror may be byte-misaligned with the "
+        f"the {framework} FlexKV adapter does NOT yet discover the physical "
+        f"KV cache shape. The CPU/SSD mirror may be byte-misaligned with the "
         f"packed GPU tensor -> offload/reload correctness is NOT guaranteed. "
         f"NVFP4 is currently verified only through the vLLM adapter. "
         f"See TODO(nvfp4) in flexkv/integration/config.py."
@@ -105,7 +100,7 @@ class FlexKVConfig:
     # model config
     model_config: ModelConfig = field(default_factory=ModelConfig)
 
-    # user config
+    # user configKV/flexkv/transfer/worker.py", line 1303, in _transfer_impl
     user_config: UserConfig = field(default_factory=UserConfig)
 
     def __post_init__(self):
@@ -210,40 +205,13 @@ class FlexKVConfig:
         self.cache_config.tokens_per_block = vllm_config.cache_config.block_size
 
         self.model_config.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
-        self.model_config.head_size = vllm_config.model_config.get_head_size()
         vllm_kv_cache_dtype = getattr(vllm_config.cache_config, 'cache_dtype', 'auto')
         self._resolve_dtype(
             framework_dtype_str=vllm_kv_cache_dtype if isinstance(vllm_kv_cache_dtype, str) else None,
             fallback_dtype=getattr(vllm_config.model_config, 'dtype', torch.bfloat16),
         )
-        self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
-        # NVFP4: vLLM stores the packed fp4 data + fp8 block scales in a single
-        # uint8 tensor whose per-head last dim is head_size//2 + head_size//16.
-        # _resolve_dtype has already mapped nvfp4 -> uint8; here we fold the
-        # packed width into head_size so the CPU/SSD mirror matches vLLM's packed
-        # GPU tensor byte-for-byte. The effective dtype string follows the same
-        # user-first-else-framework priority _resolve_dtype uses.
-        effective_dtype_str = (
-            self.user_config.kv_cache_dtype
-            if self.user_config.kv_cache_dtype is not None
-            else (vllm_kv_cache_dtype if isinstance(vllm_kv_cache_dtype, str) else None)
-        )
-        if _is_nvfp4_dtype_str(effective_dtype_str) and not self.model_config.use_mla:
-            logical_head_size = self.model_config.head_size
-            packed_head_size = nvfp4_kv_cache_full_dim(logical_head_size)
-            self.model_config.head_size = packed_head_size
-            logger.info(
-                f"[FlexKV vllm] NVFP4 KV cache detected: folding packed layout "
-                f"into head_size (logical={logical_head_size} -> "
-                f"packed={packed_head_size}, dtype=uint8)"
-            )
-        elif _is_nvfp4_dtype_str(effective_dtype_str) and self.model_config.use_mla:
-            logger.warning(
-                "[FlexKV vllm] kv_cache_dtype='nvfp4' requested for an MLA "
-                "model. vLLM MLA backends do NOT support nvfp4 KV cache now; "
-                "skipping the nvfp4 head_size fold. If vLLM rejects this "
-                "config, use fp8/fp8_ds_mla for MLA instead."
-            )
+        # kv_dim/num_kv_heads are derived from the physical tensor shape
+        # (cache_shape ndim), not from framework MLA flags.
         self.model_config.tp_size = int(parallel_config.tensor_parallel_size)
         self.model_config.dp_size = int(parallel_config.data_parallel_size)
         self.model_config.pp_size = int(parallel_config.pipeline_parallel_size)
@@ -253,6 +221,20 @@ class FlexKVConfig:
         self.model_config.attn_cp_size = self.model_config.cp_size
         self.model_config.nnodes = max(1, int(getattr(parallel_config, 'nnodes', 1)))
 
+        effective_dtype_str = (
+            self.user_config.kv_cache_dtype
+            if self.user_config.kv_cache_dtype is not None
+            else (vllm_kv_cache_dtype if isinstance(vllm_kv_cache_dtype, str) else None)
+        )
+        if vllm_config.model_config.is_deepseek_mla and _is_nvfp4_dtype_str(effective_dtype_str):
+            logger.warning(
+                "[FlexKV vllm] kv_cache_dtype='nvfp4' requested for a "
+                "combined-KV model. vLLM MLA backends do NOT support nvfp4 "
+                "KV cache now; if vLLM rejects this config, use fp8/fp8_ds_mla "
+                "for MLA instead."
+            )
+        self._configure_kv_layout_from_vllm_backend(
+            vllm_config, vllm_kv_cache_dtype)
 
         if self.model_config.pp_size > 1:
             from vllm.distributed.utils import get_pp_indices as vllm_get_pp_indices
@@ -262,11 +244,6 @@ class FlexKVConfig:
         else:
             pp_start_layer = 0
             pp_end_layer = self.model_config.num_layers
-        if self.model_config.use_mla:
-            self.model_config.num_kv_heads = 1
-        else:
-            self.model_config.num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
-
         self.model_config.instance_num = int(GLOBAL_CONFIG_FROM_ENV.instance_num)
         instance_id = int(GLOBAL_CONFIG_FROM_ENV.instance_id)
 
@@ -302,6 +279,108 @@ class FlexKVConfig:
         # Freeze model_config — no further mutations allowed
         self.model_config.freeze()
         return rank_info
+
+    def _configure_kv_layout_from_vllm_backend(
+        self,
+        vllm_config: "VllmConfig",
+        vllm_kv_cache_dtype: str,
+    ) -> None:
+        """Populate FlexKV's storage layout from vLLM's physical cache shape.
+
+        The backend reports the tensor shape for one TP rank.  FlexKV preserves
+        its physical head count and width, then scales non-MLA head counts by TP
+        so the CPU/SSD layout contains one contiguous slice for every rank.  MLA
+        heads are replicated and remain a single implicit head.  This handles
+        MLA 3D caches, packed 4D caches, and legacy split-K/V 5D caches,
+        including replicated GQA heads and FlashInfer's NVFP4 ``2 * H`` axis.
+
+        Args:
+            vllm_config (VllmConfig): the vLLM config to read the backend from.
+            vllm_kv_cache_dtype (str): vLLM's ``cache_config.cache_dtype``.
+
+        Raises:
+            ValueError: if the backend returns an unsupported cache shape.
+        """
+        from vllm.distributed.kv_transfer.kv_connector.utils import (
+            get_current_attn_backend,
+        )
+        from vllm.config import set_current_vllm_config
+
+        requested_num_heads_per_rank = vllm_config.model_config.get_num_kv_heads(vllm_config.parallel_config)
+        requested_head_size = vllm_config.model_config.get_head_size()
+
+        with set_current_vllm_config(vllm_config): # for old vllm
+            cache_shape = get_current_attn_backend(vllm_config).get_kv_cache_shape(
+                1,
+                self.cache_config.tokens_per_block,
+                requested_num_heads_per_rank,
+                requested_head_size,
+                vllm_kv_cache_dtype,
+            )
+
+        # ┌──────────────────────────────────────────────────────────────────────────┐
+        # │ kv_dim / num_kv_heads Orthogonal Assignment Table                        │
+        # │                                                                          │
+        # │ Scenario      │ kv_dim │ num_kv_heads │ Cross-rank │ Type                │
+        # │               │        │              │  shared   │                     │
+        # │ ──────────────┼────────┼──────────────┼───────────┼───────────────────── │
+        # │ MLA           │   1    │      1       │    Yes    │ K/V combined + 1 head│
+        # │ packed MHA    │   1    │      H       │    No     │ K/V combined + H heads│
+        # │ plain MHA     │   2    │      H       │    No     │ K/V separate + H heads│
+        # │                                                                          │
+        # │ kv_dim: 1 = single KV region (K/V combined), 2 = K/V separated          │
+        # │ num_kv_heads: 1 = shared across ranks (TP does not split heads),         │
+        # │               >1 = per-rank independent (TP splits heads)                │
+        # └──────────────────────────────────────────────────────────────────────────┘
+        # Derive kv_dim/num_kv_heads from the physical tensor shape, not from
+        # framework MLA flags.
+        if len(cache_shape) == 3:
+            # 3D: combined kv_buffer, single head (MLA, etc.)
+            physical_num_heads_per_rank = 1
+            physical_head_size = cache_shape[2]
+            kv_dim = 1
+        elif len(cache_shape) == 4:
+            # packed MHA: K/V combined + multi head (kv_dim=1, num_kv_heads=H).
+            # Standard packed K/V: (num_blocks, num_kv_heads, block_size, 2 * head_size).
+            # FlashInfer NVFP4: (num_blocks, 2 * num_kv_heads, block_size, packed_head_size).
+            # packed_head_size = head_size // 2 + head_size // 16.
+            physical_num_heads_per_rank = cache_shape[1]
+            physical_head_size = cache_shape[3]
+            kv_dim = 1
+        elif len(cache_shape) == 5:
+            # plain MHA: K/V separate + multi head (kv_dim=2, num_kv_heads=H).
+            # Standard split K/V: the K/V axis is dimension 0 or 1 and the
+            # last dimension is head_size. NVFP4 uses the same layout type,
+            # but the last dimension is packed_head_size.
+            if cache_shape[0] != 2 and cache_shape[1] != 2: # for LAYERFIRST or LAYERBLOCK
+                raise ValueError(
+                    "Unsupported split-K/V vLLM cache shape: expected a "
+                    f"K/V axis of size 2, got shape={cache_shape}"
+                )
+            physical_num_heads_per_rank = cache_shape[3]
+            physical_head_size = cache_shape[4]
+            kv_dim = 2
+        else:
+            raise ValueError(
+                "Unsupported vLLM KV cache shape: expected 3, 4 or 5 "
+                f"dimensions, got shape={cache_shape}"
+            )
+
+        self.model_config.num_kv_heads = physical_num_heads_per_rank
+        # Combined-KV models (3D, kv_dim=1) use a single head shared across
+        # ranks; multi-head backends (packed/plain MHA) scale by tp_size so
+        # the CPU/SSD layout holds one contiguous slice per TP rank.
+        if kv_dim != 1 or physical_num_heads_per_rank != 1:
+            self.model_config.num_kv_heads *= self.model_config.tp_size
+        self.model_config.head_size = physical_head_size
+        self.model_config.kv_dim = kv_dim
+        logger.info(
+            f"[FlexKV vllm] physical KV layout from backend: "
+            f"shape={cache_shape}, "
+            f"num_kv_heads_per_rank={physical_num_heads_per_rank}, "
+            f"total_storage_heads={self.model_config.num_kv_heads}, "
+            f"head_size={physical_head_size}, kv_dim={kv_dim}"
+        )
 
     def post_init_from_sglang_config(
         self,
@@ -372,16 +451,30 @@ class FlexKVConfig:
 
         self.model_config.num_layers = int(getattr(sglang_config, "num_hidden_layers", 0))
 
-        from sglang.srt.configs.model_config import AttentionArch
-        use_mla = getattr(sglang_config, "attention_arch", None) == AttentionArch.MLA
+        # Derive kv_dim from the physical KV buffer layout, not from
+        # AttentionArch.MLA. Models with qk_nope_head_dim (MLA, etc.)
+        # use a combined kv_buffer (K/V latent, no separate V) → kv_dim=1.
+        # Plain MHA models (Llama, Qwen, etc.) lack qk_nope_head_dim and use
+        # separate k_buffer/v_buffer → kv_dim=2.
+        has_combined_kv = hasattr(sglang_config, "qk_nope_head_dim")
 
-        if use_mla:
+        if has_combined_kv:
+            # Combined kv_buffer: K/V latent stored in a single buffer.
+            # MLA with kv_lora_rank uses kv_lora_rank + qk_rope_head_dim;
             kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
             qk_rope_head_dim = int(getattr(sglang_config, "qk_rope_head_dim", 0))
-            mla_head_size = kv_lora_rank + qk_rope_head_dim
+            if kv_lora_rank > 0:
+                # MLA (DeepSeek V2/V3, etc.)
+                combined_head_size = kv_lora_rank + qk_rope_head_dim
+            else:
+                # MLA without kv_lora_rank: nope + rope
+                qk_nope_head_dim = int(getattr(sglang_config, "qk_nope_head_dim", 0))
+                combined_head_size = qk_nope_head_dim + qk_rope_head_dim
             self.model_config.num_kv_heads = 1
-            self.model_config.head_size = int(mla_head_size)
+            self.model_config.head_size = int(combined_head_size)
+            self.model_config.kv_dim = 1
         else:
+            # Plain MHA: separate k_buffer / v_buffer.
             if hasattr(sglang_config, "get_total_num_kv_heads"):
                 try:
                     self.model_config.num_kv_heads = int(sglang_config.get_total_num_kv_heads())
@@ -396,6 +489,7 @@ class FlexKVConfig:
             else:
                 self.model_config.num_kv_heads = int(getattr(sglang_config, "num_key_value_heads", 0))
             self.model_config.head_size = int(getattr(sglang_config, "head_dim", 0))
+            self.model_config.kv_dim = 2
 
         # Resolve KV cache dtype via unified priority logic.
         self._resolve_dtype(
@@ -409,7 +503,7 @@ class FlexKVConfig:
             framework="sglang",
         )
 
-        if use_mla and getattr(sglang_config, "index_head_dim", None) is not None:
+        if has_combined_kv and getattr(sglang_config, "index_head_dim", None) is not None:
             kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
             qk_rope_head_dim = int(getattr(sglang_config, "qk_rope_head_dim", 0))
             if self.model_config.dtype == torch.float8_e4m3fn:
@@ -423,7 +517,8 @@ class FlexKVConfig:
                     + qk_rope_head_dim * torch.bfloat16.itemsize
                 )
 
-        self.model_config.use_mla = use_mla
+        # kv_dim/num_kv_heads above are derived from the physical KV buffer
+        # layout (qk_nope_head_dim presence), not from AttentionArch.MLA.
 
         # Fill FlexKV parallel config.
         #
@@ -496,7 +591,15 @@ class FlexKVConfig:
         # stays None -> the cache engine never builds an SWA pool -> a SWA-aware
         # get finds no SWA, so SWA KV is never matched/reused for this all-SWA model.
         is_dsv4 = bool(getattr(sglang_config, "is_deepseek_v4_arch", False))
+        # Debug: log kv_dim derivation for verification
+        flexkv_logger.info(
+            f"[FlexKV SGLang] is_dsv4={is_dsv4}, "
+            f"has_combined_kv={has_combined_kv}, "
+            f"model_config.kv_dim={self.model_config.kv_dim}, "
+            f"model_config.num_kv_heads={self.model_config.num_kv_heads}")
         if is_dsv4:
+            # kv_dim=1 derived from qk_nope_head_dim (combined kv_buffer).
+            # This block only handles SWA pool config and does not override kv_dim.
             swa_page_size = self.cache_config.tokens_per_block
             # bytes_per_token_per_layer MUST match the GPU SWA buffer's *padded*
             # per-token stride, not the logical 584. DeepSeekV4SingleKVPool packs
@@ -591,14 +694,37 @@ class FlexKVConfig:
                 trust_remote_code=True
             )
             self.model_config.num_layers = hf_config.num_hidden_layers
-            self.model_config.use_mla = (hasattr(hf_config, 'kv_lora_rank') and
-                            hf_config.kv_lora_rank is not None and
-                            hasattr(hf_config, 'qk_rope_head_dim') and
-                            hf_config.qk_rope_head_dim is not None)
-            if self.model_config.use_mla:
-                self.model_config.head_size = hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
+            # ┌──────────────────────────────────────────────────────────────────────────┐
+            # │ kv_dim / num_kv_heads Orthogonal Assignment Table                        │
+            # │                                                                          │
+            # │ Scenario      │ kv_dim │ num_kv_heads │ Cross-rank │ Type                │
+            # │               │        │              │  shared   │                     │
+            # │ ──────────────┼────────┼──────────────┼───────────┼───────────────────── │
+            # │ MLA           │   1    │      1       │    Yes    │ K/V combined + 1 head│
+            # │ packed MHA    │   1    │      H       │    No     │ K/V combined + H heads│
+            # │ plain MHA     │   2    │      H       │    No     │ K/V separate + H heads│
+            # │                                                                          │
+            # │ kv_dim: 1 = single KV region (K/V combined), 2 = K/V separated          │
+            # │ num_kv_heads: 1 = shared across ranks (TP does not split heads),         │
+            # │               >1 = per-rank independent (TP splits heads)                │
+            # └──────────────────────────────────────────────────────────────────────────┘
+            # Derive kv_dim from the physical KV buffer layout, not from MLA
+            # flags. Models with qk_nope_head_dim (MLA, etc.) use a
+            # combined kv_buffer → kv_dim=1. Plain MHA → kv_dim=2.
+            has_combined_kv = hasattr(hf_config, 'qk_nope_head_dim')
+            if has_combined_kv:
+                # Combined kv_buffer: K/V latent, single head.
+                # MLA with kv_lora_rank uses kv_lora_rank + qk_rope_head_dim;
+                kv_lora_rank = getattr(hf_config, 'kv_lora_rank', None)
+                qk_rope_head_dim = getattr(hf_config, 'qk_rope_head_dim', 0)
+                if kv_lora_rank is not None:
+                    self.model_config.head_size = kv_lora_rank + qk_rope_head_dim
+                else:
+                    self.model_config.head_size = hf_config.qk_nope_head_dim + qk_rope_head_dim
                 self.model_config.num_kv_heads = 1
+                self.model_config.kv_dim = 1
             else:
+                # plain MHA: K/V separate + multi head (kv_dim=2, num_kv_heads=H).
                 if hasattr(hf_config, 'num_key_value_heads'):
                     assert hf_config.num_attention_heads != hf_config.num_key_value_heads, f"{hf_config.num_attention_heads=}, {hf_config.num_key_value_heads=}"
                     self.model_config.head_size = hf_config.head_dim
@@ -606,6 +732,7 @@ class FlexKVConfig:
                 else:
                     self.model_config.head_size = hf_config.hidden_size // hf_config.num_attention_heads
                     self.model_config.num_kv_heads = hf_config.num_attention_heads
+                self.model_config.kv_dim = 2
 
         except Exception as e:
             flexkv_logger.error(f"Failed to load config from {model_path}: {e}")

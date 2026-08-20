@@ -15,7 +15,7 @@ def _model_config():
         num_layers=2,
         num_kv_heads=1,
         head_size=8,
-        use_mla=True,
+        kv_dim=1,
         dtype=torch.uint8,
         tp_size=1,
         pp_size=1,

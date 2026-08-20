@@ -228,7 +228,7 @@ void LayerwiseTransferGroup::launch_swa_h2d_layer_(
           swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
           swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
           streams_[i], transfer_cta_num, true, use_ce_transfer,
-          /*is_mla=*/true, swa_gpu_block_strides_in_bytes_[i],
+          /*kv_dim=*/1, swa_gpu_block_strides_in_bytes_[i],
           /*sync=*/false, ce_config_);
       break;
     case BackendType::TRTLLM:
@@ -239,7 +239,7 @@ void LayerwiseTransferGroup::launch_swa_h2d_layer_(
           swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
           swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
           streams_[i], transfer_cta_num, true, use_ce_transfer,
-          /*is_mla=*/true, swa_gpu_block_strides_in_bytes_[i],
+          /*kv_dim=*/1, swa_gpu_block_strides_in_bytes_[i],
           /*sync=*/false, ce_config_);
       break;
     case BackendType::SGLANG:
@@ -250,7 +250,7 @@ void LayerwiseTransferGroup::launch_swa_h2d_layer_(
           swa_h2d_cpu_kv_stride_in_bytes, swa_h2d_cpu_layer_stride_in_bytes,
           swa_cpu_block_stride_in_bytes, /*cpu_startoff=*/0, swa_chunk_size,
           streams_[i], transfer_cta_num, true, use_ce_transfer,
-          /*is_mla=*/true, swa_gpu_block_strides_in_bytes_[i],
+          /*kv_dim=*/1, swa_gpu_block_strides_in_bytes_[i],
           /*sync=*/false, ce_config_);
       break;
     }
@@ -444,13 +444,14 @@ int LayerwiseTransferGroup::swa_slots_for_orig_(int orig_layer,
 
 void LayerwiseTransferGroup::launch_swa_mg_h2d_layer_(
     int orig_layer, int num_blocks, int64_t *swa_gpu_block_ids,
-    int64_t *swa_cpu_block_ids, int transfer_cta_num, bool use_ce_transfer,
-    bool is_mla, const std::string &mla_d2h_mode) {
+    int64_t *swa_cpu_block_ids, int transfer_cta_num,     bool use_ce_transfer,
+    int kv_dim, int num_kv_heads,
+    const std::string &kv_shared_across_ranks_mode) {
   if (!has_swa_multi_group_) {
     return;
   }
   const auto &members = swa_layer_members_[orig_layer];
-  std::string mode = mla_d2h_mode;
+  std::string mode = kv_shared_across_ranks_mode;
   for (const auto &member : members) {
     int gi = member.first;
     int local_id = member.second;
@@ -458,7 +459,7 @@ void LayerwiseTransferGroup::launch_swa_mg_h2d_layer_(
     for (int d = 0; d < num_gpus_; ++d) {
       cudaSetDevice(gpu_device_ids_[d]);
       int64_t cpu_startoff_inside_chunks = d * gp.cpu_tp_stride;
-      if (is_mla) {
+      if (num_kv_heads == 1) {
         cpu_startoff_inside_chunks =
             mode == "all_write" ? d * num_blocks * gp.cpu_block_stride : 0;
       }
@@ -475,7 +476,7 @@ void LayerwiseTransferGroup::launch_swa_mg_h2d_layer_(
             swa_cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
             gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
             cpu_startoff_inside_chunks, chunk_size, streams_[d],
-            transfer_cta_num, true, use_ce_transfer, is_mla,
+            transfer_cta_num, true, use_ce_transfer, kv_dim,
             gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
         break;
       case BackendType::TRTLLM:
@@ -485,7 +486,7 @@ void LayerwiseTransferGroup::launch_swa_mg_h2d_layer_(
             swa_cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
             gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
             cpu_startoff_inside_chunks, chunk_size, streams_[d],
-            transfer_cta_num, true, use_ce_transfer, is_mla,
+            transfer_cta_num, true, use_ce_transfer, kv_dim,
             gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
         break;
       case BackendType::SGLANG:
@@ -495,7 +496,7 @@ void LayerwiseTransferGroup::launch_swa_mg_h2d_layer_(
             swa_cpu_block_ids, cpu_ptr_for_group, gp.h2d_cpu_kv_stride,
             gp.h2d_cpu_layer_stride, gp.cpu_block_stride,
             cpu_startoff_inside_chunks, chunk_size, streams_[d],
-            transfer_cta_num, true, use_ce_transfer, is_mla,
+            transfer_cta_num, true, use_ce_transfer, kv_dim,
             gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
         break;
       }
@@ -955,7 +956,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t h2d_cpu_layer_stride_in_bytes,
     const int64_t cpu_tp_stride_in_bytes, const int transfer_cta_num,
     const bool use_ce_transfer, const int num_layers,
-    const int layer_granularity, const bool is_mla, const int counter_id,
+    const int layer_granularity, const int kv_dim,
+    const int num_kv_heads, const int counter_id,
     const torch::Tensor &swa_h2d_src, const torch::Tensor &swa_h2d_dst,
     const torch::Tensor &swa_disk2h_src, const torch::Tensor &swa_disk2h_dst,
     const int64_t swa_cpu_kv_stride_in_bytes,
@@ -967,7 +969,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int64_t swa_cpu_tp_stride_in_bytes,
     const int64_t swa_ssd_layer_stride_in_bytes,
     const int64_t swa_ssd_kv_stride_in_bytes,
-    const int swa_num_blocks_per_file, const std::string &mla_d2h_mode,
+    const int swa_num_blocks_per_file, const std::string &kv_shared_across_ranks_mode,
     const std::string &notify_mode, const bool enable_trace) {
 
   if (has_multi_group_) {
@@ -1038,11 +1040,11 @@ void LayerwiseTransferGroup::layerwise_transfer(
   for (int b = 0; b < num_batches; ++b) {
     int sl = b * layer_granularity;
     int ltb = std::min(layer_granularity, num_layers - sl);
-    // Calculate data size for this batch: chunk_size * 2 (K+V) * layers *
-    // num_blocks
+    // Calculate data size for this batch across all physical KV regions.
     int64_t bytes_this_batch = 0;
     for (int g = 0; g < num_gpus_; ++g) {
-      bytes_this_batch += gpu_chunk_sizes_in_bytes_[g] * 2 * ltb * num_blocks;
+      bytes_this_batch +=
+          gpu_chunk_sizes_in_bytes_[g] * kv_dim * ltb * num_blocks;
     }
     char name[256];
     snprintf(name, sizeof(name), "CPU->GPU Layer[%d,%d) %.2fMB", sl, sl + ltb,
@@ -1062,8 +1064,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
   // at wrong CPU positions for TP > 1.
   if (enable_ssd_ && ssd_block_ids.numel() > 0) {
     int num_ssd_blocks = ssd_block_ids.numel();
-    int64_t ssd_bytes =
-        cpu_chunk_size_in_bytes * 2 * num_layers * num_ssd_blocks;
+    int64_t ssd_bytes = cpu_chunk_size_in_bytes * kv_dim * num_layers *
+                        num_ssd_blocks;
     double ssd_mb = ssd_bytes / (1024.0 * 1024.0);
     char ssd_range_name[128];
     snprintf(ssd_range_name, sizeof(ssd_range_name),
@@ -1079,8 +1081,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
         ssd_kv_stride_in_bytes, cpu_chunk_size_in_bytes,
         cpu_block_stride_in_bytes,
         true, // is_read: SSD -> CPU
-        num_blocks_per_file, round_robin, num_threads_per_device, is_mla,
-        /*ssd_io_opt=*/ssd_io_opt_);
+        num_blocks_per_file, round_robin, num_threads_per_device,
+        kv_dim, /*ssd_io_opt=*/ssd_io_opt_);
 
     nvtxRangePop();
   }
@@ -1108,20 +1110,20 @@ void LayerwiseTransferGroup::layerwise_transfer(
         swa_cpu_block_stride_in_bytes,
         true, // is_read: SSD -> CPU
         swa_num_blocks_per_file, round_robin, num_threads_per_device,
-        /*is_mla=*/true, /*ssd_io_opt=*/ssd_io_opt_);
+        /*kv_dim=*/1, /*ssd_io_opt=*/ssd_io_opt_);
   }
 
-  // Validate mla_d2h_mode (#192) once before the per-batch loop. The mode only
-  // controls where on CPU each rank reads its MLA KV from; the default
-  // "sharded" matches the legacy is_mla behaviour (cpu_startoff = 0).
-  std::string mla_mode = mla_d2h_mode;
-  if (is_mla && mla_mode != "sharded" && mla_mode != "all_write" &&
-      mla_mode != "rank0_only") {
+  // Validate kv_shared_across_ranks_mode (#192) once before the per-batch loop.
+  // The mode only controls where on CPU each rank reads its shared KV from;
+  // the default "sharded" matches the legacy behaviour (cpu_startoff = 0).
+  std::string mode = kv_shared_across_ranks_mode;
+  if (num_kv_heads == 1 && mode != "sharded" && mode != "all_write" &&
+      mode != "rank0_only") {
     FLEXKV_LOG_WARNING(
         "operation=layerwise_config act=fallback status=degraded "
-        "field=mla_d2h_mode value=\"%s\" fallback=sharded",
-        mla_mode.c_str());
-    mla_mode = "sharded";
+        "field=kv_shared_across_ranks_mode value=\"%s\" fallback=sharded",
+        mode.c_str());
+    mode = "sharded";
   }
 
   int batch_idx = 0;
@@ -1144,12 +1146,12 @@ void LayerwiseTransferGroup::layerwise_transfer(
       int64_t gpu_startoff_inside_chunks = 0;
       int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
 
-      // Handle MLA D2H mode for H2D transfer (#192, inlined logic).
-      if (is_mla) {
-        if (mla_mode == "sharded") {
+      // Apply kv_shared_across_ranks_mode for H2D transfer (inlined logic).
+      if (num_kv_heads == 1) {
+        if (mode == "sharded") {
           cpu_startoff_inside_chunks = 0;
           gpu_startoff_inside_chunks = 0;
-        } else if (mla_mode == "all_write") {
+        } else if (mode == "all_write") {
           // Each rank's complete KV occupies num_blocks blocks on CPU.
           // Use cpu_block_stride (not gpu_chunk_size) because BLOCKFIRST's
           // block_stride includes all layers+kv_dims, while LAYERFIRST's
@@ -1157,7 +1159,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
           cpu_startoff_inside_chunks =
               i * num_blocks * cpu_block_stride_in_bytes;
           gpu_startoff_inside_chunks = 0;
-        } else if (mla_mode == "rank0_only") {
+        } else if (mode == "rank0_only") {
           cpu_startoff_inside_chunks = 0;
           gpu_startoff_inside_chunks = 0;
         }
@@ -1171,7 +1173,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
             cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
             streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
-            use_ce_transfer, is_mla, gpu_block_strides_in_bytes_[i],
+            use_ce_transfer, kv_dim, gpu_block_strides_in_bytes_[i],
             /*sync=*/false, ce_config_);
         break;
       case BackendType::TRTLLM:
@@ -1181,7 +1183,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
             cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
             streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
-            use_ce_transfer, is_mla, gpu_block_strides_in_bytes_[i],
+            use_ce_transfer, kv_dim, gpu_block_strides_in_bytes_[i],
             /*sync=*/false, ce_config_);
         break;
       case BackendType::SGLANG:
@@ -1191,7 +1193,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
             cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
             streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
-            use_ce_transfer, is_mla, gpu_block_strides_in_bytes_[i],
+            use_ce_transfer, kv_dim, gpu_block_strides_in_bytes_[i],
             /*sync=*/false, ce_config_);
         break;
       }
@@ -1264,8 +1266,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
       int layers_this_batch = batch_layers_count[i];
       int64_t h2d_bytes = 0;
       for (int g = 0; g < num_gpus_; ++g) {
-        h2d_bytes +=
-            gpu_chunk_sizes_in_bytes_[g] * 2 * layers_this_batch * num_blocks;
+        h2d_bytes += gpu_chunk_sizes_in_bytes_[g] * kv_dim *
+                     layers_this_batch * num_blocks;
       }
       double data_mb = h2d_bytes / (1024.0 * 1024.0);
       double bw_mbs = (sync_ms > 0.0f) ? data_mb / (sync_ms / 1000.0) : 0.0;
@@ -1285,7 +1287,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
       cudaEventElapsedTime(&elapsed_ms, timing_events[i],
                            timing_events[i + 1]);
       for (int g = 0; g < num_gpus_; ++g) {
-        total_bytes += gpu_chunk_sizes_in_bytes_[g] * 2 *
+        total_bytes += gpu_chunk_sizes_in_bytes_[g] * kv_dim *
                        batch_layers_count[i] * num_blocks;
       }
       total_time_ms += elapsed_ms;
@@ -1313,7 +1315,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     const int num_blocks_per_file, const int round_robin,
     const int num_threads_per_device, const torch::Tensor &gpu_block_id_tensor,
     const torch::Tensor &cpu_block_id_tensor, const int transfer_cta_num,
-    const bool use_ce_transfer, const bool is_mla, const int counter_id,
+    const bool use_ce_transfer, const int kv_dim,
+    const int num_kv_heads, const int counter_id,
     const torch::Tensor &swa_h2d_src, const torch::Tensor &swa_h2d_dst,
     const torch::Tensor &swa_disk2h_src, const torch::Tensor &swa_disk2h_dst,
     const int64_t swa_cpu_kv_stride_in_bytes,
@@ -1325,7 +1328,7 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     const int64_t swa_cpu_tp_stride_in_bytes,
     const int64_t swa_ssd_layer_stride_in_bytes,
     const int64_t swa_ssd_kv_stride_in_bytes,
-    const int swa_num_blocks_per_file, const std::string &mla_d2h_mode,
+    const int swa_num_blocks_per_file, const std::string &kv_shared_across_ranks_mode,
     const std::string &notify_mode, const bool enable_trace) {
   (void)swa_cpu_tp_stride_in_bytes;
 
@@ -1346,12 +1349,12 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   int64_t *cpu_block_ids =
       static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
 
-  std::string mode = mla_d2h_mode;
-  if (is_mla && mode != "sharded" && mode != "all_write" &&
+  std::string mode = kv_shared_across_ranks_mode;
+  if (num_kv_heads == 1 && mode != "sharded" && mode != "all_write" &&
       mode != "rank0_only") {
     FLEXKV_LOG_WARNING(
         "operation=layerwise_config act=fallback status=degraded "
-        "field=mla_d2h_mode value=\"%s\" fallback=sharded",
+        "field=kv_shared_across_ranks_mode value=\"%s\" fallback=sharded",
         mode.c_str());
     mode = "sharded";
   }
@@ -1388,7 +1391,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
         /*chunk_size_in_bytes=*/block_stride,
         /*block_stride_in_bytes=*/block_stride,
         /*is_read=*/true, num_blocks_per_file, round_robin,
-        num_threads_per_device, /*is_mla=*/true, /*ssd_io_opt=*/ssd_io_opt_);
+        num_threads_per_device, kv_dim,
+        /*ssd_io_opt=*/ssd_io_opt_);
     nvtxRangePop();
   }
 
@@ -1411,7 +1415,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
           /*chunk_size_in_bytes=*/swa_block_stride,
           /*block_stride_in_bytes=*/swa_block_stride,
           /*is_read=*/true, swa_num_blocks_per_file, round_robin,
-          num_threads_per_device, /*is_mla=*/true, /*ssd_io_opt=*/ssd_io_opt_);
+          num_threads_per_device, /*kv_dim=*/1,
+          /*ssd_io_opt=*/ssd_io_opt_);
     } else {
       torch::Tensor swa_all_layer_ids = torch::arange(
           0, num_original_layers_,
@@ -1423,8 +1428,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
           swa_cpu_kv_stride_in_bytes, swa_ssd_layer_stride_in_bytes,
           swa_ssd_kv_stride_in_bytes, swa_cpu_chunk_size_in_bytes,
           swa_cpu_block_stride_in_bytes, true, swa_num_blocks_per_file,
-          round_robin, num_threads_per_device, /*is_mla=*/true,
-          /*ssd_io_opt=*/ssd_io_opt_);
+          round_robin, num_threads_per_device,
+          /*kv_dim=*/1, /*ssd_io_opt=*/ssd_io_opt_);
     }
   }
 
@@ -1528,7 +1533,7 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
       for (int d = 0; d < num_gpus_; ++d) {
         cudaSetDevice(gpu_device_ids_[d]);
         int64_t cpu_startoff_inside_chunks = d * gp.cpu_tp_stride;
-        if (is_mla) {
+        if (num_kv_heads == 1) {
           cpu_startoff_inside_chunks =
               mode == "all_write" ? d * num_blocks * gp.cpu_block_stride : 0;
         }
@@ -1544,7 +1549,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
               gpu_startoff_inside_chunks, cpu_block_ids, cpu_ptr_for_group,
               gp.h2d_cpu_kv_stride, gp.h2d_cpu_layer_stride,
               gp.cpu_block_stride, cpu_startoff_inside_chunks, chunk_size,
-              streams_[d], transfer_cta_num, true, use_ce_transfer, is_mla,
+              streams_[d], transfer_cta_num, true, use_ce_transfer,
+              kv_dim,
               gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
           break;
         case BackendType::TRTLLM:
@@ -1553,7 +1559,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
               gpu_startoff_inside_chunks, cpu_block_ids, cpu_ptr_for_group,
               gp.h2d_cpu_kv_stride, gp.h2d_cpu_layer_stride,
               gp.cpu_block_stride, cpu_startoff_inside_chunks, chunk_size,
-              streams_[d], transfer_cta_num, true, use_ce_transfer, is_mla,
+              streams_[d], transfer_cta_num, true, use_ce_transfer,
+              kv_dim,
               gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
           break;
         case BackendType::SGLANG:
@@ -1562,7 +1569,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
               gpu_startoff_inside_chunks, cpu_block_ids, cpu_ptr_for_group,
               gp.h2d_cpu_kv_stride, gp.h2d_cpu_layer_stride,
               gp.cpu_block_stride, cpu_startoff_inside_chunks, chunk_size,
-              streams_[d], transfer_cta_num, true, use_ce_transfer, is_mla,
+              streams_[d], transfer_cta_num, true, use_ce_transfer,
+              kv_dim,
               gp.gpu_block_strides[d], /*sync=*/false, ce_config_);
           break;
         }
@@ -1578,7 +1586,7 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
       for (const auto &m : members) {
         const GroupParams &gp = groups_[m.first];
         for (int d = 0; d < num_gpus_; ++d) {
-          per_orig_bytes += gp.gpu_chunk_sizes[d] * 2 * num_blocks;
+          per_orig_bytes += gp.gpu_chunk_sizes[d] * kv_dim * num_blocks;
         }
       }
       data_bytes_per_orig[ai] = per_orig_bytes;
@@ -1588,7 +1596,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
       if (has_swa_multi_group_) {
         launch_swa_mg_h2d_layer_(orig, swa_num_blocks, swa_gpu_block_ids,
                                  swa_cpu_block_ids, transfer_cta_num,
-                                 use_ce_transfer, /*is_mla=*/true, mode);
+                                 use_ce_transfer, /*kv_dim=*/1,
+                                 /*num_kv_heads=*/1, mode);
       } else {
         launch_swa_h2d_layer_(
             orig, 1, swa_num_blocks, swa_gpu_block_ids, swa_cpu_block_ids,

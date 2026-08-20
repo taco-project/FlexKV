@@ -98,7 +98,8 @@ def make_layerfirst_layout() -> KVCacheLayout:
         tokens_per_block=TOKENS_PER_BLOCK,
         num_head=1,
         head_size=BYTES_PER_TOKEN_PER_LAYER,
-        is_mla=True,
+        kv_dim=1,
+        num_kv_heads=1,
     )
 
 
@@ -144,7 +145,7 @@ def main() -> int:
         num_layers=NUM_LAYERS,
         num_kv_heads=1,
         head_size=BYTES_PER_TOKEN_PER_LAYER,
-        use_mla=True,
+        kv_dim=1,
         dtype=torch.uint8,
         tp_size=1, pp_size=1, dp_size=1, cp_size=1,
     )

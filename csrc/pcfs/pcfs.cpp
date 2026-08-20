@@ -294,7 +294,8 @@ static void _transfer_single_thread_impl(
     int start_block, int end_block, int64_t cpu_tensor_ptr,
     int64_t cpu_layer_stride_in_bytes, int64_t cfs_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t cfs_kv_stride_in_bytes,
-    int64_t block_size_in_bytes, bool is_read, int thread_id, bool is_mla) {
+    int64_t block_size_in_bytes, bool is_read, int thread_id,
+    int kv_dim) {
   int num_blocks = end_block - start_block;
   if (num_blocks == 0) {
     return;
@@ -332,7 +333,7 @@ static void _transfer_single_thread_impl(
       if (!transfer_ret) {
         throw std::runtime_error("Failed to transfer K block");
       }
-      if (is_mla) {
+      if (kv_dim == 1) {
         continue;
       }
       // read V block
@@ -361,8 +362,8 @@ static void _shared_transfer_single_thread_impl(
     const std::vector<int64_t> &cpu_block_ids, int start_layer, int end_layer,
     int64_t cpu_tensor_ptr, int64_t cpu_layer_stride_in_bytes,
     int64_t cfs_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
-    int64_t cfs_kv_stride_in_bytes, int64_t block_size_in_bytes,
-    int thread_id, bool is_mla) {
+    int64_t cfs_kv_stride_in_bytes,     int64_t block_size_in_bytes,
+    int thread_id, int kv_dim) {
   
   int num_blocks = cfs_block_ids.size();
   if (num_blocks == 0) {
@@ -396,7 +397,7 @@ static void _shared_transfer_single_thread_impl(
         throw std::runtime_error("Failed to transfer K block");
       }
       
-      if (is_mla) {
+      if (kv_dim == 1) {
         continue;
       }
       
@@ -427,7 +428,7 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     int64_t cfs_kv_stride_in_bytes, int64_t block_size_in_bytes,
     int64_t total_layers, bool is_read, int partition_block_type,
     int round_robin, int64_t num_remote_blocks_per_file, bool use_mmap,
-    int num_threads_per_file, bool is_mla) {
+    int num_threads_per_file, int kv_dim) {
 
   int num_files = file_nodeids.size();
   // int file_size = cfs_layer_stride_in_bytes * total_layers;
@@ -485,7 +486,8 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
              start_layer, end_layer, start_block, end_block, cpu_tensor_ptr,
              cpu_layer_stride_in_bytes, cfs_layer_stride_in_bytes,
              cpu_kv_stride_in_bytes, cfs_kv_stride_in_bytes,
-             block_size_in_bytes, is_read, is_mla, prom = std::move(prom),
+             block_size_in_bytes, is_read, kv_dim,
+             prom = std::move(prom),
              thread_id]() mutable {
               try {
                 _transfer_single_thread_impl(
@@ -494,7 +496,8 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
                     start_block, end_block, cpu_tensor_ptr,
                     cpu_layer_stride_in_bytes, cfs_layer_stride_in_bytes,
                     cpu_kv_stride_in_bytes, cfs_kv_stride_in_bytes,
-                    block_size_in_bytes, is_read, thread_id, is_mla);
+                    block_size_in_bytes, is_read, thread_id,
+                    kv_dim);
                 prom.set_value(nullptr);
               } catch (...) {
                 prom.set_value(std::current_exception());
@@ -529,7 +532,7 @@ void shared_transfer_kv_blocks_remote_read(
   int64_t cfs_kv_stride_in_bytes,
   int64_t block_size_in_bytes,
   int64_t total_layers,
-  bool is_mla,
+  int kv_dim,
   int num_threads_per_file) {
   
   int num_files = file_nodeids.size();
@@ -586,7 +589,8 @@ void shared_transfer_kv_blocks_remote_read(
                    start_layer, end_layer, cpu_tensor_ptr,
                    cpu_layer_stride_in_bytes, cfs_layer_stride_in_bytes,
                    cpu_kv_stride_in_bytes, cfs_kv_stride_in_bytes,
-                   block_size_in_bytes, thread_id, is_mla, prom = std::move(prom)]() mutable {
+                   block_size_in_bytes, thread_id, kv_dim,
+                   prom = std::move(prom)]() mutable {
                       try {
                           _shared_transfer_single_thread_impl(
                               file_nodeids[f],
@@ -600,7 +604,7 @@ void shared_transfer_kv_blocks_remote_read(
                               cfs_kv_stride_in_bytes,
                               block_size_in_bytes,
                               thread_id,
-                              is_mla);
+                              kv_dim);
                           prom.set_value(nullptr);
                       } catch (...) {
                           prom.set_value(std::current_exception());

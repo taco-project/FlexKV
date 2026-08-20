@@ -56,6 +56,9 @@ public:
 
   ~TPTransferThreadGroup();
 
+  void update_gpu_block_ptrs(
+      const std::vector<int64_t> &gpu_block_ptrs_flat);
+
   void tp_group_transfer(const torch::Tensor &gpu_block_id_tensor,
                          const torch::Tensor &cpu_block_id_tensor,
                          const int64_t cpu_kv_stride_in_bytes,
@@ -65,8 +68,9 @@ public:
                          const int transfer_num_cta,
                          const bool is_host_to_device,
                          const bool use_ce_transfer, const int layer_id,
-                         const int layer_granularity, const bool is_mla,
-                         const std::string &mla_d2h_mode = "sharded",
+                         const int layer_granularity, const int kv_dim,
+                         const int num_kv_heads,
+                         const std::string &kv_shared_across_ranks_mode = "sharded",
                          const int designated_rank = 0);
 
 #ifdef FLEXKV_ENABLE_NVCOMP
@@ -84,7 +88,8 @@ public:
                                const int transfer_num_cta,
                                const bool is_host_to_device,
                                const bool use_ce_transfer, const int layer_id,
-                               const int layer_granularity, const bool is_mla,
+                               const int layer_granularity, const int kv_dim,
+                               const int num_kv_heads,
                                const int64_t cpu_size_table_tp_ptr,
                                const int64_t cpu_size_table_tp_rank_stride,
                                const int64_t cpu_size_table_block_stride,

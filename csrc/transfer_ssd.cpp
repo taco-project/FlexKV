@@ -58,7 +58,7 @@ static void transfer_blocks_impl(
     int64_t cpu_layer_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes,
-    int num_files_per_device, bool is_read, bool is_mla,
+    int num_files_per_device, bool is_read, int kv_dim,
     bool ssd_io_opt, bool enable_block_first_transfer, IOCallable &do_io,
     IOVecCallable &do_iov) {
   if (end_block <= start_block) return;
@@ -101,7 +101,7 @@ static void transfer_blocks_impl(
     int ssd_bid = ssd_block_ids_in_device[start_block];
     int fd = fd_list[ssd_bid % num_files_per_device];
     ssd_bid /= num_files_per_device;
-    int num_kv = is_mla ? 1 : 2;
+    int num_kv = kv_dim;
     for (int lid = start_layer; lid < end_layer; lid++) {
       for (int kv = 0; kv < num_kv; kv++) {
         void *cpu_ptr = reinterpret_cast<char *>(cpu_tensor_ptr) +
@@ -152,7 +152,7 @@ static void transfer_blocks_impl(
       }
     }
 
-    int num_kv = is_mla ? 1 : 2;
+    int num_kv = kv_dim;
     std::vector<struct iovec> iovs;
 
     for (int lid = start_layer; lid < end_layer; lid++) {
@@ -220,7 +220,7 @@ static void transfer_blocks_impl(
         throw std::runtime_error("Failed to transfer K block");
       }
 
-      if (is_mla) {
+      if (kv_dim == 1) {
         continue;
       }
       bytes_transfer = 0;
@@ -318,7 +318,7 @@ void transfer_kv_blocks_ssd(
     int64_t ssd_kv_stride_in_bytes,    // in single file
     int64_t chunk_size_in_bytes, int64_t block_stride_in_bytes, bool is_read,
     int num_blocks_per_file, int round_robin, int num_threads_per_device,
-    bool is_mla, bool ssd_io_opt) {
+    int kv_dim, bool ssd_io_opt) {
   const int num_devices = ioctx.get_num_devices();
   const int num_files_per_device = ioctx.get_num_files_per_device();
 
@@ -346,8 +346,9 @@ void transfer_kv_blocks_ssd(
                 is_4k_aligned(chunk_size_in_bytes) &&
                 is_4k_aligned(cpu_layer_stride_in_bytes) &&
                 is_4k_aligned(ssd_layer_stride_in_bytes) &&
-                (is_mla || (is_4k_aligned(cpu_kv_stride_in_bytes) &&
-                            is_4k_aligned(ssd_kv_stride_in_bytes)));
+                (kv_dim == 1 ||
+                 (is_4k_aligned(cpu_kv_stride_in_bytes) &&
+                  is_4k_aligned(ssd_kv_stride_in_bytes)));
   }
 
   std::vector<std::vector<int>> &fds = ioctx.get_fds(is_read, is_direct);
@@ -442,8 +443,8 @@ void transfer_kv_blocks_ssd(
               cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
               cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
               chunk_size_in_bytes, block_stride_in_bytes, num_files_per_device,
-              is_read, is_mla, ssd_io_opt, enable_block_first_transfer, do_io,
-              do_iov);
+              is_read, kv_dim, ssd_io_opt,
+              enable_block_first_transfer, do_io, do_iov);
           iouring.submit();  // flush SQEs
           continue;
         }
@@ -456,7 +457,8 @@ void transfer_kv_blocks_ssd(
              cpu_layer_stride_in_bytes, ssd_layer_stride_in_bytes,
              cpu_kv_stride_in_bytes, ssd_kv_stride_in_bytes,
              chunk_size_in_bytes, block_stride_in_bytes, num_files_per_device,
-             is_read, is_mla, ssd_io_opt, enable_block_first_transfer,
+             is_read, kv_dim, ssd_io_opt,
+             enable_block_first_transfer,
              prom = std::move(prom)]() mutable {
               try {
                 IOCallable do_io = [&](int fd, void *cpu_ptr, int64_t ssd_offset,
@@ -479,8 +481,8 @@ void transfer_kv_blocks_ssd(
                     ssd_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
                     ssd_kv_stride_in_bytes, chunk_size_in_bytes,
                     block_stride_in_bytes, num_files_per_device, is_read,
-                    is_mla, ssd_io_opt, enable_block_first_transfer, do_io,
-                    do_iov);
+                    kv_dim, ssd_io_opt,
+                    enable_block_first_transfer, do_io, do_iov);
                 prom.set_value(nullptr);
               } catch (...) {
                 prom.set_value(std::current_exception());

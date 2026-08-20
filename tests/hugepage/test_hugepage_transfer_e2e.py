@@ -36,7 +36,8 @@ _CPU_LAYOUT = KVCacheLayout(
     tokens_per_block=_TOKENS_PER_BLOCK,
     num_head=_NUM_HEADS,
     head_size=_HEAD_SIZE,
-    is_mla=False,
+    kv_dim=2,
+    num_kv_heads=_NUM_HEADS,
 )
 
 _CHUNK = _CPU_LAYOUT.get_chunk_size()
@@ -61,7 +62,8 @@ def _ssd_layout_for(num_blocks_per_file: int) -> KVCacheLayout:
         tokens_per_block=_TOKENS_PER_BLOCK,
         num_head=_NUM_HEADS,
         head_size=_HEAD_SIZE,
-        is_mla=False,
+        kv_dim=2,
+        num_kv_heads=_NUM_HEADS,
     )
 
 
@@ -149,7 +151,7 @@ def test_hugepage_ssd_to_gpu_roundtrip() -> None:
             num_blocks_per_file=num_blocks_per_file,
             round_robin=1,
             num_threads_per_device=1,
-            is_mla=False,
+            kv_dim=2,
         )
 
         buf_np = np.frombuffer(

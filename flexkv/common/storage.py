@@ -36,7 +36,8 @@ class KVCacheLayout:
     tokens_per_block: int
     num_head: int
     head_size: int
-    is_mla: bool
+    kv_dim: int = 2
+    num_kv_heads: int = 1
     _kv_shape: Optional[torch.Size] = None
     # Multi-group support: when set, the layout represents a heterogeneous block
     # where different layer groups have different (num_kv_heads, head_size).
@@ -55,14 +56,11 @@ class KVCacheLayout:
                 self.tokens_per_block == other.tokens_per_block and
                 self.num_head == other.num_head and
                 self.head_size == other.head_size and
-                self.is_mla == other.is_mla and
+                self.kv_dim == other.kv_dim and
+                self.num_kv_heads == other.num_kv_heads and
                 self.layer_groups == other.layer_groups and
                 self.tp_size == other.tp_size and
                 self.kv_shape == other.kv_shape)
-
-    @property
-    def kv_dim(self) -> int:
-        return 2 if not self.is_mla else 1
 
     @property
     def kv_shape(self) -> torch.Size:
@@ -165,7 +163,8 @@ class KVCacheLayout:
             tokens_per_block=self.tokens_per_block,
             num_head=self.num_head,
             head_size=self.head_size,
-            is_mla=self.is_mla,
+            kv_dim=self.kv_dim,
+            num_kv_heads=self.num_kv_heads,
             layer_groups=self.layer_groups,
             tp_size=self.tp_size,
         )
@@ -181,7 +180,8 @@ class KVCacheLayout:
             tokens_per_block=self.tokens_per_block,
             num_head=self.num_head,
             head_size=self.head_size,
-            is_mla=self.is_mla,
+            kv_dim=self.kv_dim,
+            num_kv_heads=self.num_kv_heads,
         )
         return new_layout
 
@@ -195,7 +195,8 @@ class KVCacheLayout:
             tokens_per_block=self.tokens_per_block,
             num_head=self.num_head // num_chunks,
             head_size=self.head_size,
-            is_mla=self.is_mla,
+            kv_dim=self.kv_dim,
+            num_kv_heads=self.num_kv_heads,
         )
         return new_layout
 

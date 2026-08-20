@@ -124,8 +124,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             imported_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type (uint8 in multi-group)
-        self.is_mla = gpu_kv_layouts[0].is_mla
-        self.kv_dim = 1 if self.is_mla else 2
+        self.kv_dim = gpu_kv_layouts[0].kv_dim
+        self.num_kv_heads = gpu_kv_layouts[0].num_kv_heads
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
@@ -252,7 +252,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
         self.h2d_cta_num = h2d_cta_num
         self.d2h_cta_num = d2h_cta_num
-        self.mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
+        self.kv_shared_across_ranks_mode = GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode
         self.layerwise_notify_mode = GLOBAL_CONFIG_FROM_ENV.layerwise_notify_mode
 
         # initialize SSD storage (file count etc. — strides handled per-group below)
@@ -619,7 +619,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
         self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
         # TP-divided CPU strides (for CPU->GPU, each rank reads its own portion)
-        if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and not self.is_mla:
+        if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and self.num_kv_heads > 1:
             cpu_kv_layout_tp = cpu_kv_layout.div_head(self.tp_group_size)
         else:
             cpu_kv_layout_tp = cpu_kv_layout
@@ -652,11 +652,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             GLOBAL_CONFIG_FROM_ENV.iouring_entries,
             GLOBAL_CONFIG_FROM_ENV.iouring_flags,
             layer_eventfds_tensor, tp_group_size,
-            ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
-            ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
-            ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
-            is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
-            is_mla=self.is_mla,
+            GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+            GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+            GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+            (cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
+            self.num_kv_heads,
             ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
             ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
@@ -746,7 +746,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
             ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
             is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
-            is_mla=self.is_mla,
+            num_kv_heads=self.num_kv_heads,
             ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
             ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
@@ -960,9 +960,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                 cpu_block_id_tensor=src_block_ids_h2d,
                 transfer_cta_num=self.h2d_cta_num,
                 use_ce_transfer=self.use_ce_transfer_h2d,
-                is_mla=self.is_mla,
+                kv_dim=self.kv_dim,
+                num_kv_heads=self.num_kv_heads,
+                kv_shared_across_ranks_mode=self.kv_shared_across_ranks_mode,
                 counter_id=counter_id,
-                mla_d2h_mode=self.mla_d2h_mode,
                 notify_mode=self.layerwise_notify_mode,
                 enable_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
                 **swa_kwargs,
@@ -990,9 +991,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.use_ce_transfer_h2d,
             self.num_layers,
             1,  # layer_granularity: LAYERWISE protocol fires one eventfd per layer
-            self.is_mla,
+            self.kv_dim,
+            self.num_kv_heads,
             counter_id,
-            mla_d2h_mode=self.mla_d2h_mode,
+            kv_shared_across_ranks_mode=self.kv_shared_across_ranks_mode,
             notify_mode=self.layerwise_notify_mode,
             enable_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
             **swa_kwargs,
@@ -1044,7 +1046,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             transfer_size = self.group_cpu_block_stride * num_h2d_blocks
         else:
             transfer_size = self.cpu_chunk_size_in_bytes * self.num_layers * num_h2d_blocks * self.kv_dim
-            if self.is_mla:
+            if self.num_kv_heads == 1:
                 transfer_size *= self.tp_group_size
 
         self._log_transfer_performance(

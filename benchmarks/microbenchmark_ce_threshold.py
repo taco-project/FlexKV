@@ -22,7 +22,7 @@ Background — segment_threshold semantics (authoritative):
   threshold is passed PER-CONSTRUCTION (ce_segment_threshold ctor arg), NOT via
   env — matching production and the correctness tests.
 
-Note on mode: we use mla_d2h_mode="rank0_only" throughout. Threshold behavior is
+Note on mode: we use kv_shared_across_ranks_mode="rank0_only" throughout. Threshold behavior is
 mode-independent: choose_path() only looks at the segment count + destination
 contiguity, so "rank0_only" keeps CPU-buffer sizing simple without changing which
 path the threshold selects.
@@ -68,7 +68,7 @@ DTYPE = torch.float16
 ES = DTYPE.itemsize
 
 # A couple of MLA sizes. Tuple = (num_layers, num_blocks, tokens_per_block,
-# head_dim, num_heads); is_mla=True for all threshold cases.
+# head_dim, num_heads); kv_dim=1, num_kv_heads=1 for all threshold cases.
 THRESHOLD_SIZES = {
     "mla-medium": (32, 64, 16, 512, 1),
     "mla-large":  (80, 256, 16, 512, 1),
@@ -96,7 +96,8 @@ _LAYOUT_TYPES = {
 # rank0_only keeps CPU-buffer sizing simple without changing which path the
 # threshold selects.
 MODE = "rank0_only"
-IS_MLA = True
+KV_DIM = 1        # MLA: K/V combined, single shared head
+NUM_KV_HEADS = 1  # MLA: heads shared across ranks
 
 WARMUP_ITERS = 3
 
@@ -113,7 +114,7 @@ def probe_engine(use_ce):
         layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=1, num_block=1, tokens_per_block=1,
-            num_head=1, head_size=16, is_mla=True)
+            num_head=1, head_size=16, kv_dim=1)
         g = torch.zeros((1, 1, 1, 1, 1, 16), dtype=DTYPE, device="cuda:0")
         c = torch.zeros(tuple(layout.kv_shape), dtype=DTYPE, pin_memory=True)
         ids = torch.arange(1, dtype=torch.int64).pin_memory()
@@ -132,7 +133,8 @@ def probe_engine(use_ce):
             cpu_block_stride_in_bytes=layout.get_block_stride() * ES,
             cpu_tp_stride_in_bytes=layout.get_block_stride() * ES,
             transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-            layer_id=0, layer_granularity=1, is_mla=True, mla_d2h_mode="rank0_only")
+            layer_id=0, layer_granularity=1, kv_dim=1, num_kv_heads=1,
+            kv_shared_across_ranks_mode="rank0_only")
         torch.cuda.synchronize()
         del tp
         _probe_cache[key] = True
@@ -143,47 +145,47 @@ def probe_engine(use_ce):
 
 
 # Helpers (matching production worker.py — copied from
-# microbenchmark_mla_d2h_modes.py so behavior is identical)
+# microbenchmark_ce_strategy.py so behavior is identical)
 
-def make_layouts(num_layers, num_blocks, head_dim, cpu_layout_type, is_mla, num_gpus):
+def make_layouts(num_layers, num_blocks, head_dim, cpu_layout_type, kv_dim, num_kv_heads, num_gpus):
     """Create GPU (LAYERFIRST) and CPU layouts.
 
-    MLA: kv_dim=1, head=1 (all ranks identical).
-    MHA: kv_dim=2, head=num_gpus (each rank gets 1 head).
+    MLA (kv_dim=1, num_kv_heads=1): head=1 (all ranks identical).
+    MHA (kv_dim=2, num_kv_heads>1): head=num_gpus (each rank gets 1 head).
     GPU uses heads_per_rank (per-rank), CPU uses full num_head.
     """
-    num_head = 1 if is_mla else num_gpus
+    num_head = 1 if num_kv_heads == 1 else num_gpus
     heads_per_rank = 1  # MLA: 1 shared head; MHA: num_gpus/num_gpus = 1
     gpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=1, num_head=heads_per_rank,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     cpu_layout = KVCacheLayout(
         type=cpu_layout_type,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=1, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     return gpu_layout, cpu_layout
 
 
 def cpu_strides_for_strategy(cpu_layout, num_layers, num_blocks, head_dim,
-                             is_mla, mode, num_gpus):
+                             kv_dim, num_kv_heads, mode, num_gpus):
     """Return (cpu_kv_sb, cpu_layer_sb, cpu_block_sb, cpu_tp_sb, total_blocks).
 
     For MLA all_write: CPU holds N copies, total = num_blocks * num_gpus.
     For MHA: div_head(tp_size) on BLOCKFIRST for per-rank CPU strides.
     """
-    total = num_blocks * num_gpus if (is_mla and mode == "all_write") else num_blocks
-    num_head = 1 if is_mla else num_gpus
+    total = num_blocks * num_gpus if (num_kv_heads == 1 and mode == "all_write") else num_blocks
+    num_head = 1 if num_kv_heads == 1 else num_gpus
 
     layout_for_kv_stride = KVCacheLayout(
         type=cpu_layout.type,
         num_layer=num_layers, num_block=total,
         tokens_per_block=1, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
 
-    if not is_mla and cpu_layout.type == KVCacheLayoutType.BLOCKFIRST:
+    if num_kv_heads > 1 and cpu_layout.type == KVCacheLayoutType.BLOCKFIRST:
         layout_for_kv_stride = layout_for_kv_stride.div_head(num_gpus)
 
     kv_sb = layout_for_kv_stride.get_kv_stride() * ES
@@ -201,13 +203,13 @@ def make_gpu_tensors(num_layers, kv_dim, num_blocks, heads_per_rank, head_dim, d
     return [full[i] for i in range(num_layers)]
 
 
-def make_cpu_tensor(cpu_layout, num_layers, total_blocks, head_dim, is_mla, num_gpus):
-    num_head = 1 if is_mla else num_gpus
+def make_cpu_tensor(cpu_layout, num_layers, total_blocks, head_dim, kv_dim, num_kv_heads, num_gpus):
+    num_head = 1 if num_kv_heads == 1 else num_gpus
     layout = KVCacheLayout(
         type=cpu_layout.type,
         num_layer=num_layers, num_block=total_blocks,
         tokens_per_block=1, num_head=num_head,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     return torch.empty(tuple(layout.kv_shape), dtype=DTYPE, pin_memory=True)
 
 
@@ -254,7 +256,7 @@ def make_pattern_with_segments(num_blocks, num_segments):
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True,
                   ce_segment_threshold=8,
-                  is_mla=False, is_blockfirst=False):
+                  kv_dim=2, is_blockfirst=False):
     """TPTransferThreadGroup with CE config passed per-construction.
 
     path_opt / segment_threshold go into the C++ CETransferConfig
@@ -276,7 +278,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         enable_nvcomp=False,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
         is_blockfirst=is_blockfirst)
 
 
@@ -296,25 +298,25 @@ def bench_threshold(cpu_layout_type, num_gpus, num_layers, num_blocks, head_dim,
     The block-id pattern is built with EXACTLY num_segments contiguous runs so
     the engine's choose_path() sees that segment count.
     """
-    is_mla = IS_MLA
+    kv_dim = KV_DIM
+    num_kv_heads = NUM_KV_HEADS
     mode = MODE
-    kv_dim = 1 if is_mla else 2
     heads_per_rank = 1
 
     gpu_layout, cpu_layout = make_layouts(
-        num_layers, num_blocks, head_dim, cpu_layout_type, is_mla, num_gpus)
+        num_layers, num_blocks, head_dim, cpu_layout_type, kv_dim, num_kv_heads, num_gpus)
     cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb, total_blocks = \
         cpu_strides_for_strategy(cpu_layout, num_layers, num_blocks, head_dim,
-                                  is_mla, mode, num_gpus)
+                                  kv_dim, num_kv_heads, mode, num_gpus)
 
     all_gpu = [make_gpu_tensors(num_layers, kv_dim, num_blocks, heads_per_rank,
                                 head_dim, g) for g in range(num_gpus)]
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks, head_dim,
-                             is_mla, num_gpus)
+                             kv_dim, num_kv_heads, num_gpus)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                        num_layers, ce_path_opt=True,
                        ce_segment_threshold=ce_segment_threshold,
-                       is_mla=is_mla,
+                       kv_dim=kv_dim,
                        is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST))
 
     # Same pattern for gpu and cpu side; num_segments controls the crossover.
@@ -326,8 +328,9 @@ def bench_threshold(cpu_layout_type, num_gpus, num_layers, num_blocks, head_dim,
             cpu_kv_stride_in_bytes=cpu_kv_sb, cpu_layer_stride_in_bytes=cpu_ly_sb,
             cpu_block_stride_in_bytes=cpu_bl_sb, cpu_tp_stride_in_bytes=cpu_tp_sb,
             transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-            layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
-            mla_d2h_mode=mode)
+            layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim,
+            num_kv_heads=num_kv_heads,
+            kv_shared_across_ranks_mode=mode)
 
     def do_h2d():
         tp.tp_group_transfer(
@@ -335,8 +338,9 @@ def bench_threshold(cpu_layout_type, num_gpus, num_layers, num_blocks, head_dim,
             cpu_kv_stride_in_bytes=cpu_kv_sb, cpu_layer_stride_in_bytes=cpu_ly_sb,
             cpu_block_stride_in_bytes=cpu_bl_sb, cpu_tp_stride_in_bytes=cpu_tp_sb,
             transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=True,
-            layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
-            mla_d2h_mode=mode)
+            layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim,
+            num_kv_heads=num_kv_heads,
+            kv_shared_across_ranks_mode=mode)
 
     # Warmup
     for _ in range(WARMUP_ITERS):

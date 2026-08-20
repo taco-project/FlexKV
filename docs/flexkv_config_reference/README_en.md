@@ -84,6 +84,7 @@ Some configurations can only be set through environment variables.
 | Environment Variable | Type | Default | Description |
 |---------------------|------|---------|-------------|
 | `FLEXKV_SERVER_CLIENT_MODE` | bool | 0 | `server_client_mode`: Whether to force enable server-client mode |
+| `FLEXKV_SERVER_LAUNCH_MODE` | str | "embedded" | Shared-server ownership: `embedded` lets client 0 launch it; `external` makes every instance client-only |
 | `FLEXKV_SERVER_RECV_PORT` | str | "ipc:///tmp/flexkv_server" | `server_recv_port`: Server receive port configuration. Different instances in multi-instance mode should use the same port |
 | `FLEXKV_INSTANCE_NUM` | int | 1 | Number of inference engine instances |
 | `FLEXKV_INSTANCE_ID` | int | 0 | Inference engine instance ID |
@@ -189,3 +190,13 @@ Some configurations can only be set through environment variables.
 | `FLEXKV_EVICT_RATIO` | float | 0.05 | CPU and SSD eviction ratio for proactive eviction per cycle (0.0 = only evict the minimal necessary blocks). Recommended to keep at `0.05`, i.e., evict 5% of least recently used blocks per cycle |
 | `FLEXKV_EVICT_START_THRESHOLD` | float | 0.7 | Memory utilization threshold to trigger proactive eviction. When the cache utilization reaches this ratio, FlexKV starts evicting nodes proactively. For example, `0.7` means eviction begins when 70% of the cache is occupied. Set to `1.0` to only evict when the cache is full |
 | `FLEXKV_HIT_REWARD_SECONDS` | int | 0 | Number of bonus seconds added to a node's effective access time on each cache hit, enhancing LRU with frequency awareness. When set to `0` (default), standard LRU behavior applies. When set to a positive value, frequently hit nodes accumulate extra protection time, making them harder to evict. See [Eviction Policy Guide](../eviction_policy/README_en.md) for details |
+
+---
+
+### SGLang Integration
+
+> Note: The following configuration only takes effect when using the SGLang integration (`flexkv.integration.sglang.connector`).
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_ENABLE_COLLECTIVE_SYNC` | bool | 1 | Whether to enable cross-rank collective sync (scatter/barrier/all_reduce). This sync is primarily used for coordination between Pipeline Parallelism (PP) stages. Can be set to 0 to disable in non-PP deployments to reduce sync overhead and improve performance |

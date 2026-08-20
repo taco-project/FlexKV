@@ -124,7 +124,7 @@ class ModelConfig:
     num_layers: int = 1
     num_kv_heads: int = 1
     head_size: int = 1
-    use_mla: bool = False
+    kv_dim: int = 2
     dtype: torch.dtype = torch.bfloat16
 
     # ------------------------------------------------------------------
@@ -374,14 +374,9 @@ class ModelConfig:
     @property
     def num_kv_heads_per_node(self) -> int:
         """Number of KV heads visible to a single node."""
-        if self.use_mla:
+        if self.num_kv_heads == 1:
             return self.num_kv_heads
         return self.num_kv_heads * self.tp_size_per_node // max(1, self.tp_size)
-
-    @property
-    def kv_dim(self) -> int:
-        """KV dimension: 1 for MLA (no head split), 2 for standard (head split)."""
-        return 1 if self.use_mla else 2
 
     @property
     def bytes_per_token_per_layer(self) -> int:
@@ -396,7 +391,7 @@ class ModelConfig:
     @property
     def token_size_in_bytes(self) -> int:
         """Whole-model per-token KV footprint (bytes) across all layers/groups."""
-        kv_dim = 1 if self.use_mla else 2
+        kv_dim = self.kv_dim
         if self.layer_groups:
             # layer_groups store per-GPU num_kv_heads; multiply by tp_size
             # to get full-model per-token size (matching CPU/SSD block sizing).
@@ -421,7 +416,7 @@ class ModelConfig:
         )
         return (
             f"ModelConfig(num_layers={self.num_layers}, num_kv_heads={self.num_kv_heads}"
-            f", head_size={self.head_size}, use_mla={self.use_mla}"
+            f", head_size={self.head_size}, kv_dim={self.kv_dim}"
             f", dtype={self.dtype}"
             f", tp_size={self.tp_size}, pp_size={self.pp_size}, dp_size={self.dp_size}"
             f", cp_size={self.cp_size}"
@@ -507,16 +502,18 @@ class RankInfo:
     def effective_tp_rank(self) -> int:
         """Effective tp-rank in the *data-plane* segmentation space.
 
-        For MLA models, every CP rank holds the same KV pages (the MLA latent
-        is not split along the sequence axis from a KV perspective), so
-        ``cp_rank`` must NOT participate in slice indexing — otherwise a CP rank
-        would write to a non-existent CPU slice and corrupt block accounting.
-        For non-MLA models, CP shards along the sequence dimension and each
-        ``(cp_rank, tp_rank)`` pair owns a unique slice.
+        Each ``(cp_rank, tp_rank)`` pair owns a unique slice in the combined
+        CP×TP segmentation space.
         """
-        if self.model_config.use_mla:
-            return self.tp_rank
         return self.cp_rank * max(1, self.model_config.tp_size) + self.tp_rank
+
+    @property
+    def intra_client_id(self) -> int:
+        """Unique data-plane worker ID within one DP client."""
+        return (
+            self.pp_rank * self.model_config.effective_tp_size
+            + self.effective_tp_rank
+        )
 
     @property
     def pp_size_per_node(self) -> int:
@@ -766,6 +763,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     # Server-client mode configuration
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
+    server_launch_mode=os.getenv('FLEXKV_SERVER_LAUNCH_MODE', 'embedded').lower(),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
@@ -802,6 +800,8 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
 
+    enable_collective_sync=bool(int(os.getenv('FLEXKV_ENABLE_COLLECTIVE_SYNC', 1))),
+
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),
     trace_max_file_size_mb=int(os.getenv('FLEXKV_TRACE_MAX_FILE_SIZE_MB', 100)),
@@ -817,10 +817,12 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     lease_ttl_ms=int(os.getenv('FLEXKV_LEASE_TTL_MS', 30000)),
     safety_ttl_ms=int(os.getenv('FLEXKV_SAFETY_TTL_MS', 100)),
     renew_lease_ms=int(os.getenv('FLEXKV_RENEW_LEASE_MS', 4000)),
+    reset_barrier_timeout_ms=int(os.getenv('FLEXKV_RESET_BARRIER_TIMEOUT_MS', 60000)),
+    reset_barrier_poll_ms=int(os.getenv('FLEXKV_RESET_BARRIER_POLL_MS', 50)),
 
     nvcomp_batch_size=int(os.getenv('FLEXKV_NVCOMP_BATCH_SIZE', '0')),  # 0 = auto
 
-    mla_d2h_mode=os.getenv('FLEXKV_MLA_D2H_MODE', 'sharded'),
+    kv_shared_across_ranks_mode=os.getenv('FLEXKV_KV_SHARED_ACROSS_RANKS_MODE', 'sharded'),
 
     layerwise_notify_mode=os.getenv('FLEXKV_LAYERWISE_NOTIFY_MODE', 'hostfunc'),
 
@@ -998,8 +1000,8 @@ def recompute_cache_block_counts(
     block_size_in_bytes = block_size_in_bytes_for_cache(
         model_config, cache_config)
     capacity_divisor = 1
-    if (model_config.use_mla
-            and GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode == "all_write"):
+    if (model_config.num_kv_heads == 1
+            and GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode == "all_write"):
         capacity_divisor = max(
             1, model_config.effective_tp_size_per_node)
 
@@ -1061,14 +1063,14 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     # This mirrors the C++ offset logic in tp_transfer_thread_group.cpp where
     # GPU i writes to cpu_startoff = i * chunk_size, requiring N slots per logical block.
     model_config = rank_info.model_config
-    mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
+    kv_shared_across_ranks_mode = GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode
     capacity_divisor = 1
-    if model_config.use_mla and mla_d2h_mode == "all_write":
+    if model_config.num_kv_heads == 1 and kv_shared_across_ranks_mode == "all_write":
         num_gpus_per_node = model_config.effective_tp_size_per_node
         if num_gpus_per_node > 1:
             capacity_divisor = num_gpus_per_node
             flexkv_logger.info(
-                f"[config] MLA all_write mode: logical cpu/ssd capacity "
+                f"[config] KV shared across ranks all_write mode: logical cpu/ssd capacity "
                 f"÷{num_gpus_per_node} (each block occupies {num_gpus_per_node}× "
                 f"physical space, total memory budget unchanged)"
             )
@@ -1242,6 +1244,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
             else:
                 raise ValueError(f"Unknown config name: {global_attr_name} in config file, "
                                  f"available config names: {global_config_attrs}")
+
 
 @dataclass
 class MooncakeTransferEngineConfig:

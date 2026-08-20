@@ -64,7 +64,7 @@ def _probe_engine(use_ce):
         layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=1, num_block=1, tokens_per_block=1,
-            num_head=1, head_size=16, is_mla=True)
+            num_head=1, head_size=16, kv_dim=1, num_kv_heads=1)
         g = torch.zeros((1, 1, 1, 1, 1, 16), dtype=torch.float16, device="cuda:0")
         c = torch.zeros(tuple(layout.kv_shape), dtype=torch.float16, pin_memory=True)
         ids = torch.arange(1, dtype=torch.int64).pin_memory()
@@ -84,8 +84,8 @@ def _probe_engine(use_ce):
             cpu_block_stride_in_bytes=layout.get_block_stride() * 2,
             cpu_tp_stride_in_bytes=layout.get_block_stride() * 2,
             transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-            layer_id=0, layer_granularity=1, is_mla=True,
-            mla_d2h_mode="sharded")
+            layer_id=0, layer_granularity=1, kv_dim=1, num_kv_heads=1,
+            kv_shared_across_ranks_mode="sharded")
         torch.cuda.synchronize()
         del tp
         globals()[cache_key] = True
@@ -160,39 +160,37 @@ CE_MEMCPY2D_CONFIGS = [False, True]
 # Helpers (matching production code in worker.py / layerwise.py)
 
 def make_layouts(num_layers, num_blocks, tpb, num_heads, head_dim,
-                 cpu_layout_name, is_mla, tp_size):
+                 cpu_layout_name, kv_dim, num_kv_heads, tp_size):
     """Create GPU and CPU KVCacheLayout objects matching production conventions.
 
-    GPU: LAYERFIRST, per-rank heads for non-MLA.
+    GPU: LAYERFIRST, per-rank heads for multi-head (num_kv_heads > 1).
     CPU: specified layout, full heads.
-    For non-MLA + BLOCKFIRST: CPU strides use div_head(tp_size).
+    For multi-head + BLOCKFIRST: CPU strides use div_head(tp_size).
 
     Returns (gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank).
     """
-    kv_dim = 1 if is_mla else 2
-
-    # Non-MLA shards heads across TP ranks, so num_heads must be divisible by
-    # tp_size. This is guaranteed by MHA_SIZES (num_heads=8, tp_size=4) but we
-    # keep the assertion as a safety net against future config changes.
-    if not is_mla:
+    # Multi-head models (num_kv_heads > 1) shard heads across TP ranks, so
+    # num_heads must be divisible by tp_size. Single-head models (num_kv_heads
+    # == 1, MLA) share the single head across ranks without splitting.
+    if num_kv_heads > 1:
         assert num_heads % tp_size == 0, \
-            f"non-MLA requires num_heads % tp_size == 0, got {num_heads} % {tp_size}"
+            f"multi-head requires num_heads % tp_size == 0, got {num_heads} % {tp_size}"
 
-    heads_per_rank = num_heads if is_mla else num_heads // tp_size
+    heads_per_rank = num_heads if num_kv_heads == 1 else num_heads // tp_size
 
     gpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=tpb, num_head=heads_per_rank,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
 
     cpu_layout = KVCacheLayout(
         type=KVCacheLayoutType[cpu_layout_name.upper()],
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=tpb, num_head=num_heads,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
 
-    if not is_mla and cpu_layout.type == KVCacheLayoutType.BLOCKFIRST:
+    if num_kv_heads > 1 and cpu_layout.type == KVCacheLayoutType.BLOCKFIRST:
         cpu_layout_tp = cpu_layout.div_head(tp_size)
     else:
         cpu_layout_tp = cpu_layout
@@ -222,13 +220,13 @@ def make_cpu_tensor(cpu_layout, num_layers, total_blocks):
         num_layer=num_layers, num_block=total_blocks,
         tokens_per_block=cpu_layout.tokens_per_block,
         num_head=cpu_layout.num_head, head_size=cpu_layout.head_size,
-        is_mla=cpu_layout.is_mla)
+        kv_dim=cpu_layout.kv_dim, num_kv_heads=cpu_layout.num_kv_heads)
     return torch.zeros(tuple(layout.kv_shape), dtype=DTYPE, pin_memory=True)
 
 
 def cpu_layout_for_mode(cpu_layout, cpu_layout_tp, num_layers, num_blocks,
-                        num_heads, head_dim, tpb, is_mla, mode, num_gpus):
-    """Resolve CPU buffer size + kv/layer/block/tp strides for an MLA D2H mode.
+                        num_heads, head_dim, tpb, kv_dim, num_kv_heads, mode, num_gpus):
+    """Resolve CPU buffer size + kv/layer/block/tp strides for a shared-across-ranks D2H mode.
 
     Matches the authoritative PR #192 semantics (tp_transfer offset logic):
       - sharded / rank0_only: CPU holds one rank's KV -> num_blocks, TP strides.
@@ -241,13 +239,13 @@ def cpu_layout_for_mode(cpu_layout, cpu_layout_tp, num_layers, num_blocks,
     Returns (total_cpu_blocks, cpu_stride_kv, cpu_stride_layer,
              cpu_stride_block, cpu_stride_tp).
     """
-    if is_mla and mode == "all_write":
+    if num_kv_heads == 1 and mode == "all_write":
         total_cpu_blocks = num_blocks * num_gpus
         layout_for_strides = KVCacheLayout(
             type=cpu_layout.type,
             num_layer=num_layers, num_block=total_cpu_blocks,
             tokens_per_block=tpb, num_head=num_heads,
-            head_size=head_dim, is_mla=is_mla)
+            head_size=head_dim, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
         cpu_stride_kv = layout_for_strides.get_kv_stride() * ES
         cpu_stride_layer = layout_for_strides.get_layer_stride() * ES
     else:
@@ -287,7 +285,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_gather_threads=None,
                   ce_gather_nt=None,
                   is_blockfirst=None,
-                  is_mla=None):
+                  kv_dim=None,
+                  num_kv_heads=None):
     """Create TPTransferThreadGroup with strides from KVCacheLayout.
 
     Matches production worker.py:472 exactly -- chunk_size does NOT include kv_dim.
@@ -308,8 +307,10 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_gather_nt = GLOBAL_CONFIG_FROM_ENV.ce_gather_nt
     if is_blockfirst is None:
         is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
-    if is_mla is None:
-        is_mla = gpu_layout.is_mla
+    if kv_dim is None:
+        kv_dim = gpu_layout.kv_dim
+    if num_kv_heads is None:
+        num_kv_heads = gpu_layout.num_kv_heads
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -334,7 +335,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_gather_threads=ce_gather_threads,
         ce_gather_nt=ce_gather_nt,
         is_blockfirst=is_blockfirst,
-        is_mla=is_mla,
+        num_kv_heads=num_kv_heads,
     )
 
 
@@ -345,7 +346,8 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
                          ce_gather_threads=None,
                          ce_gather_nt=None,
                          is_blockfirst=None,
-                         is_mla=None,
+                         kv_dim=None,
+                         num_kv_heads=None,
                          ssd_io_opt=None,
                          layer_eventfds_tensor=None):
     """Create LayerwiseTransferGroup for H2D-only testing (no SSD).
@@ -370,8 +372,10 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_gather_nt = GLOBAL_CONFIG_FROM_ENV.ce_gather_nt
     if is_blockfirst is None:
         is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
-    if is_mla is None:
-        is_mla = gpu_layout.is_mla
+    if kv_dim is None:
+        kv_dim = gpu_layout.kv_dim
+    if num_kv_heads is None:
+        num_kv_heads = gpu_layout.num_kv_heads
     if ssd_io_opt is None:
         ssd_io_opt = GLOBAL_CONFIG_FROM_ENV.ssd_io_opt
     if layer_eventfds_tensor is None:
@@ -410,7 +414,7 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_gather_threads=ce_gather_threads,
         ce_gather_nt=ce_gather_nt,
         is_blockfirst=is_blockfirst,
-        is_mla=is_mla,
+        num_kv_heads=num_kv_heads,
         ssd_io_opt=ssd_io_opt,
     )
 
@@ -418,19 +422,20 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
 def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                            ids, cpu_stride_kv, cpu_stride_layer,
                            cpu_stride_block, cpu_stride_tp, chunk_size,
-                           is_mla, mode, ce_path_opt=None,
+                           kv_dim, num_kv_heads, mode, ce_path_opt=None,
                            ce_segment_threshold=None,
                            notify_mode="hostfunc", layer_granularity=None,
                            is_blockfirst=None,
                            enable_memcpy2d=None,
                            ce_gather_threads=None,
-                           ce_gather_nt=None):
-    """Run a single CE H2D via LayerwiseTransferGroup, reading `cpu_kv` back
+                           ce_gather_nt=None,
+                           use_ce=True):
+    """Run a single H2D via LayerwiseTransferGroup, reading `cpu_kv` back
     into `all_gpu` with block-id list `ids`.
 
-    LayerwiseTransferGroup is H2D-only and CE-only; this wraps the
-    SWA-capable layerwise_transfer() call. Shared by the CE-path layerwise
-    test and the roundtrip layerwise twins.
+    LayerwiseTransferGroup is H2D-only; use_ce selects the CE adaptive path
+    (True) or the baseline PER_BLOCK cuda kernel (False). Shared by the
+    CE/cuda layerwise roundtrip twins and the notify-mode test.
 
     notify_mode: "hostfunc" (default, uses CUDA hostfunc callback) or
     "polling" (uses a CPU polling thread that queries cudaEventQuery per
@@ -460,15 +465,15 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
         h2d_cpu_kv_stride_in_bytes=cpu_stride_kv,
         h2d_cpu_layer_stride_in_bytes=cpu_stride_layer,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
-        transfer_cta_num=4, use_ce_transfer=True,
+        transfer_cta_num=4, use_ce_transfer=use_ce,
         num_layers=num_layers, layer_granularity=num_layers if layer_granularity is None else layer_granularity,
-        is_mla=is_mla,
+        kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         counter_id=0,
         swa_h2d_src=empty_ids,
         swa_h2d_dst=empty_ids,
         swa_disk2h_src=empty_ids,
         swa_disk2h_dst=empty_ids,
-        mla_d2h_mode=mode,
+        kv_shared_across_ranks_mode=mode,
         notify_mode=notify_mode,
     )
     sync_all(num_gpus)
@@ -508,24 +513,26 @@ def spot_check_gpu(all_gpu, expected_gpu_id, num_gpus, num_layers, num_blocks,
 # Round-trip tests (D2H -> clear GPU -> H2D -> verify)
 
 @pytest.mark.parametrize("data_config", MHA_SIZES)
+@pytest.mark.parametrize("kv_dim", [1, 2], ids=["packed", "plain"])
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("engine_name,use_ce", ENGINES)
 @pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
-def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce, enable_memcpy2d):
-    """Non-MLA round-trip: D2H -> clear GPU -> H2D -> verify per-rank data.
+def test_non_mla_roundtrip(data_config, kv_dim, cpu_layout_name, engine_name, use_ce, enable_memcpy2d):
+    """Multi-head round-trip: D2H -> clear GPU -> H2D -> verify per-rank data.
 
-    Non-MLA does NOT use mla_d2h_mode — the C++ else-branch uses
-    cpu_tp_stride to place each rank's head partition at a different
-    CPU offset. This tests the default TP-shard path.
+    Covers packed MHA (kv_dim=1, K/V combined) and plain MHA (kv_dim=2,
+    K/V separate). Both have num_kv_heads > 1, so the C++ else-branch uses
+    cpu_tp_stride to place each rank's head partition at a different CPU
+    offset. kv_shared_across_ranks_mode is ignored for multi-head.
     """
     skip_if_engine_unsupported(use_ce)
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     num_gpus = NUM_GPUS
-    is_mla = False
+    num_kv_heads = num_heads  # data_config num_heads IS num_kv_heads
 
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        cpu_layout_name, is_mla, num_gpus)
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
 
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb, heads_per_rank, head_dim, kv_dim, g)
                for g in range(num_gpus)]
@@ -551,8 +558,8 @@ def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce, en
         cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
         cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, is_mla=False,
-        mla_d2h_mode="sharded",  # ignored for non-MLA
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode="sharded",  # ignored for multi-head
     )
     sync_all(num_gpus)
 
@@ -570,8 +577,8 @@ def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce, en
         cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
         cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, is_mla=False,
-        mla_d2h_mode="sharded",  # ignored for non-MLA
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode="sharded",  # ignored for multi-head
     )
     sync_all(num_gpus)
 
@@ -584,39 +591,46 @@ def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce, en
                         exp = expected_val(g, layer, block, 0, hd_idx, kv)
                         act = all_gpu[g][layer][kv, block, 0, 0, hd_idx].item()
                         assert abs(act - exp) < 1e-3, \
-                            f"Non-MLA round-trip mismatch: layout={cpu_layout_name} " \
+                            f"Multi-head round-trip mismatch: layout={cpu_layout_name} " \
                             f"gpu={g} layer={layer} block={block} kv={kv} hd={hd_idx}: " \
                             f"expected={exp:.6f} got={act:.6f}"
 
     del tp
 
 
-# MLA mode tests (sharded / all_write / rank0_only)
+# Shared-across-ranks mode tests (sharded / all_write / rank0_only)
+# Covers MLA (kv_dim=1, num_kv_heads=1) and plain MHA, single head (kv_dim=2, num_kv_heads=1).
 
 @pytest.mark.parametrize("data_config", MLA_SIZES)
+@pytest.mark.parametrize("kv_dim", [1, 2], ids=["mla", "kv_sep_1h"])
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("engine_name,use_ce", ENGINES)
 @pytest.mark.parametrize("mode", MLA_MODES)
 @pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
-def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, mode, enable_memcpy2d):
-    """MLA round-trip with each D2H mode. Verifies K and V."""
+def test_mla_roundtrip_modes(data_config, kv_dim, cpu_layout_name, engine_name, use_ce, mode, enable_memcpy2d):
+    """Shared-across-ranks round-trip with each D2H mode. Verifies K and V.
+
+    Covers MLA (kv_dim=1, K/V combined) and plain MHA, single head (kv_dim=2, K/V separate).
+    Both have num_kv_heads=1, so KV is shared across TP ranks and the
+    kv_shared_across_ranks_mode selects the D2H placement strategy.
+    """
     skip_if_engine_unsupported(use_ce)
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     assert num_heads == 1, "MLA_SIZES must only contain num_heads=1 configs"
 
     num_gpus = NUM_GPUS
-    is_mla = True
+    num_kv_heads = num_heads  # == 1 for MLA
 
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        cpu_layout_name, is_mla, num_gpus)
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
 
     total_cpu_blocks = num_blocks * num_gpus if mode == "all_write" else num_blocks
 
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb, heads_per_rank, head_dim, kv_dim, g)
                for g in range(num_gpus)]
 
-    # MLA: all GPUs have identical data
+    # Shared across ranks: all GPUs have identical data
     fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb, heads_per_rank, head_dim, kv_dim)
     for g in range(1, num_gpus):
         for l in range(num_layers):
@@ -633,7 +647,7 @@ def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, 
             type=cpu_layout.type,
             num_layer=num_layers, num_block=total_cpu_blocks,
             tokens_per_block=tpb, num_head=num_heads,
-            head_size=head_dim, is_mla=is_mla)
+            head_size=head_dim, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
         cpu_stride_kv = cpu_layout_for_strides.get_kv_stride() * ES
         cpu_stride_layer = cpu_layout_for_strides.get_layer_stride() * ES
     else:
@@ -657,8 +671,8 @@ def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, 
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, is_mla=True,
-        mla_d2h_mode=mode,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
 
@@ -676,8 +690,8 @@ def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, 
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, is_mla=True,
-        mla_d2h_mode=mode,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
 
@@ -688,27 +702,128 @@ def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, 
     del tp
 
 
+# tp1 (single-GPU) round-trip test
+#
+# All four-scenario tests above use num_gpus >= 2 (module-level skip at line 34
+# requires NUM_GPUS >= 2). tp1 is an independent code path: with a single GPU
+# the TP sharing logic (kv_shared_across_ranks_mode, per-rank head partitioning)
+# does not engage, and cpu_tp_stride equals the full block_stride (not divided
+# by num_gpus). This test exercises that path across the four kv_dim x
+# num_kv_heads scenarios x cuda/ce engines. mode is "sharded" (placeholder --
+# no other rank to share with).
+
+TP1_CONFIGS = [
+    # (num_layers, num_blocks, tpb, num_heads, head_dim, kv_dim, num_kv_heads)
+    pytest.param((4, 8, 16, 1, 512, 1, 1), id="mla_packed"),    # MLA, kv_dim=1
+    pytest.param((4, 8, 16, 1, 512, 2, 1), id="mla_kv_sep"),    # MLA, kv_dim=2
+    pytest.param((4, 8, 16, 8, 128, 1, 8), id="mha_packed"),    # MHA, kv_dim=1
+    pytest.param((4, 8, 16, 8, 128, 2, 8), id="mha_plain"),     # MHA, kv_dim=2
+]
+
+
+@pytest.mark.parametrize("data_config", TP1_CONFIGS)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("engine_name,use_ce", ENGINES)
+def test_tp1_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
+    """tp1 (single-GPU) round-trip: D2H -> clear GPU -> H2D -> verify.
+
+    Covers the four kv_dim x num_kv_heads scenarios x cuda/ce. With num_gpus=1
+    the TP sharing logic is inert: cpu_tp_stride == block_stride (cpu_layout_for_mode
+    divides by num_gpus=1), heads_per_rank == num_heads, and mode is a placeholder.
+    Structured after test_non_mla_roundtrip / test_mla_roundtrip_modes but with
+    num_gpus=1.
+    """
+    skip_if_engine_unsupported(use_ce)
+    (num_layers, num_blocks, tpb, num_heads, head_dim,
+     kv_dim, num_kv_heads) = data_config
+    num_gpus = 1
+    mode = "sharded"  # placeholder; no other rank to share with
+
+    gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
+
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
+                                heads_per_rank, head_dim, kv_dim, 0)]
+    fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb,
+             heads_per_rank, head_dim, kv_dim)
+    sync_all(num_gpus)
+
+    (total_blocks, cpu_stride_kv, cpu_stride_layer,
+     cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
+        cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+        num_heads, head_dim, tpb, kv_dim, num_kv_heads, mode, num_gpus)
+    # tp1: cpu_tp_stride == cpu_stride_block (not divided).
+    assert cpu_stride_tp == cpu_stride_block, \
+        "tp1 cpu_tp_stride must equal block_stride"
+    cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks)
+    ids = block_ids(num_blocks)
+
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers,
+                       is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+
+    # D2H
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
+    )
+    sync_all(num_gpus)
+
+    # Clear GPU
+    for l in range(num_layers):
+        all_gpu[0][l].zero_()
+    sync_all(num_gpus)
+
+    # H2D
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
+    )
+    sync_all(num_gpus)
+
+    # Verify the single GPU recovers its own data.
+    spot_check_gpu(all_gpu, 0, num_gpus, num_layers, num_blocks,
+                   tpb, head_dim, kv_dim, label="tp1")
+
+    del tp
+
+
 # Layerwise H2D test with notify modes (hostfunc / polling)
 
 LAYERWISE_NOTIFY_MODES = ["hostfunc", "polling"]
 
 
 @pytest.mark.parametrize("data_config", [pytest.param((4, 8, 16, 1, 512), id="ds3-mini")])
+@pytest.mark.parametrize("kv_dim", [1, 2], ids=["mla", "kv_sep_1h"])
 @pytest.mark.parametrize("engine_name,use_ce", ENGINES)
 @pytest.mark.parametrize("notify_mode", LAYERWISE_NOTIFY_MODES)
-def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mode):
+def test_layerwise_h2d_notify_modes(data_config, kv_dim, engine_name, use_ce, notify_mode):
     """Layerwise H2D round-trip under hostfunc / polling notify modes.
 
     Verifies data correctness under both notification modes.
+    Covers MLA (kv_dim=1) and plain MHA, single head (kv_dim=2), both with num_kv_heads=1.
     """
     skip_if_engine_unsupported(use_ce)
 
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     num_gpus = NUM_GPUS
+    num_kv_heads = num_heads  # == 1
 
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        "BLOCKFIRST", True, num_gpus)
+        "BLOCKFIRST", kv_dim, num_kv_heads, num_gpus)
 
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb, heads_per_rank,
                                 head_dim, kv_dim, g) for g in range(num_gpus)]
@@ -728,7 +843,7 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
     # D2H via TP group to populate CPU
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers,
                        is_blockfirst=True,
-                       is_mla=True)
+                       kv_dim=kv_dim)
     gpu_block_ids = block_ids(num_blocks)
     cpu_block_ids = block_ids(num_blocks)
     tp.tp_group_transfer(
@@ -738,8 +853,8 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, is_mla=True,
-        mla_d2h_mode="sharded",
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode="sharded",
     )
     sync_all(num_gpus)
     del tp
@@ -752,7 +867,7 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
     # H2D via layerwise with the requested notify mode
     lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
                                 is_blockfirst=True,
-                                is_mla=True)
+                                kv_dim=kv_dim)
     lw.layerwise_transfer(
         torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64),
         0, 0, 0, 0, 0,
@@ -760,7 +875,7 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block,
         gpu_layout.get_chunk_size() * ES,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_tp,
-        4, use_ce, num_layers, 1, True,
+        4, use_ce, num_layers, 1, kv_dim, num_kv_heads,
         counter_id=0,
         # pybind cannot fill the SWA tensor defaults (torch::Tensor() -> None
         # can't cast back to a non-optional `torch.Tensor` param), so the four
@@ -770,7 +885,7 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
         swa_h2d_dst=torch.empty(0, dtype=torch.int64),
         swa_disk2h_src=torch.empty(0, dtype=torch.int64),
         swa_disk2h_dst=torch.empty(0, dtype=torch.int64),
-        mla_d2h_mode="sharded",
+        kv_shared_across_ranks_mode="sharded",
         notify_mode=notify_mode,
     )
     sync_all(num_gpus)
@@ -782,28 +897,32 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
 
 # Round-trip tests via LayerwiseTransferGroup H2D
 #
-# LayerwiseTransferGroup is H2D-only and CE-only (no cuda-kernel engine, no
-# independent D2H), so these twins prepare the CPU reference with a verified
-# TPTransferThreadGroup CE D2H, then read it back with layerwise H2D and check
-# correctness. Same size matrix / modes / layouts as the TP-group round-trips
-# above, so layerwise H2D is exercised across the full production shape space.
+# LayerwiseTransferGroup is H2D-only (no independent D2H), so these twins
+# prepare the CPU reference with a verified TPTransferThreadGroup D2H, then
+# read it back with layerwise H2D and check correctness. Same size matrix /
+# modes / layouts as the TP-group round-trips above, so layerwise H2D is
+# exercised across the full production shape space. Both cuda and ce engines
+# are parametrized (layerwise_transfer accepts use_ce_transfer).
 # Uses contiguous block ids (identity) like the TP round-trips; the CE-path
 # tests separately sweep few_seg/scattered patterns for both groups.
 
 @pytest.mark.parametrize("data_config", MHA_SIZES)
+@pytest.mark.parametrize("kv_dim", [1, 2], ids=["packed", "plain"])
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
-def test_non_mla_roundtrip_layerwise(data_config, cpu_layout_name):
-    """Non-MLA: TP-group CE D2H prepares CPU, LayerwiseTransferGroup CE H2D
-    reads it back; verify each rank recovers its own data."""
-    skip_if_engine_unsupported(use_ce=True)
+@pytest.mark.parametrize("engine_name,use_ce", ENGINES)
+def test_non_mla_roundtrip_layerwise(data_config, kv_dim, cpu_layout_name, engine_name, use_ce):
+    """Multi-head: TP-group D2H prepares CPU, LayerwiseTransferGroup H2D
+    reads it back; verify each rank recovers its own data.
+    Covers packed MHA (kv_dim=1) and plain MHA (kv_dim=2), cuda + ce."""
+    skip_if_engine_unsupported(use_ce)
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     num_gpus = NUM_GPUS
-    is_mla = False
-    mode = "sharded"  # ignored for non-MLA
+    num_kv_heads = num_heads  # data_config num_heads IS num_kv_heads
+    mode = "sharded"  # ignored for multi-head
 
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        cpu_layout_name, is_mla, num_gpus)
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
 
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
                                 heads_per_rank, head_dim, kv_dim, g)
@@ -816,7 +935,7 @@ def test_non_mla_roundtrip_layerwise(data_config, cpu_layout_name):
     (total_blocks, cpu_stride_kv, cpu_stride_layer,
      cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
         cpu_layout, cpu_layout_tp, num_layers, num_blocks,
-        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+        num_heads, head_dim, tpb, kv_dim, num_kv_heads, mode, num_gpus)
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks)
     ids = block_ids(num_blocks)
     chunk_size = gpu_layout.get_chunk_size() * ES
@@ -831,9 +950,9 @@ def test_non_mla_roundtrip_layerwise(data_config, cpu_layout_name):
         cpu_layer_stride_in_bytes=cpu_stride_layer,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
-        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
-        mla_d2h_mode=mode,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
     del tp
@@ -847,12 +966,13 @@ def test_non_mla_roundtrip_layerwise(data_config, cpu_layout_name):
     # is_blockfirst MUST match the D2H path (make_tp_group above) — if it
     # defaults to GLOBAL_CONFIG_FROM_ENV.cpu_layout_type (BLOCKFIRST), the H2D
     # CE path selector sees is_blockfirst=True and picks GATHER_DIRECT instead
-    # of SEGMENT_SCATTER, breaking the round-trip for LAYERFIRST non-MLA TP.
+    # of SEGMENT_SCATTER, breaking the round-trip for LAYERFIRST multi-head TP.
     layerwise_h2d_readback(
         all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
-        chunk_size, is_mla, mode,
-        is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+        chunk_size, kv_dim, num_kv_heads, mode,
+        is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
+        use_ce=use_ce)
 
     for g in range(num_gpus):
         for layer in [0, num_layers - 1]:
@@ -862,7 +982,7 @@ def test_non_mla_roundtrip_layerwise(data_config, cpu_layout_name):
                         exp = expected_val(g, layer, block, 0, hd_idx, kv)
                         act = all_gpu[g][layer][kv, block, 0, 0, hd_idx].item()
                         assert abs(act - exp) < 1e-3, \
-                            "Non-MLA layerwise round-trip mismatch: " \
+                            "Multi-head layerwise round-trip mismatch: " \
                             "layout={} gpu={} layer={} block={} kv={} hd={}: " \
                             "expected={:.6f} got={:.6f}".format(
                                 cpu_layout_name, g, layer, block, kv, hd_idx,
@@ -870,20 +990,23 @@ def test_non_mla_roundtrip_layerwise(data_config, cpu_layout_name):
 
 
 @pytest.mark.parametrize("data_config", MLA_SIZES)
+@pytest.mark.parametrize("kv_dim", [1, 2], ids=["mla", "kv_sep_1h"])
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("mode", MLA_MODES)
-def test_mla_roundtrip_modes_layerwise(data_config, cpu_layout_name, mode):
-    """MLA: TP-group CE D2H prepares CPU, LayerwiseTransferGroup CE H2D reads
-    it back; verify all ranks recover GPU 0's data. Covers all D2H modes."""
-    skip_if_engine_unsupported(use_ce=True)
+@pytest.mark.parametrize("engine_name,use_ce", ENGINES)
+def test_mla_roundtrip_modes_layerwise(data_config, kv_dim, cpu_layout_name, mode, engine_name, use_ce):
+    """Shared-across-ranks: TP-group D2H prepares CPU, LayerwiseTransferGroup
+    H2D reads it back; verify all ranks recover GPU 0's data. Covers all D2H
+    modes. Covers MLA (kv_dim=1) and plain MHA, single head (kv_dim=2), cuda + ce."""
+    skip_if_engine_unsupported(use_ce)
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     assert num_heads == 1, "MLA_SIZES must only contain num_heads=1 configs"
     num_gpus = NUM_GPUS
-    is_mla = True
+    num_kv_heads = num_heads  # == 1
 
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        cpu_layout_name, is_mla, num_gpus)
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
 
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
                                 heads_per_rank, head_dim, kv_dim, g)
@@ -898,7 +1021,7 @@ def test_mla_roundtrip_modes_layerwise(data_config, cpu_layout_name, mode):
     (total_blocks, cpu_stride_kv, cpu_stride_layer,
      cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
         cpu_layout, cpu_layout_tp, num_layers, num_blocks,
-        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+        num_heads, head_dim, tpb, kv_dim, num_kv_heads, mode, num_gpus)
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks)
     ids = block_ids(num_blocks)
     chunk_size = gpu_layout.get_chunk_size() * ES
@@ -912,9 +1035,9 @@ def test_mla_roundtrip_modes_layerwise(data_config, cpu_layout_name, mode):
         cpu_layer_stride_in_bytes=cpu_stride_layer,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
-        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
-        mla_d2h_mode=mode,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
     del tp
@@ -927,10 +1050,11 @@ def test_mla_roundtrip_modes_layerwise(data_config, cpu_layout_name, mode):
     layerwise_h2d_readback(
         all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
-        chunk_size, is_mla, mode,
-        is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+        chunk_size, kv_dim, num_kv_heads, mode,
+        is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
+        use_ce=use_ce)
 
-    # All ranks should recover GPU 0's data (MLA replicates).
+    # All ranks should recover GPU 0's data (shared across ranks replicates).
     spot_check_gpu(all_gpu, 0, num_gpus, num_layers, num_blocks,
                    tpb, head_dim, kv_dim, label="layerwise mode={}".format(mode))
 
@@ -938,14 +1062,14 @@ def test_mla_roundtrip_modes_layerwise(data_config, cpu_layout_name, mode):
 # Invalid mode fallback test
 
 def test_invalid_mode_fallback():
-    """Invalid mla_d2h_mode falls back to 'sharded' without crash."""
+    """Invalid kv_shared_across_ranks_mode falls back to 'sharded' without crash."""
     skip_if_engine_unsupported(use_ce=False)
     num_layers, num_blocks, tpb, num_heads, head_dim = 4, 8, 16, 1, 128
     num_gpus = NUM_GPUS
 
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        "LAYERFIRST", True, num_gpus)
+        "LAYERFIRST", 1, 1, num_gpus)
 
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb, 1, head_dim, kv_dim, g)
                for g in range(num_gpus)]
@@ -969,8 +1093,8 @@ def test_invalid_mode_fallback():
         cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
         cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=False,
-        layer_id=0, layer_granularity=num_layers, is_mla=True,
-        mla_d2h_mode="invalid_xyz",
+        layer_id=0, layer_granularity=num_layers, kv_dim=1, num_kv_heads=1,
+        kv_shared_across_ranks_mode="invalid_xyz",
     )
     sync_all(num_gpus)
 
@@ -1012,17 +1136,25 @@ def test_invalid_mode_fallback():
 # cached static -- so we sweep it as an ordinary orthogonal parametrize
 # dimension in-process.
 
-# Combined (data_config, is_mla, mode) parametrization.
+# Combined (data_config, kv_dim, num_kv_heads, mode) parametrization.
 #
-# The C++ transfer branches at the top level on is_mla:
-#   - is_mla == False (MHA): a single code path (heads sharded across TP,
-#     cpu_startoff = i * cpu_tp_stride). The mla_d2h_mode argument is IGNORED.
-#   - is_mla == True  (MLA): the mode selects sharded / all_write / rank0_only.
+# The C++ transfer branches at the top level on num_kv_heads:
+#   - num_kv_heads > 1 (MHA): a single code path (heads sharded across TP,
+#     cpu_startoff = i * cpu_tp_stride). The kv_shared_across_ranks_mode
+#     argument is IGNORED.
+#   - num_kv_heads == 1 (MLA): the mode selects sharded / all_write /
+#     rank0_only.
 #
-# So mode is only meaningful for MLA. We therefore emit exactly ONE combo per
-# non-MLA size (mode is a don't-care placeholder), and THREE combos per MLA
-# size. This avoids the previous mode x is_mla cross-product that produced
-# nonsensical all_write-mha / rank0_only-mha combos handled only via skip().
+# So mode is only meaningful when num_kv_heads == 1. We therefore emit exactly
+# ONE combo per multi-head size (mode is a don't-care placeholder), and all
+# modes per single-head size. This avoids nonsensical all_write-mha /
+# rank0_only-mha combos.
+#
+# Four-quadrant coverage (kv_dim x num_kv_heads):
+#   MLA        (kv_dim=1, num_kv_heads=1) — K/V combined + single head, shared
+#   kv_sep_1h  (kv_dim=2, num_kv_heads=1) — K/V separate + single head, shared
+#   packed MHA (kv_dim=1, num_kv_heads=H) — K/V combined + multi head, sharded
+#   plain MHA  (kv_dim=2, num_kv_heads=H) — K/V separate + multi head, sharded
 #
 # Sizes cover the SAME production shape matrix as MLA_SIZES / MHA_SIZES (the
 # TP-group round-trips), so CE strategy selection is exercised across every
@@ -1046,11 +1178,24 @@ _MHA_SIZES = [
     ((2, 4, 1, 8, 128), "mha-edge"),
     ((4, 4, 16, 16, 128), "mha-16head"),
 ]
+# Four-quadrant: MLA (kv_dim=1, nkh=1), kv_sep_1h (kv_dim=2, nkh=1),
+# packed MHA (kv_dim=1, nkh=H), plain MHA (kv_dim=2, nkh=H).
+# mode only matters for num_kv_heads==1 (shared across ranks).
+_SHARED_MODES = ("sharded", "all_write", "rank0_only", "layer_parallel", "rank_rotate")
 CE_MODE_CONFIGS = (
-    [pytest.param(cfg, True, mode, id=f"mla_{mode}-{sid}")
+    # MLA: kv_dim=1, num_kv_heads=1 (from _MLA_SIZES where num_heads=1)
+    [pytest.param(cfg, 1, 1, mode, id=f"mla_{mode}-{sid}")
      for (cfg, sid) in _MLA_SIZES
-     for mode in ("sharded", "all_write", "rank0_only", "layer_parallel", "rank_rotate")]
-    + [pytest.param(cfg, False, "sharded", id=f"non_mla-{sid}")
+     for mode in _SHARED_MODES]
+    # plain MHA, single head: kv_dim=2, num_kv_heads=1 (from _MLA_SIZES where num_heads=1)
+    + [pytest.param(cfg, 2, 1, mode, id=f"kv_sep_1h_{mode}-{sid}")
+       for (cfg, sid) in _MLA_SIZES
+       for mode in _SHARED_MODES]
+    # packed MHA: kv_dim=1, num_kv_heads=H (from _MHA_SIZES where num_heads=H)
+    + [pytest.param(cfg, 1, cfg[3], "sharded", id=f"packed_mha-{sid}")
+       for (cfg, sid) in _MHA_SIZES]
+    # plain MHA: kv_dim=2, num_kv_heads=H (from _MHA_SIZES where num_heads=H)
+    + [pytest.param(cfg, 2, cfg[3], "sharded", id=f"plain_mha-{sid}")
        for (cfg, sid) in _MHA_SIZES]
 )
 
@@ -1099,7 +1244,7 @@ def make_block_id_pattern(pattern_name, num_blocks):
     return ids.pin_memory()
 
 
-def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
+def _expected_strategy(pattern_name, cpu_layout_name, kv_dim, num_kv_heads, mode,
                        is_host_to_device, num_blocks=64, threshold=8):
     """Predict which CE strategy auto-selection should pick, mirroring
     csrc/ce_transfer.cu choose_path().
@@ -1110,8 +1255,8 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
 
     Key stride facts (see cpu_layout_for_mode / tp_transfer_thread_group.cpp):
       dst_phys_contig == (cpu_block_stride == chunk_size).
-        MLA + LF: true (num_head=1, block_stride = chunk_size).
-        MHA + LF: false (num_head=num_gpus, block_stride = num_gpus*chunk_size).
+        block_stride = kv_dim * chunk_size, so dst_phys iff kv_dim == 1
+        and LAYERFIRST (MLA/packed MHA). kv_sep_1h/plain MHA (kv_dim=2) -> false.
         BF: always false.
       src_phys_contig == (gpu_block_stride == chunk_size).
         Non-sharded: always contiguous.
@@ -1124,10 +1269,12 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
       threshold even few_seg (4 segments) can exceed it and route to
       GATHER_SCATTER, exactly as choose_path() does.
     """
-    # MHA + LF: cpu_block_stride = num_gpus * head_dim != chunk_size = head_dim
-    dst_phys = (cpu_layout_name == "LAYERFIRST") and is_mla
+    # dst_phys_contig: block_stride == kv_dim * chunk_size, so contiguous
+    # only when kv_dim == 1 (K/V combined: MLA or packed MHA).
+    dst_phys = (cpu_layout_name == "LAYERFIRST") and kv_dim == 1
     is_blockfirst = (cpu_layout_name == "BLOCKFIRST")
-    sharded_d2h = (is_mla and mode == "sharded" and not is_host_to_device)
+    # Sharded D2H only applies when KV is shared across ranks (num_kv_heads == 1).
+    sharded_d2h = (num_kv_heads == 1 and mode == "sharded" and not is_host_to_device)
     src_phys = not sharded_d2h  # only sharded D2H breaks GPU-side contiguity
 
     if pattern_name == "contiguous":
@@ -1142,7 +1289,7 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
     # (non-sharded). Sharded D2H breaks gpu_phys_contig, so the compact-staging
     # direct memcpy is invalid; those route to GATHER_SCATTER (which CPU-scatters
     # each shard to its exact offset). Covers rank0_only/all_write/layer_parallel.
-    # Exception (commit eab52a2a3): bfirst + MLA + D2H + !full_block
+    # Exception (commit eab52a2a3): bfirst + shared + D2H + !full_block
     # (layer_parallel / rank_rotate) -> SEGMENT_SCATTER, which is 30%-8.9x
     # faster than GATHER_DIRECT for the lighter staging+scatter path.
     # is_full_block == (all layers*kv_dim transferred in one call);
@@ -1152,16 +1299,16 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
     # here because its gpu_phys_contig is false.)
     is_full_block = mode in ("rank0_only", "all_write")
     if not dst_phys and is_blockfirst and src_phys:
-        if not is_host_to_device and is_mla and not is_full_block:
+        if not is_host_to_device and num_kv_heads == 1 and not is_full_block:
             return ("SEGMENT_SCATTER", "")
         return ("GATHER_DIRECT", "")
     # CONTIG_DIRECT: logical + physical contiguity on both sides.
     if pattern_name == "contiguous" and dst_phys and src_phys:
         return ("CONTIG_DIRECT", "")
-    # Sharded D2H (LF + MLA sharded, !gpu_phys_contig) -> GATHER_SCATTER.
+    # Sharded D2H (LF + shared sharded, !gpu_phys_contig) -> GATHER_SCATTER.
     if not src_phys:
         return ("GATHER_SCATTER", "")
-    # LAYERFIRST or BF MHA: few segments -> SEGMENT_DIRECT or SEGMENT_SCATTER.
+    # LAYERFIRST or BF multi-head: few segments -> SEGMENT_DIRECT or SEGMENT_SCATTER.
     if num_segments <= threshold:
         if dst_phys:
             return ("SEGMENT_DIRECT", "")
@@ -1170,20 +1317,20 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
     return ("GATHER_SCATTER", "")
 
 
-@pytest.mark.parametrize("data_config,is_mla,mode", CE_MODE_CONFIGS)
+@pytest.mark.parametrize("data_config,kv_dim,num_kv_heads,mode", CE_MODE_CONFIGS)
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("pattern", CE_PATTERNS)
 @pytest.mark.parametrize("segment_threshold", CE_SEGMENT_THRESHOLDS,
                          ids=lambda t: "thr{}".format(t))
 @pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
 @pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
-def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
+def test_ce_paths_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name, pattern,
                             path_opt, mode, segment_threshold, enable_memcpy2d):
     """CE strategy round-trip correctness via block-id patterns.
 
-    Combos come from CE_MODE_CONFIGS: MLA sizes x {sharded, all_write,
-    rank0_only}, plus non-MLA sizes once (mode is a don't-care for MHA).
-    Each pattern triggers a different auto-selected CE strategy:
+    Combos come from CE_MODE_CONFIGS: four-quadrant coverage
+    (MLA/kv_sep_1h/packed MHA/plain MHA).  Each pattern triggers a different
+    auto-selected CE strategy:
       contiguous -> CONTIG_DIRECT (LF) / SEGMENT_SCATTER (BF)
       few_seg    -> SEGMENT_DIRECT (LF) / SEGMENT_SCATTER (BF)
       scattered  -> GATHER_SCATTER (LF/BF non-sharded) /
@@ -1204,13 +1351,13 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
     num_gpus = NUM_GPUS
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        cpu_layout_name, is_mla, num_gpus)
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
 
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
                                heads_per_rank, head_dim, kv_dim, g)
                for g in range(num_gpus)]
 
-    if is_mla:
+    if num_kv_heads == 1:
         fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb,
                  heads_per_rank, head_dim, kv_dim)
         for g in range(1, num_gpus):
@@ -1225,7 +1372,7 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
     (total_cpu_blocks, cpu_stride_kv, cpu_stride_layer,
      cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
         cpu_layout, cpu_layout_tp, num_layers, num_blocks,
-        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+        num_heads, head_dim, tpb, kv_dim, num_kv_heads, mode, num_gpus)
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_cpu_blocks)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
                        gpu_layout, num_layers, ce_path_opt=path_opt,
@@ -1245,8 +1392,8 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
-        mla_d2h_mode=mode,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
 
@@ -1264,13 +1411,13 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
-        mla_d2h_mode=mode,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
 
     # Verify round-trip data integrity
-    expected_gpu = 0 if is_mla else None
+    expected_gpu = 0 if num_kv_heads == 1 else None
     for g in range(num_gpus):
         src_g = expected_gpu if expected_gpu is not None else g
         for layer in [0, num_layers // 2, num_layers - 1]:
@@ -1289,7 +1436,7 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
     del tp
 
 
-@pytest.mark.parametrize("data_config,is_mla,mode", CE_MODE_CONFIGS)
+@pytest.mark.parametrize("data_config,kv_dim,num_kv_heads,mode", CE_MODE_CONFIGS)
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("pattern", CE_PATTERNS)
 @pytest.mark.parametrize("segment_threshold", CE_SEGMENT_THRESHOLDS,
@@ -1298,7 +1445,7 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
 @pytest.mark.parametrize("notify_mode", ["polling"], ids=["polling"])
 @pytest.mark.parametrize("layer_granularity", [1, None], ids=["lg1", "lg_all"])
 @pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
-def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
+def test_ce_paths_layerwise_h2d(data_config, kv_dim, num_kv_heads, cpu_layout_name, pattern,
                                 path_opt, mode, segment_threshold,
                                 notify_mode, layer_granularity, enable_memcpy2d):
     """CE strategy correctness for LayerwiseTransferGroup H2D.
@@ -1308,8 +1455,8 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     same block-id pattern.  Verifies that the layerwise CE strategy produces
     identical results to the TP-group CE strategy.
 
-    Combos come from CE_MODE_CONFIGS: MLA sizes x {sharded, all_write,
-    rank0_only} plus non-MLA sizes once (mode is a don't-care for MHA).
+    Combos come from CE_MODE_CONFIGS: four-quadrant coverage
+    (MLA/kv_sep_1h/packed MHA/plain MHA).
 
     notify_mode="polling" exercises the async GATHER_SCATTER/SEGMENT_SCATTER
     path (sync=false), which was previously deadlocked by internal
@@ -1335,13 +1482,13 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     num_gpus = NUM_GPUS
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        cpu_layout_name, is_mla, num_gpus)
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
 
     # Fill GPU with deterministic data
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
                                heads_per_rank, head_dim, kv_dim, g)
                for g in range(num_gpus)]
-    if is_mla:
+    if num_kv_heads == 1:
         fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb,
                  heads_per_rank, head_dim, kv_dim)
         for g in range(1, num_gpus):
@@ -1356,7 +1503,7 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     (total_blocks, cpu_stride_kv, cpu_stride_layer,
      cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
         cpu_layout, cpu_layout_tp, num_layers, num_blocks,
-        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+        num_heads, head_dim, tpb, kv_dim, num_kv_heads, mode, num_gpus)
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks)
     ids = make_block_id_pattern(pattern, num_blocks)
     chunk_size = gpu_layout.get_chunk_size() * ES
@@ -1373,8 +1520,8 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
-        mla_d2h_mode=mode,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
     del tp
@@ -1393,7 +1540,7 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     layerwise_h2d_readback(
         all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
-        chunk_size, is_mla, mode,
+        chunk_size, kv_dim, num_kv_heads, mode,
         ce_path_opt=path_opt,
         ce_segment_threshold=segment_threshold, notify_mode=notify_mode,
         layer_granularity=layer_granularity,
@@ -1401,7 +1548,7 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
         enable_memcpy2d=enable_memcpy2d)
 
     # Verify GPU data == original
-    expected_gpu = 0 if is_mla else None
+    expected_gpu = 0 if num_kv_heads == 1 else None
     for g in range(num_gpus):
         src_g = expected_gpu if expected_gpu is not None else g
         for layer in [0, num_layers // 2, num_layers - 1]:
@@ -1419,19 +1566,26 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
 
 
 def _strategy_matrix():
-    """Enumerate (threshold, pattern, layout, is_mla, mode, direction, size) ->
-    (strategy, variant) over exactly the swept parametrize space, so this
-    matches what test_ce_paths_roundtrip / _layerwise_h2d actually exercise
-    (including the scattered-skip-when-num_blocks<=threshold rule).
+    """Enumerate (threshold, pattern, layout, kv_dim, num_kv_heads, mode,
+    direction, size) -> (strategy, variant) over exactly the swept parametrize
+    space, so this matches what test_ce_paths_roundtrip / _layerwise_h2d
+    actually exercise (including the scattered-skip-when-num_blocks<=threshold
+    rule).
 
     Returns a list of (label, strategy, variant) rows.
     """
     rows = []
     layouts = ["LAYERFIRST", "BLOCKFIRST"]
-    # (is_mla, mode) combos as produced by CE_MODE_CONFIGS.
-    mode_combos = [(True, "sharded"), (True, "all_write"),
-                   (True, "rank0_only"), (True, "layer_parallel"),
-                   (True, "rank_rotate"), (False, "sharded")]
+    # (kv_dim, num_kv_heads, mode) combos as produced by CE_MODE_CONFIGS.
+    mode_combos = [
+        (1, 1, "sharded"), (1, 1, "all_write"),
+        (1, 1, "rank0_only"), (1, 1, "layer_parallel"),
+        (1, 1, "rank_rotate"),
+        (2, 1, "sharded"), (2, 1, "all_write"),
+        (2, 1, "rank0_only"), (2, 1, "layer_parallel"),
+        (2, 1, "rank_rotate"),
+        (1, 8, "sharded"), (2, 8, "sharded"),
+    ]
     # Representative block counts from the size matrix: a small one (skips
     # scattered at threshold=8) and a large one.
     block_counts = [4, 64]
@@ -1442,14 +1596,18 @@ def _strategy_matrix():
                 if pattern == "scattered" and num_blocks <= threshold:
                     continue
                 for layout in layouts:
-                    for is_mla, mode in mode_combos:
+                    for kv_dim, num_kv_heads, mode in mode_combos:
                         for is_h2d in (False, True):
                             strat, variant = _expected_strategy(
-                                pattern, layout, is_mla, mode, is_h2d,
-                                num_blocks=num_blocks, threshold=threshold)
-                            tag = "mla_{}".format(mode) if is_mla else "non_mla"
+                                pattern, layout, kv_dim, num_kv_heads, mode,
+                                is_h2d, num_blocks=num_blocks,
+                                threshold=threshold)
+                            if num_kv_heads == 1:
+                                tag = "mla_{}".format(mode) if kv_dim == 1 else "kv_sep_1h_{}".format(mode)
+                            else:
+                                tag = "packed_mha" if kv_dim == 1 else "plain_mha"
                             label = ("thr{:<2d} nb{:<3d} {:<10s} {:<10s} "
-                                     "{:<12s} {}").format(
+                                     "{:<16s} {}").format(
                                 threshold, num_blocks, pattern, layout, tag,
                                 "h2d" if is_h2d else "d2h")
                             rows.append((label, strat, variant))
@@ -1469,8 +1627,9 @@ def test_mla_designated_rank_d2h(data_config, designated_rank):
     skip_if_engine_unsupported(use_ce=True)
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     num_gpus = NUM_GPUS
+    num_kv_heads = num_heads  # == 1
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
-        num_layers, num_blocks, tpb, num_heads, head_dim, "BLOCKFIRST", True, num_gpus)
+        num_layers, num_blocks, tpb, num_heads, head_dim, "BLOCKFIRST", 1, num_kv_heads, num_gpus)
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb, heads_per_rank, head_dim, kv_dim, g) for g in range(num_gpus)]
     fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb, heads_per_rank, head_dim, kv_dim)
     for g in range(1, num_gpus):
@@ -1480,7 +1639,7 @@ def test_mla_designated_rank_d2h(data_config, designated_rank):
     cpu_stride_block = cpu_layout.get_block_stride() * ES
     cpu_stride_tp = cpu_stride_block // num_gpus
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, num_blocks)
-    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers, is_blockfirst=True, is_mla=True)
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers, is_blockfirst=True, kv_dim=kv_dim)
     ids = block_ids(num_blocks)
     tp.tp_group_transfer(
         gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
@@ -1489,15 +1648,15 @@ def test_mla_designated_rank_d2h(data_config, designated_rank):
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, is_mla=True,
-        mla_d2h_mode="rank0_only", designated_rank=designated_rank)
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode="rank0_only", designated_rank=designated_rank)
     sync_all(num_gpus)
     del tp
     for g in range(num_gpus):
         for l in range(num_layers):
             all_gpu[g][l].zero_()
     sync_all(num_gpus)
-    lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers, is_blockfirst=True, is_mla=True)
+    lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers, is_blockfirst=True, kv_dim=kv_dim)
     empty_ids = torch.empty(0, dtype=torch.int64)
     lw.layerwise_transfer(
         ssd_block_ids=empty_ids,
@@ -1520,13 +1679,14 @@ def test_mla_designated_rank_d2h(data_config, designated_rank):
         use_ce_transfer=True,
         num_layers=num_layers,
         layer_granularity=1,
-        is_mla=True,
+        kv_dim=kv_dim,
+        num_kv_heads=num_kv_heads,
         counter_id=0,
         swa_h2d_src=empty_ids,
         swa_h2d_dst=empty_ids,
         swa_disk2h_src=empty_ids,
         swa_disk2h_dst=empty_ids,
-        mla_d2h_mode="rank0_only",
+        kv_shared_across_ranks_mode="rank0_only",
         notify_mode="hostfunc",
     )
     sync_all(num_gpus)
@@ -1575,30 +1735,35 @@ def test_ce_strategy_coverage():
 #   True = use NT stores, False = regular stores
 # Both are correctness-transparent optimizations on the CE path.
 
+# Four-quadrant: (cfg, kv_dim, num_kv_heads, mode)
+# MLA (kv_dim=1, nkh=1), kv_sep_1h (kv_dim=2, nkh=1), packed MHA (kv_dim=1, nkh=8),
+# plain MHA (kv_dim=2, nkh=8). Shared modes only for num_kv_heads==1.
 GATHER_NT_MODE_CONFIGS = [
-    pytest.param((4, 8, 16, 1, 512), True, "sharded", id="mla_sharded"),
-    pytest.param((4, 8, 16, 1, 512), True, "all_write", id="mla_all_write"),
-    pytest.param((4, 8, 16, 1, 512), True, "rank0_only", id="mla_rank0_only"),
-    pytest.param((4, 8, 16, 8, 128), False, "sharded", id="mha"),
+    pytest.param((4, 8, 16, 1, 512), 1, 1, "sharded", id="mla_sharded"),
+    pytest.param((4, 8, 16, 1, 512), 1, 1, "all_write", id="mla_all_write"),
+    pytest.param((4, 8, 16, 1, 512), 1, 1, "rank0_only", id="mla_rank0_only"),
+    pytest.param((4, 8, 16, 1, 512), 2, 1, "sharded", id="kv_sep_1h_sharded"),
+    pytest.param((4, 8, 16, 8, 128), 1, 8, "sharded", id="packed_mha"),
+    pytest.param((4, 8, 16, 8, 128), 2, 8, "sharded", id="plain_mha"),
 ]
 
 GATHER_THREADS_VALUES = [0, 1, 4, 8]
 GATHER_NT_VALUES = [True, False]
 
 
-@pytest.mark.parametrize("data_config,is_mla,mode", GATHER_NT_MODE_CONFIGS)
+@pytest.mark.parametrize("data_config,kv_dim,num_kv_heads,mode", GATHER_NT_MODE_CONFIGS)
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("gather_threads", GATHER_THREADS_VALUES,
                          ids=["gt0", "gt1", "gt4", "gt8"])
 @pytest.mark.parametrize("gather_nt", GATHER_NT_VALUES,
                          ids=["nt_on", "nt_off"])
-def test_gather_nt_roundtrip(data_config, is_mla, cpu_layout_name, mode,
+def test_gather_nt_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name, mode,
                              gather_threads, gather_nt):
     """CE gather threads and NT store round-trip correctness.
 
     Sweeps gather_threads (0=disable, 1, 4, 8) and gather_nt (on/off)
     to verify parallel CPU gather/scatter and non-temporal stores produce
-    correct results across MLA modes and CPU layouts.
+    correct results across four-quadrant configs and CPU layouts.
     """
     skip_if_engine_unsupported(use_ce=True)
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
@@ -1606,13 +1771,13 @@ def test_gather_nt_roundtrip(data_config, is_mla, cpu_layout_name, mode,
 
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        cpu_layout_name, is_mla, num_gpus)
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
 
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
                                heads_per_rank, head_dim, kv_dim, g)
                for g in range(num_gpus)]
 
-    if is_mla:
+    if num_kv_heads == 1:
         fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb,
                  heads_per_rank, head_dim, kv_dim)
         for g in range(1, num_gpus):
@@ -1627,7 +1792,7 @@ def test_gather_nt_roundtrip(data_config, is_mla, cpu_layout_name, mode,
     (total_cpu_blocks, cpu_stride_kv, cpu_stride_layer,
      cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
         cpu_layout, cpu_layout_tp, num_layers, num_blocks,
-        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+        num_heads, head_dim, tpb, kv_dim, num_kv_heads, mode, num_gpus)
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_cpu_blocks)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
                        gpu_layout, num_layers,
@@ -1647,8 +1812,8 @@ def test_gather_nt_roundtrip(data_config, is_mla, cpu_layout_name, mode,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
-        mla_d2h_mode=mode,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
 
@@ -1666,13 +1831,13 @@ def test_gather_nt_roundtrip(data_config, is_mla, cpu_layout_name, mode,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
-        mla_d2h_mode=mode,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
 
     # Verify round-trip data integrity
-    expected_gpu = 0 if is_mla else None
+    expected_gpu = 0 if num_kv_heads == 1 else None
     for g in range(num_gpus):
         src_g = expected_gpu if expected_gpu is not None else g
         for layer in [0, num_layers - 1]:
@@ -1691,13 +1856,13 @@ def test_gather_nt_roundtrip(data_config, is_mla, cpu_layout_name, mode,
     del tp
 
 
-@pytest.mark.parametrize("data_config,is_mla,mode", GATHER_NT_MODE_CONFIGS)
+@pytest.mark.parametrize("data_config,kv_dim,num_kv_heads,mode", GATHER_NT_MODE_CONFIGS)
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("gather_threads", GATHER_THREADS_VALUES,
                          ids=["gt0", "gt1", "gt4", "gt8"])
 @pytest.mark.parametrize("gather_nt", GATHER_NT_VALUES,
                          ids=["nt_on", "nt_off"])
-def test_gather_nt_layerwise_h2d(data_config, is_mla, cpu_layout_name, mode,
+def test_gather_nt_layerwise_h2d(data_config, kv_dim, num_kv_heads, cpu_layout_name, mode,
                                  gather_threads, gather_nt):
     """CE gather threads and NT store correctness for layerwise H2D.
 
@@ -1710,12 +1875,12 @@ def test_gather_nt_layerwise_h2d(data_config, is_mla, cpu_layout_name, mode,
 
     gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        cpu_layout_name, is_mla, num_gpus)
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
 
     all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
                                heads_per_rank, head_dim, kv_dim, g)
                for g in range(num_gpus)]
-    if is_mla:
+    if num_kv_heads == 1:
         fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb,
                  heads_per_rank, head_dim, kv_dim)
         for g in range(1, num_gpus):
@@ -1730,7 +1895,7 @@ def test_gather_nt_layerwise_h2d(data_config, is_mla, cpu_layout_name, mode,
     (total_blocks, cpu_stride_kv, cpu_stride_layer,
      cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
         cpu_layout, cpu_layout_tp, num_layers, num_blocks,
-        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+        num_heads, head_dim, tpb, kv_dim, num_kv_heads, mode, num_gpus)
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks)
     ids = block_ids(num_blocks)
     chunk_size = gpu_layout.get_chunk_size() * ES
@@ -1746,8 +1911,8 @@ def test_gather_nt_layerwise_h2d(data_config, is_mla, cpu_layout_name, mode,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
-        mla_d2h_mode=mode,
+        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
     del tp
@@ -1761,12 +1926,12 @@ def test_gather_nt_layerwise_h2d(data_config, is_mla, cpu_layout_name, mode,
     layerwise_h2d_readback(
         all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
-        chunk_size, is_mla, mode,
+        chunk_size, kv_dim, num_kv_heads, mode,
         is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
         ce_gather_threads=gather_threads,
         ce_gather_nt=gather_nt)
 
-    expected_gpu = 0 if is_mla else None
+    expected_gpu = 0 if num_kv_heads == 1 else None
     for g in range(num_gpus):
         src_g = expected_gpu if expected_gpu is not None else g
         for layer in [0, num_layers - 1]:
@@ -1851,16 +2016,18 @@ def _ssd_roundtrip_verify(cpu_orig, cpu_readback, layout, num_layers,
 
 
 @pytest.mark.parametrize("data_config", SSD_SIZES)
+@pytest.mark.parametrize("kv_dim", [1, 2], ids=["kv1", "kv2"])
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("num_threads", SSD_THREADS, ids=["t1", "t4"])
 @pytest.mark.parametrize("ssd_io_opt", [False, True], ids=["baseline", "optimized"])
 @pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
-def test_ssd_transfer_roundtrip(data_config, cpu_layout_name, num_threads,
+def test_ssd_transfer_roundtrip(data_config, kv_dim, cpu_layout_name, num_threads,
                                 ssd_io_opt, iouring_entries, tmp_path):
     """SSD roundtrip: CPU → SSD → CPU with byte-level verification. Covers thread/io_uring engines (iouring_entries=0/512).
 
-    Covers LAYERFIRST/BLOCKFIRST × MLA/MHA × multi-layer × 1/4 threads ×
-    FLEXKV_SSD_IO_OPT (baseline=off=basic fragmented I/O, optimized=on=bf/lf opt).
+    Covers LAYERFIRST/BLOCKFIRST × four-quadrant (MLA/kv_sep_1h/packed MHA/plain
+    MHA) × multi-layer × 1/4 threads × FLEXKV_SSD_IO_OPT (baseline=off=basic
+    fragmented I/O, optimized=on=bf/lf opt).
     SSD layout matches CPU layout. Both modes must be byte-identical to source.
     """
     if not _SSD_AVAILABLE:
@@ -1870,15 +2037,14 @@ def test_ssd_transfer_roundtrip(data_config, cpu_layout_name, num_threads,
     import tempfile
 
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
-    is_mla = (num_heads == 1)
-    kv_dim = 1 if is_mla else 2
+    num_kv_heads = num_heads  # data_config num_heads IS num_kv_heads
 
     # Build CPU/SSD layout (same type, same as production)
     layout = KVCacheLayout(
         type=KVCacheLayoutType[cpu_layout_name.upper()],
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=tpb, num_head=num_heads,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
 
     chunk_size = layout.get_chunk_size()
     block_stride = layout.get_block_stride()
@@ -1925,7 +2091,7 @@ def test_ssd_transfer_roundtrip(data_config, cpu_layout_name, num_threads,
         num_blocks_per_file=num_blocks,
         round_robin=1,
         num_threads_per_device=num_threads,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
         ssd_io_opt=ssd_io_opt,
     )
 
@@ -1949,12 +2115,12 @@ def test_ssd_transfer_roundtrip(data_config, cpu_layout_name, num_threads,
         num_blocks_per_file=num_blocks,
         round_robin=1,
         num_threads_per_device=num_threads,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
         ssd_io_opt=ssd_io_opt,
     )
 
     # Verify
-    label = (f"layout={cpu_layout_name} mla={is_mla} layers={num_layers} "
+    label = (f"layout={cpu_layout_name} kv_dim={kv_dim} layers={num_layers} "
              f"blocks={num_blocks} threads={num_threads}")
     _ssd_roundtrip_verify(cpu_orig, cpu_kv, layout, num_layers, num_blocks,
                           tpb, num_heads, head_dim, kv_dim, label=label)
@@ -1965,11 +2131,12 @@ def test_ssd_transfer_roundtrip(data_config, cpu_layout_name, num_threads,
 
 @pytest.mark.parametrize("data_config", [pytest.param((4, 8, 16, 1, 512), id="mla-mini"),
                                          pytest.param((4, 8, 16, 8, 128), id="mha-mini")])
+@pytest.mark.parametrize("kv_dim", [1, 2], ids=["kv1", "kv2"])
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("num_threads", [1, 4], ids=["t1", "t4"])
 @pytest.mark.parametrize("ssd_io_opt", [False, True], ids=["baseline", "optimized"])
 @pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
-def test_ssd_transfer_partial_blocks(data_config, cpu_layout_name, num_threads,
+def test_ssd_transfer_partial_blocks(data_config, kv_dim, cpu_layout_name, num_threads,
                                      ssd_io_opt, iouring_entries, tmp_path):
     """SSD roundtrip with non-contiguous block IDs: write [0,2,4,6] → read into [1,3,5,7]. Covers thread/io_uring engines (iouring_entries=0/512).
 
@@ -1982,14 +2149,13 @@ def test_ssd_transfer_partial_blocks(data_config, cpu_layout_name, num_threads,
     import shutil
 
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
-    is_mla = (num_heads == 1)
-    kv_dim = 1 if is_mla else 2
+    num_kv_heads = num_heads  # data_config num_heads IS num_kv_heads
 
     layout = KVCacheLayout(
         type=KVCacheLayoutType[cpu_layout_name.upper()],
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=tpb, num_head=num_heads,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
 
     chunk_size = layout.get_chunk_size()
     block_stride = layout.get_block_stride()
@@ -2032,7 +2198,7 @@ def test_ssd_transfer_partial_blocks(data_config, cpu_layout_name, num_threads,
         num_blocks_per_file=num_blocks,
         round_robin=1,
         num_threads_per_device=num_threads,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
         ssd_io_opt=ssd_io_opt,
     )
 
@@ -2064,7 +2230,7 @@ def test_ssd_transfer_partial_blocks(data_config, cpu_layout_name, num_threads,
         num_blocks_per_file=num_blocks,
         round_robin=1,
         num_threads_per_device=num_threads,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
         ssd_io_opt=ssd_io_opt,
     )
 
@@ -2118,10 +2284,11 @@ def _ssd_block_layer_view(cpu_kv, layout, block_id, layer_id):
                                          pytest.param((16, 16, 16, 1, 512), id="mla-multi"),
                                          pytest.param((4, 8, 16, 8, 128), id="mha-mini"),
                                          pytest.param((16, 16, 16, 8, 128), id="mha-multi")])
+@pytest.mark.parametrize("kv_dim", [1, 2], ids=["kv1", "kv2"])
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("num_threads", [1, 4], ids=["t1", "t4"])
 @pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
-def test_ssd_io_opt_on_off_byte_identical(data_config, cpu_layout_name, num_threads,
+def test_ssd_io_opt_on_off_byte_identical(data_config, kv_dim, cpu_layout_name, num_threads,
                                           iouring_entries, tmp_path):
     """FLEXKV_SSD_IO_OPT ON vs OFF must produce byte-identical SSD roundtrips. Covers thread/io_uring engines (iouring_entries=0/512).
 
@@ -2134,14 +2301,13 @@ def test_ssd_io_opt_on_off_byte_identical(data_config, cpu_layout_name, num_thre
     import shutil
 
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
-    is_mla = (num_heads == 1)
-    kv_dim = 1 if is_mla else 2
+    num_kv_heads = num_heads  # data_config num_heads IS num_kv_heads
 
     layout = KVCacheLayout(
         type=KVCacheLayoutType[cpu_layout_name.upper()],
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=tpb, num_head=num_heads,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim, num_kv_heads=num_kv_heads)
     chunk_bytes = layout.get_chunk_size() * ES
     block_stride_bytes = layout.get_block_stride() * ES
     kv_stride_bytes = layout.get_kv_stride() * ES
@@ -2170,7 +2336,7 @@ def test_ssd_io_opt_on_off_byte_identical(data_config, cpu_layout_name, num_thre
                          block_stride_in_bytes=block_stride_bytes,
                          is_read=False, num_blocks_per_file=num_blocks,
                          round_robin=1, num_threads_per_device=num_threads,
-                         is_mla=is_mla, ssd_io_opt=opt)
+                         kv_dim=kv_dim, ssd_io_opt=opt)
             cpu_kv.zero_()
             _ssd_xfer_fn(ioctx=ioctx, cpu_layer_id_list=layer_ids,
                          cpu_tensor_ptr=cpu_kv.data_ptr(),
@@ -2183,7 +2349,7 @@ def test_ssd_io_opt_on_off_byte_identical(data_config, cpu_layout_name, num_thre
                          block_stride_in_bytes=block_stride_bytes,
                          is_read=True, num_blocks_per_file=num_blocks,
                          round_robin=1, num_threads_per_device=num_threads,
-                         is_mla=is_mla, ssd_io_opt=opt)
+                         kv_dim=kv_dim, ssd_io_opt=opt)
         finally:
             del ioctx
             shutil.rmtree(sub, ignore_errors=True)
@@ -2199,15 +2365,16 @@ def test_ssd_io_opt_on_off_byte_identical(data_config, cpu_layout_name, num_thre
     off_bytes = read_off.view(torch.uint8).reshape(-1)
     assert torch.equal(on_bytes, off_bytes), \
         f"SSD opt ON vs OFF diverge: {(on_bytes != off_bytes).sum().item()} " \
-        f"bytes differ (layout={cpu_layout_name} mla={is_mla} threads={num_threads})"
+        f"bytes differ (layout={cpu_layout_name} kv_dim={kv_dim} threads={num_threads})"
 
 
 @pytest.mark.parametrize("data_config", [pytest.param((4, 8, 16, 1, 512), id="mla-mini"),
                                          pytest.param((16, 16, 16, 1, 512), id="mla-multi")])
+@pytest.mark.parametrize("kv_dim", [1, 2], ids=["mla", "kv_sep_1h"])
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("ssd_io_opt", [False, True], ids=["baseline", "optimized"])
 @pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
-def test_ssd_transfer_layerwise_disk2h(data_config, cpu_layout_name, ssd_io_opt,
+def test_ssd_transfer_layerwise_disk2h(data_config, kv_dim, cpu_layout_name, ssd_io_opt,
                                        iouring_entries, tmp_path):
     """Layerwise SSD disk2h: SSD -> CPU (staging) -> GPU via LayerwiseTransferGroup. Covers thread/io_uring engines (iouring_entries=0/512).
 
@@ -2217,28 +2384,27 @@ def test_ssd_transfer_layerwise_disk2h(data_config, cpu_layout_name, ssd_io_opt,
     copies CPU -> GPU. Verifies the CPU staging buffer recovers the original
     source for both opt/baseline (the direct output of the SSD path).
 
-    MLA-only + sharded: all ranks hold identical data, so the SSD read's full
-    CPU layout is consistent with the H2D sharded offset (0). This is the path
-    the user flagged as needing coverage for the FLEXKV_SSD_IO_OPT switch.
+    Shared-across-ranks + sharded: all ranks hold identical data, so the SSD
+    read's full CPU layout is consistent with the H2D sharded offset (0).
+    Covers MLA (kv_dim=1) and plain MHA, single head (kv_dim=2), both with num_kv_heads=1.
     """
     if not _SSD_AVAILABLE:
         pytest.skip(SSD_SKIP_REASON)
     import shutil
 
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
-    assert num_heads == 1, "layerwise SSD disk2h test is MLA-only (sharded)"
+    assert num_heads == 1, "layerwise SSD disk2h test is shared-across-ranks only (num_kv_heads=1)"
     num_gpus = NUM_GPUS
-    is_mla = True
-    kv_dim = 1
+    num_kv_heads = num_heads  # == 1
 
     gpu_layout, cpu_layout, cpu_layout_tp, _, heads_per_rank = make_layouts(
         num_layers, num_blocks, tpb, num_heads, head_dim,
-        cpu_layout_name, is_mla, num_gpus)
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
 
     (total_blocks, cpu_stride_kv, cpu_stride_layer,
      cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
         cpu_layout, cpu_layout_tp, num_layers, num_blocks,
-        num_heads, head_dim, tpb, is_mla, "sharded", num_gpus)
+        num_heads, head_dim, tpb, kv_dim, num_kv_heads, "sharded", num_gpus)
     cpu_chunk_bytes = cpu_layout.get_chunk_size() * ES
 
     # CPU staging buffer (source). Fill with deterministic pattern.
@@ -2283,7 +2449,7 @@ def test_ssd_transfer_layerwise_disk2h(data_config, cpu_layout_name, ssd_io_opt,
                  block_stride_in_bytes=cpu_stride_block,
                  is_read=False, num_blocks_per_file=num_blocks,
                  round_robin=1, num_threads_per_device=32,
-                 is_mla=is_mla, ssd_io_opt=ssd_io_opt)
+                 kv_dim=kv_dim, ssd_io_opt=ssd_io_opt)
     cpu_kv.zero_()
 
     group = LayerwiseTransferGroup(
@@ -2306,7 +2472,6 @@ def test_ssd_transfer_layerwise_disk2h(data_config, cpu_layout_name, ssd_io_opt,
         ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
         ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
         is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
-        is_mla=is_mla,
         ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
         ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
         ssd_io_opt=ssd_io_opt,
@@ -2334,9 +2499,10 @@ def test_ssd_transfer_layerwise_disk2h(data_config, cpu_layout_name, ssd_io_opt,
         True,             # use_ce_transfer
         num_layers,
         1,                # layer_granularity
-        is_mla,
+        kv_dim,
+        num_kv_heads,
         0,                # counter_id
-        mla_d2h_mode="sharded",
+        kv_shared_across_ranks_mode="sharded",
         notify_mode="hostfunc",
     )
     sync_all(num_gpus)
@@ -2351,6 +2517,112 @@ def test_ssd_transfer_layerwise_disk2h(data_config, cpu_layout_name, ssd_io_opt,
         f"{(orig_bytes != read_bytes).sum().item()} / {orig_bytes.numel()} bytes differ"
 
     del ioctx, group
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("data_config", [pytest.param((4, 8, 16, 1, 512), id="mla-mini"),
+                                         pytest.param((16, 16, 16, 1, 512), id="mla-multi")])
+@pytest.mark.parametrize("kv_dim", [1, 2], ids=["mla", "kv_sep_1h"])
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("ssd_io_opt", [False, True], ids=["baseline", "optimized"])
+@pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
+def test_ssd_transfer_layerwise_h2disk(data_config, kv_dim, cpu_layout_name, ssd_io_opt,
+                                       iouring_entries, tmp_path):
+    """Layerwise SSD h2disk: CPU -> SSD via transfer_kv_blocks_ssd(is_read=False).
+
+    Mirrors test_ssd_transfer_layerwise_disk2h (same MLA-only shape matrix, same
+    SSD file setup / stride computation via cpu_layout_for_mode) but isolates the
+    H2Disk write direction as the test target. The disk2h twin only verifies the
+    SSD->CPU readback (treating the CPU->SSD write as setup); this test verifies
+    the write itself by reading the SSD file back into a fresh CPU buffer and
+    checking byte-level equality.
+
+    NOTE: LayerwiseTransferGroup::layerwise_transfer is disk2host-only
+    (SSD->CPU->GPU; see csrc/layerwise.h:135, csrc/layerwise.cpp:1060 Step 0).
+    There is no CPU->SSD path inside layerwise_transfer. Production H2Disk uses
+    the standalone transfer_kv_blocks_ssd with is_read=False via
+    CPUSSDDiskTransferWorker (flexkv/transfer/transfer_engine.py:565), so this
+    test exercises that same path with the layerwise-style strides/config to
+    match the disk2h twin's wiring.
+
+    Shared-across-ranks + sharded: num_kv_heads=1 (layerwise SSD is
+    shared-across-ranks only). Covers MLA (kv_dim=1) and plain MHA, single head
+    (kv_dim=2).
+    """
+    if not _SSD_AVAILABLE:
+        pytest.skip(SSD_SKIP_REASON)
+    import shutil
+
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    assert num_heads == 1, "layerwise SSD h2disk test is shared-across-ranks only (num_kv_heads=1)"
+    num_gpus = NUM_GPUS
+    num_kv_heads = num_heads  # == 1
+
+    gpu_layout, cpu_layout, cpu_layout_tp, _, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
+
+    (total_blocks, cpu_stride_kv, cpu_stride_layer,
+     cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
+        cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+        num_heads, head_dim, tpb, kv_dim, num_kv_heads, "sharded", num_gpus)
+    cpu_chunk_bytes = cpu_layout.get_chunk_size() * ES
+
+    # CPU source buffer (the H2Disk source). Fill with deterministic pattern.
+    cpu_kv = torch.zeros(tuple(cpu_layout.kv_shape), dtype=DTYPE).pin_memory()
+    _fill_cpu_kv(cpu_kv, cpu_layout, num_layers, num_blocks, tpb,
+                 num_heads, head_dim, kv_dim)
+    cpu_orig = cpu_kv.clone()
+
+    # SSD layout mirrors CPU layout (1 file holds all blocks).
+    ssd_layer_bytes = cpu_layout.get_layer_stride() * ES
+    ssd_kv_bytes = cpu_layout.get_kv_stride() * ES
+
+    tmpdir = str(tmp_path)
+    ssd_files = _setup_ssd_file(cpu_layout, num_blocks, tmpdir)
+    ioctx = SSDIOCTX(ssd_files, 1, iouring_entries, 0)
+
+    block_ids = torch.arange(num_blocks, dtype=torch.int64).pin_memory()
+    layer_ids = torch.arange(num_layers, dtype=torch.int32).pin_memory()
+
+    # H2Disk: CPU -> SSD (the test target).
+    _ssd_xfer_fn(ioctx=ioctx, cpu_layer_id_list=layer_ids,
+                 cpu_tensor_ptr=cpu_kv.data_ptr(),
+                 ssd_block_ids=block_ids, cpu_block_ids=block_ids,
+                 cpu_layer_stride_in_bytes=cpu_stride_layer,
+                 cpu_kv_stride_in_bytes=cpu_stride_kv,
+                 ssd_layer_stride_in_bytes=ssd_layer_bytes,
+                 ssd_kv_stride_in_bytes=ssd_kv_bytes,
+                 chunk_size_in_bytes=cpu_chunk_bytes,
+                 block_stride_in_bytes=cpu_stride_block,
+                 is_read=False, num_blocks_per_file=num_blocks,
+                 round_robin=1, num_threads_per_device=32,
+                 kv_dim=kv_dim, ssd_io_opt=ssd_io_opt)
+    cpu_kv.zero_()
+
+    # Read back SSD -> CPU (verification, mirrors disk2h setup write direction).
+    _ssd_xfer_fn(ioctx=ioctx, cpu_layer_id_list=layer_ids,
+                 cpu_tensor_ptr=cpu_kv.data_ptr(),
+                 ssd_block_ids=block_ids, cpu_block_ids=block_ids,
+                 cpu_layer_stride_in_bytes=cpu_stride_layer,
+                 cpu_kv_stride_in_bytes=cpu_stride_kv,
+                 ssd_layer_stride_in_bytes=ssd_layer_bytes,
+                 ssd_kv_stride_in_bytes=ssd_kv_bytes,
+                 chunk_size_in_bytes=cpu_chunk_bytes,
+                 block_stride_in_bytes=cpu_stride_block,
+                 is_read=True, num_blocks_per_file=num_blocks,
+                 round_robin=1, num_threads_per_device=32,
+                 kv_dim=kv_dim, ssd_io_opt=ssd_io_opt)
+
+    # The CPU readback must equal the original source for both opt/baseline.
+    orig_bytes = cpu_orig.view(torch.uint8).reshape(-1)
+    read_bytes = cpu_kv.view(torch.uint8).reshape(-1)
+    assert torch.equal(orig_bytes, read_bytes), \
+        f"layerwise SSD h2disk mismatch (layout={cpu_layout_name} " \
+        f"ssd_io_opt={ssd_io_opt}): " \
+        f"{(orig_bytes != read_bytes).sum().item()} / {orig_bytes.numel()} bytes differ"
+
+    del ioctx
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 

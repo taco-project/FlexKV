@@ -100,7 +100,7 @@ def load_dist_direct_config(config_path: str):
     model_config.num_kv_heads = config["num_kv_heads"]
     model_config.head_size = config["head_size"]
     model_config.dtype = eval(f"torch.{config['dtype']}")
-    model_config.use_mla = config["use_mla"]
+    model_config.kv_dim = config.get("kv_dim", 2)
     model_config.tp_size = config["tp_size"]
     model_config.dp_size = config["dp_size"]
     cache_config.tokens_per_block = config["tokens_per_block"]
@@ -203,7 +203,8 @@ def run_tp_client(dp_client_id, tp_rank, gpu_register_port, model_config, cache_
     in the main process (not in a KVServer subprocess).
     """
     device_id = tp_rank + dp_client_id * model_config.tp_size
-    tp_client = KVTPClient(gpu_register_port, dp_client_id, device_id)
+    tp_client = KVTPClient(gpu_register_port, dp_client_id, device_id,
+                           intra_client_id=tp_rank)
 
     gpu_kv_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
@@ -212,7 +213,7 @@ def run_tp_client(dp_client_id, tp_rank, gpu_register_port, model_config, cache_
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
 
     # Create GPU blocks for this tp_rank in the tp_client process

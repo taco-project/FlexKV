@@ -25,8 +25,15 @@ struct CETransferConfig {
   bool enable_memcpy2d = false;
   // CPU layout: BLOCKFIRST vs LAYERFIRST
   bool is_blockfirst = false;
-  // model uses MLA (kv_dim=1)
-  bool is_mla = false;
+  // num_kv_heads == 1 means rank-shared KV (no TP head split → all TP ranks
+  // hold identical KV). This alone gates the sharded-D2H CE branch
+  // (kv_shared_across_ranks_mode), independent of kv_dim — both kv_dim=1
+  // (MLA/DSv4) and a hypothetical kv_dim=2 single-shared-head model
+  // rank-shard their D2H writes. kv_dim == 1 must NOT gate this path:
+  // packed MHA (kv_dim=1, num_kv_heads>1) is multi-head, not rank-shared.
+  // (kv_dim is passed as a separate parameter to transfer_kv_blocks for
+  // chunk-count/stride calculations, not stored here.)
+  int num_kv_heads = 1;
   // parallel CPU gather/scatter threads; 0=disable
   int gather_threads = 4;
   // NT store (AVX-512/AVX2 streaming store) for scatter/gather

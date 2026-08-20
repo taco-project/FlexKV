@@ -53,12 +53,12 @@ HEAD_DIM = 128
 #   MLA     (kv_dim=1): DeepSeek-style MLA layout.
 # Use --config all to sweep both.
 KV_CONFIGS_ALL = [
-    # (label, kv_dim, is_mla)
-    ("non-MLA", 2, False),
-    ("MLA",     1, True),
+    # (label, kv_dim, num_kv_heads)
+    ("non-MLA", 2, 8),   # plain MHA: K/V separate, 8 heads
+    ("MLA",     1, 1),   # MLA: K/V combined, single shared head
 ]
-KV_CONFIGS_BY_NAME = {label: (label, kv_dim, is_mla)
-                      for label, kv_dim, is_mla in KV_CONFIGS_ALL}
+KV_CONFIGS_BY_NAME = {label: (label, kv_dim, num_kv_heads)
+                      for label, kv_dim, num_kv_heads in KV_CONFIGS_ALL}
 
 # Sweep: vary block count to expose per-call overhead
 BLOCK_COUNTS = [64, 128, 256, 512, 1024, 2048, 4096]
@@ -66,18 +66,18 @@ BLOCK_COUNTS = [64, 128, 256, 512, 1024, 2048, 4096]
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def make_layouts(num_layers, num_blocks, head_dim, num_gpus, is_mla, num_heads):
+def make_layouts(num_layers, num_blocks, head_dim, num_gpus, kv_dim, num_heads):
     """GPU (LAYERFIRST) and CPU (LAYERFIRST) layouts."""
     gpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=1, num_head=num_heads,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     cpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=1, num_head=num_heads,
-        head_size=head_dim, is_mla=is_mla)
+        head_size=head_dim, kv_dim=kv_dim)
     return gpu_layout, cpu_layout
 
 
@@ -94,7 +94,7 @@ def make_cpu_tensor(cpu_layout):
 
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
-                  is_mla=False, is_blockfirst=False):
+                  kv_dim=2, is_blockfirst=False):
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -113,7 +113,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         gpu_chunk_sizes_in_bytes=[gpu_layout.get_chunk_size() * ES] * num_gpus,
         gpu_device_ids=list(range(num_gpus)),
         enable_nvcomp=False,
-        is_mla=is_mla,
+        kv_dim=kv_dim,
         is_blockfirst=is_blockfirst)
 
 
@@ -125,7 +125,7 @@ def block_ids(n):
 
 def bench_transfer(tp, gpu_ids, cpu_ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                    num_layers, is_host_to_device, use_ce, num_gpus, iters,
-                   is_mla, transfer_num_cta=4):
+                   kv_dim, num_kv_heads, transfer_num_cta=4):
     """Time one direction (H2D or D2H), returns (avg_ms, p99_ms)."""
 
     def do_transfer():
@@ -135,7 +135,8 @@ def bench_transfer(tp, gpu_ids, cpu_ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp
             cpu_block_stride_in_bytes=cpu_bl_sb, cpu_tp_stride_in_bytes=cpu_tp_sb,
             transfer_num_cta=transfer_num_cta, is_host_to_device=is_host_to_device,
             use_ce_transfer=use_ce, layer_id=0, layer_granularity=num_layers,
-            is_mla=is_mla, mla_d2h_mode="sharded")
+            kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+            kv_shared_across_ranks_mode="sharded")
 
     # Warmup
     for _ in range(WARMUP_ITERS):
@@ -205,10 +206,10 @@ def main():
 
     results = []
 
-    for cfg_label, kv_dim, is_mla in kv_configs:
+    for cfg_label, kv_dim, num_kv_heads in kv_configs:
         print("\n" + "#" * 90)
-        print("#  Config: {} (kv_dim={}, is_mla={})".format(
-            cfg_label, kv_dim, is_mla))
+        print("#  Config: {} (kv_dim={}, num_kv_heads={})".format(
+            cfg_label, kv_dim, num_kv_heads))
         print("#" * 90)
 
         for num_blocks in BLOCK_COUNTS:
@@ -217,7 +218,7 @@ def main():
                            args.num_heads * 1 * HEAD_DIM * ES)
 
             gpu_layout, cpu_layout = make_layouts(
-                NUM_LAYERS, num_blocks, HEAD_DIM, num_gpus, is_mla,
+                NUM_LAYERS, num_blocks, HEAD_DIM, num_gpus, kv_dim,
                 args.num_heads)
             cpu_kv_sb = cpu_layout.get_kv_stride() * ES
             cpu_ly_sb = cpu_layout.get_layer_stride() * ES
@@ -229,7 +230,7 @@ def main():
                        for g in range(num_gpus)]
             cpu_kv = make_cpu_tensor(cpu_layout)
             tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
-                               gpu_layout, NUM_LAYERS)
+                               gpu_layout, NUM_LAYERS, kv_dim=kv_dim)
 
             gpu_ids = block_ids(num_blocks)
             cpu_ids = block_ids(num_blocks)
@@ -248,7 +249,7 @@ def main():
                         r = bench_transfer(
                             tp, gpu_ids, cpu_ids, cpu_kv_sb, cpu_ly_sb,
                             cpu_bl_sb, cpu_tp_sb, NUM_LAYERS, is_h2d, use_ce,
-                            num_gpus, args.iters, is_mla,
+                            num_gpus, args.iters, kv_dim, num_kv_heads,
                             transfer_num_cta=args.cta)
 
                         bw = total_bytes / (r["avg_ms"] / 1000) / 1e9  # GB/s
@@ -278,7 +279,7 @@ def main():
     print("  Summary: CE vs Kernel bandwidth (GB/s), per config")
     print("=" * 90)
 
-    for cfg_label, kv_dim, is_mla in kv_configs:
+    for cfg_label, kv_dim, num_kv_heads in kv_configs:
         for dir_name in ["H2D", "D2H"]:
             print("\n  Config: {} | Direction: {}".format(cfg_label, dir_name))
             hdr = "{:>8s}  {:>10s}  {:>10s}  {:>12s}  {:>10s}".format(
@@ -313,7 +314,7 @@ def main():
     print("  (difference between CE and Kernel wall-clock time, divided by")
     print("   number of cudaMemcpyAsync calls)")
 
-    for cfg_label, kv_dim, is_mla in kv_configs:
+    for cfg_label, kv_dim, num_kv_heads in kv_configs:
         for dir_name in ["H2D", "D2H"]:
             print("\n  Config: {} | Direction: {}".format(cfg_label, dir_name))
             hdr = "{:>8s}  {:>12s}  {:>12s}  {:>14s}".format(

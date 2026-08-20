@@ -107,6 +107,17 @@ class FlexkvLogger:
         if self.is_enabled_for(logging.ERROR):
             self._log(logging.ERROR, msg, args, kwargs)
 
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """Log at ERROR with the active traceback, mirroring stdlib logging.
+
+        Call sites already exist (worker control ack, GPU control drain) and
+        expect the stdlib name; without it the ``except`` block that calls
+        this raises AttributeError and masks the original failure.
+        """
+        kwargs.setdefault("exc_info", True)
+        if self.is_enabled_for(logging.ERROR):
+            self._log(logging.ERROR, msg, args, kwargs)
+
     def critical(self, msg: str, *args: Any, **kwargs: Any) -> None:
         if self.is_enabled_for(logging.CRITICAL):
             self._log(logging.CRITICAL, msg, args, kwargs)

@@ -32,7 +32,7 @@ static size_t transfer_kv_blocks_ans_binding(
     int64_t chunk_size_in_bytes,
     int start_layer_id,
     int num_layers,
-    bool is_mla,
+    bool kv_dim,
     int gpu_block_type,
     int64_t cpu_size_table_ptr,
     int64_t cpu_size_table_block_stride,
@@ -83,7 +83,7 @@ static size_t transfer_kv_blocks_ans_binding(
       &ctx, num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,   \
       cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,                         \
       cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,                   \
-      chunk_size_in_bytes, is_mla, cpu_size_table,                            \
+      chunk_size_in_bytes, kv_dim, cpu_size_table,                            \
       cpu_size_table_block_stride, cpu_size_table_layer_stride, stream)
 #define ANS_SWITCH(func)                                                     \
   switch (bt) {                                                              \
@@ -127,7 +127,7 @@ static size_t transfer_kv_blocks_ans_comp_binding(
     int64_t chunk_size_in_bytes,
     int start_layer_id,
     int num_layers,
-    bool is_mla,
+    bool kv_dim,
     int gpu_block_type,
     int64_t cpu_size_table_ptr,
     int64_t cpu_size_table_block_stride,
@@ -138,7 +138,7 @@ static size_t transfer_kv_blocks_ans_comp_binding(
       gpu_layer_stride_in_bytes, cpu_block_id_tensor, cpu_tensor,
       cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
       cpu_block_stride_in_bytes, chunk_size_in_bytes, start_layer_id,
-      num_layers, is_mla, gpu_block_type, cpu_size_table_ptr,
+      num_layers, kv_dim, gpu_block_type, cpu_size_table_ptr,
       cpu_size_table_block_stride, cpu_size_table_layer_stride);
 }
 
@@ -157,7 +157,7 @@ static size_t transfer_kv_blocks_ans_decomp_binding(
     int64_t chunk_size_in_bytes,
     int start_layer_id,
     int num_layers,
-    bool is_mla,
+    bool kv_dim,
     int gpu_block_type,
     int64_t cpu_size_table_ptr,
     int64_t cpu_size_table_block_stride,
@@ -168,7 +168,7 @@ static size_t transfer_kv_blocks_ans_decomp_binding(
       gpu_layer_stride_in_bytes, cpu_block_id_tensor, cpu_tensor,
       cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
       cpu_block_stride_in_bytes, chunk_size_in_bytes, start_layer_id,
-      num_layers, is_mla, gpu_block_type, cpu_size_table_ptr,
+      num_layers, kv_dim, gpu_block_type, cpu_size_table_ptr,
       cpu_size_table_block_stride, cpu_size_table_layer_stride);
 }
 
@@ -202,7 +202,7 @@ void register_ans_bindings(py::module_& m) {
         py::arg("cpu_tensor"), py::arg("cpu_kv_stride_in_bytes"),
         py::arg("cpu_layer_stride_in_bytes"),
         py::arg("cpu_block_stride_in_bytes"), py::arg("chunk_size_in_bytes"),
-        py::arg("start_layer_id"), py::arg("num_layers"), py::arg("is_mla"),
+        py::arg("start_layer_id"), py::arg("num_layers"), py::arg("kv_dim"),
         py::arg("gpu_block_type"), py::arg("cpu_size_table_ptr"),
         py::arg("cpu_size_table_block_stride"),
         py::arg("cpu_size_table_layer_stride"));
@@ -215,7 +215,7 @@ void register_ans_bindings(py::module_& m) {
         py::arg("cpu_tensor"), py::arg("cpu_kv_stride_in_bytes"),
         py::arg("cpu_layer_stride_in_bytes"),
         py::arg("cpu_block_stride_in_bytes"), py::arg("chunk_size_in_bytes"),
-        py::arg("start_layer_id"), py::arg("num_layers"), py::arg("is_mla"),
+        py::arg("start_layer_id"), py::arg("num_layers"), py::arg("kv_dim"),
         py::arg("gpu_block_type"), py::arg("cpu_size_table_ptr"),
         py::arg("cpu_size_table_block_stride"),
         py::arg("cpu_size_table_layer_stride"));

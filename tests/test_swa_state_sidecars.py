@@ -50,7 +50,8 @@ def test_swa_state_sidecars_share_one_byte_flat_host_block() -> None:
         tokens_per_block=page_size,
         num_head=1,
         head_size=585,
-        is_mla=True,
+        kv_dim=1,
+        num_kv_heads=1,
         layer_groups=groups,
     )
 
