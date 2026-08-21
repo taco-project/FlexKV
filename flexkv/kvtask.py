@@ -711,12 +711,13 @@ class KVTaskManager:
 
     def _fail_task(self, task_id: int) -> None:
         """A transfer op of this task's graph failed and the graph has fully
-        drained. Roll the plan back instead of completing it: ops that did
-        finish already ran their callbacks (their nodes are ready and their
-        data is valid, so abort keeps them), while nodes whose transfer never
-        ran are still unready and get removed with their blocks recycled.
-        The task terminates as FAILED so wait() reports the failure instead
-        of a misleading TIMEOUT."""
+        drained. Roll the plan back instead of completing it. Under
+        insert-after nothing this plan staged is on any radix tree yet -- the
+        graph-completion callback is the only publisher -- so the abort is
+        fail-closed: every staged block is recycled and every SWA slot
+        returned, even on tiers whose own ops did succeed. The task terminates
+        as FAILED so wait() reports the failure instead of a misleading
+        TIMEOUT."""
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]
@@ -738,14 +739,13 @@ class KVTaskManager:
         task = self.tasks[task_id]
         if not task.is_completed():
             # A task whose graph never launched still holds everything its
-            # plan acquired at create time: locked radix nodes, CPU staging
-            # blocks, and is_ready=False index nodes that only a completion
-            # callback could publish. Dropping the task without aborting leaks
-            # all of it -- the staging blocks become unreachable (mempool
-            # exhaustion) and the unready nodes are permanently unevictable
-            # holes that also shadow future puts of the same prefix. Abort
-            # rolls those back; RUNNING tasks keep the old behavior (their
-            # graph is in flight and completion callbacks will still fire).
+            # plan acquired at create time: locked radix nodes and staging
+            # blocks that only a completion callback could mount on the tree.
+            # Dropping the task without aborting leaks all of it -- the staging
+            # blocks become unreachable (mempool exhaustion) and the pinned
+            # nodes stay unevictable. Abort rolls those back; RUNNING tasks
+            # keep the old behavior (their graph is in flight and completion
+            # callbacks will still fire).
             if task.status in (TaskStatus.UNREADY, TaskStatus.READY):
                 self._abort_task_plans(task)
             task.status = TaskStatus.CANCELLED
@@ -1169,9 +1169,9 @@ class KVTaskEngine(KVTaskManager):
         """
         nvtx.push_range(f"get match: task_id={task_id}", color=get_nvtx_default_color())
         # self._sync_prefetch(token_ids, namespace)
-        # Flush pending D2H completions so set_ready callbacks run before
-        # we check the radix tree.  Without this, blocks offloaded between
-        # scheduler steps remain "not ready" until the next try_wait call,
+        # Flush pending D2H completions so their insert-after callbacks run
+        # before we check the radix tree.  Without this, blocks offloaded
+        # between scheduler steps stay unmounted until the next try_wait call,
         # which comes too late (after get_match).
         self._update_tasks(timeout=0)
         if token_mask is None:
@@ -1469,7 +1469,7 @@ class KVTaskEngine(KVTaskManager):
         # Invalidate in-flight tasks' callbacks BEFORE dropping the cache. The
         # callback / op_callback_dict partials close over the exact radix nodes
         # and mempool blocks we are about to free; if a late transfer fired them
-        # after reset they would unlock/set_ready a deleted node, or recycle a
+        # after reset they would unlock or mount onto a deleted node, or recycle a
         # block into the freshly-emptied mempool (which raises "already free").
         # Clear them here so the dispatch in _update_tasks has nothing to fire.
         # Note: reset_cache() runs on the same thread as the callback dispatch
