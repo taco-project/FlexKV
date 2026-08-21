@@ -33,7 +33,10 @@ except:
     try:
         cudart = ctypes.CDLL("libcudart.so.12")
     except:
-        cudart = ctypes.CDLL("libcudart.so.11")
+        try:
+            cudart = ctypes.CDLL("libcudart.so.11")
+        except:
+            cudart = None  # Non-CUDA host: importable, IPC fails on use
 
 # Load CUDA driver library. CuMemAllocator's cuMemCreate + cuMemMap live in
 # libcuda, not libcudart, so we need both. Setting to None on ImportError

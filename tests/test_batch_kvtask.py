@@ -48,7 +48,7 @@ def running_kvmanager(model_config, cache_config, test_config):
     parent_conn, child_conn = mp_ctx.Pipe()
     tp_proc = mp_ctx.Process(
         target=run_tp_client,
-        args=(0, 0, kvmanager.gpu_register_port, model_config, cache_config,
+        args=(0, 0, kvmanager.server_recv_port, model_config, cache_config,
               num_gpu_blocks, child_conn, GPU_LAYOUT_TYPE),
         daemon=True,
     )

@@ -8,12 +8,21 @@ from flexkv.common.config import ModelConfig, RankInfo
 from flexkv.server.request import RegisterTPClientRequest
 
 
-# Registration tests do not need the CUDA/liburing transfer workers.
+# Registration tests do not need the CUDA/liburing transfer workers. Stub the
+# heavy module ONLY while TransferManager is imported, then restore sys.modules
+# so later tests in the same pytest session import the real TransferEngine
+# instead of this stub.
+_saved_transfer_engine = sys.modules.get("flexkv.transfer.transfer_engine")
 transfer_engine_module = types.ModuleType("flexkv.transfer.transfer_engine")
 transfer_engine_module.TransferEngine = object
 sys.modules["flexkv.transfer.transfer_engine"] = transfer_engine_module
-
-from flexkv.transfer_manager import TransferManager
+try:
+    from flexkv.transfer_manager import TransferManager
+finally:
+    if _saved_transfer_engine is not None:
+        sys.modules["flexkv.transfer.transfer_engine"] = _saved_transfer_engine
+    else:
+        del sys.modules["flexkv.transfer.transfer_engine"]
 
 
 def _request(dp_client_id: int, intra_client_id: int, device_id: int):
@@ -129,9 +138,14 @@ def test_intra_client_id_flattens_pp_and_effective_tp_rank():
         attn_cp_rank=1,
     )
 
-    assert model_config.effective_tp_size == 4
-    assert rank_info.effective_tp_rank == 3
-    assert rank_info.intra_client_id == 7
+    # CP folds into the data-plane segmentation space:
+    #   effective_tp_size  = tp_size * cp_size           = 4 * 2 = 8
+    #   effective_tp_rank  = cp_rank * tp_size + tp_rank = 1 * 4 + 3 = 7
+    #   intra_client_id    = pp_rank * effective_tp_size + effective_tp_rank
+    #                      = 1 * 8 + 7 = 15
+    assert model_config.effective_tp_size == 8
+    assert rank_info.effective_tp_rank == 7
+    assert rank_info.intra_client_id == 15
 
 
 def test_registration_key_distinguishes_replicas_from_cuda_device_id():

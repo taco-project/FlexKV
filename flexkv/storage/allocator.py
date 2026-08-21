@@ -148,7 +148,10 @@ _PROT_WRITE = 0x2
 _MAP_FAILED = ctypes.c_void_p(-1).value  # (void*)-1
 _HUGETLBFS_MAGIC = 0x958458F6
 
-_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+try:
+    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+except OSError:
+    _libc = ctypes.CDLL(None, use_errno=True)  # Non-Linux: keep importable
 _libc.mmap.restype = ctypes.c_void_p
 _libc.mmap.argtypes = [
     ctypes.c_void_p,

@@ -181,6 +181,10 @@ class TransferEngine:
         # Create shutdown pipe for zero-latency selector
         self.shutdown_read_fd, self.shutdown_write_fd = os.pipe()
         self.gpu_handle_groups = gpu_handles  # WorkerKey -> list of GPU handles for that TP group
+        local_pp_ranks = {wk.pp_rank for wk in gpu_handles}
+        self._node_min_start_layer = min(
+            (model_config.get_pp_indices(p)[0] for p in local_pp_ranks),
+            default=0)
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
@@ -248,6 +252,11 @@ class TransferEngine:
         # Ops with at least one failed replica: must be discarded, not
         # finalized, when their pending_count drains to zero.
         self._failed_parent_op_ids: Set[int] = set()
+
+    def _pp_offset(self, worker_key: WorkerKey) -> int:
+        """Pool-local layer offset for this worker's PP stage."""
+        return self.model_config.get_pp_indices(worker_key.pp_rank)[0] - self._node_min_start_layer
+
 
     def _get_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
         """Get multi-group kwargs for TP=1 workers (GPUCPU / GDS)."""
@@ -471,6 +480,7 @@ class TransferEngine:
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                         compressor=self._compressors["gpu_cpu"],
+                        start_layer_id=self._pp_offset(worker_key),
                         **self._get_multi_group_kwargs_tp1(worker_key),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
@@ -492,6 +502,7 @@ class TransferEngine:
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                         compressor=self._compressors["gpu_cpu_tp"],
+                        start_layer_id=self._pp_offset(worker_key),
                         **self._get_multi_group_kwargs_tp(worker_key),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
@@ -516,7 +527,8 @@ class TransferEngine:
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                     compressor=self._compressors["gpu_cpu"],
-                    **self._get_multi_group_kwargs_tp1(worker_key),
+                    start_layer_id=self._pp_offset(worker_key),
+                        **self._get_multi_group_kwargs_tp1(worker_key),
                 )
                 for worker_key, gpu_handles in self.gpu_handle_groups.items()
             }
@@ -537,7 +549,8 @@ class TransferEngine:
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                     transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                     compressor=self._compressors["gpu_cpu_tp"],
-                    **self._get_multi_group_kwargs_tp(worker_key),
+                    start_layer_id=self._pp_offset(worker_key),
+                        **self._get_multi_group_kwargs_tp(worker_key),
                 )
                 for worker_key, gpu_handles in self.gpu_handle_groups.items()
             }
@@ -663,6 +676,7 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         gpu_device_id=gpu_handles[0].gpu_device_id,
+                        start_layer_id=self._pp_offset(worker_key),
                         **self._get_multi_group_kwargs_tp1(worker_key),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
@@ -680,6 +694,7 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         tp_group_size=self.model_config.effective_tp_size_per_node,
+                        start_layer_id=self._pp_offset(worker_key),
                         **self._get_multi_group_kwargs_tp(worker_key),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
@@ -719,7 +734,8 @@ class TransferEngine:
                     d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
                     # Fuse main-KV + uniform/multi-group SWA into one LAYERWISE op.
                     **self._get_layerwise_swa_kwargs(worker_key),
-                    **self._get_multi_group_kwargs_tp(worker_key),
+                    start_layer_id=self._pp_offset(worker_key),
+                        **self._get_multi_group_kwargs_tp(worker_key),
                 )
                 self.layerwise_workers[worker_key] = worker
 
@@ -788,6 +804,7 @@ class TransferEngine:
                             use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                             transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                             transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                            start_layer_id=self._pp_offset(worker_key),
                             **self._get_swa_multi_group_kwargs_tp1(worker_key),
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()
@@ -808,6 +825,7 @@ class TransferEngine:
                             use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                             transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                             transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+                            start_layer_id=self._pp_offset(worker_key),
                             **self._get_swa_multi_group_kwargs_tp(worker_key),
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()
@@ -831,7 +849,8 @@ class TransferEngine:
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                        **self._get_swa_multi_group_kwargs_tp1(worker_key),
+                        start_layer_id=self._pp_offset(worker_key),
+                            **self._get_swa_multi_group_kwargs_tp1(worker_key),
                     )
                     for worker_key, swa_handles in self._swa_gpu_handles.items()
                 }
@@ -851,7 +870,8 @@ class TransferEngine:
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
                         transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                        **self._get_swa_multi_group_kwargs_tp(worker_key),
+                        start_layer_id=self._pp_offset(worker_key),
+                            **self._get_swa_multi_group_kwargs_tp(worker_key),
                         )
                     for worker_key, swa_handles in self._swa_gpu_handles.items()
                 }
@@ -954,6 +974,7 @@ class TransferEngine:
                             ssd_kv_layout=self._swa_ssd_handle.kv_layout,
                             dtype=swa_handles[0].dtype,
                             gpu_device_id=swa_handles[0].gpu_device_id,
+                            start_layer_id=self._pp_offset(worker_key),
                             **self._get_swa_multi_group_kwargs_tp1(worker_key),
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()
@@ -971,6 +992,7 @@ class TransferEngine:
                             ssd_kv_layout=self._swa_ssd_handle.kv_layout,
                             dtype=swa_handles[0].dtype,
                             tp_group_size=self.model_config.effective_tp_size_per_node,
+                            start_layer_id=self._pp_offset(worker_key),
                             **self._get_swa_multi_group_kwargs_tp(worker_key),
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()

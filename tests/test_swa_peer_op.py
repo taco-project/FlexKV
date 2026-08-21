@@ -23,17 +23,25 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-if 'flexkv.c_ext' not in sys.modules:
+# Stub flexkv.c_ext (not needed by these pure-graph tests) ONLY while the
+# flexkv.cache modules are imported, then restore sys.modules so later tests
+# in the same pytest session import the real extension.
+_stub_c_ext = 'flexkv.c_ext' not in sys.modules
+if _stub_c_ext:
     sys.modules['flexkv.c_ext'] = MagicMock()
 
 import numpy as np
 import pytest
 
-from flexkv.common.transfer import (
-    TransferOpGraph, TransferOp, TransferType, DeviceType,
-)
-from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
-from flexkv.cache.swa_cache_engine import SWAOpConstructor
+try:
+    from flexkv.common.transfer import (
+        TransferOpGraph, TransferOp, TransferType, DeviceType,
+    )
+    from flexkv.cache.transfer_pattern import add_virtual_op_for_multiple_finished_ops
+    from flexkv.cache.swa_cache_engine import SWAOpConstructor
+finally:
+    if _stub_c_ext:
+        del sys.modules['flexkv.c_ext']
 
 pytestmark = pytest.mark.unit
 

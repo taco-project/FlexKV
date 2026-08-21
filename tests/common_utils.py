@@ -132,8 +132,6 @@ def create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_
         kv_dim=model_config.kv_dim,
         num_kv_heads=model_config.num_kv_heads,
     )
-    # When num_kv_heads > 1, heads are sharded across TP ranks (MHA path).
-    # When num_kv_heads == 1, the single head is shared across ranks (MLA).
     gpu_kv_layout = tpgroup_gpu_kv_layout.div_head(tp_size) if model_config.num_kv_heads > 1 else tpgroup_gpu_kv_layout
     return gpu_kv_layout
 
@@ -175,9 +173,22 @@ class GPUKVCacheVerifier:
         self.gpu_block_num = gpu_kv_layout.num_block
         self.tp_size = tp_size
         self.kv_dim = gpu_kv_layout.kv_dim
-        self.num_kv_heads = gpu_kv_layout.num_kv_heads
         self.tokens_per_block = tokens_per_block
         self.dtype = dtype
+
+    def synchronize_all_devices(self):
+        """Synchronize all CUDA devices that hold GPU blocks.
+
+        When tp_size > 1, GPU blocks are distributed across multiple devices
+        (cuda:0..cuda:tp_size-1). A bare torch.cuda.synchronize() only syncs
+        the current device (default cuda:0), leaving writes on other devices
+        unsynchronized. This causes intermittent got=0.0 verification failures
+        at the tail (last head of V on last layer, especially on the highest
+        tp_id device) because the D2H/H2D transfer or verification reads
+        stale data.
+        """
+        for tp_id in range(self.tp_size):
+            torch.cuda.synchronize(tp_id)
 
 
     def _combined_hash(self, layer_id, kv_id, token_ids, head_id):
@@ -252,7 +263,7 @@ class GPUKVCacheVerifier:
                         raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
                     for head_id in range(self.gpu_kv_layout.num_head):
-                        actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if self.num_kv_heads > 1 else head_id
+                        actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if self.kv_dim > 1 else head_id
 
                         for block_idx, block_id in enumerate(block_ids):
                             start_token_idx = block_idx * self.tokens_per_block
@@ -337,7 +348,7 @@ class GPUKVCacheVerifier:
                         raise ValueError(f"Invalid GPU layout type: {self.gpu_layout_type}")
 
                     for head_id in range(self.gpu_kv_layout.num_head):
-                        actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if self.num_kv_heads > 1 else head_id
+                        actual_head_id = tp_id * self.gpu_kv_layout.num_head + head_id if self.kv_dim > 1 else head_id
                         for block_idx, block_id in enumerate(block_ids):
                             start_token_idx = block_idx * self.tokens_per_block
                             end_token_idx = start_token_idx + self.tokens_per_block
@@ -494,7 +505,7 @@ def example_usage_gpu_kv_cache_verifier():
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
         kv_dim=model_config.kv_dim,
-        num_kv_heads=model_config.num_kv_heads,
+        num_kv_heads=model_config.num_kv_heads
     )
 
     # Create mock GPU blocks

@@ -241,6 +241,10 @@ class FlexKVConfig:
             pp_start_layer, pp_end_layer = vllm_get_pp_indices(
                 self.model_config.num_layers, pp_rank, self.model_config.pp_size
             )
+            self.model_config.pp_layer_ranges = tuple(
+                vllm_get_pp_indices(
+                    self.model_config.num_layers, r, self.model_config.pp_size)
+                for r in range(self.model_config.pp_size))
         else:
             pp_start_layer = 0
             pp_end_layer = self.model_config.num_layers
@@ -547,6 +551,10 @@ class FlexKVConfig:
             pp_start_layer, pp_end_layer = sglang_get_pp_indices(
                 self.model_config.num_layers, pp_rank, self.model_config.pp_size
             )
+            self.model_config.pp_layer_ranges = tuple(
+                sglang_get_pp_indices(
+                    self.model_config.num_layers, r, self.model_config.pp_size)
+                for r in range(self.model_config.pp_size))
         else:
             pp_start_layer = 0
             pp_end_layer = self.model_config.num_layers

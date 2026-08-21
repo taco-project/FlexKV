@@ -10,6 +10,17 @@
 
 namespace flexkv {
 
+// Restores the caller's current CUDA device on scope exit. Transfers
+// cudaSetDevice() to each group GPU; without restore the last GPU leaks as
+// the thread's current device, breaking later ambient-device launches.
+namespace {
+struct CurrentDeviceGuard {
+  int dev = 0;
+  CurrentDeviceGuard() { cudaGetDevice(&dev); }
+  ~CurrentDeviceGuard() { cudaSetDevice(dev); }
+};
+} // namespace
+
 // ===== Event polling notification (#199) =====
 
 void LayerwiseTransferGroup::notify_layer_batch(int start_layer,
@@ -506,7 +517,7 @@ void LayerwiseTransferGroup::launch_swa_mg_h2d_layer_(
 
 LayerwiseTransferGroup::LayerwiseTransferGroup(
     int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-    torch::Tensor &cpu_blocks,
+    torch::Tensor &cpu_blocks, int64_t pp_offset_bytes,
     std::map<int, std::vector<std::string>> &ssd_files, int num_layers,
     torch::Tensor &gpu_kv_strides_tensor,
     torch::Tensor &gpu_block_strides_tensor,
@@ -605,7 +616,9 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
         gpu_block_strides_in_bytes_[i], gpu_layer_strides_in_bytes_[i]);
   }
 
-  cpu_blocks_ = cpu_blocks.data_ptr();
+  // Anchor the per-node pool at this PP stage's first layer; layerwise
+  // batches then address layers 0-based against the anchored view.
+  cpu_blocks_ = static_cast<char *>(cpu_blocks.data_ptr()) + pp_offset_bytes;
 
   // Get GPU device IDs from tensors (like tp_transfer_thread_group.cpp)
   gpu_device_ids_.resize(num_gpus_);
@@ -972,6 +985,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int swa_num_blocks_per_file, const std::string &kv_shared_across_ranks_mode,
     const std::string &notify_mode, const bool enable_trace) {
 
+  CurrentDeviceGuard device_guard;
+
   if (has_multi_group_) {
     throw std::runtime_error(
         "[LayerwiseTransferGroup] layerwise_transfer() invoked on a "
@@ -1331,6 +1346,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     const int swa_num_blocks_per_file, const std::string &kv_shared_across_ranks_mode,
     const std::string &notify_mode, const bool enable_trace) {
   (void)swa_cpu_tp_stride_in_bytes;
+
+  CurrentDeviceGuard device_guard;
 
   if (!has_multi_group_) {
     throw std::runtime_error(
