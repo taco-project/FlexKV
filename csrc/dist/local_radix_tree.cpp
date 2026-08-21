@@ -86,7 +86,7 @@ LocalRadixTree::~LocalRadixTree() {
 
 CRadixNode *LocalRadixTree::insert(torch::Tensor &physical_block_ids,
   torch::Tensor &block_hashes, int num_blocks, int num_insert_blocks,
-  bool ready, CRadixNode *last_node, int num_matched_blocks, int last_node_matched_length) {
+  CRadixNode *last_node, int num_matched_blocks, int last_node_matched_length) {
   // Mirror CRadixTreeIndex::insert but attach LeaseMeta for every newly created node
   if (num_insert_blocks == -1) {
     num_insert_blocks = num_blocks;
@@ -142,7 +142,7 @@ CRadixNode *LocalRadixTree::insert(torch::Tensor &physical_block_ids,
   }
 
   // Create the new leaf node and attach LeaseMeta immediately
-  CRadixNode *new_node = new CRadixNode(this, ready, 0);
+  CRadixNode *new_node = new CRadixNode(this, 0);
 
   auto &new_block_hashes = new_node->get_block_hashes();
   auto &new_physical_blocks = new_node->get_physical_blocks();
@@ -474,7 +474,6 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   int evictable_count = 0;
   int not_evictable_count = 0;
   int locked_count = 0;
-  int not_ready_count = 0;
   int expired_count = 0;
   int fresh_count = 0;
   int about_to_evict_count = 0;
@@ -485,7 +484,6 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
       not_evictable_count++;
       // Check why not evictable
       if (node->get_lock_cnt() > 0) locked_count++;
-      if (!node->is_ready()) not_ready_count++;
       continue;
     }
     evictable_count++;
@@ -512,9 +510,9 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
       fresh_q(CRadixNode::Compare(), std::move(fresh_candidates));
   
   // Log eviction状态 when eviction is attempted
-  /*printf("[EVICT] need=%d, leaf_list=%zu, evictable=%d (expired=%d, fresh_normal=%d, about_to_evict=%d), not_evictable=%d (locked=%d, not_ready=%d)\n",
+  /*printf("[EVICT] need=%d, leaf_list=%zu, evictable=%d (expired=%d, fresh_normal=%d, about_to_evict=%d), not_evictable=%d (locked=%d)\n",
          num_evicted, leaf_list.size(), evictable_count, expired_count, fresh_count, 
-         about_to_evict_count, not_evictable_count, locked_count, not_ready_count);*/
+         about_to_evict_count, not_evictable_count, locked_count);*/
 
   auto push_parent_if_candidate = [&](CRadixNode *parent){
     if (parent == nullptr) {
@@ -669,8 +667,6 @@ std::shared_ptr<CMatchResult> LocalRadixTree::match_prefix(torch::Tensor &block_
   return result;
 }
 
-int LocalRadixTree::total_unready_blocks() { return CRadixTreeIndex::total_unready_blocks(); }
-int LocalRadixTree::total_ready_blocks() { return CRadixTreeIndex::total_ready_blocks(); }
 int LocalRadixTree::total_cached_blocks() { return CRadixTreeIndex::total_cached_blocks(); }
 int LocalRadixTree::total_node_num() { return CRadixTreeIndex::total_node_num(); }
 void LocalRadixTree::reset() {
@@ -706,10 +702,6 @@ void LocalRadixTree::unlock(CRadixNode *node) { CRadixTreeIndex::unlock(node); }
 bool LocalRadixTree::is_empty() { return CRadixTreeIndex::is_empty(); }
 void LocalRadixTree::inc_node_count() { CRadixTreeIndex::inc_node_count(); }
 void LocalRadixTree::dec_node_count() { CRadixTreeIndex::dec_node_count(); }
-void LocalRadixTree::set_ready(CRadixNode *node, bool ready, int ready_length) {
-  CRadixTreeIndex::set_ready(node, ready, ready_length);
-}
-
 size_t LocalRadixTree::lease_pool_capacity() const { return lease_pool.capacity(); }
 size_t LocalRadixTree::lease_pool_free_size() const { return lease_pool.free_size(); }
 size_t LocalRadixTree::pending_queue_size() const {
