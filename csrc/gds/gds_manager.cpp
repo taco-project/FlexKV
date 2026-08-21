@@ -693,6 +693,7 @@ void transfer_kv_blocks_gds(
             max_block_partition = gpu_blocks.size();
     } 
 
+    size_t task_index = 0;
     for (size_t j = 0; j < max_block_partition; j++) {
         for (int device_id = 0; device_id < num_devices; device_id++) {
             const std::vector<int>& gpu_blocks = gpu_blocks_partition[device_id];
@@ -702,7 +703,7 @@ void transfer_kv_blocks_gds(
             const std::vector<int>& ssd_blocks = ssd_blocks_partition[device_id];
             const int gpu_block_id = gpu_blocks[j];
             const int ssd_block_id = ssd_blocks[j];
-            const int slot_id = (device_id * gpu_blocks.size() + j) % num_slots;
+            const int slot_id = static_cast<int>(task_index++ % num_slots);
             
             futures.push_back(gds_manager.enqueue_task([&, device_id, gpu_block_id, ssd_block_id, slot_id, gpu_id]() {
                 // Set correct CUDA device for this worker thread
