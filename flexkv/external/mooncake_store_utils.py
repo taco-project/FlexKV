@@ -469,7 +469,7 @@ class MooncakeStoreClient:
 
 
 class _MooncakeStoreDummyNode:
-    """Placeholder node for MooncakeStoreCacheEngine.insert(); unlock/set_ready are no-ops."""
+    """Placeholder node for MooncakeStoreCacheEngine.insert(); unlock is a no-op."""
 
     def size(self) -> int:
         return 0
@@ -639,11 +639,9 @@ class MooncakeStoreCacheEngine:
         n_blocks = sequence_meta.num_blocks
         if n_blocks == 0:
             return MatchResultAccel(
-                num_ready_matched_blocks=0,
                 num_matched_blocks=0,
                 kv_matched_blocks=0,
                 swa_hit_blocks=0,
-                last_ready_node=None,
                 last_node=None,
                 last_node_matched_length=0,
                 physical_blocks=np.arange(0, dtype=np.int64),
@@ -654,11 +652,9 @@ class MooncakeStoreCacheEngine:
         joint_matched, kv_matched, swa_hit = self._joint_match_length(block_hashes)
 
         return MatchResultAccel(
-            num_ready_matched_blocks=joint_matched,
             num_matched_blocks=joint_matched,
             kv_matched_blocks=kv_matched,
             swa_hit_blocks=swa_hit,
-            last_ready_node=None,
             last_node=None,
             last_node_matched_length=joint_matched,
             physical_blocks=np.arange(joint_matched, dtype=np.int64),
@@ -670,7 +666,6 @@ class MooncakeStoreCacheEngine:
         sequence_meta: SequenceMeta,
         physical_block_ids,
         num_insert_blocks: int = -1,
-        is_ready: bool = True,
         match_result: Optional[MatchResultAccel] = None,
     ) -> _MooncakeStoreDummyNode:
         """No-op. Writes to mooncake-store are performed by the transfer worker."""
@@ -692,9 +687,6 @@ class MooncakeStoreCacheEngine:
         pass
 
     def unlock(self, node: Any) -> None:
-        pass
-
-    def set_ready(self, node: Any, ready: bool, ready_length: int) -> None:
         pass
 
     def insert_and_publish(self, node: Any) -> bool:
