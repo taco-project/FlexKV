@@ -169,10 +169,11 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
     const int64_t ssd_tp_stride_in_bytes,
     const int64_t num_blocks_per_file,
     const bool is_read,
-    const int layer_id,
+    const int start_layer_id,
     const int layer_granularity,
     const int kv_dim,
-    const int num_kv_heads) {
+    const int num_kv_heads,
+    const int64_t ssd_pp_seek_offset_bytes) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -183,7 +184,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
         // Prepare layer ID list for this specific layer range
-        torch::Tensor layer_id_list = torch::arange(layer_id, layer_id + layer_granularity, 
+        torch::Tensor layer_id_list = torch::arange(start_layer_id, start_layer_id + layer_granularity, 
                                                     torch::TensorOptions().dtype(torch::kInt32));
         //here the ssd_copy_off_inside_chunks is the offset of the ssd block in the ssd file
         int64_t ssd_copy_off_inside_chunks;
@@ -195,6 +196,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
           ssd_copy_off_inside_chunks = i * ssd_tp_stride_in_bytes;
         }
 
+        ssd_copy_off_inside_chunks += ssd_pp_seek_offset_bytes;
         int64_t chunk_size = gpu_chunk_size_in_bytes;
         switch (backend_type_) {
           case BackendType::VLLM:

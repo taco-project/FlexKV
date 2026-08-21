@@ -185,13 +185,21 @@ class ModelConfig:
     # and token_size_in_bytes/num_cpu_blocks are computed by summing across groups.
     layer_groups: Optional[List[LayerGroupSpec]] = None
 
+    pp_layer_ranges: Optional[Tuple[Tuple[int, int], ...]] = None
+
     # ------------------------------------------------------------------
     # Freeze mechanism: after post_init, ModelConfig must not be mutated
     # ------------------------------------------------------------------
     _frozen: bool = field(default=False, init=False, repr=False)
 
-    def freeze(self) -> None:
-        """Lock the config so that any subsequent __setattr__ raises an error."""
+    def _normalize_cp_sizes(self) -> None:
+        """Mirror cp_size <-> attn_cp_size so derived topology stays consistent.
+
+        RankInfo mirrors cp_rank <-> attn_cp_rank at construction; without the
+        same normalization here, effective_tp_size (folds cp_size) and
+        effective_tp_rank (folds cp_rank) disagree and intra_client_id can
+        collide across (pp_rank, cp_rank, tp_rank) tuples.
+        """
         if self.cp_size == 1 and self.attn_cp_size != 1:
             self.cp_size = self.attn_cp_size
         elif self.attn_cp_size == 1 and self.cp_size != 1:
@@ -201,6 +209,13 @@ class ModelConfig:
                 f"[ModelConfig] cp_size={self.cp_size} and "
                 f"attn_cp_size={self.attn_cp_size} disagree"
             )
+
+    def __post_init__(self) -> None:
+        self._normalize_cp_sizes()
+
+    def freeze(self) -> None:
+        """Lock the config so that any subsequent __setattr__ raises an error."""
+        self._normalize_cp_sizes()
         # ---- Topology validation ----
         if self.total_gpus % self.nnodes != 0:
             raise ValueError(
@@ -220,6 +235,7 @@ class ModelConfig:
 
         # ---- LayerGroup invariants ----
         self._validate_layer_groups()
+        self._validate_pp_layer_ranges()
 
         object.__setattr__(self, '_frozen', True)
 
@@ -288,6 +304,8 @@ class ModelConfig:
         # specifically so multi-group registration paths work.
         if name == 'layer_groups':
             return object.__setattr__(self, name, value)
+        if name == 'pp_layer_ranges':
+            return object.__setattr__(self, name, value)
         if getattr(self, '_frozen', False):
             raise AttributeError(
                 f"ModelConfig is frozen — cannot set '{name}'. "
@@ -297,6 +315,50 @@ class ModelConfig:
                 f"and cannot be set at all."
             )
         object.__setattr__(self, name, value)
+
+    def _validate_pp_layer_ranges(self) -> None:
+        """Validate ``pp_layer_ranges`` against ``num_layers``/``pp_size``."""
+        if self.pp_layer_ranges is None:
+            return
+        ranges = self.pp_layer_ranges
+        if len(ranges) != self.pp_size:
+            raise ValueError(
+                f"[ModelConfig] pp_layer_ranges has {len(ranges)} entries, "
+                f"expected pp_size={self.pp_size}"
+            )
+        expected_start = 0
+        for p, (start, end) in enumerate(ranges):
+            if not (0 <= start <= end <= self.num_layers):
+                raise ValueError(
+                    f"[ModelConfig] pp_layer_ranges[{p}]=({start}, {end}) "
+                    f"out of bounds for num_layers={self.num_layers}"
+                )
+            if start != expected_start:
+                raise ValueError(
+                    f"[ModelConfig] pp_layer_ranges must be contiguous and "
+                    f"non-overlapping: ranges[{p}] starts at {start}, expected "
+                    f"{expected_start} (ranges={ranges})"
+                )
+            expected_start = end
+        if expected_start != self.num_layers:
+            raise ValueError(
+                f"[ModelConfig] pp_layer_ranges must cover [0, {self.num_layers}), "
+                f"got coverage ending at {expected_start} (ranges={ranges})"
+            )
+
+    def get_pp_indices(self, pp_rank: int) -> Tuple[int, int]:
+        """Global [start, end) layer range owned by ``pp_rank``."""
+        if not 0 <= pp_rank < self.pp_size:
+            raise ValueError(
+                f"[ModelConfig] pp_rank={pp_rank} out of range for "
+                f"pp_size={self.pp_size}"
+            )
+        if self.pp_layer_ranges is not None:
+            return self.pp_layer_ranges[pp_rank]
+        base, rem = divmod(self.num_layers, self.pp_size)
+        start = pp_rank * base + min(pp_rank, rem)
+        end = start + base + (1 if pp_rank < rem else 0)
+        return start, end
 
     # ------------------------------------------------------------------
     # Derived topology properties

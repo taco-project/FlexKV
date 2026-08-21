@@ -204,13 +204,21 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_block_stride_in_bytes,
     const int64_t cpu_tp_stride_in_bytes,     const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
-    const int layer_id, const int layer_granularity, const int kv_dim,
+    const int64_t pp_offset_bytes, const int start_layer_id,
+    const int layer_granularity, const int kv_dim,
     const int num_kv_heads,
     const std::string &kv_shared_across_ranks_mode,
     const int designated_rank) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
+
+  // pp_offset_bytes anchors the per-node CPU pool at this PP stage's first
+  // layer; start_layer_id is the batch-local start layer and indexes both the
+  // anchored CPU view and the 0-based per-stage GPU pointer array.
+  void *cpu_base =
+      static_cast<char *>(cpu_blocks_) + pp_offset_bytes;
+
   // threads_.clear();
   // threads_.reserve(num_gpus_);
 
@@ -285,7 +293,7 @@ void TPTransferThreadGroup::tp_group_transfer(
             static_cast<int64_t *>(gpu_block_id_tensor.data_ptr());
         int64_t *cpu_block_ids =
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
-        void *cpu_ptr = cpu_blocks_;
+        void *cpu_ptr = cpu_base;
         int64_t cpu_startoff_inside_chunks = 0;
         int64_t gpu_startoff_inside_chunks = 0;
         int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
@@ -303,8 +311,8 @@ void TPTransferThreadGroup::tp_group_transfer(
           cpu_startoff_inside_chunks = i * num_blocks * cpu_block_stride_in_bytes;
         }
         
-        // Effective layer range: round_robin assigns subset; else full (layer_id, layer_granularity).
-        int eff_start_layer = layer_id;
+        // Effective layer range: round_robin assigns subset; else full (start_layer_id, layer_granularity).
+        int eff_start_layer = start_layer_id;
         int eff_num_layers = layer_granularity;
         if (num_kv_heads == 1 && !is_host_to_device && mode == "layer_parallel") {
           int L_rotate = layer_granularity, N_rotate = num_gpus_;
@@ -317,7 +325,7 @@ void TPTransferThreadGroup::tp_group_transfer(
             my_start_rotate = remainder_rotate * (layers_per_rank_rotate + 1) +
                           (i - remainder_rotate) * layers_per_rank_rotate;
           }
-          eff_start_layer = layer_id + my_start_rotate;
+          eff_start_layer = start_layer_id + my_start_rotate;
           eff_num_layers = (i < remainder_rotate) ? (layers_per_rank_rotate + 1)
                                               : layers_per_rank_rotate;
         }

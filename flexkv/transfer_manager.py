@@ -371,6 +371,18 @@ class TransferManager:
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
         num_layers_per_pp_stage = next(iter(self.all_gpu_layouts.values())).num_layer
 
+        # Per-node pool sizing: sum all distinct local pp_ranks' layers.
+        distinct_local_pp_ranks = sorted({wk.pp_rank for wk in self.gpu_worker_key_mapping.values()})
+        num_layers_on_node = sum(
+            self.model_config.get_pp_indices(p)[1] - self.model_config.get_pp_indices(p)[0]
+            for p in distinct_local_pp_ranks
+        )
+        if len(distinct_local_pp_ranks) > 1:
+            flexkv_logger.info(
+                f"[TransferManager] per-node pool: num_layers_on_node={num_layers_on_node} "
+                f"(local pp_ranks={distinct_local_pp_ranks})")
+            num_layers_per_pp_stage = num_layers_on_node
+
         # Recompute block counts once layer_groups are known (heterogeneous /
         # multi-pool models).  Must match CacheEngine mempool sizing in the
         # main process — sglang DSv4 applies the same recompute before

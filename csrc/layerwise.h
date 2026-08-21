@@ -61,7 +61,7 @@ public:
   // Single-group constructor (legacy: uniform num_kv_heads/head_size/dtype).
   LayerwiseTransferGroup(
       int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-      torch::Tensor &cpu_blocks,
+      torch::Tensor &cpu_blocks, int64_t pp_offset_bytes,
       std::map<int, std::vector<std::string>> &ssd_files, int num_layers,
       torch::Tensor &gpu_kv_strides_tensor,
       torch::Tensor &gpu_block_strides_tensor,

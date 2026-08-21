@@ -211,8 +211,7 @@ void ce_transfer_per_block(
           cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
           j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
       for (int b = 0; b < num_blocks; b++) {
-        int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                        i + start_layer_id, j,
+        int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j,
                                         gpu_block_ids[b]);
         int64_t *gpu_ptr_off =
             reinterpret_cast<int64_t *>(gpu_ptr) +
@@ -291,8 +290,7 @@ void ce_transfer_segment_direct(
             j * cpu_kv_stride_int64 +
             cpu_block_ids[seg.start_k] * cpu_block_stride_int64 +
             cpu_startoff_inside_chunks_int64;
-        int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                        i + start_layer_id, j,
+        int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j,
                                         gpu_block_ids[seg.start_k]);
         int64_t *gpu_ptr_off =
             reinterpret_cast<int64_t *>(gpu_ptr) +
@@ -666,11 +664,9 @@ void ce_transfer_segment_scatter(
       int j = (int)(it % kv_dim);
       for (const auto &seg : ce_analysis.segments) {
         // GPU block stride = pointer diff of two adjacent blocks
-        int64_t *gpu_ptr_first = ptr_at<Type>(gpu_tensor_handler,
-                                              i + start_layer_id, j,
+        int64_t *gpu_ptr_first = ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j,
                                               gpu_block_ids[seg.start_k]);
-        int64_t *gpu_ptr_next = ptr_at<Type>(gpu_tensor_handler,
-                                             i + start_layer_id, j,
+        int64_t *gpu_ptr_next = ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j,
                                              gpu_block_ids[seg.start_k] + 1);
         size_t gpu_pitch = (size_t)((char *)gpu_ptr_next - (char *)gpu_ptr_first);
         void *gpu_ptr = (char *)gpu_ptr_first +
@@ -723,8 +719,7 @@ void ce_transfer_segment_scatter(
       int64_t seg_offset = 0;
       for (const auto &seg : ce_analysis.segments) {
         int64_t seg_size = (int64_t)seg.nr_blocks * chunk_size_in_bytes;
-        int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                        i + start_layer_id, j,
+        int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j,
                                         gpu_block_ids[seg.start_k]);
         int64_t *gpu_ptr_off =
             reinterpret_cast<int64_t *>(gpu_ptr) +
@@ -777,8 +772,7 @@ void ce_transfer_segment_scatter(
       int64_t off = 0;
       for (const auto &seg : ce_analysis.segments) {
         int64_t seg_size = (int64_t)seg.nr_blocks * chunk_size_in_bytes;
-        int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                        i + start_layer_id, j,
+        int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j,
                                         gpu_block_ids[seg.start_k]);
         int64_t *gpu_ptr_off =
             reinterpret_cast<int64_t *>(gpu_ptr) +

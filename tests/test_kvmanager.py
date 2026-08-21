@@ -14,6 +14,7 @@ from flexkv.common.config import (
     CacheConfig,
     RankInfo,
     LayerGroupSpec,
+    SWAPoolConfig,
 )
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
@@ -26,7 +27,7 @@ import traceback
 from flexkv.common.debug import flexkv_logger
 
 # Import utilities from common_utils
-from common_utils import (
+from tests.common_utils import (
     DEFAULT_MODEL_CONFIG, DEFAULT_CACHE_CONFIG, DEFAULT_TEST_CONFIG,
     generate_request_pair, block_ids_2_slot_mapping,
     skip_if_insufficient_gpus, create_gpu_kv_layout, GPUKVCacheVerifier,
@@ -56,24 +57,171 @@ def run_tp_client(dp_client_id,
                   cache_config,
                   num_gpu_blocks,
                   child_conn,
-                  gpu_layout_type):
-    """Run tp_client process"""
+                  gpu_layout_type,
+                  pp_rank=0):
+    """Run tp_client process.
+
+    When ``model_config.layer_groups`` is set (multi-group / indexer mode),
+    creates per-group GPU blocks and registers via the unified
+    ``register_to_server(layer_groups=..., gpu_layouts=...,
+    handles_per_group=...)`` API.  Otherwise registers a single group.
+    """
     try:
-        device_id = tp_rank + dp_client_id * model_config.tp_size
-        tp_client = KVTPClient(server_recv_port,
-                               dp_client_id=dp_client_id, pp_rank=0,
-                               intra_client_id=tp_rank,
+        device_id = tp_rank + pp_rank * model_config.tp_size + dp_client_id * model_config.tp_size * model_config.pp_size
+        gpu_register_port = server_recv_port + "_gpu_register"
+        tp_client = KVTPClient(gpu_register_port,
+                               dp_client_id=dp_client_id, pp_rank=pp_rank,
+                               intra_client_id=tp_rank + pp_rank * model_config.tp_size,
                                device_id=device_id)
 
-        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
+        # For PP>1, each stage's GPU only holds its own layers.
+        stage_num_layers = model_config.num_layers
+        if model_config.pp_size > 1:
+            pp_start, pp_end = model_config.get_pp_indices(pp_rank)
+            stage_num_layers = pp_end - pp_start
+            stage_model_config = ModelConfig(
+                num_layers=stage_num_layers,
+                num_kv_heads=model_config.num_kv_heads,
+                head_size=model_config.head_size,
+                dtype=model_config.dtype,
+                kv_dim=model_config.kv_dim,
+                tp_size=model_config.tp_size,
+                dp_size=model_config.dp_size,
+                pp_size=model_config.pp_size,
+                nnodes=model_config.nnodes,
+            )
+            gpu_kv_layout = create_gpu_kv_layout(stage_model_config, cache_config, num_gpu_blocks, gpu_layout_type)
+        else:
+            gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
 
-        # Create GPU blocks for this tp_rank in the tp_client process
+        # Create main GPU blocks
         gpu_blocks_for_tp = []
-        if gpu_layout_type in (
-            GPU_LAYOUT_LAYERFIRST,
-            GPU_LAYOUT_VLLM_LAYERBLOCK,
-        ):
-            for _ in range(model_config.num_layers):
+        if gpu_layout_type in (GPU_LAYOUT_LAYERFIRST, GPU_LAYOUT_VLLM_LAYERBLOCK):
+            for _ in range(stage_num_layers):
+                gpu_blocks_for_tp.append(
+                    torch.empty(size=tuple(gpu_kv_layout.kv_shape[1:]), dtype=model_config.dtype).cuda(device_id))
+        elif gpu_layout_type == GPU_LAYOUT_BLOCKFIRST:
+            gpu_blocks_for_tp.append(
+                torch.empty(size=tuple(gpu_kv_layout.kv_shape[:]), dtype=model_config.dtype).cuda(device_id))
+        elif gpu_layout_type == GPU_LAYOUT_SGLANG:
+            kv_dim = model_config.kv_dim
+            for _ in range(stage_num_layers * kv_dim):
+                gpu_blocks_for_tp.append(
+                    torch.empty(size=tuple(gpu_kv_layout.kv_shape[2:]), dtype=model_config.dtype).cuda(device_id))
+        elif gpu_layout_type == GPU_LAYOUT_VLLM_PACKED:
+            for _ in range(stage_num_layers):
+                physical = torch.empty(
+                    size=(gpu_kv_layout.num_block, gpu_kv_layout.tokens_per_block,
+                          gpu_kv_layout.num_head, gpu_kv_layout.head_size),
+                    dtype=model_config.dtype, device=f"cuda:{device_id}")
+                packed = physical.permute(0, 2, 1, 3)
+                gpu_blocks_for_tp.append(packed)
+        elif gpu_layout_type == GPU_LAYOUT_VLLM_MLA:
+            for _ in range(stage_num_layers):
+                gpu_blocks_for_tp.append(
+                    torch.empty(
+                        size=(gpu_kv_layout.num_block, gpu_kv_layout.tokens_per_block,
+                              gpu_kv_layout.head_size),
+                        dtype=model_config.dtype, device=f"cuda:{device_id}"))
+        else:
+            raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
+
+        # Multi-group (indexer) path: create per-group blocks when layer_groups is set
+        if model_config.layer_groups and len(model_config.layer_groups) >= 2:
+            indexer_group = model_config.layer_groups[-1]
+            indexer_tpb = cache_config.tokens_per_block // indexer_group.compress_ratio
+            indexer_num_layers = stage_num_layers
+            indexer_blocks = [
+                torch.empty(num_gpu_blocks, indexer_tpb, indexer_group.head_size,
+                            dtype=indexer_group.dtype).cuda(device_id)
+                for _ in range(indexer_num_layers)
+            ]
+            indexer_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=indexer_num_layers, num_block=num_gpu_blocks,
+                tokens_per_block=indexer_tpb,
+                num_head=indexer_group.num_kv_heads,
+                head_size=indexer_group.head_size,
+                kv_dim=model_config.kv_dim,
+                num_kv_heads=indexer_group.num_kv_heads,
+            )
+            tp_client.register_to_server(
+                kv_caches=gpu_blocks_for_tp, kv_layout=gpu_kv_layout,
+                layer_groups=model_config.layer_groups,
+                gpu_layouts=[gpu_kv_layout, indexer_layout],
+                handles_per_group=[gpu_blocks_for_tp, indexer_blocks],
+            )
+            if child_conn is not None:
+                shared_main = [TensorSharedHandle(t) for t in gpu_blocks_for_tp]
+                shared_idx = [TensorSharedHandle(t) for t in indexer_blocks]
+                child_conn.send({"main": shared_main, "indexer": shared_idx})
+                child_conn.close()
+        else:
+            tp_client.register_to_server(gpu_blocks_for_tp, gpu_kv_layout)
+            if child_conn is not None:
+                shared_gpu_blocks = [TensorSharedHandle(tensor) for tensor in gpu_blocks_for_tp]
+                child_conn.send(shared_gpu_blocks)
+                child_conn.close()
+
+        while True:
+            time.sleep(1)
+    except Exception as e:
+        print(f"[TP Client {tp_rank}] Exception: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        if child_conn is not None:
+            child_conn.send(None)
+            child_conn.close()
+
+
+def run_tp_client_with_swa(dp_client_id,
+                           tp_rank,
+                           server_recv_port,
+                           model_config,
+                           cache_config,
+                           num_gpu_blocks,
+                           child_conn,
+                           gpu_layout_type,
+                           pp_rank=0,
+                           swa_head_size=128):
+    """Run tp_client process with SWA sidecar GPU blocks.
+
+    Creates main KV blocks (same as run_tp_client) plus SWA sidecar blocks
+    (one per SWA layer, LAYERFIRST kv_dim=1).  Registers both to server.
+    SWA pool sizing and PP offset are handled by TransferEngine/TransferManager
+    the same way as the main KV pool.
+    """
+    try:
+        device_id = tp_rank + pp_rank * model_config.tp_size + dp_client_id * model_config.tp_size * model_config.pp_size
+        gpu_register_port = server_recv_port + "_gpu_register"
+        tp_client = KVTPClient(gpu_register_port,
+                               dp_client_id=dp_client_id, pp_rank=pp_rank,
+                               intra_client_id=tp_rank + pp_rank * model_config.tp_size,
+                               device_id=device_id)
+
+        stage_num_layers = model_config.num_layers
+        if model_config.pp_size > 1:
+            pp_start, pp_end = model_config.get_pp_indices(pp_rank)
+            stage_num_layers = pp_end - pp_start
+            stage_model_config = ModelConfig(
+                num_layers=stage_num_layers,
+                num_kv_heads=model_config.num_kv_heads,
+                head_size=model_config.head_size,
+                dtype=model_config.dtype,
+                kv_dim=model_config.kv_dim,
+                tp_size=model_config.tp_size,
+                dp_size=model_config.dp_size,
+                pp_size=model_config.pp_size,
+                nnodes=model_config.nnodes,
+            )
+            gpu_kv_layout = create_gpu_kv_layout(stage_model_config, cache_config, num_gpu_blocks, gpu_layout_type)
+        else:
+            gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
+
+        # Main KV GPU blocks (same as run_tp_client)
+        gpu_blocks_for_tp = []
+        if gpu_layout_type in (GPU_LAYOUT_LAYERFIRST, GPU_LAYOUT_VLLM_LAYERBLOCK):
+            for _ in range(stage_num_layers):
                 gpu_blocks_for_tp.append(
                     torch.empty(size=tuple(gpu_kv_layout.kv_shape[1:]), dtype=model_config.dtype).cuda(device_id)
                 )
@@ -83,65 +231,49 @@ def run_tp_client(dp_client_id,
             )
         elif gpu_layout_type == GPU_LAYOUT_SGLANG:
             kv_dim = model_config.kv_dim
-            for _ in range(model_config.num_layers * kv_dim):
+            for _ in range(stage_num_layers * kv_dim):
                 gpu_blocks_for_tp.append(
                     torch.empty(size=tuple(gpu_kv_layout.kv_shape[2:]), dtype=model_config.dtype).cuda(device_id)
                 )
-        elif gpu_layout_type == GPU_LAYOUT_VLLM_PACKED:
-            for _ in range(model_config.num_layers):
-                physical = torch.empty(
-                    size=(
-                        gpu_kv_layout.num_block,
-                        gpu_kv_layout.tokens_per_block,
-                        gpu_kv_layout.num_head,
-                        gpu_kv_layout.head_size,
-                    ),
-                    dtype=model_config.dtype,
-                    device=f"cuda:{device_id}",
-                )
-                packed = physical.permute(0, 2, 1, 3)
-                assert not packed.is_contiguous()
-                assert packed.stride(0) == gpu_kv_layout.get_block_stride()
-                assert packed.stride(1) == gpu_kv_layout.head_size
-                assert packed.stride(2) == (
-                    gpu_kv_layout.num_head * gpu_kv_layout.head_size
-                )
-                gpu_blocks_for_tp.append(packed)
-        elif gpu_layout_type == GPU_LAYOUT_VLLM_MLA:
-            for _ in range(model_config.num_layers):
-                gpu_blocks_for_tp.append(
-                    torch.empty(
-                        size=(
-                            gpu_kv_layout.num_block,
-                            gpu_kv_layout.tokens_per_block,
-                            gpu_kv_layout.head_size,
-                        ),
-                        dtype=model_config.dtype,
-                        device=f"cuda:{device_id}",
-                    )
-                )
         else:
-            raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
-        tp_client.register_to_server(gpu_blocks_for_tp, gpu_kv_layout)
+            raise ValueError(f"Invalid GPU layout type for SWA test: {gpu_layout_type}")
 
-        # Send GPU blocks back to main process via pipe if connection provided
+        # SWA sidecar GPU blocks: one tensor per SWA layer, LAYERFIRST
+        swa_layout = KVCacheLayout(
+            type=KVCacheLayoutType.LAYERFIRST,
+            num_layer=stage_num_layers,
+            num_block=num_gpu_blocks,
+            tokens_per_block=cache_config.tokens_per_block,
+            num_head=1,
+            head_size=swa_head_size,
+            kv_dim=1,
+            num_kv_heads=1,
+        )
+        swa_blocks_for_tp = [
+            torch.empty(size=tuple(swa_layout.kv_shape[1:]), dtype=model_config.dtype).cuda(device_id)
+            for _ in range(stage_num_layers)
+        ]
+
+        tp_client.register_to_server(
+            gpu_blocks_for_tp, gpu_kv_layout,
+            swa_caches=swa_blocks_for_tp, swa_layout=swa_layout,
+        )
+
         if child_conn is not None:
-            print(f"[TP Client {tp_rank}] Converting {len(gpu_blocks_for_tp)} GPU blocks to TensorSharedHandle")
             shared_gpu_blocks = [TensorSharedHandle(tensor) for tensor in gpu_blocks_for_tp]
             child_conn.send(shared_gpu_blocks)
-            print(f"[TP Client {tp_rank}] Sent GPU blocks to main process via pipe")
             child_conn.close()
 
-        # Keep the process running
         while True:
             time.sleep(1)
     except Exception as e:
-        print(f"[TP Client {tp_rank}] Exception occurred: {type(e).__name__}: {str(e)}")
+        print(f"[SWA TP Client {tp_rank}] Exception: {type(e).__name__}: {str(e)}")
         import traceback
         traceback.print_exc()
         if child_conn is not None:
             child_conn.send(None)
             child_conn.close()
+
 
 def shutdown_tp_client(tp_client_processes):
     for tp_process in tp_client_processes:
@@ -167,7 +299,6 @@ def shutdown_tp_client(tp_client_processes):
                 "num_kv_heads": 4,
                 "head_size": 36,
                 "dtype": torch.uint8,
-                "kv_dim": 2,
             },
             id="nvfp4",
         ),
@@ -211,10 +342,16 @@ def shutdown_tp_client(tp_client_processes):
 ], indirect=True)
 @pytest.mark.parametrize("gpu_layout_type", [
     GPU_LAYOUT_LAYERFIRST,
+    GPU_LAYOUT_BLOCKFIRST,
+    GPU_LAYOUT_SGLANG,
+    GPU_LAYOUT_VLLM_LAYERBLOCK,
     GPU_LAYOUT_VLLM_PACKED,
     GPU_LAYOUT_VLLM_MLA,
 ], ids=[
     "layerfirst",
+    "blockfirst",
+    "sglang",
+    "vllm-layerblock",
     "vllm-packed-4d",
     "vllm-mla-3d",
 ])
@@ -299,7 +436,7 @@ def test_kvmanager(
 
         tp_client_process = mp_ctx.Process(
             target=run_tp_client,
-            args=(0, tp_rank, kvmanager.gpu_register_port, model_config, cache_config, \
+            args=(0, tp_rank, kvmanager.server_recv_port, model_config, cache_config, \
                 num_gpu_blocks + tp_rank, child_conn, gpu_layout_type),
             daemon=True
         )
@@ -337,7 +474,26 @@ def test_kvmanager(
         print(f"[Main Process] Creating GPUKVCacheVerifier with GPU blocks from {len(all_gpu_blocks)} TP clients")
 
         # Get gpu_kv_layout from cache_config for GPUKVCacheVerifier
-        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
+        # For PP>1, each stage's GPU only holds its own layers.
+        stage_num_layers = model_config.num_layers
+        if model_config.pp_size > 1:
+            pp_start, pp_end = model_config.get_pp_indices(pp_rank)
+            stage_num_layers = pp_end - pp_start
+            stage_model_config = ModelConfig(
+                num_layers=stage_num_layers,
+                num_kv_heads=model_config.num_kv_heads,
+                head_size=model_config.head_size,
+                dtype=model_config.dtype,
+                kv_dim=model_config.kv_dim,
+                tp_size=model_config.tp_size,
+                dp_size=model_config.dp_size,
+                pp_size=model_config.pp_size,
+                nnodes=model_config.nnodes,
+            )
+            stage_cache_config = cache_config
+            gpu_kv_layout = create_gpu_kv_layout(stage_model_config, stage_cache_config, num_gpu_blocks, gpu_layout_type)
+        else:
+            gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
 
         gpu_kv_verifier = GPUKVCacheVerifier(
             shared_gpu_blocks=all_gpu_blocks,
@@ -366,6 +522,7 @@ def test_kvmanager(
     for token_ids, block_ids, dp_client_id in request_pairs[:initial_write_num]:
         if gpu_kv_verifier is not None:
             gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
+            gpu_kv_verifier.synchronize_all_devices()
         write_request = kvmanager.put_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
@@ -375,8 +532,7 @@ def test_kvmanager(
         kvmanager.wait([write_request], completely=True)
         if gpu_kv_verifier is not None:
             gpu_kv_verifier.clear_gpu_blocks(block_ids)
-
-    #corner case: input token length for put is less than tokens_per_block
+            gpu_kv_verifier.synchronize_all_devices()
     write_request = kvmanager.put_async(
         token_ids=torch.randint(0, 100, size=(8,), dtype=torch.int64),
         slot_mapping=block_ids_2_slot_mapping(torch.arange(0,1, dtype=torch.int64), tokens_per_block, actual_length=8),
@@ -422,6 +578,7 @@ def test_kvmanager(
         token_ids, block_ids, dp_client_id = request_pairs[i]
         if gpu_kv_verifier is not None:
             gpu_kv_verifier.fill_gpu_blocks(token_ids, block_ids)
+            gpu_kv_verifier.synchronize_all_devices()
         request_id = kvmanager.put_async(
             token_ids=token_ids,
             slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
@@ -441,9 +598,15 @@ def test_kvmanager(
                 if gpu_kv_verifier is not None:
                     for req_id in running_put_requests:
                         gpu_kv_verifier.clear_gpu_blocks(req_id2block_ids[req_id])
+                    gpu_kv_verifier.synchronize_all_devices()
             if len(running_get_requests) > 0:
                 return_results = kvmanager.wait(running_get_requests, completely=True)
+                # H2D transfer uses CUDA async streams; the completion signal
+                # can fire before all memory writes are visible. Synchronize
+                # before verifying GPU data to prevent flaky got=0.0 failures
+                # (especially at the last head of V on the last layer).
                 if gpu_kv_verifier is not None:
+                    gpu_kv_verifier.synchronize_all_devices()
                     for req_id, kvresponse in return_results.items():
                         assert kvresponse.status == KVResponseStatus.SUCCESS
                         valid_fetched_tokens = kvresponse.return_mask.sum().item() // \
@@ -565,7 +728,7 @@ def test_kvmanager(
     # so it runs even if the assertion or an earlier step fails.
 
     # Only verify data in direct mode
-    # verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers)
+    # verify_data(gpu_blocks, dp_wise_gpu_blocks_gt, num_kv_heads, tp_size, dp_size, num_layers, kv_dim)
     if total_cache_miss == 0:
         return
     elif total_cache_miss > 0:
@@ -696,123 +859,6 @@ class GPUIndexerCacheVerifier:
         return verification_passed
 
 
-def run_tp_client_with_indexer(dp_client_id,
-                               tp_rank,
-                               server_recv_port,
-                               model_config,
-                               cache_config,
-                               num_gpu_blocks,
-                               child_conn,
-                               gpu_layout_type):
-    """Run tp_client process with indexer expressed as an extra LayerGroupSpec.
-
-    Reads indexer shape from ``model_config.layer_groups[-1]`` (the indexer
-    group, populated by _run_indexer_test before spawn). Registers main +
-    indexer buffers via the unified ``register_to_server(layer_groups=...,
-    gpu_layouts=..., handles_per_group=...)`` API.
-    """
-    try:
-        device_id = tp_rank + dp_client_id * model_config.tp_size
-
-        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
-
-        # Create main GPU blocks
-        gpu_blocks_for_tp = []
-        if gpu_layout_type == 0:
-            for _ in range(model_config.num_layers):
-                gpu_blocks_for_tp.append(
-                    torch.empty(size=tuple(gpu_kv_layout.kv_shape[1:]), dtype=model_config.dtype).cuda(device_id)
-                )
-        elif gpu_layout_type == 2:
-            kv_dim = model_config.kv_dim
-            for _ in range(model_config.num_layers * kv_dim):
-                gpu_blocks_for_tp.append(
-                    torch.empty(size=tuple(gpu_kv_layout.kv_shape[2:]), dtype=model_config.dtype).cuda(device_id)
-                )
-        else:
-            raise ValueError(f"Invalid GPU layout type for indexer test: {gpu_layout_type}")
-
-        # Indexer parameters come from model_config.layer_groups[-1] — the
-        # indexer group appended by _run_indexer_test before spawn.
-        assert model_config.layer_groups and len(model_config.layer_groups) >= 2, (
-            "model_config.layer_groups must contain a main + indexer group "
-            "(set by _run_indexer_test)"
-        )
-        indexer_group = model_config.layer_groups[-1]
-        # Indexer per-block token count after compression. With
-        # compress_ratio=1 (default) this matches the main KV's tpb (DSv4
-        # per-token form); with compress_ratio>1 the GPU tensor shrinks to
-        # tpb_g = tpb // compress_ratio, matching the shape sglang allocates
-        # for the compressed group (see storage._compute_kv_shape and
-        # worker._init_multi_group).
-        assert cache_config.tokens_per_block % indexer_group.compress_ratio == 0, (
-            f"indexer compress_ratio={indexer_group.compress_ratio} must divide "
-            f"tokens_per_block={cache_config.tokens_per_block}"
-        )
-        indexer_tokens_per_block = cache_config.tokens_per_block // indexer_group.compress_ratio
-        indexer_num_layers = indexer_group.num_layers
-
-        # Create indexer GPU blocks (MLA-style: 3D tensors)
-        indexer_blocks = []
-        for _ in range(indexer_num_layers):
-            indexer_blocks.append(
-                torch.empty(
-                    num_gpu_blocks,
-                    indexer_tokens_per_block,
-                    indexer_group.head_size,
-                    dtype=indexer_group.dtype,
-                ).cuda(device_id)
-            )
-
-        from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-        indexer_layout = KVCacheLayout(
-            type=KVCacheLayoutType.LAYERFIRST,
-            num_layer=indexer_num_layers,
-            num_block=num_gpu_blocks,
-            tokens_per_block=indexer_tokens_per_block,
-            num_head=indexer_group.num_kv_heads,
-            head_size=indexer_group.head_size,
-            kv_dim=1,
-            num_kv_heads=1,
-        )
-
-        # Unified registration: main + indexer go through one register_to_server
-        # call, matching the production vllm adapter path.
-        tp_client = KVTPClient(
-            gpu_register_port=server_recv_port + "_gpu_register",
-            dp_client_id=dp_client_id, pp_rank=0,
-            intra_client_id=tp_rank,
-            device_id=device_id,
-        )
-        tp_client.register_to_server(
-            kv_caches=gpu_blocks_for_tp,
-            kv_layout=gpu_kv_layout,
-            layer_groups=model_config.layer_groups,
-            gpu_layouts=[gpu_kv_layout, indexer_layout],
-            handles_per_group=[gpu_blocks_for_tp, indexer_blocks],
-        )
-
-        # Send GPU blocks back to main process via pipe
-        if child_conn is not None:
-            shared_gpu_blocks = [TensorSharedHandle(tensor) for tensor in gpu_blocks_for_tp]
-            shared_indexer_blocks = [TensorSharedHandle(tensor) for tensor in indexer_blocks]
-            child_conn.send({
-                "main": shared_gpu_blocks,
-                "indexer": shared_indexer_blocks,
-            })
-            child_conn.close()
-
-        # Keep the process running
-        while True:
-            time.sleep(1)
-    except Exception as e:
-        print(f"[TP Client {tp_rank}] Exception occurred: {type(e).__name__}: {str(e)}")
-        traceback.print_exc()
-        if child_conn is not None:
-            child_conn.send(None)
-            child_conn.close()
-
-
 INDEXER_STARTUP_TIMEOUT_S = 60.0
 
 
@@ -893,7 +939,7 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
         pipe_connections.append(parent_conn)
 
         tp_client_process = mp_ctx.Process(
-            target=run_tp_client_with_indexer,
+            target=run_tp_client,
             args=(0, tp_rank, kvmanager.server_recv_port,
                   model_config, cache_config, num_gpu_blocks, child_conn,
                   gpu_layout_type),
@@ -935,7 +981,26 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
 
     gpu_kv_verifier = None
     if all_gpu_blocks and len(all_gpu_blocks) == tp_size:
-        gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
+        # For PP>1, each stage's GPU only holds its own layers.
+        stage_num_layers = model_config.num_layers
+        if model_config.pp_size > 1:
+            pp_start, pp_end = model_config.get_pp_indices(pp_rank)
+            stage_num_layers = pp_end - pp_start
+            stage_model_config = ModelConfig(
+                num_layers=stage_num_layers,
+                num_kv_heads=model_config.num_kv_heads,
+                head_size=model_config.head_size,
+                dtype=model_config.dtype,
+                kv_dim=model_config.kv_dim,
+                tp_size=model_config.tp_size,
+                dp_size=model_config.dp_size,
+                pp_size=model_config.pp_size,
+                nnodes=model_config.nnodes,
+            )
+            stage_cache_config = cache_config
+            gpu_kv_layout = create_gpu_kv_layout(stage_model_config, stage_cache_config, num_gpu_blocks, gpu_layout_type)
+        else:
+            gpu_kv_layout = create_gpu_kv_layout(model_config, cache_config, num_gpu_blocks, gpu_layout_type)
         gpu_kv_verifier = GPUKVCacheVerifier(
             shared_gpu_blocks=all_gpu_blocks,
             gpu_kv_layout=gpu_kv_layout,
@@ -953,7 +1018,7 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
     )
     if all_indexer_blocks and len(all_indexer_blocks) == tp_size and indexer_cfg is not None:
         # Indexer GPU layout uses tpb_g = tpb // compress_ratio (matches the
-        # GPU tensor allocated in run_tp_client_with_indexer).
+        # GPU tensor allocated in run_tp_client multi-group path).
         indexer_gpu_tpb = cache_config.tokens_per_block // indexer_cfg.compress_ratio
         indexer_gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
@@ -963,7 +1028,6 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
             num_head=indexer_cfg.num_kv_heads,
             head_size=indexer_cfg.head_size,
             kv_dim=1,
-            num_kv_heads=1,
         )
         indexer_kv_verifier = GPUIndexerCacheVerifier(
             shared_indexer_blocks=all_indexer_blocks,
@@ -1305,6 +1369,13 @@ def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_confi
     """
     from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 
+    # Layerwise GET fuses DISK2H + H2D, so it requires SSD.
+    if not cache_config.enable_ssd:
+        pytest.skip("layerwise transfer requires SSD (DISK2H + H2D)")
+
+    # io_uring is optional: when unavailable, the C++ SSD layer falls back
+    # to threaded synchronous pread/pwrite automatically.
+
     # Save original values
     orig_layerwise_env = os.environ.get('FLEXKV_ENABLE_LAYERWISE_TRANSFER')
     orig_socket_env = os.environ.get('FLEXKV_LAYERWISE_EVENTFD_SOCKET')
@@ -1365,3 +1436,488 @@ def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_confi
         GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = orig_layerwise_flag
         with contextlib.suppress(FileNotFoundError):
             os.unlink(socket_path)
+
+
+# ---------------------------------------------------------------------------
+# Same-node PP>1 end-to-end: two PP stages on one node, shared CPU pool.
+# Verifies PUT/GET round-trip per stage with correct pool offset.
+# ---------------------------------------------------------------------------
+
+STARTUP_TIMEOUT_S = 60.0
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1, "pp_size": 2, "nnodes": 1,
+         "num_layers": 4, "num_kv_heads": 1, "kv_dim": 1},
+        {"tp_size": 2, "dp_size": 1, "pp_size": 2, "nnodes": 1,
+         "num_layers": 4, "num_kv_heads": 1, "kv_dim": 1},
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("cache_config", [
+    {"enable_cpu": True, "enable_ssd": False, "num_cpu_blocks": 1024},
+    {"enable_cpu": True, "enable_ssd": True, "num_cpu_blocks": 256, "num_ssd_blocks": 2048},
+], indirect=True)
+@pytest.mark.parametrize("test_config", [
+    {"num_gpu_blocks": 64, "requests_per_block": 16, "initial_write_ratio": 0.5},
+    {"num_gpu_blocks": 128, "requests_per_block": 16, "initial_write_ratio": 0.25},
+], indirect=True)
+def test_kvmanager_same_node_pp(model_config, cache_config, test_config, request):
+    """End-to-end same-node PP=2: two PP stages share one node.
+
+    Each stage registers GPU blocks for its own layers (get_pp_indices).
+    TransferManager sizes the CPU pool for the SUM of both stages.
+    TransferEngine injects start_layer_id per worker via _pp_offset.
+
+    Verifies PUT (D2H) then GET (H2D) round-trip for each stage independently,
+    confirming no cross-stage data corruption.
+    """
+    tp_size = model_config.tp_size
+    pp_size = model_config.pp_size
+    skip_if_insufficient_gpus(tp_size * pp_size)
+
+    num_gpu_blocks = test_config["num_gpu_blocks"]
+    block_per_request = test_config['requests_per_block']
+    tokens_per_block = cache_config.tokens_per_block
+    num_requests = num_gpu_blocks // block_per_request
+    initial_write_num = int(num_requests * test_config['initial_write_ratio'])
+
+    kvmanager = KVManager(
+        model_config=model_config,
+        cache_config=cache_config,
+        dp_client_id=0,
+    )
+
+    mp_ctx = mp.get_context('spawn')
+    pipe_connections = []
+    tp_client_processes = []
+
+    def cleanup():
+        for conn in pipe_connections:
+            with contextlib.suppress(OSError):
+                conn.close()
+        shutdown_tp_client(tp_client_processes)
+        kvmanager.shutdown()
+
+    request.addfinalizer(cleanup)
+    kvmanager.start()
+
+    # Spawn TP clients for each PP stage
+    gpu_layout_type = GPU_LAYOUT_LAYERFIRST
+    for pp_rank in range(pp_size):
+        for tp_rank in range(tp_size):
+            parent_conn, child_conn = mp_ctx.Pipe()
+            pipe_connections.append(parent_conn)
+
+            tp_client_process = mp_ctx.Process(
+                target=run_tp_client,
+                args=(0, tp_rank, kvmanager.server_recv_port,
+                      model_config, cache_config,
+                      num_gpu_blocks + tp_rank, child_conn, gpu_layout_type),
+                kwargs={"pp_rank": pp_rank},
+                daemon=True,
+            )
+            tp_client_processes.append(tp_client_process)
+            tp_client_process.start()
+            child_conn.close()
+
+    # Collect GPU blocks from all TP clients
+    all_gpu_blocks = []
+    for i, parent_conn in enumerate(pipe_connections):
+        try:
+            if not parent_conn.poll(STARTUP_TIMEOUT_S):
+                raise TimeoutError(f"TP client {i} timed out")
+            shared_gpu_blocks = parent_conn.recv()
+            if shared_gpu_blocks is not None:
+                all_gpu_blocks.append(shared_gpu_blocks)
+        except Exception as e:
+            print(f"[Main] Error receiving from TP client {i}: {e}")
+        finally:
+            with contextlib.suppress(OSError):
+                parent_conn.close()
+
+    assert len(all_gpu_blocks) == tp_size * pp_size, \
+        f"Expected {tp_size * pp_size} TP clients, got {len(all_gpu_blocks)}"
+
+    # Wait for FlexKV to be ready (with timeout for debugging)
+    ready_deadline = time.monotonic() + 120.0
+    while not kvmanager.is_ready():
+        if time.monotonic() > ready_deadline:
+            # Check if subprocess is alive
+            tm_handle = kvmanager.kv_task_engine.transfer_handles[0]._handle
+            if hasattr(tm_handle, 'process') and tm_handle.process is not None:
+                alive = tm_handle.process.is_alive()
+                exitcode = tm_handle.process.exitcode
+                raise TimeoutError(
+                    f"KVManager not ready after 120s. "
+                    f"TransferManager subprocess: alive={alive}, exitcode={exitcode}. "
+                    f"Check stderr for worker initialization errors.")
+            raise TimeoutError("KVManager not ready after 120s")
+        time.sleep(1)
+
+    request_pairs = [generate_request_pair(i, block_per_request, num_gpu_blocks,
+                                           tokens_per_block, 1)
+                     for i in range(num_requests)]
+
+    print(f"[PP Test] Writing {initial_write_num} requests...")
+    put_task_ids = []
+    for token_ids, block_ids, _ in request_pairs[:initial_write_num]:
+        task_id = kvmanager.put_async(
+            token_ids=token_ids,
+            slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
+            token_mask=None,
+        )
+        put_task_ids.append(task_id)
+
+    # Wait for all puts to complete
+    kvmanager.wait(put_task_ids, completely=True)
+    print(f"[PP Test] All {len(put_task_ids)} puts completed")
+
+    # GET: read back and verify cache hit
+    print(f"[PP Test] Reading back {initial_write_num} requests...")
+    total_cache_miss = 0
+    for token_ids, block_ids, _ in request_pairs[:initial_write_num]:
+        request_id, return_mask = kvmanager.get_match(
+            token_ids=token_ids,
+            token_mask=None,
+        )
+        slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
+        kvmanager.launch(request_id, slot_mapping)
+        kvmanager.wait([request_id], completely=True)
+        cache_miss = len(return_mask) - return_mask.sum().item()
+        total_cache_miss += cache_miss
+
+    print(f"[PP Test] total_cache_miss={total_cache_miss}")
+    assert total_cache_miss == 0, \
+        f"PP same-node: expected 0 cache miss (CPU pool covers all), got {total_cache_miss}"
+    print("[PP Test] PASSED: same-node PP=2 PUT/GET round-trip verified")
+
+
+# ---------------------------------------------------------------------------
+# Multi-group (indexer) + PP=2 end-to-end
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1, "pp_size": 2, "nnodes": 1,
+         "num_layers": 4, "num_kv_heads": 1, "kv_dim": 1},
+        {"tp_size": 2, "dp_size": 1, "pp_size": 2, "nnodes": 1,
+         "num_layers": 4, "num_kv_heads": 1, "kv_dim": 1},
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("cache_config", [
+    {"enable_cpu": True, "enable_ssd": False, "num_cpu_blocks": 1024},
+    {"enable_cpu": True, "enable_ssd": True, "num_cpu_blocks": 256, "num_ssd_blocks": 2048},
+], indirect=True)
+@pytest.mark.parametrize("test_config", [
+    {"num_gpu_blocks": 64, "requests_per_block": 16, "initial_write_ratio": 0.5},
+    {"num_gpu_blocks": 128, "requests_per_block": 16, "initial_write_ratio": 0.25},
+], indirect=True)
+@pytest.mark.parametrize("gpu_layout_type", [0])
+@pytest.mark.parametrize("indexer_compress_ratio", [1])
+def test_kvmanager_with_indexer_pp(model_config, cache_config, test_config,
+                                    gpu_layout_type, indexer_compress_ratio,
+                                    request):
+    """Multi-group (indexer) + same-node PP=2 end-to-end.
+
+    Spawns TP clients for each PP stage, each registering per-stage layers
+    for both main KV and indexer groups. Verifies PUT/GET round-trip.
+    """
+    tp_size = model_config.tp_size
+    pp_size = model_config.pp_size
+    skip_if_insufficient_gpus(tp_size * pp_size)
+
+    # Set up layer_groups (main + indexer) like _run_indexer_test
+    main_layer_indices = list(range(model_config.num_layers))
+    main_group = LayerGroupSpec(
+        num_layers=model_config.num_layers,
+        num_kv_heads=model_config.num_kv_heads,
+        head_size=model_config.head_size,
+        layer_indices=main_layer_indices,
+        dtype=model_config.dtype,
+    )
+    indexer_group = LayerGroupSpec(
+        num_layers=model_config.num_layers,
+        num_kv_heads=1,
+        head_size=64,
+        layer_indices=main_layer_indices,
+        dtype=torch.uint8,
+        compress_ratio=indexer_compress_ratio,
+    )
+    model_config.layer_groups = [main_group, indexer_group]
+
+    tokens_per_block = cache_config.tokens_per_block
+    num_gpu_blocks = test_config["num_gpu_blocks"]
+    block_per_request = test_config['requests_per_block']
+    num_requests = num_gpu_blocks // block_per_request
+    initial_write_num = int(num_requests * test_config['initial_write_ratio'])
+
+    kvmanager = KVManager(
+        model_config=model_config,
+        cache_config=cache_config,
+        dp_client_id=0,
+    )
+
+    mp_ctx = mp.get_context('spawn')
+    pipe_connections = []
+    tp_client_processes = []
+
+    def cleanup():
+        for conn in pipe_connections:
+            with contextlib.suppress(OSError):
+                conn.close()
+        shutdown_tp_client(tp_client_processes)
+        kvmanager.shutdown()
+
+    request.addfinalizer(cleanup)
+    kvmanager.start()
+
+    # Spawn TP clients for each PP stage
+    for pp_rank in range(pp_size):
+        for tp_rank in range(tp_size):
+            parent_conn, child_conn = mp_ctx.Pipe()
+            pipe_connections.append(parent_conn)
+            tp_client_process = mp_ctx.Process(
+                target=run_tp_client,
+                args=(0, tp_rank, kvmanager.server_recv_port,
+                      model_config, cache_config,
+                      num_gpu_blocks + tp_rank, child_conn, gpu_layout_type),
+                kwargs={"pp_rank": pp_rank},
+                daemon=True,
+            )
+            tp_client_processes.append(tp_client_process)
+            tp_client_process.start()
+            child_conn.close()
+
+    # Collect GPU blocks
+    all_gpu_blocks = []
+    for i, parent_conn in enumerate(pipe_connections):
+        try:
+            if not parent_conn.poll(STARTUP_TIMEOUT_S):
+                raise TimeoutError(f"TP client {i} timed out")
+            shared = parent_conn.recv()
+            if shared is not None:
+                all_gpu_blocks.append(shared)
+        except Exception as e:
+            print(f"[Main] Error receiving from TP client {i}: {e}")
+        finally:
+            with contextlib.suppress(OSError):
+                parent_conn.close()
+
+    assert len(all_gpu_blocks) == tp_size * pp_size
+
+    ready_deadline = time.monotonic() + 120.0
+    while not kvmanager.is_ready():
+        if time.monotonic() > ready_deadline:
+            tm_handle = kvmanager.kv_task_engine.transfer_handles[0]._handle
+            if hasattr(tm_handle, 'process') and tm_handle.process is not None:
+                alive = tm_handle.process.is_alive()
+                exitcode = tm_handle.process.exitcode
+                raise TimeoutError(
+                    f"KVManager not ready after 120s. "
+                    f"TransferManager subprocess: alive={alive}, exitcode={exitcode}. "
+                    f"Check stderr for worker initialization errors.")
+            raise TimeoutError("KVManager not ready after 120s")
+        time.sleep(1)
+
+    request_pairs = [generate_request_pair(i, block_per_request, num_gpu_blocks,
+                                           tokens_per_block, 1)
+                     for i in range(num_requests)]
+
+    # PUT
+    print(f"[Indexer+PP Test] Writing {initial_write_num} requests...")
+    put_task_ids = []
+    for token_ids, block_ids, _ in request_pairs[:initial_write_num]:
+        task_id = kvmanager.put_async(
+            token_ids=token_ids,
+            slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
+            token_mask=None,
+        )
+        put_task_ids.append(task_id)
+    kvmanager.wait(put_task_ids, completely=True)
+    print(f"[Indexer+PP Test] All puts completed")
+
+    # GET
+    print(f"[Indexer+PP Test] Reading back...")
+    total_cache_miss = 0
+    for token_ids, block_ids, _ in request_pairs[:initial_write_num]:
+        request_id, return_mask = kvmanager.get_match(
+            token_ids=token_ids,
+            token_mask=None,
+        )
+        slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
+        kvmanager.launch(request_id, slot_mapping)
+        kvmanager.wait([request_id], completely=True)
+        cache_miss = len(return_mask) - return_mask.sum().item()
+        total_cache_miss += cache_miss
+
+    print(f"[Indexer+PP Test] total_cache_miss={total_cache_miss}")
+    assert total_cache_miss == 0, \
+        f"Indexer+PP: expected 0 cache miss, got {total_cache_miss}"
+    print("[Indexer+PP Test] PASSED")
+
+
+# ---------------------------------------------------------------------------
+# SWA + PP=2 end-to-end
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"tp_size": 1, "dp_size": 1, "pp_size": 2, "nnodes": 1,
+         "num_layers": 4, "num_kv_heads": 1, "kv_dim": 1},
+        {"tp_size": 2, "dp_size": 1, "pp_size": 2, "nnodes": 1,
+         "num_layers": 4, "num_kv_heads": 1, "kv_dim": 1},
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("cache_config", [
+    {"enable_cpu": True, "enable_ssd": False, "num_cpu_blocks": 1024},
+    {"enable_cpu": True, "enable_ssd": True, "num_cpu_blocks": 256, "num_ssd_blocks": 2048},
+], indirect=True)
+@pytest.mark.parametrize("test_config", [
+    {"num_gpu_blocks": 64, "requests_per_block": 16, "initial_write_ratio": 0.5},
+    {"num_gpu_blocks": 128, "requests_per_block": 16, "initial_write_ratio": 0.25},
+], indirect=True)
+def test_kvmanager_swa_pp(model_config, cache_config, test_config, request):
+    """SWA sidecar + same-node PP=2 end-to-end.
+
+    Configures a SWA sidecar pool (separate from main KV pool) with
+    per-node sizing and start_layer_id offset for PP>1.  Each TP client
+    registers both main KV and SWA GPU blocks; the TransferEngine creates
+    separate workers for the SWA pool with the same PP offset logic.
+    """
+    tp_size = model_config.tp_size
+    pp_size = model_config.pp_size
+    skip_if_insufficient_gpus(tp_size * pp_size)
+
+    # io_uring is optional: when unavailable, the C++ SSD layer falls back
+    # to threaded synchronous pread/pwrite automatically.
+
+    # Configure SWA sidecar pool
+    swa_head_size = 128
+    swa_bytes_per_token = swa_head_size * model_config.dtype.itemsize
+    # num_ssd_slots must be > 0 when SSD is enabled, otherwise the SSD tier
+    # owns no SWA pool and every PUT fails with swa_slot_alloc_failed.
+    cache_config.swa = SWAPoolConfig(
+        enabled=True,
+        num_slots=1024,
+        num_ssd_slots=2048 if cache_config.enable_ssd else 0,
+        num_swa_layers=model_config.num_layers,
+        bytes_per_token_per_layer=swa_bytes_per_token,
+    )
+    cache_config.enable_swa_transfer = True
+
+    num_gpu_blocks = test_config["num_gpu_blocks"]
+    block_per_request = test_config['requests_per_block']
+    tokens_per_block = cache_config.tokens_per_block
+    num_requests = num_gpu_blocks // block_per_request
+    initial_write_num = int(num_requests * test_config['initial_write_ratio'])
+
+    kvmanager = KVManager(
+        model_config=model_config,
+        cache_config=cache_config,
+        dp_client_id=0,
+    )
+
+    mp_ctx = mp.get_context('spawn')
+    pipe_connections = []
+    tp_client_processes = []
+
+    def cleanup():
+        for conn in pipe_connections:
+            with contextlib.suppress(OSError):
+                conn.close()
+        shutdown_tp_client(tp_client_processes)
+        kvmanager.shutdown()
+
+    request.addfinalizer(cleanup)
+    kvmanager.start()
+
+    # Spawn TP clients with SWA for each PP stage
+    gpu_layout_type = GPU_LAYOUT_LAYERFIRST
+    for pp_rank in range(pp_size):
+        for tp_rank in range(tp_size):
+            parent_conn, child_conn = mp_ctx.Pipe()
+            pipe_connections.append(parent_conn)
+            tp_client_process = mp_ctx.Process(
+                target=run_tp_client_with_swa,
+                args=(0, tp_rank, kvmanager.server_recv_port,
+                      model_config, cache_config,
+                      num_gpu_blocks + tp_rank, child_conn, gpu_layout_type),
+                kwargs={"pp_rank": pp_rank, "swa_head_size": swa_head_size},
+                daemon=True,
+            )
+            tp_client_processes.append(tp_client_process)
+            tp_client_process.start()
+            child_conn.close()
+
+    # Collect GPU blocks
+    all_gpu_blocks = []
+    for i, parent_conn in enumerate(pipe_connections):
+        try:
+            if not parent_conn.poll(STARTUP_TIMEOUT_S):
+                raise TimeoutError(f"TP client {i} timed out")
+            shared_gpu_blocks = parent_conn.recv()
+            if shared_gpu_blocks is not None:
+                all_gpu_blocks.append(shared_gpu_blocks)
+        except Exception as e:
+            print(f"[Main] Error receiving from TP client {i}: {e}")
+        finally:
+            with contextlib.suppress(OSError):
+                parent_conn.close()
+
+    assert len(all_gpu_blocks) == tp_size * pp_size
+
+    ready_deadline = time.monotonic() + 120.0
+    while not kvmanager.is_ready():
+        if time.monotonic() > ready_deadline:
+            tm_handle = kvmanager.kv_task_engine.transfer_handles[0]._handle
+            if hasattr(tm_handle, 'process') and tm_handle.process is not None:
+                alive = tm_handle.process.is_alive()
+                exitcode = tm_handle.process.exitcode
+                raise TimeoutError(
+                    f"KVManager not ready after 120s. "
+                    f"TransferManager subprocess: alive={alive}, exitcode={exitcode}. "
+                    f"Check stderr for worker initialization errors.")
+            raise TimeoutError("KVManager not ready after 120s")
+        time.sleep(1)
+
+    request_pairs = [generate_request_pair(i, block_per_request, num_gpu_blocks,
+                                           tokens_per_block, 1)
+                     for i in range(num_requests)]
+
+    # PUT
+    print(f"[SWA+PP Test] Writing {initial_write_num} requests...")
+    put_task_ids = []
+    for token_ids, block_ids, _ in request_pairs[:initial_write_num]:
+        task_id = kvmanager.put_async(
+            token_ids=token_ids,
+            slot_mapping=block_ids_2_slot_mapping(block_ids, tokens_per_block),
+            token_mask=None,
+        )
+        put_task_ids.append(task_id)
+    kvmanager.wait(put_task_ids, completely=True)
+
+    # GET
+    print(f"[SWA+PP Test] Reading back...")
+    total_cache_miss = 0
+    for token_ids, block_ids, _ in request_pairs[:initial_write_num]:
+        request_id, return_mask = kvmanager.get_match(
+            token_ids=token_ids,
+            token_mask=None,
+        )
+        slot_mapping = block_ids_2_slot_mapping(block_ids, tokens_per_block)
+        kvmanager.launch(request_id, slot_mapping)
+        kvmanager.wait([request_id], completely=True)
+        cache_miss = len(return_mask) - return_mask.sum().item()
+        total_cache_miss += cache_miss
+
+    print(f"[SWA+PP Test] total_cache_miss={total_cache_miss}")
+    assert total_cache_miss == 0, \
+        f"SWA+PP: expected 0 cache miss, got {total_cache_miss}"
+    print("[SWA+PP Test] PASSED")

@@ -19,6 +19,7 @@ Run:
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import pytest
@@ -305,7 +306,8 @@ def _d2h_main_group(
         fx.strides["group_cpu_layer_strides"][group_idx],  # type: ignore[index]
         fx.strides["group_cpu_block_strides"][group_idx],  # type: ignore[index]
         fx.strides["group_chunk_sizes"][group_idx],  # type: ignore[index]
-        0,
+        0,  # pp_offset_bytes
+        0,  # start_layer_id
         g.num_layers,
         4,
         False,  # D2H
@@ -337,7 +339,8 @@ def _d2h_swa(
         fx.swa_strides["swa_cpu_layer_stride_in_bytes"],  # type: ignore[index]
         fx.swa_strides["swa_cpu_block_stride_in_bytes"],  # type: ignore[index]
         fx.swa_strides["swa_cpu_chunk_size_in_bytes"],  # type: ignore[index]
-        0,
+        0,  # pp_offset_bytes
+        0,  # start_layer_id
         NUM_ORIGINAL_LAYERS,
         4,
         False,
@@ -396,6 +399,8 @@ def _zero_all_gpu(fx: MultiGroupFixture) -> None:
 class TestLayerwiseDsv4MultiGroupSwaRoundtrip:
     def test_dsv4_write_read_roundtrip_main_indexer_swa(self) -> None:
         """GPU seed -> D2H (3 groups + SWA) -> layerwise H2D -> byte-exact restore."""
+        # io_uring is optional: when unavailable, the C++ SSD layer falls
+        # back to threaded synchronous pread/pwrite automatically.
         torch.cuda.set_device(DEVICE_ID)
         layer_groups = _dsv4_layer_groups()
         fx = _build_dsv4_fixture(layer_groups)

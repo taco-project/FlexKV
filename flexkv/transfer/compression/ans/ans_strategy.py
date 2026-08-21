@@ -199,6 +199,7 @@ class NvcompGpuCpuTpStrategy(CompressionStrategy):
                 transfer_num_cta,
                 transfer_type == TransferType.H2D,
                 use_ce_transfer,
+                worker.start_layer_id * worker.cpu_layer_stride_in_bytes,  # PP anchor
                 0,
                 worker.num_layers,
                 worker.kv_dim,

@@ -44,10 +44,11 @@ public:
       const int64_t ssd_chunk_size_in_bytes,
       const int64_t num_blocks_per_file,
       const bool is_read,  // true for SSD->GPU, false for GPU->SSD
-      const int layer_id,
+      const int start_layer_id,
       const int layer_granularity,
       const int kv_dim,
-      const int num_kv_heads = 1);
+      const int num_kv_heads = 1,
+      const int64_t ssd_pp_seek_offset_bytes = 0);
 
 private:
   using Task = std::function<void()>;

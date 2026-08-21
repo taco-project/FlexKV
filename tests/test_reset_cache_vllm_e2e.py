@@ -32,8 +32,17 @@ pytest.importorskip("flexkv")
 from vllm import SamplingParams  # noqa: E402  (guarded by importorskip above)
 
 # Default matches the user's `vllm serve` command; override with FLEXKV_TEST_MODEL.
-MODEL = "/raid/model/Qwen3-8B"
+MODEL = os.environ.get("FLEXKV_TEST_MODEL", "/raid/model/Qwen3-8B")
 MAX_MODEL_LEN = 8192
+
+# These e2e tests need a real local model directory; skip (not error) when it
+# is absent so the suite stays green on machines without the model.
+if not os.path.isdir(MODEL):
+    pytest.skip(
+        f"model {MODEL!r} not found; set FLEXKV_TEST_MODEL to a local model "
+        f"directory to run the vLLM cache-reset e2e tests",
+        allow_module_level=True,
+    )
 
 # Prometheus counter names (vllm/v1/metrics/loggers.py).
 _EXT_HITS = "vllm:external_prefix_cache_hits"
