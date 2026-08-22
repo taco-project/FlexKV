@@ -22,9 +22,10 @@ import pytest
 import torch
 import gc
 
-from flexkv.c_ext import TPTransferThreadGroup, LayerwiseTransferGroup
+from flexkv.c_ext import TPTransferThreadGroup, LayerwiseTransferGroup, TPGDSTransferThreadGroup
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.storage.allocator import SSDAllocator
 
 
 # Skip conditions
@@ -1830,6 +1831,14 @@ def _setup_ssd_file(layout, num_blocks_per_file, tmpdir):
         os.fsync(f.fileno())
     return {0: [fpath]}
 
+def _setup_ssd_files(layout, dtype, cache_dirs):
+    ssd_handle = SSDAllocator.allocate(
+        layout=layout,
+        dtype=dtype,
+        cache_dir=cache_dirs,
+        max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
+    )
+    return ssd_handle.get_file_list(), ssd_handle.num_blocks_per_file
 
 def _fill_cpu_kv(cpu_tensor, layout, num_layers, num_blocks, tpb, num_heads,
                  head_dim, kv_dim, seed=42):
@@ -2353,6 +2362,114 @@ def test_ssd_transfer_layerwise_disk2h(data_config, cpu_layout_name, ssd_io_opt,
     del ioctx, group
     shutil.rmtree(tmpdir, ignore_errors=True)
 
+@pytest.fixture
+def ssd_cache_dirs(tmp_path):
+    raw = os.getenv("FLEXKV_TEST_SSD_CACHE_DIRS")
+    return [p.strip() for p in raw.split(";") if p.strip()]
+
+def make_tp_gds_group(gpu_blocks,
+                      ssd_files,
+                      num_layers,
+                      gpu_kv_layout,
+                      num_gpus):
+    gpu_block_ptrs_flat = []
+    for gpu_tensors in gpu_blocks:
+        for t in gpu_tensors:
+            gpu_block_ptrs_flat.append(t.data_ptr())
+
+    tp_gds = TPGDSTransferThreadGroup(num_gpus,
+                                      gpu_block_ptrs_flat,
+                                      num_layers, # num_tensors_per_gpu
+                                      ssd_files,
+                                      num_layers,
+                                      [gpu_kv_layout.get_kv_stride() * ES] * num_gpus,
+                                      [gpu_kv_layout.get_block_stride() * ES] * num_gpus,
+                                      [gpu_kv_layout.get_layer_stride() * ES] * num_gpus,
+                                      [gpu_kv_layout.get_chunk_size() * ES] * num_gpus,
+                                      list(range(num_gpus))
+                                      )
+
+    return tp_gds
+
+@pytest.mark.parametrize("data_config", MHA_SIZES)
+def test_mha_gds(data_config, ssd_cache_dirs):
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    is_mla = (num_heads == 1)
+    assert is_mla is False
+    kv_dim = 1 if is_mla else 2
+    num_gpus = NUM_GPUS
+
+    ssd_layout_name = "BLOCKFIRST"
+
+    gpu_layout, ssd_layout, _, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        ssd_layout_name, is_mla, num_gpus)
+
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb, heads_per_rank, head_dim, kv_dim, g)
+               for g in range(num_gpus)]
+
+    files, num_blocks_per_file = _setup_ssd_files(ssd_layout, DTYPE, ssd_cache_dirs)
+
+    ssd_block_stride_in_bytes = ssd_layout.get_block_stride() * ES
+    ssd_tp_stride_in_bytes = (ssd_layout.get_block_stride() * ES // num_gpus
+                              if not is_mla else ssd_layout.get_block_stride() * ES)
+    if not is_mla:
+        ssd_layout = ssd_layout.div_head(num_gpus)
+
+    tp_gds = make_tp_gds_group(all_gpu, files, num_layers, gpu_layout, num_gpus)
+
+    gpu_block_ids = block_ids(num_blocks)
+    ssd_block_ids = block_ids(num_blocks)
+    ssd_block_ids = ssd_block_ids[torch.randperm(ssd_block_ids.size(0))]
+
+    for g in range(num_gpus):
+        fill_gpu(all_gpu[g], g, num_layers, num_blocks, tpb, heads_per_rank, head_dim, kv_dim)
+
+    sync_all(num_gpus)
+
+    tp_gds.tp_group_transfer(gpu_block_ids,
+                             ssd_block_ids,
+                             ssd_layout.get_layer_stride() * ES,
+                             ssd_layout.get_kv_stride() * ES,
+                             ssd_block_stride_in_bytes,
+                             ssd_tp_stride_in_bytes,
+                             num_blocks_per_file,
+                             False,
+                             0, num_layers,
+                             is_mla)
+
+
+    for g in range(num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].zero_()
+    sync_all(num_gpus)
+
+    tp_gds.tp_group_transfer(gpu_block_ids,
+                             ssd_block_ids,
+                             ssd_layout.get_layer_stride() * ES,
+                             ssd_layout.get_kv_stride() * ES,
+                             ssd_block_stride_in_bytes,
+                             ssd_tp_stride_in_bytes,
+                             num_blocks_per_file,
+                             True,
+                             0, num_layers,
+                             is_mla)
+
+    expected_gpu = 0 if is_mla else None
+    for g in range(num_gpus):
+        src_g = expected_gpu if expected_gpu is not None else g
+        for layer in [0, num_layers - 1]:
+            for block in range(num_blocks):
+                for kv in range(kv_dim):
+                    for hd_idx in [0, head_dim - 1]:
+                        exp = expected_val(src_g, layer, block, 0, hd_idx, kv)
+                        act = all_gpu[g][layer][kv, block, 0, 0, hd_idx].item()
+                        assert abs(act - exp) < 1e-3, \
+                            f"Non-MLA round-trip mismatch: layout={ssd_layout_name} " \
+                            f"gpu={g} layer={layer} block={block} kv={kv} hd={hd_idx}: " \
+                            f"expected={exp:.6f} got={act:.6f}"
+
+    del tp_gds
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
