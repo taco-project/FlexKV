@@ -158,7 +158,6 @@ def create_cpu_gpu_worker(
             cpu_kv_layout=cpu_handle.kv_layout,
             dtype=model_config.dtype,
             tp_group_size=model_config.tp_size,
-            dp_group_id=0,
             use_ce_transfer_h2d=use_ce_transfer,
             use_ce_transfer_d2h=use_ce_transfer,
             transfer_num_cta_h2d=transfer_num_cta,
@@ -316,7 +315,6 @@ def create_gpu_ssd_worker(
             ssd_kv_layout=ssd_handle.kv_layout,
             dtype=model_config.dtype,
             tp_group_size=model_config.tp_size,
-            dp_group_id=0,
         )
     return (
         worker_handle,
