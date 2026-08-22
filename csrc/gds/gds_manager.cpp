@@ -689,7 +689,8 @@ void transfer_kv_blocks_gds(
     size_t max_block_partition = 0;
     for (int device_id = 0; device_id < num_devices; device_id++) {
         const std::vector<int>& gpu_blocks = gpu_blocks_partition[device_id];
-        size_t max_block_partition = std::max(max_block_partition, gpu_blocks.size())
+        size_t max_block_partition = std::max(max_block_partition, gpu_blocks.size());
+    }
 
     size_t task_index = 0;
     for (size_t j = 0; j < max_block_partition; j++) {
@@ -699,6 +700,7 @@ void transfer_kv_blocks_gds(
                 continue;
 
             const std::vector<int>& ssd_blocks = ssd_blocks_partition[device_id];
+            assert(ssd_blocks.size() == gpu_blocks.size());
             const int gpu_block_id = gpu_blocks[j];
             const int ssd_block_id = ssd_blocks[j];
             const int slot_id = static_cast<int>(task_index++ % num_slots);
