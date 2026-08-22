@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
     if _HAS_KV_CONNECTOR_OUTPUT:
         from vllm.v1.outputs import KVConnectorOutput
@@ -992,10 +993,12 @@ class FlexKVWorkerConnector:
             self.remote_transfer_manager_process = None
 
 class FlexKVConnectorV1Impl:
-    def __init__(self, vllm_config: "VllmConfig", role: "KVConnectorRole"):
+    def __init__(self, vllm_config: "VllmConfig", role: "KVConnectorRole",
+                 kv_cache_config: Optional["KVCacheConfig"] = None):
         self.role = role
         flexkv_config = FlexKVConfig.from_env()
-        rank_info = flexkv_config.post_init_from_vllm_config(vllm_config)
+        rank_info = flexkv_config.post_init_from_vllm_config(
+            vllm_config, kv_cache_config)
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector = FlexKVSchedulerConnector(flexkv_config, rank_info)
