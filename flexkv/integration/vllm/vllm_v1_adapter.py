@@ -534,12 +534,27 @@ class FlexKVSchedulerConnector:
         if self.maybe_skip_put and os.path.exists('/tmp/flexkv_skip_put'):
             return False
 
-        task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(request=request)
+        # vLLM passes only blocks backed by completed model execution. During
+        # abort, request.num_tokens can also include tokens still in flight or
+        # waiting on a remote-KV load, so it is not a valid upper bound for a
+        # GPU-to-host transfer.
+        max_backed_tokens = len(block_ids) * self.block_size
+        num_tokens_to_put = min(
+            ((request.num_tokens - 1) // self.block_size) * self.block_size,
+            max_backed_tokens,
+        )
+        if num_tokens_to_put == 0:
+            return False
 
-        self.flexkv_stats.record_put(num_all_tokens=request.num_tokens,
+        task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(
+            request=request,
+            num_tokens_to_put=num_tokens_to_put,
+        )
+
+        self.flexkv_stats.record_put(num_all_tokens=num_tokens_to_put,
                                      num_unmatched_tokens=num_unmatched_tokens)
 
-        if not self._need_to_put(num_all_tokens=request.num_tokens,
+        if not self._need_to_put(num_all_tokens=num_tokens_to_put,
                                 num_matched_tokens=num_matched_tokens,
                                 num_unmatched_tokens=num_unmatched_tokens):
             return False
@@ -559,7 +574,8 @@ class FlexKVSchedulerConnector:
 
     def _put_match(
         self,
-        request: "Request"
+        request: "Request",
+        num_tokens_to_put: int,
     ) -> tuple[int, int, int]:
         """
         Args:
@@ -570,7 +586,6 @@ class FlexKVSchedulerConnector:
                             the task_id, number of matched tokens and number of unmatched tokens.
         """
         match_start_time = time.perf_counter()
-        num_tokens_to_put = ((request.num_tokens - 1) // self.block_size) * self.block_size
         token_ids = request.all_token_ids[:num_tokens_to_put]
 
         if num_tokens_to_put == 0:
