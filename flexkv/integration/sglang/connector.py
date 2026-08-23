@@ -1509,11 +1509,11 @@ class FlexKVConnector:
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             inflight = list(self._inflight_stores.items())
             task_ids = [fk_tid for _, fk_tid in inflight if fk_tid >= 0]
-            responses: Dict[int, Any] = {}
+            store_responses: Dict[int, Any] = {}
             wait_error = ""
             if task_ids:
                 try:
-                    responses = self.kv_manager.wait(
+                    store_responses = self.kv_manager.wait(
                         task_ids, timeout=30.0, completely=True
                     ) or {}
                 except Exception as exc:  # noqa: BLE001
@@ -1522,7 +1522,7 @@ class FlexKVConnector:
             for rid, fk_tid in inflight:
                 if fk_tid < 0:
                     continue
-                response = responses.get(fk_tid)
+                response = store_responses.get(fk_tid)
                 status = _status_value(response)
                 if response is None or not _is_terminal_status(status):
                     unsafe.append(fk_tid)
