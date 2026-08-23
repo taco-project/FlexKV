@@ -81,6 +81,13 @@ class RadixNode:
     hit_count: int = 0
     creation_time: float = 0.0
     last_access_time: float = 0.0
+    # Cached sum of ancestor sizes (blocks preceding this node). Maintained
+    # incrementally in split() and RadixTreeIndex.insert so StreamingLLM sink
+    # checks are O(1) instead of an O(depth) walk to root. split()/merge_child
+    # preserve the block count along every root->descendant path, so only the
+    # split node itself and freshly-inserted nodes ever need updating (no
+    # subtree refresh). Root and freshly-created nodes start at 0.
+    block_offset: int = 0
 
     parent: Optional['RadixNode'] = None
     children: Dict[Optional[HashType], 'RadixNode'] = field(default_factory=dict)
@@ -180,6 +187,11 @@ class RadixNode:
         new_node.parent = self.parent
         self.parent = new_node
         new_node.children[self.head_hash()] = self
+        # Offset maintenance (O(1)): new_node is the PREFIX half and keeps this
+        # node's original offset; self is the SUFFIX half and now starts
+        # new_node.size() blocks later. Read the old offset before overwriting.
+        new_node.block_offset = self.block_offset
+        self.block_offset = new_node.block_offset + new_node.size()
         # self keeps its SWA and its SWA-LRU membership unchanged (its last page
         # is unchanged), so no SWA-LRU surgery is needed here.
         return new_node
@@ -534,6 +546,10 @@ class RadixTreeIndex:
         new_node.parent = last_node
         last_node.children[new_node.head_hash()] = new_node
         self.leaf_nodes[new_node.head_hash()] = new_node
+        # O(1) offset: blocks preceding new_node == offset+size of its parent.
+        # (last_node may be the root, whose offset and size are both 0.)
+        new_node.block_offset = (0 if last_node.is_root()
+                                 else last_node.block_offset + last_node.size())
 
         return new_node
 
@@ -846,10 +862,19 @@ class RadixTreeIndex:
 
 
     def _get_block_offset_from_root(self, node: RadixNode) -> int:
-        """Compute the total number of blocks preceding *node* (i.e. the sum of
-        sizes of all ancestors).  Nodes whose offset is below
-        ``sink_block_count`` are treated as attention sinks and protected from
-        eviction (StreamingLLM)."""
+        """Total number of blocks preceding *node* (the sum of sizes of all
+        ancestors).  Nodes whose offset is below ``sink_block_count`` are
+        treated as attention sinks and protected from eviction (StreamingLLM).
+
+        O(1): the value is maintained incrementally in ``RadixNode.split`` and
+        ``RadixTreeIndex.insert``.  It used to be an O(depth) walk to root,
+        called per candidate on every eviction; see ``_walk_block_offset`` for
+        the reference computation used by tests/asserts."""
+        return node.block_offset
+
+    def _walk_block_offset(self, node: RadixNode) -> int:
+        """Reference O(depth) offset used to validate the cached value in
+        tests/debug asserts.  Not used on the hot path."""
         offset = 0
         cur = node.parent
         while cur is not None and not cur.is_root():

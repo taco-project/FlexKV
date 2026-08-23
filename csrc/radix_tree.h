@@ -28,6 +28,13 @@ private:
   uint64_t creation_time;
   int hit_count;
   int leaf_vector_index = -1;
+  // Cached sum of ancestor sizes (blocks preceding this node). Maintained
+  // incrementally in split() and CRadixTreeIndex::insert so StreamingLLM sink
+  // checks are O(1) instead of an O(depth) walk to root. split()/merge_child
+  // preserve the block count along every root->descendant path, so only the
+  // split node itself and freshly-inserted nodes ever need updating (no
+  // subtree refresh). Mirror of Python RadixNode.block_offset.
+  int block_offset_ = 0;
 
   // ===== SWA (Sliding Window Attention) fields =====
   // SWA snapshot state attached to this node. Mirrors the Python RadixNode
@@ -109,6 +116,10 @@ public:
   void set_leaf_vector_index(int index) { leaf_vector_index = index; }
 
   int get_leaf_vector_index() { return leaf_vector_index; }
+
+  void set_block_offset(int offset) { block_offset_ = offset; }
+
+  int get_block_offset() const { return block_offset_; }
 
   // ===== SWA accessors =====
   int get_swa_host_slot() { return swa_host_slot; }
@@ -377,9 +388,17 @@ public:
     swa_lru_tail->set_swa_lru_prev(swa_lru_head);
   }
 
-  // Compute the total number of blocks preceding *node* (sum of sizes of all
-  // ancestors).  Used by StreamingLLM sink-token protection.
+  // Number of blocks preceding *node* (sum of sizes of all ancestors).  Used
+  // by StreamingLLM sink-token protection.  O(1): maintained incrementally in
+  // CRadixNode::split and CRadixTreeIndex::insert (was an O(depth) walk called
+  // per candidate on every eviction).  See walk_block_offset_from_root for the
+  // reference computation used by debug asserts / tests.
   int get_block_offset_from_root(CRadixNode *node) const {
+    return node->get_block_offset();
+  }
+
+  // Reference O(depth) computation; not on the hot path.
+  int walk_block_offset_from_root(CRadixNode *node) const {
     int offset = 0;
     CRadixNode *cur = node->get_parent();
     while (cur != nullptr && !is_root(cur)) {
@@ -439,6 +458,28 @@ public:
     swa_lru_head->set_swa_lru_next(swa_lru_tail);
     swa_lru_tail->set_swa_lru_prev(swa_lru_head);
     freed_swa_slots.clear();
+  }
+
+  // Recompute cached offsets after bulk tree construction/re-parenting.
+  // Normal insert/split maintain offsets incrementally in O(1); distributed
+  // rebuilds attach and merge whole subtrees through several custom paths, so
+  // one O(nodes) pass at the end is simpler and keeps the node invariant exact.
+  void rebuild_block_offsets() {
+    root->set_block_offset(0);
+    std::vector<CRadixNode *> stack{root};
+    while (!stack.empty()) {
+      CRadixNode *parent = stack.back();
+      stack.pop_back();
+      const int child_offset =
+          is_root(parent) ? 0 : parent->get_block_offset() + parent->size();
+      parent->for_each_child([&](HashType, CRadixNode *child) {
+        if (child == nullptr) {
+          return;
+        }
+        child->set_block_offset(child_offset);
+        stack.push_back(child);
+      });
+    }
   }
 
   bool is_root(CRadixNode *node) const { return node == root; }

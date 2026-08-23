@@ -999,16 +999,18 @@ PYBIND11_MODULE(c_ext, m) {
       .def("size", &flexkv::CRadixNode::size)
       .def("has_block_node_ids", &flexkv::CRadixNode::has_block_node_ids)
       // Structural / lock accessors — needed to assert the node-mount SWA
-      // invariants (I1/I2/I3) from Python against the production CRadixTreeIndex
-      // path (see tests/test_swa_node_mount.py). Previously only bound for
-      // the P2P LocalRadixTree, so the non-P2P DSv4 build had no way to read
-      // them and the C++ node-mount SWA path went untested.
+      // invariants (I1/I2/I3) from Python against the production
+      // CRadixTreeIndex path (see tests/test_swa_node_mount.py). Previously
+      // only bound for the P2P LocalRadixTree, so the non-P2P DSv4 build had no
+      // way to read them and the C++ node-mount SWA path went untested.
       .def("is_leaf", &flexkv::CRadixNode::is_leaf)
       .def("num_children", &flexkv::CRadixNode::get_num_children)
       .def("get_lock_cnt", &flexkv::CRadixNode::get_lock_cnt)
       .def("lock", &flexkv::CRadixNode::lock)
       .def("unlock", &flexkv::CRadixNode::unlock)
       .def("has_swa", &flexkv::CRadixNode::has_swa)
+      .def_property_readonly("block_offset",
+                             &flexkv::CRadixNode::get_block_offset)
       .def_property_readonly("parent", &flexkv::CRadixNode::get_parent,
                              py::return_value_policy::reference)
       // ===== SWA accessors (node-attached SWA state) =====

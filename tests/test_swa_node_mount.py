@@ -54,6 +54,83 @@ def _phys(*xs):
     return np.array(xs, dtype=np.int64)
 
 
+def _walk_block_offset(node):
+    """Reference O(depth) computation for cached-offset tests."""
+    offset = 0
+    cur = node.parent
+    while cur is not None and not cur.is_root():
+        offset += cur.size()
+        cur = cur.parent
+    return offset
+
+
+def _assert_cached_offsets(idx):
+    stack = [idx.root_node]
+    while stack:
+        node = stack.pop()
+        if not node.is_root():
+            assert node.block_offset == _walk_block_offset(node)
+            assert idx._get_block_offset_from_root(node) == node.block_offset
+        stack.extend(node.children.values())
+
+
+def _insert_tokens(idx, token_ids, next_physical_block):
+    seq = _seq(token_ids)
+    match = idx.match_prefix(seq, update_cache_info=False)
+    num_new_blocks = seq.num_blocks - match.num_matched_blocks
+    physical = np.arange(
+        next_physical_block,
+        next_physical_block + num_new_blocks,
+        dtype=np.int64,
+    )
+    node = idx.insert(seq, physical, is_ready=True, match_result=match)
+    return node, next_physical_block + num_new_blocks
+
+
+def test_py_cached_block_offset_survives_split_and_branch_insert():
+    idx = RadixTreeIndex(tokens_per_block=TPB, sink_block_count=2)
+    next_physical = 0
+
+    # First insert is one four-block leaf at offset 0.
+    leaf, next_physical = _insert_tokens(
+        idx, [1, 2, 3, 4, 5, 6, 7, 8], next_physical)
+    assert leaf is not None and leaf.block_offset == 0
+
+    # Sharing two blocks and diverging forces leaf.split(2): the new prefix
+    # keeps offset 0, while both suffix branches start at offset 2.
+    branch, next_physical = _insert_tokens(
+        idx, [1, 2, 3, 4, 9, 10, 11, 12], next_physical)
+    assert branch is not None and branch.block_offset == 2
+
+    prefix = branch.parent
+    assert prefix is not None and prefix.block_offset == 0
+    assert sorted(child.block_offset for child in prefix.children.values()) == [2, 2]
+    _assert_cached_offsets(idx)
+
+
+def test_py_cached_block_offset_matches_walk_for_random_prefix_tree():
+    rng = random.Random(20260823)
+    idx = RadixTreeIndex(tokens_per_block=TPB, sink_block_count=4)
+    next_physical = 0
+    sequences = []
+
+    for request_id in range(200):
+        if sequences and rng.random() < 0.8:
+            base = list(rng.choice(sequences))
+            prefix_blocks = rng.randrange(0, len(base) // TPB + 1)
+            token_ids = base[:prefix_blocks * TPB]
+        else:
+            token_ids = []
+
+        new_blocks = rng.randint(1, 8)
+        start = 1_000_000 + request_id * 100
+        token_ids.extend(range(start, start + new_blocks * TPB))
+        sequences.append(tuple(token_ids))
+
+        _, next_physical = _insert_tokens(idx, token_ids, next_physical)
+        _assert_cached_offsets(idx)
+
+
 def test_py_match_returns_last_swa_node():
     idx = RadixTreeIndex(tokens_per_block=TPB)
     n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
@@ -374,9 +451,10 @@ def test_promote_swa_ignores_dead_node():
 
 c_ext = pytest.importorskip("flexkv.c_ext")
 
-_CEXT_OK = "swa_host_slot" in dir(c_ext.CRadixNode) and all(
+_CEXT_OK = all(
     n in dir(c_ext.CRadixNode)
-    for n in ("is_leaf", "get_lock_cnt", "has_swa", "lock", "unlock")
+    for n in ("swa_host_slot", "is_leaf", "get_lock_cnt", "has_swa", "lock",
+              "unlock", "block_offset")
 )
 _cext_reason = "CRadixNode SWA/structural bindings not present (rebuild c_ext)"
 cext = pytest.mark.skipif(not _CEXT_OK, reason=_cext_reason)
@@ -485,16 +563,20 @@ def test_cpp_partial_node_match_hides_tail_swa():
 def test_cpp_split_preserves_swa_on_suffix():
     t = _tree()
     n = _insert(t, [1, 2, 3, 4, 5, 6, 7, 8], 0)
+    assert n.block_offset == 0
     t.set_swa(n, 200)
     # Diverge after 2 blocks -> split the 4-block node into prefix(2)+suffix(2).
     s2 = [1, 2, 3, 4, 55, 66, 77, 88]
     m = t.match_prefix(_hashes(s2), 4, False)
     assert m.num_matched_blocks == 2
-    _insert(t, s2, 8, match=m)
+    branch = _insert(t, s2, 8, match=m)
     # original node is now the suffix half and KEEPS its slot; nothing freed.
     assert n.swa_host_slot == 200 and not n.swa_tombstone and n.size() == 2
     parent = n.parent
     assert parent is not None and parent.swa_host_slot == -1 and parent.swa_tombstone
+    assert parent.block_offset == 0
+    assert n.block_offset == 2
+    assert branch is not None and branch.block_offset == 2
     assert t.drain_freed_swa_slots() == []
     mr = t.match_prefix(_hashes([1, 2, 3, 4, 5, 6, 7, 8]), 4, False)
     assert mr.last_swa_node is not None and mr.swa_hit_blocks == 4

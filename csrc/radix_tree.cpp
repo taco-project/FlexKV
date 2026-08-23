@@ -135,6 +135,12 @@ CRadixNode *CRadixNode::split(int prefix_length) {
 
   set_parent(new_node);
 
+  // Offset maintenance (O(1)): new_node is the PREFIX half and keeps this
+  // node's original offset; `this` is the SUFFIX half and now starts
+  // new_node->size() blocks later.  Read the old offset before overwriting.
+  new_node->set_block_offset(get_block_offset());
+  set_block_offset(new_node->get_block_offset() + new_node->size());
+
   // SWA (node-mount, I0/I4): the SWA snapshot lives on the node's LAST page.
   // After the split, `this` is the SUFFIX half and still owns that original
   // last page, so its SWA (slot / tombstone / lock / SWA-LRU membership) stays
@@ -374,6 +380,11 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
 
   new_node->set_parent(last_node);
   last_node->set_child(new_node->get_head_hash(), new_node);
+  // O(1) offset: blocks preceding new_node == offset+size of its parent.
+  // (last_node may be the root, whose offset and size are both 0.)
+  new_node->set_block_offset(
+      is_root(last_node) ? 0
+                         : last_node->get_block_offset() + last_node->size());
 
   add_node(new_node);
   add_leaf(new_node);
