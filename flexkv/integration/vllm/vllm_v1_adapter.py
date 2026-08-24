@@ -438,6 +438,9 @@ class FlexKVSchedulerConnector:
         self.flexkv_stats.record_put(num_all_tokens=request.num_tokens,
                                      num_unmatched_tokens=num_unmatched_tokens)
 
+        if len(block_ids) == 0:
+            return False # adapt for vLLM when it gives empty list
+
         if not self._need_to_put(num_all_tokens=request.num_tokens,
                                 num_matched_tokens=num_matched_tokens,
                                 num_unmatched_tokens=num_unmatched_tokens):
