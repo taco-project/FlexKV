@@ -538,11 +538,17 @@ class TransferWorkerBase(ABC):
                 # continue would otherwise drop the first op forever (which
                 # stalls D2H → H2REMOTE and leaves mooncake PutStart=0).
                 batch_ops = [op]
-                shutdown_after_batch = False
+                stop_after_batch = False
                 while self.transfer_conn.poll(timeout=0):
-                    op = self.transfer_conn.recv()
+                    try:
+                        op = self.transfer_conn.recv()
+                    except EOFError:
+                        # A closed pipe is readable. Preserve the batch already
+                        # received, then exit after reporting its completions.
+                        stop_after_batch = True
+                        break
                     if op is None:
-                        shutdown_after_batch = True
+                        stop_after_batch = True
                         break
                     if not isinstance(op, dict):
                         op._received_ns = time.perf_counter_ns()
@@ -617,13 +623,12 @@ class TransferWorkerBase(ABC):
                         # stays compatible.
                         self.finished_ops_queue.put(
                             (op.transfer_op_id, False, None))
-                if shutdown_after_batch:
-                    if hasattr(self, "shutdown") and callable(self.shutdown):
-                        try:
-                            self.shutdown()
-                        except Exception as e:
-                            flexkv_logger.error(f"Error when shut down worker: {e}")
-                    break
+                if stop_after_batch:
+                    # _worker_process owns the single shutdown() call in its
+                    # finally block. Calling subclass shutdown here can repeat
+                    # external unregister work before super()'s idempotence
+                    # guard is reached.
+                    return
             except EOFError:
                 flexkv_logger.warning(
                     f"[worker {self.worker_id}] transfer pipe EOF; exiting run loop"
