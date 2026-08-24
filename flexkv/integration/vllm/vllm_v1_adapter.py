@@ -438,24 +438,39 @@ class FlexKVSchedulerConnector:
         self.flexkv_stats.record_put(num_all_tokens=request.num_tokens,
                                      num_unmatched_tokens=num_unmatched_tokens)
 
-        if len(block_ids) == 0:
-            return False # adapt for vLLM when it gives empty list
-
         if not self._need_to_put(num_all_tokens=request.num_tokens,
                                 num_matched_tokens=num_matched_tokens,
                                 num_unmatched_tokens=num_unmatched_tokens):
             return False
 
+        # compute slot mapping
+        num_matched_blocks = num_matched_tokens // self.block_size
+        num_unmatched_blocks = num_unmatched_tokens // self.block_size
+        block_ids_to_put = block_ids[
+            num_matched_blocks : num_matched_blocks + num_unmatched_blocks
+        ]
+
+        # vLLM >= 0.25 returns only the blocks covering num_computed_tokens,
+        # after pruning out-of-window prefix blocks -- see
+        # Scheduler._connector_finished(). On abort / preemption / lookahead
+        # over-allocation this is shorter than the put plan (possibly empty).
+        # Slicing truncates silently and blows the src/dst size assert in
+        # TransferOpGraph.set_gpu_blocks(), so bail out instead.
+        if len(block_ids_to_put) != num_unmatched_blocks:
+            logger.warning(
+                "FlexKV put for req %s expects %d blocks but vLLM provided %d "
+                "(total %d); cancelling put.",
+                request.request_id, num_unmatched_blocks,
+                len(block_ids_to_put), len(block_ids))
+            return False
+
         # prepare to launch task
         task: FlexKVPutTask = self.tasks_to_cancel.pop(task_id)
         self.tasks_to_launch[task_id] = task
-
-        # compute slot mapping
-        # num_blocks_to_put = (num_matched_tokens+num_unmatched_tokens) // self.block_size
-        num_matched_blocks = num_matched_tokens // self.block_size
-        num_unmatched_tokens = num_unmatched_tokens // self.block_size
-        block_ids_to_put = block_ids[num_matched_blocks:num_matched_blocks+num_unmatched_tokens]
-        task.slot_mapping = np.array(block_ids_to_put).repeat(self.block_size)*self.block_size
+        task.slot_mapping = (
+            np.array(block_ids_to_put, dtype=np.int64).repeat(self.block_size)
+            * self.block_size
+        )
 
         return True
 
