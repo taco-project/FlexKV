@@ -469,19 +469,27 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks,
       candidates.push_back(node);
     }
   }
-  // Fallback: if every evictable leaf is a sink block, we must still make
-  // progress, so allow evicting the lowest-priority sink block.
-  if (candidates.empty()) {
-    candidates = std::move(sink_candidates);
-  }
-
   std::priority_queue<CRadixNode *, std::vector<CRadixNode *>,
                       CRadixNode::Compare>
       candidate(CRadixNode::Compare(), std::move(candidates));
+  std::priority_queue<CRadixNode *, std::vector<CRadixNode *>,
+                      CRadixNode::Compare>
+      sink_candidate(CRadixNode::Compare(), std::move(sink_candidates));
 
-  while ((has_evicted < num_evicted) && candidate.size()) {
-    auto node = candidate.top();
-    candidate.pop();
+  while (has_evicted < num_evicted &&
+         (!candidate.empty() || !sink_candidate.empty())) {
+    // Prefer every available non-sink block. Only fall back to sinks when the
+    // normal heap is empty; this decision is re-evaluated after each cascade
+    // because deleting a child can expose a new sink parent.
+    const bool use_sink_fallback = candidate.empty();
+    CRadixNode *node;
+    if (use_sink_fallback) {
+      node = sink_candidate.top();
+      sink_candidate.pop();
+    } else {
+      node = candidate.top();
+      candidate.pop();
+    }
 
     if (node->size() > num_evicted - has_evicted) {
       auto [blocks, block_hashes] = node->shrink(num_evicted - has_evicted);
@@ -512,7 +520,11 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks,
         add_leaf(parent);
       }
       if (parent != nullptr && parent->evictable()) {
-        candidate.push(parent);
+        if (is_sink_block(parent)) {
+          sink_candidate.push(parent);
+        } else {
+          candidate.push(parent);
+        }
       }
     }
   }

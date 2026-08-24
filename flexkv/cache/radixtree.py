@@ -602,20 +602,22 @@ class RadixTreeIndex:
             # evicted only as a last resort when no non-sink block is available.
             is_sink = (self.sink_block_count > 0 and
                        self._get_block_offset_from_root(node) < self.sink_block_count)
-            priority = self._get_eviction_priority(node)
             if is_sink:
-                sink_candidates.append((priority, node))
+                sink_candidates.append(
+                    (self._get_raw_eviction_priority(node), node))
             else:
-                candidates.append((priority, node))
-        # Fallback: if every evictable leaf is a sink block, we must still make
-        # progress, so allow evicting the lowest-priority sink block.
-        if not candidates:
-            candidates = sink_candidates
+                candidates.append((self._get_eviction_priority(node), node))
         heapq.heapify(candidates)
+        heapq.heapify(sink_candidates)
         evicted_blocks = np.array([], dtype=np.int64)
         evicted_block_hashes = np.array([], dtype=np.int64)
-        while len(evicted_blocks) < num_evicted and candidates:
-            priority, node = heapq.heappop(candidates)
+        while (len(evicted_blocks) < num_evicted
+               and (candidates or sink_candidates)):
+            # Re-evaluate fallback after every structural mutation: a child
+            # eviction may expose a sink parent while non-sink work remains.
+            use_sink_fallback = not candidates
+            heap = sink_candidates if use_sink_fallback else candidates
+            priority, node = heapq.heappop(heap)
             if node.size() > num_evicted - len(evicted_blocks):
                 physical_blocks, _block_hashes = node.shrink(num_evicted - len(evicted_blocks))
                 # SWA: node survives but its trailing page changed, so its old
@@ -643,8 +645,21 @@ class RadixTreeIndex:
                         physical_blocks = np.concatenate([physical_blocks, cascade_blocks])
                         _block_hashes = np.concatenate([_block_hashes, cascade_hashes])
                 if parent is not None and parent.evictable():
-                    priority = self._get_eviction_priority(parent)
-                    heapq.heappush(candidates, (priority, parent))
+                    is_sink_parent = (
+                        self.sink_block_count > 0
+                        and self._get_block_offset_from_root(parent)
+                        < self.sink_block_count
+                    )
+                    if is_sink_parent:
+                        heapq.heappush(
+                            sink_candidates,
+                            (self._get_raw_eviction_priority(parent), parent),
+                        )
+                    else:
+                        heapq.heappush(
+                            candidates,
+                            (self._get_eviction_priority(parent), parent),
+                        )
 
             evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
             evicted_block_hashes = np.concatenate([evicted_block_hashes, _block_hashes])
@@ -843,22 +858,23 @@ class RadixTreeIndex:
         return offset
 
     def _get_eviction_priority(self, node: RadixNode):
-        """Get the eviction priority for a node based on the configured policy.
+        """Get eviction priority including attention-sink protection.
 
         Lower priority values are evicted first (min-heap).
 
         Nodes within the first ``sink_block_count`` blocks from the root are
         treated as attention sinks (StreamingLLM) and given maximum priority so
-        they are never evicted.
+        they are never evicted except in the explicit all-sink fallback.
         """
         # StreamingLLM: protect attention sinks (first N blocks) from eviction.
         if self.sink_block_count > 0:
             offset = self._get_block_offset_from_root(node)
             if offset < self.sink_block_count:
-                # Return a value larger than any real priority so the node is
-                # never selected for eviction (min-heap: larger = evicted later).
                 return float('inf')
+        return self._get_raw_eviction_priority(node)
 
+    def _get_raw_eviction_priority(self, node: RadixNode):
+        """Get policy priority without attention-sink protection."""
         if self.eviction_policy == "lru":
             return node.grace_time
         elif self.eviction_policy == "lfu":

@@ -441,7 +441,7 @@ public:
     freed_swa_slots.clear();
   }
 
-  bool is_root(CRadixNode *node) { return node == root; }
+  bool is_root(CRadixNode *node) const { return node == root; }
 
   CRadixNode *get_root() { return root; }
 
