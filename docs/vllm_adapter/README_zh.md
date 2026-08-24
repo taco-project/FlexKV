@@ -88,6 +88,32 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
         '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}'
 ```
 
+### 实验性 Layer-wise KV 加载
+
+Layer-wise 加载可让 FlexKV 搬运第 `N+1` 层 KV 的同时，vLLM 计算第 `N`
+层，从而在外部 KV 传输位于关键路径时降低 TTFT。
+
+```bash
+VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
+  --kv-transfer-config \
+  '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both",\
+"kv_connector_extra_config":{"use_layerwise":true}}'
+```
+
+必须设置 `use_layerwise=true`，使 vLLM 选择 PIECEWISE CUDA Graph 模式；
+逐层 eventfd 等待无法在完整 CUDA Graph 捕获/回放中正确执行。为保证安全，
+仅设置 `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1` 会被 vLLM adapter 忽略。在对应的
+vLLM wrapper 改动合入上游前，请给 vLLM 应用
+`examples/vllm_adaption/vllm_main-flexkv-layerwise-wrapper.patch`。
+
+当前仅对 GET/H2D 做逐层流水；PUT 仍是请求级异步。
+当前暂不支持 Context Parallel（`context_parallel_size > 1`），因为 vLLM
+运行时 DCP/PCP rank 尚未映射到 FlexKV 的 eventfd 索引空间。该模式也暂不
+支持 GDS，因为融合后的 layer-wise graph 使用 CPU/SSD/remote staging，而
+不是直接 `DISK2D`。如果某一层在
+`FLEXKV_LAYERWISE_WAIT_TIMEOUT_S`（默认 `60` 秒）内未就绪，forward 会失败，
+而不是永久卡住。
+
 ### 使用旧版 vLLM（需 patch）
 
 如需在 vLLM < 0.17.2 上使用 FlexKV，请手动 apply 对应版本的 patch：

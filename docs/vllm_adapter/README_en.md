@@ -88,6 +88,34 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve Qwen3/Qwen3-32B \
         '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}'
 ```
 
+### Experimental Layer-wise KV Loading
+
+Layer-wise loading overlaps FlexKV H2D transfer for layer `N+1` with vLLM
+compute for layer `N`, reducing TTFT when external KV transfer is on the
+critical path.
+
+```bash
+VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
+  --kv-transfer-config \
+  '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both",\
+"kv_connector_extra_config":{"use_layerwise":true}}'
+```
+
+`use_layerwise=true` is required so vLLM selects PIECEWISE CUDA graph mode;
+the per-layer eventfd waits cannot execute correctly inside a captured full
+CUDA graph. For safety, setting `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1` alone is
+ignored by the vLLM adapter. Until the matching vLLM wrapper change is merged upstream, apply
+`examples/vllm_adaption/vllm_main-flexkv-layerwise-wrapper.patch` to vLLM.
+
+The feature currently pipelines GET/H2D only. PUT remains request-level async.
+Context parallelism (`context_parallel_size > 1`) is not supported yet because
+vLLM's runtime DCP/PCP rank has not been mapped into FlexKV's eventfd index.
+GDS is also unsupported in this mode because the fused layer-wise graph uses
+CPU/SSD/remote staging rather than direct `DISK2D` operations.
+If a layer does not become ready within
+`FLEXKV_LAYERWISE_WAIT_TIMEOUT_S` (default `60` seconds), the forward fails
+instead of hanging indefinitely.
+
 ### Using Older vLLM (Patch Required)
 
 If you need to use FlexKV with vLLM < 0.17.2, apply the corresponding patch manually:
