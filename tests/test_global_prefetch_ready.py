@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -35,6 +36,7 @@ def _prefetch_engine(*, use_mooncake: bool):
     engine.index_accel = False
     engine.use_mooncake_store_backend = use_mooncake
     engine._metrics_collector = None
+    engine._cache_tree_lock = threading.RLock()
 
     cpu_root = MagicMock()
     remote_node = MagicMock()
