@@ -21,12 +21,13 @@ import time
 import numpy as np
 import torch
 
+from flexkv import c_ext
 from flexkv.server.client import KVDPClient
 from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
 from flexkv.integration.dynamo.collector import KVEventCollector
-from flexkv.common.debug import flexkv_logger
+from flexkv.common.debug import eviction_log_aggregator, flexkv_logger
 from flexkv.cache.redis_meta import RedisMeta
 
 
@@ -38,13 +39,17 @@ class KVManager:
                  server_recv_port: str = "",
                  gpu_register_port: str = "",
                  event_collector: Optional[KVEventCollector] = None):
-        flexkv_logger.info(f"{model_config = }")
-        flexkv_logger.info(f"{cache_config = }")
-        flexkv_logger.info(f"{GLOBAL_CONFIG_FROM_ENV = }")
+        # Use the curated ``__str__`` summaries. Dataclass repr includes
+        # credential-bearing fields such as ``redis_password``.
+        flexkv_logger.info(
+            "[FlexKV-CONFIG] operation=config act=load status=success "
+            "component=kv_manager commit=%s model_config=%s cache_config=%s",
+            getattr(c_ext, "__git_commit__", "unknown"),
+            model_config,
+            cache_config,
+        )
         self.model_config = model_config
         self.cache_config = cache_config
-        self.instance_id = GLOBAL_CONFIG_FROM_ENV.instance_id
-        self.instance_num = GLOBAL_CONFIG_FROM_ENV.instance_num
 
         if server_recv_port != "":
             self.server_recv_port = server_recv_port
@@ -55,35 +60,51 @@ class KVManager:
         else:
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
+        flexkv_logger.info(
+            f"[KVManager] IPC ports: server_recv_port={self.server_recv_port}, "
+            f"gpu_register_port={self.gpu_register_port}"
+        )
+
         # Multi-instance mode also requires server_client_mode
         self.server_client_mode = (model_config.dp_size > 1 or
-                                   self.instance_num > 1 or
+                                   model_config.instance_num > 1 or
                                    GLOBAL_CONFIG_FROM_ENV.server_client_mode)
-        self.dp_client_id = dp_client_id
+        self.server_launch_mode = GLOBAL_CONFIG_FROM_ENV.server_launch_mode
+        if self.server_launch_mode not in ("embedded", "external"):
+            raise ValueError(
+                "FLEXKV_SERVER_LAUNCH_MODE must be embedded or external, "
+                f"got {self.server_launch_mode!r}"
+            )
+        if self.server_launch_mode == "external" and not self.server_client_mode:
+            raise ValueError(
+                "FLEXKV_SERVER_LAUNCH_MODE=external requires server-client mode"
+            )
 
-        # Calculate global_client_id for multi-instance mode
-        self.global_client_id = self.instance_id * model_config.dp_size + dp_client_id
-
-        flexkv_logger.info(f"server_client_mode: {self.server_client_mode}")
+        flexkv_logger.info(
+            f"[KVManager] instance_num={model_config.instance_num}, dp_size={model_config.dp_size}, "
+            f"server_client_mode={self.server_client_mode}, "
+            f"server_launch_mode={self.server_launch_mode}"
+        )
 
         self.redis_meta_client = None
         self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
+        self.owns_mps = self.enable_mps and self.server_launch_mode != "external"
 
         if self.server_client_mode:
-            # In server_client_mode, RedisMeta is created and initialized inside KVServer
-            # Server should only be created once across all instances and dp ranks
-            if self.instance_id == 0 and dp_client_id == 0:
-                total_clients = self.instance_num * model_config.dp_size
+            if self.server_launch_mode == "embedded" and dp_client_id == 0:
                 self.server_handle = KVServer.create_server(model_config=model_config,
                                                             cache_config=cache_config,
                                                             gpu_register_port=self.gpu_register_port,
                                                             server_recv_port=self.server_recv_port,
-                                                            total_clients=total_clients,
                                                             inherit_env=False)
 
             else:
                 self.server_handle = None
-            self.dp_client = KVDPClient(self.server_recv_port, self.model_config, self.global_client_id)
+            self.dp_client = KVDPClient(
+                self.server_recv_port,
+                model_config=model_config,
+                dp_client_id=dp_client_id,
+            )
         else:
             # In non-server_client_mode, create RedisMeta here and pass to KVTaskEngine
             if self.cache_config.enable_kv_sharing:
@@ -101,14 +122,16 @@ class KVManager:
                 self.cache_config.distributed_node_id = self.redis_meta_client.get_node_id()
 
             self.server_handle = None
-            self.kv_task_engine = KVTaskEngine(self.model_config, self.cache_config, self.gpu_register_port, redis_meta=self.redis_meta_client, event_collector=event_collector)
-
-    @property
-    def dpclient_id(self) -> int:
-        return self.dp_client_id
+            self.kv_task_engine = KVTaskEngine(
+                model_config,
+                self.cache_config,
+                self.gpu_register_port,
+                redis_meta=self.redis_meta_client,
+                event_collector=event_collector,
+            )
 
     def start(self) -> None:
-        if self.enable_mps:
+        if self.owns_mps:
             # try to start MPS
             subprocess.run(['nvidia-cuda-mps-control', '-d'], check=False)
             flexkv_logger.debug("MPS started")
@@ -126,27 +149,31 @@ class KVManager:
             return self.kv_task_engine.is_ready()
 
     def shutdown(self) -> None:
+        flexkv_logger.info("[FLEXKV] KVManager.shutdown begin.")
+        eviction_log_aggregator.flush()
         if self.server_client_mode:
-            self.dp_client.shutdown()
-            # Wait for the server process to exit after sending shutdown request
-            if self.server_handle is not None:
-                self.server_handle.shutdown()
-                self.server_handle = None
+            if self.server_launch_mode == "external":
+                self.dp_client.unregister()
+            else:
+                self.dp_client.shutdown()
+                # Wait for the server process to exit after sending shutdown request
+                if self.server_handle is not None:
+                    self.server_handle.shutdown()
+                    self.server_handle = None
         else:
             self.kv_task_engine.shutdown()
 
-        if self.enable_mps:
+        if self.owns_mps:
             flexkv_logger.info(
                 "MPS is enabled. To stop MPS daemon manually, run: "
                 "'echo quit | nvidia-cuda-mps-control'"
             )
+        flexkv_logger.info("[FLEXKV] KVManager.shutdown done.")
 
     def get_async(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   slot_mapping: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  layer_granularity: int = -1,
-                  dp_id: int = 0,
                   namespace: Optional[List[str]] = None,
                   ) -> int:
         if isinstance(token_ids, torch.Tensor):
@@ -159,25 +186,30 @@ class KVManager:
             task_id = self.dp_client.get_async(token_ids,
                                                slot_mapping,
                                                token_mask,
-                                               layer_granularity,
                                                namespace=namespace)
         else:
-            task_id, _ = self.kv_task_engine.get_async(token_ids,
-                                                       slot_mapping,
-                                                       token_mask,
-                                                       layer_granularity,
-                                                       dp_id,
-                                                       namespace=namespace)
+            task_id, _ = self.kv_task_engine.get_async(
+                token_ids=token_ids,
+                slot_mapping=slot_mapping,
+                token_mask=token_mask,
+                namespace=namespace,
+            )
         return task_id
 
     def get_match(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  layer_granularity: int = -1,
-                  dp_id: int = 0,
                   cpu_only: bool = False,
                   namespace: Optional[List[str]] = None,
+                  swa_aware: bool = False,
                   ) -> Tuple[int, np.ndarray]:
+        """Match a prefix and build the load graph; return (task_id, mask).
+
+        ``swa_aware=True`` clamps the Full-KV transfer to the reusable SWA window
+        (from the same single match); the SWA window is the trailing block of the
+        returned mask, which the caller reads directly. ``swa_aware=False``
+        (default) is the plain path.
+        """
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if isinstance(token_mask, torch.Tensor):
@@ -185,23 +217,23 @@ class KVManager:
         if self.server_client_mode:
             task_id, mask = self.dp_client.get_match(token_ids,
                                                      token_mask,
-                                                     layer_granularity,
                                                      cpu_only=cpu_only,
-                                                     namespace=namespace)
+                                                     namespace=namespace,
+                                                     swa_aware=swa_aware)
         else:
-            task_id, mask = self.kv_task_engine.get_match(token_ids,
-                                                          token_mask,
-                                                          layer_granularity,
-                                                          dp_id,
-                                                          cpu_only=cpu_only,
-                                                          namespace=namespace)
+            task_id, mask = self.kv_task_engine.get_match(
+                token_ids=token_ids,
+                token_mask=token_mask,
+                cpu_only=cpu_only,
+                namespace=namespace,
+                swa_aware=swa_aware,
+            )
         return task_id, mask
 
     def put_async(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   slot_mapping: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  dp_id: int = 0,
                   namespace: Optional[List[str]] = None,
                   ) -> int:
         if isinstance(token_ids, torch.Tensor):
@@ -211,15 +243,20 @@ class KVManager:
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask, namespace=namespace)
+            task_id = self.dp_client.put_async(token_ids, slot_mapping, token_mask,
+                                               namespace=namespace)
         else:
-            task_id, _ = self.kv_task_engine.put_async(token_ids, slot_mapping, token_mask, dp_id, namespace=namespace)
+            task_id, _ = self.kv_task_engine.put_async(
+                token_ids=token_ids,
+                slot_mapping=slot_mapping,
+                token_mask=token_mask,
+                namespace=namespace,
+            )
         return task_id
 
     def put_match(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                  dp_id: int = 0,
                   namespace: Optional[List[str]] = None,
                   ) -> Tuple[int, np.ndarray]:
         if isinstance(token_ids, torch.Tensor):
@@ -227,37 +264,86 @@ class KVManager:
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id, mask = self.dp_client.put_match(token_ids, token_mask, namespace=namespace)
+            task_id, mask = self.dp_client.put_match(token_ids, token_mask,
+                                                     namespace=namespace)
         else:
-            task_id, mask = self.kv_task_engine.put_match(token_ids, token_mask, dp_id, namespace=namespace)
+            task_id, mask = self.kv_task_engine.put_match(
+                token_ids=token_ids,
+                token_mask=token_mask,
+                namespace=namespace,
+            )
         return task_id, mask
 
     def prefetch_async(self,
                        token_ids: np.ndarray,
-                       dp_id: int = 0,
-                       namespace: Optional[List[str]] = None) -> int:
+                       namespace: Optional[List[str]] = None,
+                       swa_aware: bool = False) -> int:
+        """Launch prefetch; return the task_id.
+
+        The prefetch is fire-and-forget at launch time. Callers poll progress
+        via ``try_wait``/``wait`` — the returned ``KVResponse.return_mask`` is
+        rewritten to the CPU-tree state at graph completion (post-commit), so
+        ``sum(return_mask)`` is the authoritative usable-token count.
+
+        ``swa_aware=True`` plans a joint Full+SWA REMOTE2H so the SWA snapshot
+        lands on the local CPU SWA pool alongside the Full-KV prefix. The tree
+        keeps the invariant "SWA present ⇒ Full ready up to this node" —
+        partial Full or SWA failure frees the SWA slot; only the Full prefix
+        (if any) stays on the tree.
+        """
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if self.server_client_mode:
-            task_id = self.dp_client.prefetch_async(token_ids, namespace=namespace)
+            task_id = self.dp_client.prefetch_async(
+                token_ids, namespace=namespace, swa_aware=swa_aware)
         else:
-            task_id = self.kv_task_engine.prefetch_async(token_ids, dp_id=dp_id, namespace=namespace)
+            task_id = self.kv_task_engine.prefetch_async(
+                token_ids,
+                namespace=namespace,
+                swa_aware=swa_aware,
+            )
         return task_id
 
     def launch(self,
                task_ids: Union[int, List[int]],
                slot_mappings: Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]],
-               as_batch: bool = False) -> List[int]:
+               swa_slot_mappings: Optional[Union[np.ndarray, List[Optional[np.ndarray]], torch.Tensor, List[Optional[torch.Tensor]]]] = None,
+               as_batch: bool = False,
+               layerwise_transfer: bool = False,
+               counter_id: int = 0) -> List[int]:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         if not isinstance(slot_mappings, List):
             slot_mappings = [slot_mappings]
         if isinstance(slot_mappings[0], torch.Tensor):
             slot_mappings = [slot_mapping.numpy() for slot_mapping in slot_mappings]
+        # SWA GPU slot_mappings (optional): the connector supplies these only when
+        # it registered an SWA GPU pool and the request has an SWA reuse window.
+        if swa_slot_mappings is not None and not isinstance(swa_slot_mappings, List):
+            swa_slot_mappings = [swa_slot_mappings]
+        if isinstance(swa_slot_mappings, List):
+            swa_slot_mappings = [
+                sm.numpy() if isinstance(sm, torch.Tensor) else sm
+                for sm in swa_slot_mappings
+            ]
         if self.server_client_mode:
-            return self.dp_client.launch_tasks(task_ids, slot_mappings, as_batch)
+            return self.dp_client.launch_tasks(
+                task_ids=task_ids,
+                slot_mappings=slot_mappings,
+                swa_slot_mappings=swa_slot_mappings,
+                as_batch=as_batch,
+                layerwise_transfer=layerwise_transfer,
+                counter_id=counter_id,
+            )
         else:
-            return self.kv_task_engine.launch_tasks(task_ids, slot_mappings, as_batch)
+            return self.kv_task_engine.launch_tasks(
+                task_ids,
+                slot_mappings,
+                swa_slot_mappings=swa_slot_mappings,
+                as_batch=as_batch,
+                layerwise_transfer=layerwise_transfer,
+                counter_id=counter_id,
+            )
 
     def cancel(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):
@@ -293,3 +379,16 @@ class KVManager:
             return
         else:
             self.kv_task_engine._clear_cpu_cache()
+
+    def reset(self) -> None:
+        """Invalidate the cache across all tiers (CPU + SSD + remote): drop the
+        radix tree and free the mempool.
+
+        Call after a weight update so KV computed against stale weights is not
+        reused. Works in both in-process and server-client mode. Cheap and
+        idempotent (resetting an already-empty tree/mempool is a no-op).
+        """
+        if self.server_client_mode:
+            self.dp_client.reset()
+        else:
+            self.kv_task_engine.reset_cache()

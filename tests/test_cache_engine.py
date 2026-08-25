@@ -187,8 +187,9 @@ def test_mempool():
     with pytest.raises(ValueError):
         mempool.recycle_blocks(np.array([1, 2, 3], dtype=np.int32))
 
-    # recycle_blocks no longer raises ValueError for already free blocks
-    mempool.recycle_blocks(np.array([1, 2, 3], dtype=np.int64))
+    # Recycle already free blocks raises
+    with pytest.raises(ValueError):
+        mempool.recycle_blocks(np.array([1, 2, 3], dtype=np.int64))
     assert mempool.num_free_blocks == DEFAULT_NUM_TOTAL_BLOCKS
 
     # Recycle wrong ndim raises
@@ -264,6 +265,150 @@ def test_match_and_insert(cache_engine: CacheEngineType, num_insert: int, seq_le
         match_result = cache_engine.match(insert_sequence_meta)
         assert match_result.num_matched_blocks == insert_sequence_meta.num_blocks
         assert match_result.num_ready_matched_blocks == insert_sequence_meta.num_blocks
+
+
+@pytest.mark.parametrize(
+    "cache_engine",
+    [{'num_total_blocks': 16, 'tokens_per_block': 1}],
+    indirect=True,
+)
+def test_ready_match_is_a_contiguous_prefix(cache_engine: CacheEngineType):
+    """A ready child below an unready split parent is not a readable prefix."""
+    first = SequenceMeta(
+        token_ids=np.array([1, 2, 3, 4], dtype=np.int64),
+        tokens_per_block=1,
+    )
+    branch = SequenceMeta(
+        token_ids=np.array([1, 2, 30, 40], dtype=np.int64),
+        tokens_per_block=1,
+    )
+
+    first_node = cache_engine.insert(
+        first, cache_engine.take(4), is_ready=False)
+    branch_match = cache_engine.match(branch)
+    assert branch_match.num_matched_blocks == 2
+    branch_node = cache_engine.insert(
+        branch,
+        cache_engine.take(2),
+        is_ready=False,
+        match_result=branch_match,
+    )
+
+    # This is the dangerous completion order: the new suffix finishes before
+    # the writer that owns the shared prefix.
+    cache_engine.set_ready(branch_node, True, 2)
+    pending_prefix = cache_engine.match(branch)
+    assert pending_prefix.num_matched_blocks == 4
+    assert pending_prefix.num_ready_matched_blocks == 0
+
+    # The original node pointer is now the split suffix. The saved insertion
+    # length walks through its parent and makes the whole path readable.
+    cache_engine.set_ready(first_node, True, 4)
+    completed = cache_engine.match(branch)
+    assert completed.num_matched_blocks == 4
+    assert completed.num_ready_matched_blocks == 4
+
+
+@pytest.mark.parametrize(
+    ("second_tokens", "expected_second_match"),
+    [
+        ([1, 2], 2),       # identical stale insert
+        ([1, 30], 1),      # stale insert that should rematch and split
+    ],
+)
+@pytest.mark.parametrize(
+    "cache_engine",
+    [{'num_total_blocks': 16, 'tokens_per_block': 1}],
+    indirect=True,
+)
+def test_stale_insert_rejects_existing_child_without_taking_block_ownership(
+    cache_engine: CacheEngineType,
+    second_tokens,
+    expected_second_match,
+):
+    """A stale match cannot overwrite a child inserted by another caller."""
+    first = SequenceMeta(
+        token_ids=np.array([1, 2], dtype=np.int64),
+        tokens_per_block=1,
+    )
+    second = SequenceMeta(
+        token_ids=np.array(second_tokens, dtype=np.int64),
+        tokens_per_block=1,
+    )
+    first_match = cache_engine.match(first)
+    stale_second_match = cache_engine.match(second)
+    first_blocks = cache_engine.take(2)
+    second_blocks = cache_engine.take(2)
+    second_blocks_before = second_blocks.copy()
+
+    cache_engine.insert(
+        first, first_blocks, is_ready=True, match_result=first_match)
+    with pytest.raises(RuntimeError, match="radix insert conflict"):
+        cache_engine.insert(
+            second,
+            second_blocks,
+            is_ready=True,
+            match_result=stale_second_match,
+        )
+
+    # Only the first insertion is reachable. The rejected blocks are still
+    # allocated and unchanged, so the caller can safely recycle or retry them.
+    assert cache_engine.index.total_cached_blocks() == 2
+    assert cache_engine.mempool.num_used_blocks == 4
+    np.testing.assert_array_equal(second_blocks, second_blocks_before)
+    assert cache_engine.match(first).num_matched_blocks == 2
+    assert cache_engine.match(second).num_matched_blocks == expected_second_match
+
+    cache_engine.recycle(second_blocks)
+    assert cache_engine.mempool.num_used_blocks == 2
+
+
+@pytest.mark.parametrize(
+    "cache_engine",
+    [{'num_total_blocks': 16, 'tokens_per_block': 1}],
+    indirect=True,
+)
+def test_stale_partial_match_is_rejected_after_concurrent_split(
+    cache_engine: CacheEngineType,
+):
+    cached = SequenceMeta(
+        token_ids=np.array([1, 2, 3, 4], dtype=np.int64),
+        tokens_per_block=1,
+    )
+    stale_sequence = SequenceMeta(
+        token_ids=np.array([1, 2, 30, 40], dtype=np.int64),
+        tokens_per_block=1,
+    )
+    concurrent_sequence = SequenceMeta(
+        token_ids=np.array([1, 2, 30, 50], dtype=np.int64),
+        tokens_per_block=1,
+    )
+    cache_engine.insert(cached, cache_engine.take(4), is_ready=True)
+    stale_match = cache_engine.match(stale_sequence)
+    concurrent_match = cache_engine.match(concurrent_sequence)
+    assert stale_match.num_matched_blocks == 2
+
+    cache_engine.insert(
+        concurrent_sequence,
+        cache_engine.take(2),
+        is_ready=True,
+        match_result=concurrent_match,
+    )
+    rejected_blocks = cache_engine.take(2)
+    with pytest.raises(RuntimeError, match="radix insert conflict"):
+        cache_engine.insert(
+            stale_sequence,
+            rejected_blocks,
+            is_ready=True,
+            match_result=stale_match,
+        )
+
+    assert cache_engine.index.total_cached_blocks() == 6
+    assert cache_engine.match(cached).num_matched_blocks == 4
+    assert cache_engine.match(concurrent_sequence).num_matched_blocks == 4
+    assert cache_engine.match(stale_sequence).num_matched_blocks == 3
+    cache_engine.recycle(rejected_blocks)
+    assert cache_engine.mempool.num_used_blocks == 6
 
 
 # ---------------------------------------------------------------------------

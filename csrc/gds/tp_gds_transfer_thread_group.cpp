@@ -9,7 +9,6 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
     const std::vector<int64_t> &gpu_block_ptrs_flat,
     int num_tensors_per_gpu,
     std::map<int, std::vector<std::string>> &ssd_files, 
-    int dp_group_id,
     int num_layers,
     const std::vector<int64_t> &gpu_kv_strides_in_bytes,
     const std::vector<int64_t> &gpu_block_strides_in_bytes,
@@ -19,7 +18,6 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
   
   num_gpus_ = num_gpus;
   num_tensors_per_gpu_ = num_tensors_per_gpu;
-  dp_group_id_ = dp_group_id;
   
   // per-GPU layout parameters
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
@@ -172,8 +170,9 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
     const int64_t num_blocks_per_file,
     const bool is_read,
     const int layer_id,
-    const int layer_granularity, 
-    const bool is_mla) {
+    const int layer_granularity,
+    const int kv_dim,
+    const int num_kv_heads) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -190,7 +189,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
         int64_t ssd_copy_off_inside_chunks;
         int64_t gpu_chunk_size_in_bytes = gpu_chunk_sizes_in_bytes_[i];
         //for simplicity, we don't consider write deduplication for multiple gpus for mla (in fact write will not be used)
-        if (is_mla) {
+        if (num_kv_heads == 1) {
             ssd_copy_off_inside_chunks = 0;
         } else {
           ssd_copy_off_inside_chunks = i * ssd_tp_stride_in_bytes;
@@ -204,7 +203,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
                 ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
-                is_read, false, is_mla
+                is_read, false, kv_dim
             );
             break;
           case BackendType::TRTLLM:
@@ -213,7 +212,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
                 ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
-                is_read, false, is_mla
+                is_read, false, kv_dim
             );
             break;
           case BackendType::SGLANG:
@@ -222,7 +221,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
                 ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
                 ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
                 ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
-                is_read, false, is_mla
+                is_read, false, kv_dim
             );
             break;
         }

@@ -104,7 +104,7 @@ class FlexKVTracer:
             "num_layers": model_config.num_layers,
             "num_kv_heads": model_config.num_kv_heads,
             "head_size": model_config.head_size,
-            "use_mla": model_config.use_mla,
+            "kv_dim": model_config.kv_dim,
             "dtype": str(model_config.dtype),
             "tp_size": model_config.tp_size,
             "dp_size": model_config.dp_size,
@@ -124,7 +124,6 @@ class FlexKVTracer:
             "num_remote_blocks": cache_config.num_remote_blocks,
             "ssd_cache_dir": cache_config.ssd_cache_dir,
             "gds_cache_dir": cache_config.gds_cache_dir,
-            "remote_cache_size_mode": cache_config.remote_cache_size_mode,
             "remote_file_size": cache_config.remote_file_size,
             "remote_file_num": cache_config.remote_file_num,
             "remote_file_prefix": cache_config.remote_file_prefix,
@@ -163,7 +162,8 @@ class FlexKVTracer:
                 "tokens_per_block": gpu_layout.tokens_per_block,
                 "num_head": gpu_layout.num_head,
                 "head_size": gpu_layout.head_size,
-                "is_mla": gpu_layout.is_mla,
+                "kv_dim": gpu_layout.kv_dim,
+                "num_kv_heads": gpu_layout.num_kv_heads,
             }
 
         record = {
@@ -194,8 +194,7 @@ class FlexKVTracer:
                      token_ids: Union[torch.Tensor, np.ndarray],
                      slot_mapping: Union[torch.Tensor, np.ndarray],
                      token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
-                     layer_granularity: int = -1,
-                     dp_id: int = 0,
+                     dp_client_id: int = 0,
                      **kwargs):
         """Record a request operation"""
         if not self.enabled:
@@ -210,8 +209,7 @@ class FlexKVTracer:
             "token_ids": self._convert_tensor_to_list(token_ids),
             "slot_mapping": self._convert_tensor_to_list(slot_mapping),
             "token_mask": self._convert_tensor_to_list(token_mask) if token_mask is not None else None,
-            "layer_granularity": layer_granularity,
-            "dp_id": dp_id,
+            "dp_client_id": dp_client_id,
             "token_ids_shape": list(token_ids.shape),
             "slot_mapping_shape": list(slot_mapping.shape),
             "token_mask_shape": list(token_mask.shape) if token_mask is not None else None,

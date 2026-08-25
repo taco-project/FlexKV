@@ -68,6 +68,13 @@ class DistributedRadixTree:
         self._c.stop()
         self._started = False
 
+    @property
+    def started(self) -> bool:
+        return self._started
+
+    def reset(self) -> None:
+        self._c.reset()
+
     def remote_tree_refresh(self) -> Optional["RefRadixTree"]:
         """Refresh the remote tree by loading block metadata from Redis.
         
@@ -167,6 +174,10 @@ class LocalRadixTree:
         self._c.stop()
         self._started = False
 
+    @property
+    def started(self) -> bool:
+        return self._started
+
     # Mirror base class methods on LocalRadixTree
     def match_prefix(self, block_hashes: torch.Tensor, num_blocks: int, update_cache_info: bool = True):
         return self._c.match_prefix(block_hashes, int(num_blocks), bool(update_cache_info))
@@ -185,6 +196,15 @@ class LocalRadixTree:
 
     def reset(self) -> None:
         self._c.reset()
+
+    def lease_pool_capacity(self) -> int:
+        return int(self._c.lease_pool_capacity())
+
+    def lease_pool_free_size(self) -> int:
+        return int(self._c.lease_pool_free_size())
+
+    def pending_queue_size(self) -> int:
+        return int(self._c.pending_queue_size())
 
     def is_root(self, node: "CRadixNode") -> bool:
         # Note: CRadixNode pointer type is opaque in Python; in practice this is used internally
@@ -263,5 +283,3 @@ class LocalRadixTree:
 
     def drain_pending_queues(self) -> int:
         return int(self._c.drain_pending_queues())
-
-

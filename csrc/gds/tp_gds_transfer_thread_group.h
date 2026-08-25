@@ -27,7 +27,6 @@ public:
       const std::vector<int64_t> &gpu_block_ptrs_flat,
       int num_tensors_per_gpu,
       std::map<int, std::vector<std::string>> &ssd_files, 
-      int dp_group_id,
       int num_layers,
       const std::vector<int64_t> &gpu_kv_strides_in_bytes,
       const std::vector<int64_t> &gpu_block_strides_in_bytes,
@@ -46,15 +45,15 @@ public:
       const int64_t num_blocks_per_file,
       const bool is_read,  // true for SSD->GPU, false for GPU->SSD
       const int layer_id,
-      const int layer_granularity, 
-      const bool is_mla);
+      const int layer_granularity,
+      const int kv_dim,
+      const int num_kv_heads = 1);
 
 private:
   using Task = std::function<void()>;
   std::future<void> enqueue_for_gpu(int gpu_idx, Task task);
 
   int num_gpus_;
-  int dp_group_id_;
   std::vector<int> gpu_device_ids_;
   void **gpu_blocks_;
   int num_tensors_per_gpu_;

@@ -13,14 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import threading
 import time
-from functools import partial
+from functools import partial, wraps
 from queue import Queue
 from typing import List, Tuple, Optional, Dict, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-import os
 import numpy as np
 import nvtx
 import torch
@@ -30,19 +30,244 @@ from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
-from flexkv.cache.transfer_pattern import add_virtal_op_for_mutiple_finished_ops
-from flexkv.common.block import SequenceMeta
-from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.cache.swa_cache_engine import SWAOpConstructor
+from flexkv.common.block import SequenceMeta, format_block_hash
+from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig
 from flexkv.common.transfer import (
-    DeviceType, TransferOpGraph, TransferOp, TransferType
+    CompletedOp,
+    CompletionAwareCallback,
+    DeviceType,
+    TransferOpGraph,
+    TransferOp,
+    TransferType,
+    add_virtual_op_for_multiple_finished_ops,
 )
-from flexkv.common.debug import flexkv_logger
+from flexkv.common.debug import (
+    eviction_log_aggregator,
+    flexkv_logger,
+    summarize_id_tensor,
+)
 from flexkv.common.type import MatchResultAccel
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics import FlexKVMetricsCollector, init_global_collector, get_global_collector
 
 DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
 _VALID_EVICTION_POLICIES = {'lru', 'lfu', 'slru', 'fifo', 'mru', 'filo'}
+
+
+def _synchronized_cache_tree(method: Callable) -> Callable:
+    """Serialize radix-tree planning and completion-time mutations."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._cache_tree_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
+@dataclass
+class MooncakeLoadResult:
+    """Per-request Mooncake outcome populated by the REMOTE2H callback."""
+
+    block_results: Optional[Tuple[bool, ...]] = None
+
+    def record(self, completed_op: Optional[CompletedOp]) -> None:
+        self.block_results = (
+            None if completed_op is None else completed_op.block_results)
+
+    def successful_prefix(self, expected_blocks: int) -> int:
+        if (self.block_results is None
+                or len(self.block_results) != expected_blocks):
+            return 0
+        prefix = 0
+        for succeeded in self.block_results:
+            if not succeeded:
+                break
+            prefix += 1
+        return prefix
+
+
+@dataclass
+class DeferredPublishResult:
+    """CPU radix publication outcome for a deferred Mooncake load.
+
+    Transfer ``block_results`` alone are not enough for prefetch
+    ``return_mask``: rematch/insert may discard staging even when REMOTE2H
+    succeeded. Task finalize takes
+    ``min(transfer_prefix, published_remote_blocks)``.
+    """
+
+    published_remote_blocks: Optional[int] = None
+    failed: bool = False
+    reason: str = ""
+
+    def record(
+            self,
+            published_remote_blocks: int,
+            reason: str = "ok",
+            failed: bool = False) -> None:
+        self.published_remote_blocks = int(published_remote_blocks)
+        self.reason = reason
+        self.failed = bool(failed)
+
+    def record_failure(self, reason: str = "error") -> None:
+        self.record(0, reason=reason, failed=True)
+
+
+@dataclass(frozen=True)
+class DeferredCacheInsert:
+    """Detached tier blocks published by the graph-completion callback.
+
+    ``load_result`` is present for Mooncake reads, where only the longest
+    successful remote prefix is valid.  PUT staging has already completed all
+    of its graph consumers when this record is committed, so ``None`` means the
+    complete staged range is valid.
+
+    ``swa_anchor_block`` / ``swa_load_result`` support joint Full+SWA prefetch:
+    the SWA snapshot is a single-block window keyed at position
+    ``swa_anchor_block`` (i.e. J-1 for a joint match of length J). At commit
+    time the joint guard mounts the SWA slot ONLY when the Full commit reaches
+    ``swa_anchor_block+1`` AND the SWA REMOTE2H reported success; otherwise the
+    slot is freed and only the Full prefix is published to the tree.
+
+    ``publish_result`` (CPU Mooncake loads) is filled by
+    ``_commit_deferred_insert`` / ``_transfer_callback`` so prefetch finalize
+    can report the mounted prefix rather than transfer-only success.
+    """
+
+    device_type: DeviceType
+    sequence_meta: SequenceMeta
+    physical_blocks: np.ndarray
+    staged_start_block: int
+    remote_start_block: int
+    requested_end_block: int
+    load_result: Optional[MooncakeLoadResult] = None
+    swa_slot: int = -1
+    publish_to_peer: bool = False
+    swa_anchor_block: int = -1
+    swa_load_result: Optional[MooncakeLoadResult] = None
+    publish_result: Optional[DeferredPublishResult] = None
+
+
+@dataclass
+class GetTransferPlan:
+    transfer_graph: TransferOpGraph
+    finished_ops_ids: List[int]
+    node_to_unlock: Dict[DeviceType, Tuple[object, int]]
+    op_callback_dict: Dict[int, Callable]
+    buffer_to_free: Dict[DeviceType, np.ndarray]
+    num_gpu_blocks_to_transfer: int
+    deferred_inserts: List[DeferredCacheInsert] = field(default_factory=list)
+    # SWA read reservation held by this plan; released by an op callback on the
+    # normal path, or by the abort path when the plan is cancelled unlaunched.
+    swa_reservation: Optional["SWAReadReservation"] = None
+
+    @classmethod
+    def empty(cls) -> "GetTransferPlan":
+        return cls(
+            transfer_graph=TransferOpGraph.create_empty_graph(),
+            finished_ops_ids=[],
+            node_to_unlock={},
+            op_callback_dict={},
+            buffer_to_free={},
+            num_gpu_blocks_to_transfer=0,
+        )
+
+
+@dataclass
+class PutTransferPlan:
+    transfer_graph: TransferOpGraph
+    finished_ops_ids: List[int]
+    node_to_unlock: Dict[DeviceType, Tuple[object, int]]
+    op_callback_dict: Dict[int, Callable]
+    buffer_to_free: Dict[DeviceType, np.ndarray]
+    num_gpu_blocks_to_transfer: int
+    skipped_gpu_blocks: int
+    deferred_inserts: List[DeferredCacheInsert] = field(default_factory=list)
+    # SWA slots reserved for this put but not yet mounted (publication happens
+    # in an op callback); the abort path must return them to the host pool.
+    swa_slots_to_free: List[Tuple[DeviceType, int]] = field(default_factory=list)
+
+    @classmethod
+    def empty(cls) -> "PutTransferPlan":
+        return cls(
+            transfer_graph=TransferOpGraph.create_empty_graph(),
+            finished_ops_ids=[],
+            node_to_unlock={},
+            op_callback_dict={},
+            buffer_to_free={},
+            num_gpu_blocks_to_transfer=0,
+            skipped_gpu_blocks=0,
+        )
+
+
+@dataclass
+class SWAReadSource:
+    hit_blocks: int = 0
+    host_slot: int = -1
+    node: Optional[object] = None
+    device_type: Optional[DeviceType] = None
+    engine: Optional[object] = None
+    # Key-addressed REMOTE tier (mooncake-store): the tail hash of the hit
+    # block is the sole remote handle — no radix node / host slot exists on
+    # that tier, so pin / unlock / evict do not apply to the source.
+    mooncake_tail_hash: Optional[str] = None
+
+    @property
+    def is_mooncake(self) -> bool:
+        return self.mooncake_tail_hash is not None
+
+    @property
+    def found(self) -> bool:
+        if self.hit_blocks <= 0 or self.device_type is None:
+            return False
+        if self.is_mooncake:
+            return self.device_type == DeviceType.REMOTE
+        return self.host_slot >= 0 and self.node is not None
+
+
+@dataclass(frozen=True)
+class SWAReadReservation:
+    """Pinned SWA source plus any transient CPU staging slot and graph op."""
+    source: SWAReadSource
+    staging_slot: int
+    h2d_id: int
+
+
+class TransferPlanHandle:
+    """Completion callback for a planned get/put, with an abort path.
+
+    Calling the handle (the pre-existing contract for ``task.callback``)
+    publishes the plan's results exactly as the plain completion partial did.
+    ``abort()`` instead rolls back a plan whose graph was never launched:
+    unlock, drop unready inserts, recycle staging, release SWA state. At most
+    one of the two may run, and only once; the handle enforces that so a
+    cancel racing a completion cannot double-unlock.
+    """
+
+    __slots__ = ("_complete", "_abort", "_consumed")
+
+    def __init__(self, complete: Callable[[], None], abort: Callable[[], None]):
+        self._complete = complete
+        self._abort = abort
+        self._consumed = False
+
+    def __call__(self) -> None:
+        if self._consumed:
+            return
+        self._consumed = True
+        self._complete()
+
+    def abort(self) -> None:
+        if self._consumed:
+            return
+        self._consumed = True
+        self._abort()
+
+    @property
+    def keywords(self) -> Dict:
+        """Expose completion-partial metadata for existing callback users."""
+        return getattr(self._complete, "keywords", {})
+
 
 class CacheEngineAccel:
     def __init__(self,
@@ -55,7 +280,8 @@ class CacheEngineAccel:
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector = None,
-                 protected_threshold: int = 2):
+                 protected_threshold = 2,
+                 swa_config: Optional["SWAPoolConfig"] = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -81,13 +307,104 @@ class CacheEngineAccel:
         self.num_total_blocks = num_total_blocks
         self.evict_ratio = evict_ratio
         self.evict_start_threshold = evict_start_threshold
-        
+
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
+
+        # SWA (Sliding Window Attention) — NODE-MOUNTED on the Full-KV radix
+        # tree (hicache / sglang style), NOT a standalone index. The radix nodes
+        # carry the SWA slot / tombstone / lock (see csrc/radix_tree.h and
+        # flexkv/cache/radixtree.py); this engine only owns the SWA host-pool
+        # (slot bytes + free-list) and the slot alloc/free/drain plumbing. SWA
+        # and Full eviction are UNIFIED through the one tree so the two pools
+        # never drift. Thisengine owns SWA initialization for its tier; init_swa()
+        #  remains public for tests and explicit embedding.
+        self.swa_pool = None
+        tier_swa_config = (swa_config.for_cache_tier(device_type)
+                           if swa_config is not None else None)
+        if tier_swa_config is not None:
+            self.init_swa(tier_swa_config)
+
+    def init_swa(self, swa_config: "SWAPoolConfig") -> None:
+        """Initialize the SWA host pool for node-mounted SWA on this engine."""
+        from flexkv.swa.swa_host_pool import SWAHostPool
+        self.swa_pool = SWAHostPool(swa_config)
+
+    @property
+    def swa_enabled(self) -> bool:
+        return self.swa_pool is not None
+
+    def _alloc_swa_slot(self, protected_node=None) -> int:
+        """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
+        if self.swa_pool is None:
+            return -1
+        slot = self.swa_pool.allocate()
+        if slot is not None:
+            return slot
+        # can not allocate SWA slot, evict SWA-LRU once
+        if protected_node is not None:
+            self.lock_node(protected_node)
+        try:
+            self._evict_swa_slots(1)
+        finally:
+            if protected_node is not None:
+                self.unlock(protected_node)
+        slot = self.swa_pool.allocate()
+        return slot if slot is not None else -1
+
+    def _free_swa_slot(self, slot: int) -> None:
+        """Return one detached SWA slot to this tier's pool."""
+        self.swa_pool.free(int(slot))
+
+    def _drain_unmounted_swa_slots(self) -> None:
+        """Return slots detached by radix-tree structural changes to the pool."""
+        if self.swa_pool is None:
+            return
+        for slot in self.index.drain_freed_swa_slots():
+            self._free_swa_slot(slot)
+
+    def _pin_swa_node(self, node) -> None:
+        self.index.lock(node)
+        try:
+            node.inc_swa_lock_ref()
+        except Exception:
+            self.index.unlock(node)
+            raise
+
+    def _evict_swa_slots(self, num_swa_evicted: int) -> int:
+        """Evict node-mounted SWA slots through the C++ radix tree."""
+        if self.swa_pool is None:
+            return 0
+        free_before = self.swa_pool.num_free
+        start_ns = time.perf_counter_ns()
+        evicted_full = torch.zeros(0, dtype=torch.int64)
+        num_freed = self.index.evict_swa(evicted_full, num_swa_evicted)
+        if evicted_full.numel() > 0:
+            self.mempool.recycle_blocks(evicted_full.numpy())
+        self._drain_unmounted_swa_slots()
+        free_after = self.swa_pool.num_free
+        eviction_log_aggregator.record(
+            tier=DEVICE_TYPE[self.device_type].lower(),
+            scope="swa",
+            reason="capacity",
+            requested_blocks=num_swa_evicted,
+            required_blocks=num_swa_evicted,
+            evicted_blocks=num_freed,
+            free_blocks_before=free_before,
+            free_blocks_after=free_after,
+            total_blocks=self.swa_pool.num_slots,
+            duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
+            target_met=num_freed >= num_swa_evicted,
+        )
+        return num_freed
 
     def reset(self) -> None:
         self.index.reset()
         self.mempool.reset()
+        # The tree reset bulk-deletes all nodes (their SWA slots are not
+        # buffered), so re-arm the SWA pool as fully free to avoid a leak.
+        if self.swa_pool is not None:
+            self.swa_pool.reset()
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
         sequence_meta.gen_hashes()
@@ -113,6 +430,10 @@ class CacheEngineAccel:
             physical_blocks=phys,
             block_node_ids=bnids_np,
             matched_pos="remote" if self.device_type == DeviceType.REMOTE else "local",
+            # SWA node-mount: carry the SWA hit found on the SAME forward pass so
+            # the SWA-aware get can reuse it (no second match_prefix walk).
+            last_swa_node=getattr(match_result, "last_swa_node", None),
+            swa_hit_blocks=int(getattr(match_result, "swa_hit_blocks", 0) or 0),
         )
 
     def insert(self,
@@ -144,6 +465,7 @@ class CacheEngineAccel:
                 block_size=self.tokens_per_block,
                 medium=DEVICE_TYPE[self.device_type]
             )
+
         return node
 
     def lock_node(self, node: CRadixNode) -> None:
@@ -160,35 +482,50 @@ class CacheEngineAccel:
              protected_node: Optional[CRadixNode] = None,
              strict: bool = True) -> np.ndarray:
         # Calculate current utilization
-        utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
-        
+        utilization = ((self.mempool.num_total_blocks - self.mempool.num_free_blocks)
+                       / self.mempool.num_total_blocks) if self.mempool.num_total_blocks > 0 else 0
+
         # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
-        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
-        
+        should_evict = (utilization >= self.evict_start_threshold) or \
+            (num_required_blocks > self.mempool.num_free_blocks)
+
         if should_evict:
             if protected_node is not None:
                 self.index.lock(protected_node)
-            
+
             # Calculate how many blocks to evict
             # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
             target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
             evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
-            
+
             evict_block_num = max(
                 num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
                 evict_to_reach_target,                               # Or reach target free ratio
-                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
+                # Or minimum evict_ratio
+                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0
             )
-            
+
             if evict_block_num > 0:
+                free_before = self.mempool.num_free_blocks
+                start_ns = time.perf_counter_ns()
                 target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
                 evicted_block_hashes = torch.zeros(evict_block_num, dtype=torch.int64)
+                # evict() resizes both tensors in-place to the actual freed count
+                # (which may EXCEED evict_block_num when the I2 tombstone cascade
+                # frees ancestors) and returns that count. Trust it, don't assume
+                # evict_block_num.
                 num_evicted = self.index.evict(target_blocks, evicted_block_hashes, evict_block_num)
-                if num_evicted != evict_block_num:
+                if target_blocks.numel() != num_evicted:
                     target_blocks.resize_(num_evicted)
                     evicted_block_hashes.resize_(num_evicted)
                 target_blocks = target_blocks.numpy()
                 self.mempool.recycle_blocks(target_blocks)
+
+                # SWA node-mount: full eviction may have connected-freed SWA
+                # slots (record_freed_swa_slot in split/evict). Return them to the
+                # SWA host pool so the two pools stay in lock-step (I1). No-op when
+                # SWA is disabled.
+                self._drain_unmounted_swa_slots()
 
                 # Record eviction metrics
                 if self._metrics_collector is not None and num_evicted > 0:
@@ -199,24 +536,69 @@ class CacheEngineAccel:
                         block_hashes=evicted_block_hashes.numpy(),
                         medium=DEVICE_TYPE[self.device_type]
                     )
+                free_after = self.mempool.num_free_blocks
+                target_met = free_after >= max(
+                    num_required_blocks, target_free_blocks
+                )
+                sample_block_hashes = None
+                batch_level = logging.DEBUG if target_met else logging.WARNING
+                if flexkv_logger.is_enabled_for(batch_level):
+                    sample_block_hashes = [
+                        format_block_hash(value)
+                        for value in evicted_block_hashes[:3].tolist()
+                    ]
+                eviction_log_aggregator.record(
+                    tier=DEVICE_TYPE[self.device_type].lower(),
+                    scope="full",
+                    reason=(
+                        "capacity"
+                        if num_required_blocks > free_before
+                        else "threshold"
+                    ),
+                    requested_blocks=num_required_blocks,
+                    required_blocks=evict_block_num,
+                    evicted_blocks=num_evicted,
+                    free_blocks_before=free_before,
+                    free_blocks_after=free_after,
+                    total_blocks=self.mempool.num_total_blocks,
+                    duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
+                    sample_block_hashes=sample_block_hashes,
+                    target_met=target_met,
+                )
             if protected_node is not None:
                 self.index.unlock(protected_node)
-        
+
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise RuntimeError(f"Not enough free blocks to take, "
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
-        
+
         # Record allocation metrics
         if self._metrics_collector is not None and num_allocated_blocks > 0:
             self._metrics_collector.record_allocation(DEVICE_TYPE[self.device_type].lower(), num_allocated_blocks)
-        
+
         return allocated_blocks
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
+        self._drain_unmounted_swa_slots()
+
+    def rollback_unready_insert(self, node: Optional[CRadixNode]) -> int:
+        """Undo an ``is_ready=False`` insert whose completion callback will
+        never run (plan aborted before launch). No-op for ready nodes, so it is
+        safe to call on every entry of a plan's node_to_unlock: only nodes this
+        plan inserted are unready. Recycles the freed blocks."""
+        if node is None:
+            return 0
+        freed = torch.zeros(node.size(), dtype=torch.int64)
+        num_freed = self.index.remove_unready_leaf(node, freed)
+        if freed.numel() != num_freed:
+            freed.resize_(num_freed)
+        if num_freed > 0:
+            self.recycle(freed.numpy())
+        return num_freed
 
 class CacheEngine:
     def __init__(self,
@@ -229,7 +611,8 @@ class CacheEngine:
                  eviction_policy: str = "lru",
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector = None,
-                 protected_threshold: int = 2):
+                 protected_threshold = 2,
+                 swa_config: Optional["SWAPoolConfig"] = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -246,8 +629,10 @@ class CacheEngine:
 
         self.device_type = device_type
 
-        self.index = RadixTreeIndex(tokens_per_block=tokens_per_block, hit_reward_seconds=hit_reward_seconds, eviction_policy=eviction_policy,
-                                       protected_threshold=protected_threshold)
+        self.index = RadixTreeIndex(tokens_per_block=tokens_per_block,
+                                    hit_reward_seconds=hit_reward_seconds,
+                                    eviction_policy=eviction_policy,
+                                    protected_threshold=protected_threshold)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
@@ -259,9 +644,91 @@ class CacheEngine:
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
 
+        # Legacy Python mirror. Keep the SWA helpers local to this class; the
+        # C++ CacheEngineAccel path is the maintained path.
+        self.swa_pool = None
+        self.tier_swa_config = (swa_config.for_cache_tier(device_type)
+                           if swa_config is not None else None)
+        if self.tier_swa_config is not None:
+            self.init_swa(self.tier_swa_config)
+
+    def init_swa(self, swa_config: "SWAPoolConfig") -> None:
+        """Initialize the SWA host pool for node-mounted SWA on this engine."""
+        from flexkv.swa.swa_host_pool import SWAHostPool
+        self.swa_pool = SWAHostPool(swa_config)
+
+    @property
+    def swa_enabled(self) -> bool:
+        return self.tier_swa_config is not None and self.tier_swa_config.enabled \
+               and self.swa_pool is not None
+
+    def _alloc_swa_slot(self, protected_node=None) -> int:
+        """Allocate one SWA slot; evict SWA-LRU once when the pool is full."""
+        if self.swa_pool is None:
+            return -1
+        slot = self.swa_pool.allocate()
+        if slot is not None:
+            return slot
+        if protected_node is not None:
+            self.lock_node(protected_node)
+        try:
+            self._evict_swa_slots(1)
+        finally:
+            if protected_node is not None:
+                self.unlock(protected_node)
+        slot = self.swa_pool.allocate()
+        return slot if slot is not None else -1
+
+    def _free_swa_slot(self, slot: int) -> None:
+        """Return one detached SWA slot to this tier's pool."""
+        self.swa_pool.free(int(slot))
+
+    def _drain_unmounted_swa_slots(self) -> None:
+        """Return slots detached by radix-tree structural changes to the pool."""
+        if self.swa_pool is None:
+            return
+        for slot in self.index.drain_freed_swa_slots():
+            self._free_swa_slot(slot)
+
+    def _pin_swa_node(self, node) -> None:
+        self.index.lock(node)
+        try:
+            node.inc_swa_lock_ref()
+        except Exception:
+            self.index.unlock(node)
+            raise
+
+    def _evict_swa_slots(self, num_swa_evicted: int) -> int:
+        """Evict node-mounted SWA slots through the Python radix tree."""
+        if self.swa_pool is None:
+            return 0
+        free_before = self.swa_pool.num_free
+        start_ns = time.perf_counter_ns()
+        evicted_full, num_freed = self.index.evict_swa(num_swa_evicted)
+        if evicted_full.size > 0:
+            self.mempool.recycle_blocks(evicted_full)
+        self._drain_unmounted_swa_slots()
+        free_after = self.swa_pool.num_free
+        eviction_log_aggregator.record(
+            tier=DEVICE_TYPE[self.device_type].lower(),
+            scope="swa",
+            reason="capacity",
+            requested_blocks=num_swa_evicted,
+            required_blocks=num_swa_evicted,
+            evicted_blocks=num_freed,
+            free_blocks_before=free_before,
+            free_blocks_after=free_after,
+            total_blocks=self.swa_pool.num_slots,
+            duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
+            target_met=num_freed >= num_swa_evicted,
+        )
+        return num_freed
+
     def reset(self) -> None:
         self.index.reset()
         self.mempool.reset()
+        if self.swa_pool is not None:
+            self.swa_pool.reset()
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResult:
         match_result = self.index.match_prefix(sequence_meta,
@@ -280,7 +747,8 @@ class CacheEngine:
                                  is_ready=is_ready,
                                  match_result=match_result)
         if self.event_collector is not None:
-            self.event_collector.publish_stored(block_hashes=sequence_meta.block_hashes[:None if num_insert_blocks == -1 else num_insert_blocks],
+            self.event_collector.publish_stored(
+                block_hashes=sequence_meta.block_hashes[:None if num_insert_blocks == -1 else num_insert_blocks],
                                                 block_size=self.tokens_per_block,
                                                 medium=DEVICE_TYPE[self.device_type])
         return node
@@ -299,54 +767,104 @@ class CacheEngine:
              protected_node: Optional[RadixNode] = None,
              strict: bool = True) -> np.ndarray:
         # Calculate current utilization
-        utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
-        
+        utilization = ((self.mempool.num_total_blocks - self.mempool.num_free_blocks)
+                       / self.mempool.num_total_blocks) if self.mempool.num_total_blocks > 0 else 0
+
         # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
-        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
-        
+        should_evict = (utilization >= self.evict_start_threshold) or \
+            (num_required_blocks > self.mempool.num_free_blocks)
+
         if should_evict:
             if protected_node is not None:
                 self.index.lock(protected_node)
-            
+
             # Calculate how many blocks to evict
             # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
             target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
             evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
-            
+
             evict_block_num = max(
                 num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
                 evict_to_reach_target,                               # Or reach target free ratio
-                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
+                # Or minimum evict_ratio
+                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0
             )
             if evict_block_num > 0:
+                free_before = self.mempool.num_free_blocks
+                start_ns = time.perf_counter_ns()
                 evicted_blocks, evicted_block_hashes = self.index.evict(evict_block_num)
                 self.mempool.recycle_blocks(evicted_blocks)
-                
+
+                # SWA node-mount: return connected-freed SWA slots to the pool (I1).
+                self._drain_unmounted_swa_slots()
+
                 # Record eviction metrics
                 if self._metrics_collector is not None and len(evicted_blocks) > 0:
                     self._metrics_collector.record_eviction(DEVICE_TYPE[self.device_type].lower(), len(evicted_blocks))
-                
+
                 if self.event_collector is not None:
                     self.event_collector.publish_removed(block_hashes=evicted_block_hashes,
                                                          medium=DEVICE_TYPE[self.device_type])
+                free_after = self.mempool.num_free_blocks
+                target_met = free_after >= max(
+                    num_required_blocks, target_free_blocks
+                )
+                sample_block_hashes = None
+                batch_level = logging.DEBUG if target_met else logging.WARNING
+                if flexkv_logger.is_enabled_for(batch_level):
+                    sample_block_hashes = [
+                        format_block_hash(value)
+                        for value in evicted_block_hashes[:3].tolist()
+                    ]
+                eviction_log_aggregator.record(
+                    tier=DEVICE_TYPE[self.device_type].lower(),
+                    scope="full",
+                    reason=(
+                        "capacity"
+                        if num_required_blocks > free_before
+                        else "threshold"
+                    ),
+                    requested_blocks=num_required_blocks,
+                    required_blocks=evict_block_num,
+                    evicted_blocks=len(evicted_blocks),
+                    free_blocks_before=free_before,
+                    free_blocks_after=free_after,
+                    total_blocks=self.mempool.num_total_blocks,
+                    duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
+                    sample_block_hashes=sample_block_hashes,
+                    target_met=target_met,
+                )
             if protected_node is not None:
                 self.index.unlock(protected_node)
-        
+
         if strict and num_required_blocks > self.mempool.num_free_blocks:
             raise RuntimeError("Not enough free blocks to take, ",
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
-        
+
         # Record allocation metrics
         if self._metrics_collector is not None and num_allocated_blocks > 0:
             self._metrics_collector.record_allocation(DEVICE_TYPE[self.device_type].lower(), num_allocated_blocks)
-        
+
         return allocated_blocks
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
+        self._drain_unmounted_swa_slots()
+
+    def rollback_unready_insert(self, node: Optional[RadixNode]) -> int:
+        """Undo an ``is_ready=False`` insert whose completion callback will
+        never run (plan aborted before launch). No-op for ready nodes, so it is
+        safe to call on every entry of a plan's node_to_unlock: only nodes this
+        plan inserted are unready. Recycles the freed blocks."""
+        if node is None:
+            return 0
+        freed = self.index.remove_unready_leaf(node)
+        if freed.size > 0:
+            self.recycle(freed)
+        return int(freed.size)
 
 @dataclass
 class CacheStrategy:
@@ -363,9 +881,30 @@ DEFAULT_CACHE_STRATEGY = CacheStrategy()
 
 CPUONLY_CACHE_STRATEGY = CacheStrategy(ignore_gpu=False, ignore_ssd=True, ignore_remote=True, ignore_gds=True)
 
+
+def resolve_get_cache_strategy(
+        use_mooncake_store_backend: bool,
+        temp_cache_strategy: CacheStrategy) -> CacheStrategy:
+    """Apply mooncake prefetch/compute split to a GET CacheStrategy.
+
+    Prefetch tasks set ``ignore_gpu=True`` and may pull REMOTE2H.
+    Compute retrieve (GPU-bound GET) must stay on local CPU/SSD when mooncake
+    is enabled — remote misses become CPU misses / recompute, never an
+    in-graph REMOTE2H.
+    """
+    if (use_mooncake_store_backend
+            and not temp_cache_strategy.ignore_gpu
+            and not temp_cache_strategy.ignore_remote):
+        return replace(temp_cache_strategy, ignore_remote=True)
+    return temp_cache_strategy
+
+
 class GlobalCacheEngine:
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None,
                  event_collector: Optional[KVEventCollector] = None):
+        # pybind releases the GIL around radix match/insert/evict. Protect the
+        # tree across planning and callback-time rematch+insert transactions.
+        self._cache_tree_lock = threading.RLock()
         self.cache_config = cache_config
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
@@ -373,6 +912,14 @@ class GlobalCacheEngine:
         self.cpu_cache_engine = None
         self.ssd_cache_engine = None
         self.remote_cache_engine = None
+        self.use_mooncake_store_backend = cache_config.use_mooncake_store_backend
+        if self.use_mooncake_store_backend:
+            # Product rule (M0): mooncake REMOTE2H runs in prefetch only;
+            # compute retrieve matches local ready tiers and does H2D.
+            flexkv_logger.info(
+                "Mooncake store enabled: REMOTE2H is prefetch-only; "
+                "compute GET forces ignore_remote=True"
+            )
 
         self.index_accel = GLOBAL_CONFIG_FROM_ENV.index_accel
         if cache_config.enable_kv_sharing:
@@ -409,7 +956,8 @@ class GlobalCacheEngine:
 
         if cache_config.enable_cpu:
             if cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta) #TODO
+                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(
+                    cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta)
             elif self.index_accel:
                 self.cpu_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.CPU,
@@ -422,6 +970,7 @@ class GlobalCacheEngine:
                     event_collector=event_collector,
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
+                    swa_config=cache_config.swa,
                 )
             else:
                 self.cpu_cache_engine = CacheEngine(
@@ -435,11 +984,13 @@ class GlobalCacheEngine:
                     event_collector=event_collector,
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
+                    swa_config=cache_config.swa,
                 )
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
-                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta) #TODO
+                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(
+                    cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta)
             elif self.index_accel:
                 self.ssd_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.SSD,
@@ -452,6 +1003,7 @@ class GlobalCacheEngine:
                     event_collector=event_collector,
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
+                    swa_config=cache_config.swa,
                 )
             else:
                 self.ssd_cache_engine = CacheEngine(
@@ -465,12 +1017,19 @@ class GlobalCacheEngine:
                     event_collector=event_collector,
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
+                    swa_config=cache_config.swa,
                 )
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
-            if cache_config.enable_kv_sharing:
+            if self.use_mooncake_store_backend:
+                from flexkv.external.mooncake_store_utils import MooncakeStoreCacheEngine
+                self.remote_cache_engine = MooncakeStoreCacheEngine(
+                    cache_config=cache_config,
+                )
+            elif cache_config.enable_kv_sharing:
                 # Build PCFSCacheEngine from CacheConfig directly (replacing RemotePCFSCacheEngine) TODO
-                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
+                self.remote_cache_engine = HierarchyLRCacheEngine.from_cache_config(
+                    cache_config, self.node_id, DeviceType.REMOTE, meta=self.redis_meta)
             elif self.index_accel:
                 self.remote_cache_engine = CacheEngineAccel(
                     device_type=DeviceType.REMOTE,
@@ -483,6 +1042,7 @@ class GlobalCacheEngine:
                     event_collector=None,
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
+                    swa_config=cache_config.swa,
                 )
             else:
                 self.remote_cache_engine = CacheEngine(
@@ -496,17 +1056,22 @@ class GlobalCacheEngine:
                     event_collector=None,
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
+                    swa_config=cache_config.swa,
                 )
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
+
+        # SWA peer-op builder. Per-tier match/slot resolution is fused into the
+        # Full-KV get/put implementations; this helper only appends SWA ops.
+        self.swa_op_constructor = SWAOpConstructor(self)
 
         #TODO move this to kvmanager.start()
         self.start()
 
-        self._empty_get_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]] = \
-            lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0)
-        self._empty_put_return: Callable[[int], Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]] = \
-            lambda request_id: (TransferOpGraph.create_empty_graph(), [], {}, {}, {}, 0, 0)
-        
+        self._empty_get_return: Callable[[int], GetTransferPlan] = \
+            lambda request_id: GetTransferPlan.empty()
+        self._empty_put_return: Callable[[int], PutTransferPlan] = \
+            lambda request_id: PutTransferPlan.empty()
+
         # Update initial mempool stats
         self._update_mempool_metrics()
 
@@ -518,6 +1083,7 @@ class GlobalCacheEngine:
         if self.remote_cache_engine and self.cache_config.enable_3rd_remote:
             self.remote_cache_engine.start()
 
+    @_synchronized_cache_tree
     def reset(self) -> None:
         if self.cpu_cache_engine:
             self.cpu_cache_engine.reset()
@@ -538,43 +1104,40 @@ class GlobalCacheEngine:
                     engine.mempool.num_total_blocks,
                     engine.mempool.num_free_blocks
                 )
-    
+
+    @_synchronized_cache_tree
     def get(self,
             request_id: int,
             token_ids: np.ndarray,
             token_mask: np.ndarray,
             slot_mapping: np.ndarray,
-            layer_num: int = -1,
-            layer_granularity: int = -1,
-            dp_id: int = 0,
+            dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
-            namespace: Optional[List[str]] = None) \
+            namespace: Optional[List[str]] = None,
+            swa_aware: bool = False) \
                  -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
 
-        if layer_num == -1:
-            layer_num = self.model_config.num_layers
-        if layer_granularity == -1:
-            layer_granularity = layer_num
-
-        if layer_num != layer_granularity:
-            flexkv_logger.error(f"Layerwise transfer is not supported yet, "
-                                f"layer_num: {layer_num}, layer_granularity: {layer_granularity}")
-            raise NotImplementedError(f"Layerwise transfer is not supported yet, "
-                                      f"layer_num: {layer_num}, layer_granularity: {layer_granularity}")
-
-        combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
-        if not combine_with_trtllm:
-            aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
-        else:
-            # When using FlexKV with TensorRT-LLM, we ignore the last incomplete block.
-            aligned_length = ((token_ids.shape[0] - 1) // self.tokens_per_block) * self.tokens_per_block
+        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
 
         aligned_token_ids = token_ids[:aligned_length]
         token_mask[aligned_length:] = False
 
+        if aligned_length == 0 or not token_mask.any():
+            transfer_graph = TransferOpGraph.create_empty_graph()
+            return_mask = np.zeros_like(token_mask, dtype=np.bool_)
+            callback = partial(self._transfer_callback, node_to_unlock={}, buffer_to_free={})
+            return transfer_graph, return_mask, callback, {}, -1
+
         block_start_idx, block_end_idx = self._get_block_range(token_mask)
-        assert block_end_idx == aligned_length // self.tokens_per_block
+        # block_end_idx is the block just past the LAST True in token_mask. On the
+        # plain path the caller marks every non-resident token up to the aligned
+        # end, so this equals aligned_length // tokens_per_block. On the SWA-aware
+        # path (swa_aware=True) _get_impl_* clamps the window to usable = min(full,
+        # swa) after matching, which can end before the aligned length. So the
+        # invariant is <= (can never exceed the aligned length), not ==. Nothing
+        # below uses aligned_length; all downstream sizing keys off block_end_idx.
+        assert block_end_idx <= aligned_length // self.tokens_per_block
         gpu_block_ids = self.slot_mapping_to_block_ids(slot_mapping,
                                                        self.tokens_per_block)[:block_end_idx-block_start_idx]
 
@@ -582,68 +1145,164 @@ class GlobalCacheEngine:
                                      tokens_per_block=self.cache_config.tokens_per_block,
                                      namespace=namespace)
 
+        temp_cache_strategy = resolve_get_cache_strategy(
+            self.use_mooncake_store_backend, temp_cache_strategy)
+
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             # from this entrance, we will also handle the case of peer_cpu and peer_ssd
-            (transfer_graph, finished_ops_ids, node_to_unlock,
-             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
-                self._get_impl_local(
-                    request_id,
-                    sequence_meta,
-                    block_start_idx,
-                    block_end_idx,
-                    gpu_block_ids,
-                    layer_num,
-                    temp_cache_strategy
-                )
+            plan = self._get_impl_local(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+                swa_aware=swa_aware,
+            )
         else:
             #TODO pcfs will be supported later
-            (transfer_graph, finished_ops_ids, node_to_unlock,
-             op_node_to_ready, buffer_to_free, num_gpu_blocks_to_transfer) = \
-                self._get_impl_global(
-                    request_id,
-                    sequence_meta,
-                    block_start_idx,
-                    block_end_idx,
-                    gpu_block_ids,
-                    layer_num,
-                    temp_cache_strategy
-                )
+            plan = self._get_impl_global(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+                swa_aware=swa_aware,
+            )
 
-        transfer_graph, task_end_op_id = add_virtal_op_for_mutiple_finished_ops(
-            transfer_graph,
-            finished_ops_ids
+        transfer_graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
+            plan.transfer_graph,
+            plan.finished_ops_ids,
+            dp_client_id,
             )
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
-        return_mask[block_start_idx* self.tokens_per_block:
-                    (block_start_idx + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
+        if temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
+            # Prefetch return_mask covers Full REMOTE2H tokens only (A: planned
+            # remote pull). SWA REMOTE2H ops live in a separate slot space and
+            # must not be summed into prefetch_blocks. Place the True span at
+            # the remote fragment start (f12), not block_start_idx — otherwise
+            # a non-zero CPU/SSD prefix shifts the mask onto local blocks.
+            prefetch_blocks = 0
+            for op in transfer_graph._op_map.values():
+                if op.transfer_type == TransferType.REMOTE2H and not op.is_swa:
+                    prefetch_blocks += len(op.src_block_ids)
+            if prefetch_blocks > 0:
+                remote_start_block = block_start_idx
+                for pending in plan.deferred_inserts:
+                    if pending.device_type == DeviceType.CPU:
+                        remote_start_block = pending.remote_start_block
+                        break
+                return_mask[remote_start_block * self.tokens_per_block:
+                            (remote_start_block + prefetch_blocks) * self.tokens_per_block] = True
+        else:
+            return_mask[block_start_idx* self.tokens_per_block:
+                    (block_start_idx + plan.num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
 
         # if layer_num // layer_granularity != 1:
         #     transfer_graph, finished_ops_ids = convert_read_graph_to_layer_wise_graph(transfer_graph=transfer_graph,
         #                                                                         finished_ops_ids=finished_ops_ids,
         #                                                                         layer_num=layer_num,
         #                                                                         layer_granularity=layer_granularity)
-        transfer_graph.bind_to_dp_group(dp_id)
 
-        for device_type in node_to_unlock:
-            self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
+        for device_type in plan.node_to_unlock:
+            self.cache_engines[device_type].lock_node(plan.node_to_unlock[device_type][0])
 
-        callback = partial(self._transfer_callback,
-                           node_to_unlock=node_to_unlock,
-                           buffer_to_free=buffer_to_free)
+        callback = TransferPlanHandle(
+            complete=partial(self._transfer_callback,
+                             node_to_unlock=plan.node_to_unlock,
+                             buffer_to_free=plan.buffer_to_free,
+                             deferred_inserts=plan.deferred_inserts),
+            abort=partial(self._abort_transfer_plan,
+                          node_to_unlock=plan.node_to_unlock,
+                          buffer_to_free=plan.buffer_to_free,
+                          deferred_inserts=plan.deferred_inserts,
+                          swa_reservation=plan.swa_reservation),
+        )
 
-        op_callback_dict = {} # dict, op_id -> callback
-        for op_id in op_node_to_ready:
-            op_callback_dict[op_id] = partial(self._op_callback,
-                                              device_type=op_node_to_ready[op_id][0],
-                                              node_to_ready=op_node_to_ready[op_id][1],
-                                              ready_length=op_node_to_ready[op_id][2])
-        
+        op_callback_dict = plan.op_callback_dict
+
         # Update mempool metrics after GET operation
         if self._metrics_collector is not None:
             self._update_mempool_metrics()
-        
+
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
+
+    def _build_op_callback_dict(self, op_node_to_ready: Dict) -> Dict[int, Callable]:
+        op_callback_dict = {}
+        for op_id, (device_type, node_to_ready, ready_length) in op_node_to_ready.items():
+            op_callback_dict[op_id] = partial(self._op_callback,
+                                              device_type=device_type,
+                                              node_to_ready=node_to_ready,
+                                              ready_length=ready_length)
+        return op_callback_dict
+
+    @staticmethod
+    def _append_op_callback(op_callback_dict: Dict[int, Callable],
+                            op_id: int,
+                            callback: Callable) -> None:
+        """Append ``callback`` without overwriting another completion action."""
+        previous = op_callback_dict.get(op_id)
+        if previous is None:
+            op_callback_dict[op_id] = callback
+            return
+
+        def combined_callback() -> None:
+            previous()
+            callback()
+
+        op_callback_dict[op_id] = combined_callback
+
+    @_synchronized_cache_tree
+    def _publish_swa_put_slot(self,
+                              device_type: DeviceType,
+                              node,
+                              slot: int) -> None:
+        """Make a reserved PUT slot readable after its tier transfer completes.
+
+        The slot id is allocated before graph construction so the data plane can
+        address it, but it is deliberately not mounted on the radix node until
+        this callback.  Full-KV and SWA publication therefore remain independent:
+        either transfer may finish first without exposing unfilled SWA bytes.
+        """
+        assert node is not None
+        assert slot >= 0
+        engine = self.cache_engines[device_type]
+        engine.index.set_swa(node, int(slot))
+
+    def _fail_put_before_insert(
+            self,
+            request_id: int,
+            reason: str,
+            cpu_blocks: np.ndarray,
+            cpu_swa_slot: int = -1,
+            ssd_blocks: Optional[np.ndarray] = None,
+            ssd_swa_slot: int = -1,
+            remote_blocks: Optional[np.ndarray] = None,
+            remote_swa_slot: int = -1) -> PutTransferPlan:
+        flexkv_logger.warning(
+            "[FlexKV-SWA] PUT request failed before radix insert; "
+            f"request_id={request_id}, reason={reason}, "
+            f"cpu_blocks={len(cpu_blocks)}, ssd_blocks={0 if ssd_blocks is None else len(ssd_blocks)}, "
+            f"remote_blocks={0 if remote_blocks is None else len(remote_blocks)}, "
+            f"cpu_swa_slot={cpu_swa_slot}, ssd_swa_slot={ssd_swa_slot}, "
+            f"remote_swa_slot={remote_swa_slot}"
+        )
+        if cpu_swa_slot >= 0:
+            self.cpu_cache_engine._free_swa_slot(cpu_swa_slot)
+        if ssd_swa_slot >= 0:
+            self.ssd_cache_engine._free_swa_slot(ssd_swa_slot)
+        if remote_swa_slot >= 0:
+            self.remote_cache_engine._free_swa_slot(remote_swa_slot)
+        self.cpu_cache_engine.recycle(cpu_blocks)
+        if ssd_blocks is not None:
+            self.ssd_cache_engine.recycle(ssd_blocks)
+        if remote_blocks is not None:
+            self.remote_cache_engine.recycle(remote_blocks)
+        return self._empty_put_return(request_id)
 
     def _get_impl_global(self,
             request_id: int,
@@ -651,9 +1310,10 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num: int,
-            temp_cache_strategy: CacheStrategy) \
-                 -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
+            temp_cache_strategy: CacheStrategy,
+            dp_client_id: int,
+            swa_aware: bool = False) \
+                 -> GetTransferPlan:
         """
         transfer pattern:
 
@@ -675,19 +1335,50 @@ class GlobalCacheEngine:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
         else:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
+        transfer_graph = TransferOpGraph()
+        swa_reservation: Optional[SWAReadReservation] = None
+        swa_read_source: SWAReadSource = SWAReadSource()
+        if swa_aware:
+            block_mask_end, swa_read_source = self._select_swa_read_source(
+                block_mask_start,
+                block_mask_end,
+                {DeviceType.CPU: cpu_matched_result,
+                 DeviceType.SSD: ssd_matched_result,
+                 DeviceType.REMOTE: remote_matched_result},
+                sequence_meta=sequence_meta,
+            )
+            protected_cpu_node = (
+                cpu_matched_result.last_ready_node
+                if cpu_matched_result.num_ready_matched_blocks > block_mask_start
+                else None
+            )
+            if enable_gpu:
+                swa_reservation = self._reserve_swa_read_source(
+                    transfer_graph, swa_read_source, protected_cpu_node, dp_client_id)
+            # Compute path: SWA reservation failure -> no Full-only restore.
+            # Prefetch path (not enable_gpu): reservation is intentionally
+            # skipped; the SWA REMOTE2H is planned later in the joint block,
+            # and the commit-time guard enforces the tree invariant.
+            if enable_gpu and swa_read_source.found and swa_reservation is None:
+                block_mask_end = block_mask_start
+            if (enable_gpu and swa_read_source.found and swa_reservation is None
+                    and self._metrics_collector is not None):
+                self._metrics_collector.record_allocation_failure("global")
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
             :cpu_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
         remote_matched_blocks = remote_matched_result.physical_blocks[
             :remote_matched_result.num_ready_matched_blocks][block_mask_start:block_mask_end]
-        shared_pcfs_read = self.cache_config.enable_kv_sharing and self.index_accel
+        shared_pcfs_read = (self.cache_config.enable_kv_sharing and self.index_accel
+                            and not self.use_mooncake_store_backend)
         remote_file_nodeids = None
         if shared_pcfs_read:
             remote_file_nodeids = remote_matched_result.block_node_ids
         fragment123_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks), len(remote_matched_blocks))
         #early return if no blocks to transfer
         if fragment123_num_blocks == 0:
+            self._release_swa_read_reservation(swa_reservation)
             # All cache levels missed - record miss for all requested blocks
             if self._metrics_collector is not None:
                 total_query_blocks = block_mask_end - block_mask_start
@@ -696,7 +1387,6 @@ class GlobalCacheEngine:
             return self._empty_get_return(request_id)
         assert fragment123_num_blocks <= len(gpu_block_ids)
 
-        transfer_graph = TransferOpGraph()
         finished_ops_ids = []
 
         fragment1_num_blocks = len(cpu_matched_blocks)
@@ -704,6 +1394,8 @@ class GlobalCacheEngine:
         fragment12_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks))
         fragment3_num_blocks = max(len(remote_matched_blocks) - fragment12_num_blocks, 0)
         fragment23_num_blocks = fragment2_num_blocks + fragment3_num_blocks
+        defer_mooncake_commit = (
+            self.use_mooncake_store_backend and fragment3_num_blocks > 0)
 
         fragment123_gpu_blocks = gpu_block_ids[:fragment123_num_blocks]
         fragment123_cpu_blocks = cpu_matched_blocks
@@ -716,34 +1408,49 @@ class GlobalCacheEngine:
         ssd_node_to_unlock = ssd_matched_result.last_ready_node
         remote_node_to_unlock = remote_matched_result.last_ready_node
         cpu_blocks_to_free = np.array([], dtype=np.int64)
+        cpu_node_to_ready = None
+        ssd_node_to_ready = None
 
         if fragment23_num_blocks > 0:
             num_extra_required_blocks = fragment23_num_blocks
-            fragment23_cpu_blocks = self.cpu_cache_engine.take(
-                num_required_blocks=num_extra_required_blocks,
-                protected_node=cpu_matched_result.last_node,
-                strict=True
-            )
+            try:
+                fragment23_cpu_blocks = self.cpu_cache_engine.take(
+                    num_required_blocks=num_extra_required_blocks,
+                    protected_node=cpu_matched_result.last_node,
+                    strict=True
+                )
+            except RuntimeError:
+                self._release_swa_read_reservation(swa_reservation)
+                if self._metrics_collector is not None:
+                    self._metrics_collector.record_allocation_failure("global")
+                return self._empty_get_return(request_id)
             if len(fragment23_cpu_blocks) < num_extra_required_blocks:
                 self.cpu_cache_engine.recycle(fragment23_cpu_blocks)
+                self._release_swa_read_reservation(swa_reservation)
                 # Record allocation failure (resource unavailable, not cache miss)
                 if self._metrics_collector is not None:
                     self._metrics_collector.record_allocation_failure("global")
                 return self._empty_get_return(request_id)
             fragment123_cpu_blocks = np.concatenate([fragment123_cpu_blocks, fragment23_cpu_blocks])
-            # we only insert the buffer blocks to cpu cache engine only:
-            # 1. the cpu cache engine satisfies prefix cache after insertion
-            # 2. the sequence is all ready blocks
-            if (cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
-                cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
-                cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
-                                                                  fragment23_cpu_blocks,
-                                                                  num_insert_blocks=fragment123_num_blocks + \
-                                                                    block_mask_start,
-                                                                  is_ready=False,
-                                                                  match_result=cpu_matched_result)
-            else:
-                cpu_blocks_to_free = fragment23_cpu_blocks
+            # Mooncake can partially fail after match. Keep its staging blocks
+            # detached until graph completion; the callback will fresh-rematch
+            # and publish only the successfully loaded prefix.
+            # Non-mooncake still inserts now (is_ready=False) and publishes via
+            # cpu_node_to_ready after the host-stage virtual join completes.
+            if not defer_mooncake_commit:
+                if (cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
+                        cpu_matched_result.num_ready_matched_blocks ==
+                        cpu_matched_result.num_matched_blocks):
+                    cpu_node_to_unlock = self.cpu_cache_engine.insert(
+                        sequence_meta,
+                        fragment23_cpu_blocks,
+                        num_insert_blocks=fragment123_num_blocks + block_mask_start,
+                        is_ready=False,
+                        match_result=cpu_matched_result,
+                    )
+                    cpu_node_to_ready = cpu_node_to_unlock
+                else:
+                    cpu_blocks_to_free = fragment23_cpu_blocks
 
         # Record cache hit/miss metrics after confirming successful allocation
         if self._metrics_collector is not None:
@@ -766,21 +1473,26 @@ class GlobalCacheEngine:
                 transfer_type = TransferType.DISK2H,
                 src_block_ids = fragment2_ssd_blocks,
                 dst_block_ids = fragment123_cpu_blocks[fragment1_num_blocks:fragment12_num_blocks],
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_disk2h)
 
         op_remote2h = None
         if fragment3_num_blocks > 0:
+            mooncake_block_hashes = None
+            if self.use_mooncake_store_backend:
+                mooncake_block_hashes = sequence_meta.block_hashes[
+                    block_mask_start + fragment12_num_blocks:
+                    block_mask_start + fragment12_num_blocks + fragment3_num_blocks
+                ]
             op_remote2h = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.REMOTE2H,
                 src_block_ids = fragment3_remote_blocks,
                 dst_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
-                layer_id = 0,
-                layer_granularity = layer_num,
-                src_block_node_ids = fragment3_remote_file_nodeids
+                src_block_node_ids = fragment3_remote_file_nodeids,
+                dp_client_id = dp_client_id,
+                mooncake_store_block_hashes = mooncake_block_hashes,
             )
             transfer_graph.add_transfer_op(op_remote2h)
 
@@ -789,7 +1501,8 @@ class GlobalCacheEngine:
         if (enable_ssd and
             op_remote2h is not None and
             ssd_matched_result.num_ready_matched_blocks >= block_mask_start and
-            ssd_matched_result.num_ready_matched_blocks == ssd_matched_result.num_matched_blocks):
+            ssd_matched_result.num_ready_matched_blocks == ssd_matched_result.num_matched_blocks and
+            ssd_matched_result.num_matched_blocks == block_mask_start + fragment12_num_blocks):
             # only when the above all are satisfied, we load data back from cpu to ssd
             write_ssd_blocks_from_remote = True
             fragment3_ssd_blocks = self.ssd_cache_engine.take(
@@ -806,26 +1519,71 @@ class GlobalCacheEngine:
                     transfer_type = TransferType.H2DISK,
                     src_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
                     dst_block_ids = fragment3_ssd_blocks,
-                    layer_id = 0,
-                    layer_granularity = layer_num
+                    dp_client_id = dp_client_id,
                 )
                 transfer_graph.add_transfer_op(op_h2disk)
                 transfer_graph.add_dependency(op_h2disk.op_id, op_remote2h.op_id)
 
-                ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
-                                                                fragment3_ssd_blocks,
-                                                                num_insert_blocks=fragment123_num_blocks + \
-                                                                    block_mask_start,
-                                                                is_ready=False,
-                                                                match_result=ssd_matched_result)
+                if not defer_mooncake_commit:
+                    ssd_node_to_unlock = self.ssd_cache_engine.insert(
+                        sequence_meta,
+                        fragment3_ssd_blocks,
+                        num_insert_blocks=fragment123_num_blocks + block_mask_start,
+                        is_ready=False,
+                        match_result=ssd_matched_result,
+                    )
+                    ssd_node_to_ready = ssd_node_to_unlock
+
+        # A prefetch has no H2D op, so its terminal op must be the host-stage
+        # transfer itself.  The global path also inserts REMOTE2H/DISK2H
+        # destinations into the CPU radix as ``is_ready=False``.  Publish that
+        # node only after every host-stage fragment is complete; otherwise the
+        # unready nodes accumulate, cannot be evicted, and eventually exhaust
+        # the CPU pool.  A virtual join preserves parallel SSD and remote IO.
+        # Mooncake insert-after skips plan-time insert, so cpu/ssd_node_to_ready
+        # stay None and these set_ready callbacks are not registered.
+        op_callback_dict = {}
+        host_finished_ops_ids = [
+            op.op_id for op in (op_disk2h, op_remote2h) if op is not None
+        ]
+        host_ready_op_id = -1
+        if host_finished_ops_ids:
+            transfer_graph, host_ready_op_id = add_virtual_op_for_multiple_finished_ops(
+                transfer_graph, host_finished_ops_ids, dp_client_id
+            )
+            if not enable_gpu:
+                finished_ops_ids.append(host_ready_op_id)
+        if cpu_node_to_ready is not None:
+            assert host_ready_op_id >= 0
+            self._append_op_callback(
+                op_callback_dict,
+                host_ready_op_id,
+                partial(
+                    self._op_callback,
+                    device_type=DeviceType.CPU,
+                    node_to_ready=cpu_node_to_ready,
+                    ready_length=cpu_node_to_ready.size(),
+                ),
+            )
+        if ssd_node_to_ready is not None:
+            assert op_h2disk is not None
+            self._append_op_callback(
+                op_callback_dict,
+                op_h2disk.op_id,
+                partial(
+                    self._op_callback,
+                    device_type=DeviceType.SSD,
+                    node_to_ready=ssd_node_to_ready,
+                    ready_length=ssd_node_to_ready.size(),
+                ),
+            )
         if enable_gpu:
             op_h2d = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2D,
                 src_block_ids = fragment123_cpu_blocks,
                 dst_block_ids = fragment123_gpu_blocks,
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_h2d)
             if op_disk2h is not None:
@@ -836,18 +1594,125 @@ class GlobalCacheEngine:
 
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
-            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+            node_to_unlock[DeviceType.CPU] = (
+                cpu_node_to_unlock,
+                0 if defer_mooncake_commit else cpu_node_to_unlock.size(),
+            )
         if ssd_node_to_unlock is not None:
-            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+            node_to_unlock[DeviceType.SSD] = (
+                ssd_node_to_unlock,
+                0 if defer_mooncake_commit else ssd_node_to_unlock.size(),
+            )
         if remote_node_to_unlock is not None:
             node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
 
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
+        num_gpu_blocks_to_transfer = len(fragment123_gpu_blocks) if enable_gpu else 0
+        deferred_inserts: List[DeferredCacheInsert] = []
 
-        # NOTE: for now in build transfer graph, we assume that cpu works as a cache for ssd
-        return (
-            transfer_graph, finished_ops_ids, node_to_unlock, {}, buffer_to_free,
-            len(fragment123_gpu_blocks) if enable_gpu else 0  # op_node_to_ready: {}
+        # construct the SWA op for joint prefetch
+        joint_prefetch_swa_slot = -1
+        joint_prefetch_swa_anchor = -1
+        joint_prefetch_swa_load_result: Optional[MooncakeLoadResult] = None
+        if (defer_mooncake_commit
+                and swa_aware
+                and not enable_gpu
+                and swa_reservation is None
+                and swa_read_source.found
+                and swa_read_source.is_mooncake
+                and self.swa_op_constructor.enabled):
+            joint_prefetch_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
+                protected_node=cpu_matched_result.last_ready_node)
+            if joint_prefetch_swa_slot >= 0:
+                joint_prefetch_swa_anchor = swa_read_source.hit_blocks - 1
+                swa_op_id = self.swa_op_constructor.build_swa_op(
+                    transfer_graph,
+                    TransferType.REMOTE2H,
+                    src_slot_ids=np.array([0], dtype=np.int64),
+                    dst_slot_ids=np.array(
+                        [joint_prefetch_swa_slot], dtype=np.int64),
+                    dp_client_id=dp_client_id,
+                    mooncake_tail_hashes=[swa_read_source.mooncake_tail_hash],
+                )
+                if swa_op_id is None:
+                    # SWA transfer gated off after all; return the slot.
+                    self.cpu_cache_engine._free_swa_slot(joint_prefetch_swa_slot)
+                    joint_prefetch_swa_slot = -1
+                    joint_prefetch_swa_anchor = -1
+                else:
+                    joint_prefetch_swa_load_result = MooncakeLoadResult()
+                    op_callback_dict[swa_op_id] = CompletionAwareCallback(
+                        joint_prefetch_swa_load_result.record)
+                    # Report the SWA REMOTE2H as a finished op so the graph
+                    # cannot complete before its mask lands on the pending.
+                    finished_ops_ids.append(swa_op_id)
+            else:
+                flexkv_logger.warning(
+                    "[FlexKV-SWA] Joint prefetch SWA slot allocation failed; "
+                    f"falling back to Full-only prefetch, request_id={request_id}"
+                )
+                if self._metrics_collector is not None:
+                    self._metrics_collector.record_joint_prefetch_swa_slot_alloc_failure()
+
+        if defer_mooncake_commit:
+            assert op_remote2h is not None
+            load_result = MooncakeLoadResult()
+            # CPU publication drives prefetch return_mask; SSD commit is
+            # independent and must not overwrite this tracker.
+            publish_result = DeferredPublishResult()
+            op_callback_dict[op_remote2h.op_id] = CompletionAwareCallback(
+                load_result.record)
+            remote_start_block = block_mask_start + fragment12_num_blocks
+            requested_end_block = block_mask_start + fragment123_num_blocks
+            deferred_inserts.append(DeferredCacheInsert(
+                device_type=DeviceType.CPU,
+                sequence_meta=sequence_meta,
+                physical_blocks=fragment23_cpu_blocks,
+                staged_start_block=block_mask_start + fragment1_num_blocks,
+                remote_start_block=remote_start_block,
+                requested_end_block=requested_end_block,
+                load_result=load_result,
+                swa_slot=joint_prefetch_swa_slot,
+                swa_anchor_block=joint_prefetch_swa_anchor,
+                swa_load_result=joint_prefetch_swa_load_result,
+                publish_result=publish_result,
+            ))
+            if write_ssd_blocks_from_remote:
+                deferred_inserts.append(DeferredCacheInsert(
+                    device_type=DeviceType.SSD,
+                    sequence_meta=sequence_meta,
+                    physical_blocks=fragment3_ssd_blocks,
+                    staged_start_block=remote_start_block,
+                    remote_start_block=remote_start_block,
+                    requested_end_block=requested_end_block,
+                    load_result=load_result,
+                ))
+        elif joint_prefetch_swa_slot >= 0:
+            # SWA op was planned but Full mooncake path was skipped
+            # (defer_mooncake_commit False): no CPU pending will consume the
+            # slot, so free it and drop the op-side callback wiring rather
+            # than leak a slot into an untracked graph.
+            self.cpu_cache_engine._free_swa_slot(joint_prefetch_swa_slot)
+            joint_prefetch_swa_slot = -1
+        if swa_reservation is not None:
+            assert num_gpu_blocks_to_transfer > 0
+            finished_ops_ids.append(swa_reservation.h2d_id)
+            op_callback_dict[swa_reservation.h2d_id] = partial(
+                self._swa_release_load_lock,
+                node=swa_reservation.source.node,
+                staging_slot=swa_reservation.staging_slot,
+                engine=swa_reservation.source.engine,
+            )
+
+        return GetTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free=buffer_to_free,
+            num_gpu_blocks_to_transfer=num_gpu_blocks_to_transfer,
+            deferred_inserts=deferred_inserts,
+            swa_reservation=swa_reservation,
         )
 
     def _get_impl_local(self,
@@ -856,9 +1721,10 @@ class GlobalCacheEngine:
                         block_mask_start: int,
                         block_mask_end: int,
                         gpu_block_ids: np.ndarray,
-                        layer_num: int,
-                        temp_cache_strategy: CacheStrategy) \
-                            -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int]:
+                        temp_cache_strategy: CacheStrategy,
+                        dp_client_id: int,
+                        swa_aware: bool = False) \
+                            -> GetTransferPlan:
         """
         transfer pattern:
 
@@ -878,14 +1744,47 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
 
         if self.index_accel:
-            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta, temp_cache_strategy, is_put=False, gpu_matched_blocks=block_mask_start)
+            cpu_matched_result, ssd_matched_result = self.match_local_accel(
+                sequence_meta, temp_cache_strategy, is_put=False, gpu_matched_blocks=block_mask_start)
         else:
             cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
 
+        transfer_graph = TransferOpGraph()
+        swa_reservation: Optional[SWAReadReservation] = None
+        swa_read_source: SWAReadSource = SWAReadSource()
+        if swa_aware:
+            block_mask_end, swa_read_source = self._select_swa_read_source(
+                block_mask_start,
+                block_mask_end,
+                {DeviceType.CPU: cpu_matched_result,
+                 DeviceType.SSD: ssd_matched_result},
+                sequence_meta=sequence_meta,
+            )
+            protected_cpu_node = (
+                cpu_matched_result.last_ready_node
+                if cpu_matched_result.num_ready_matched_blocks > block_mask_start
+                else None
+            )
+            if enable_gpu:
+                swa_reservation = self._reserve_swa_read_source(
+                    transfer_graph, swa_read_source, protected_cpu_node, dp_client_id)
+            # Align with _get_impl_global: only refuse Full-only restore when
+            # compute needs GPU SWA but reservation failed. Prefetch
+            # (not enable_gpu) leaves Full intact; SWA is staged separately.
+            # (When no SWA source exists, _select_swa_read_source already
+            # returned block_mask_end == block_mask_start.)
+            if enable_gpu and swa_read_source.found and swa_reservation is None:
+                block_mask_end = block_mask_start
+            if (enable_gpu and swa_read_source.found and swa_reservation is None
+                    and self._metrics_collector is not None):
+                self._metrics_collector.record_allocation_failure("local")
 
         # DEBUG: Log GET operation with hash info
         #if len(sequence_meta.block_hashes) > 0:
-        #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
+        #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, "
+        #          f"CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, "
+        #          f"SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, "
+        #          f"pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
 
         # tailor the blocks to assure:
         # the blocks are needed by the mask & the blocks are ready
@@ -904,6 +1803,7 @@ class GlobalCacheEngine:
         fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
         #early return if no blocks to transfer
         if fragment12_num_blocks == 0:
+            self._release_swa_read_reservation(swa_reservation)
             # All cache levels missed - record miss for all requested blocks
             if self._metrics_collector is not None:
                 total_query_blocks = block_mask_end - block_mask_start
@@ -913,7 +1813,6 @@ class GlobalCacheEngine:
             return self._empty_get_return(request_id)
         assert fragment12_num_blocks <= len(gpu_block_ids)
 
-        transfer_graph = TransferOpGraph()
         finished_ops_ids = []
         op_node_to_ready = {}
 
@@ -930,23 +1829,29 @@ class GlobalCacheEngine:
         op_gds_transfer = None
         fragment2_cpu_blocks = None
 
-        #allocated new cpu blocks for this request
-        allocated_cpu_block_num = fragment2_num_blocks
-        # NOTE: When matched_pos is "remote", we ALWAYS need to allocate local CPU blocks
-        # to receive the data, regardless of whether we insert to local index or not
+        # Allocate CPU blocks only for paths that actually stage data through
+        # host memory. GDS moves fragment2 directly from SSD to GPU.
+        allocated_cpu_block_num = 0 if enable_gds else fragment2_num_blocks
+        # Remote CPU hits still need local CPU blocks for PEERH2H staging,
+        # regardless of whether those blocks are inserted into the local index.
         if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
             allocated_cpu_block_num += fragment1_num_blocks
-        nvtx.push_range(f"take {allocated_cpu_block_num} cpu blocks", color="green")
-        allocated_cpu_blocks = self.cpu_cache_engine.take(
-            num_required_blocks=allocated_cpu_block_num,
-            protected_node=cpu_matched_result.last_node,
-            strict=False
-        )
-        nvtx.pop_range()
+        if allocated_cpu_block_num > 0:
+            nvtx.push_range(f"take {allocated_cpu_block_num} cpu blocks", color="green")
+            allocated_cpu_blocks = self.cpu_cache_engine.take(
+                num_required_blocks=allocated_cpu_block_num,
+                protected_node=cpu_matched_result.last_node,
+                strict=False
+            )
+            nvtx.pop_range()
+        else:
+            # take(0) may still trigger proactive eviction at high utilization.
+            allocated_cpu_blocks = np.empty(0, dtype=np.int64)
         # NOTE: not enough space to allocate, skip the request
         # there might be a better way to handle this
         if len(allocated_cpu_blocks) < allocated_cpu_block_num:
             self.cpu_cache_engine.recycle(allocated_cpu_blocks)
+            self._release_swa_read_reservation(swa_reservation)
             # Record allocation failure (resource unavailable, not cache miss)
             if self._metrics_collector is not None:
                 self._metrics_collector.record_allocation_failure("local")
@@ -958,7 +1863,7 @@ class GlobalCacheEngine:
             total_query_blocks = block_mask_end - block_mask_start
             # CPU hit blocks (directly from CPU cache)
             self._metrics_collector.record_cache_hit("cpu", fragment1_num_blocks)
-            # SSD hit blocks (blocks loaded from SSD to CPU)
+            # SSD hit blocks (loaded directly to GPU with GDS, otherwise via CPU)
             self._metrics_collector.record_cache_hit("ssd", fragment2_num_blocks)
             # Miss blocks (not in any cache)
             miss_blocks = total_query_blocks - fragment12_num_blocks
@@ -972,15 +1877,15 @@ class GlobalCacheEngine:
                 transfer_type = TransferType.PEERH2H,
                 src_block_ids = fragment1_cpu_blocks,
                 dst_block_ids = fragment1_cpu_blocks_local,
-                layer_id = 0,
-                layer_granularity = layer_num,
                 remote_node_ids = cpu_matched_result.matched_node_ids,
-                src_block_node_ids = cpu_matched_result.matched_node_ids  # Add this for worker
+                src_block_node_ids = cpu_matched_result.matched_node_ids,  # Add this for worker
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_peerh2h)
-            #TODO here we dont combine peer cpu or local cpu match results, so we can safely add remote results to local cpu
+            # TODO here we dont combine peer cpu or local cpu match results,
+            # so we can safely add remote results to local cpu
             #TODO here assume all matched blocks are ready blocks for peer cpu
-            if (cpu_matched_result.insert_to_local_cpu_index and 
+            if (cpu_matched_result.insert_to_local_cpu_index and
                 cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
                 cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
                 cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
@@ -998,8 +1903,7 @@ class GlobalCacheEngine:
                     transfer_type = TransferType.DISK2D,
                     src_block_ids = fragment2_ssd_blocks,
                     dst_block_ids = fragment12_gpu_blocks[-fragment2_num_blocks:],
-                    layer_id = 0,
-                    layer_granularity = layer_num
+                    dp_client_id = dp_client_id,
                 )
                 transfer_graph.add_transfer_op(op_gds_transfer)
                 finished_ops_ids.append(op_gds_transfer.op_id)
@@ -1011,19 +1915,22 @@ class GlobalCacheEngine:
 
                 op_disk2h = TransferOp(
                     graph_id = transfer_graph.graph_id,
-                    transfer_type = TransferType.PEERSSD2H if ssd_matched_result.matched_pos == "remote" else TransferType.DISK2H,
+                    transfer_type = TransferType.PEERSSD2H
+                        if ssd_matched_result.matched_pos == "remote" else TransferType.DISK2H,
                     src_block_ids = fragment2_ssd_blocks,
                     dst_block_ids = fragment2_cpu_blocks,
-                    layer_id = 0,
-                    layer_granularity = layer_num,
-                    remote_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None,
-                    src_block_node_ids = ssd_matched_result.matched_node_ids if ssd_matched_result.matched_pos == "remote" else None
+                    remote_node_ids = ssd_matched_result.matched_node_ids
+                        if ssd_matched_result.matched_pos == "remote" else None,
+                    src_block_node_ids = ssd_matched_result.matched_node_ids
+                        if ssd_matched_result.matched_pos == "remote" else None,
+                    dp_client_id = dp_client_id,
                 )
                 transfer_graph.add_transfer_op(op_disk2h)
                 # we only insert the buffer blocks to cpu cache engine only:
                 # 1. the cpu cache engine satisfies prefix cache after insertion
                 # 2. the sequence is all ready blocks
-                # TODO: for simplicity, if we use peer cpu results, we dont insert the buffer ssd blocks to local cpu any more
+                # TODO: for simplicity, if we use peer cpu results,
+                # we dont insert the buffer ssd blocks to local cpu any more
                 if (cpu_matched_result.matched_pos == "local" and
                     cpu_matched_result.num_ready_matched_blocks >= block_mask_start and
                     cpu_matched_result.num_ready_matched_blocks == cpu_matched_result.num_matched_blocks):
@@ -1051,8 +1958,7 @@ class GlobalCacheEngine:
                 src_block_ids = fragment12_cpu_blocks if not enable_gds else fragment1_cpu_blocks,
                 dst_block_ids = fragment12_gpu_blocks if not enable_gds \
                     else fragment12_gpu_blocks[:fragment1_num_blocks],
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_h2d)
             if op_disk2h is not None:
@@ -1067,26 +1973,40 @@ class GlobalCacheEngine:
         if ssd_node_to_unlock is not None:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
         buffer_to_free = {DeviceType.CPU: cpu_blocks_to_free}
+        num_gpu_blocks_to_transfer = len(fragment12_gpu_blocks) if enable_gpu else 0
+        op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+
+        if swa_reservation is not None:
+            assert num_gpu_blocks_to_transfer > 0
+            finished_ops_ids.append(swa_reservation.h2d_id)
+            op_callback_dict[swa_reservation.h2d_id] = partial(
+                self._swa_release_load_lock,
+                node=swa_reservation.source.node,
+                staging_slot=swa_reservation.staging_slot,
+                engine=swa_reservation.source.engine,
+            )
         nvtx.end_range(nvtx_range)
-        return (
-            transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
-            buffer_to_free, len(fragment12_gpu_blocks) if enable_gpu else 0
+        return GetTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free=buffer_to_free,
+            num_gpu_blocks_to_transfer=num_gpu_blocks_to_transfer,
+            swa_reservation=swa_reservation,
         )
 
+    @_synchronized_cache_tree
     def put(self,
             request_id: int,
             token_ids: np.ndarray,
             token_mask: np.ndarray,
             slot_mapping: np.ndarray,
-            layer_num : int = -1,
-            dp_id: int = 0,
+            dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         self._check_input(token_ids, token_mask, slot_mapping)
-
-        if layer_num == -1:
-            layer_num = self.model_config.num_layers
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
         aligned_token_ids = token_ids[:aligned_length]
@@ -1105,54 +2025,54 @@ class GlobalCacheEngine:
 
         assert not temp_cache_strategy.ignore_gpu
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
-            (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
-             buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
-                self._put_impl_local(
-                    request_id,
-                    sequence_meta,
-                    block_start_idx,
-                    block_end_idx,
-                    gpu_block_ids,
-                    layer_num,
-                    temp_cache_strategy
-                )
+            plan = self._put_impl_local(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+            )
         else:
-            (transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready,
-             buffer_to_free, num_gpu_blocks_to_transfer, skipped_gpu_blocks) = \
-                self._put_impl_global(
-                    request_id,
-                    sequence_meta,
-                    block_start_idx,
-                    block_end_idx,
-                    gpu_block_ids,
-                    layer_num,
-                    temp_cache_strategy
-                )
+            plan = self._put_impl_global(
+                request_id,
+                sequence_meta,
+                block_start_idx,
+                block_end_idx,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+            )
 
-        transfer_graph, task_end_op_id = add_virtal_op_for_mutiple_finished_ops(
-            transfer_graph,
-            finished_ops_ids
+        transfer_graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
+            plan.transfer_graph,
+            plan.finished_ops_ids,
+            dp_client_id,
+        )
+        return_mask = np.zeros_like(token_mask, dtype=np.bool_)
+        mask_lo = (block_start_idx + plan.skipped_gpu_blocks) * self.tokens_per_block
+        mask_hi = (block_start_idx + plan.skipped_gpu_blocks
+                   + plan.num_gpu_blocks_to_transfer) * self.tokens_per_block
+        return_mask[mask_lo:mask_hi] = True
+
+        for device_type in plan.node_to_unlock:
+            self.cache_engines[device_type].lock_node(plan.node_to_unlock[device_type][0])
+
+        callback = TransferPlanHandle(
+            complete=partial(self._transfer_callback,
+                             node_to_unlock=plan.node_to_unlock,
+                             buffer_to_free=plan.buffer_to_free,
+                             deferred_inserts=plan.deferred_inserts,
+                             is_put=True),
+            abort=partial(self._abort_transfer_plan,
+                          node_to_unlock=plan.node_to_unlock,
+                          buffer_to_free=plan.buffer_to_free,
+                          deferred_inserts=plan.deferred_inserts,
+                          swa_slots_to_free=plan.swa_slots_to_free),
         )
 
-        return_mask = np.zeros_like(token_mask, dtype=np.bool_)
-        return_mask[(block_start_idx + skipped_gpu_blocks)* self.tokens_per_block:
-                    (block_start_idx + skipped_gpu_blocks + num_gpu_blocks_to_transfer) * self.tokens_per_block] = True
-        transfer_graph.bind_to_dp_group(dp_id)
-
-        for device_type in node_to_unlock:
-            self.cache_engines[device_type].lock_node(node_to_unlock[device_type][0])
-
-        callback = partial(self._transfer_callback,
-                           node_to_unlock=node_to_unlock,
-                           buffer_to_free=buffer_to_free,
-                           is_put=True)
-
-        op_callback_dict = {}
-        for op_id in op_node_to_ready:
-            op_callback_dict[op_id] = partial(self._op_callback,
-                                              device_type=op_node_to_ready[op_id][0],
-                                              node_to_ready=op_node_to_ready[op_id][1],
-                                              ready_length=op_node_to_ready[op_id][2])
+        op_callback_dict = plan.op_callback_dict
 
         # Update mempool metrics after PUT operation
         if self._metrics_collector is not None:
@@ -1166,9 +2086,9 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num : int,
-            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
-                -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
+            temp_cache_strategy: CacheStrategy,
+            dp_client_id: int) \
+                -> PutTransferPlan:
         """
         transfer pattern:
 
@@ -1200,27 +2120,60 @@ class GlobalCacheEngine:
         else:
             cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta,
                                                                                            temp_cache_strategy=temp_cache_strategy)
+        defer_put_commit = self.use_mooncake_store_backend
+        if defer_put_commit:
+            # PUT sources must be addresses in this process's registered host
+            # buffers. A hierarchical match may select a peer node, which is a
+            # valid GET source but cannot back local H2DISK/H2REMOTE writes.
+            match_cpu_local = getattr(self.cpu_cache_engine, "match_local", None)
+            if callable(match_cpu_local):
+                cpu_matched_result = match_cpu_local(sequence_meta)
+            if enable_ssd:
+                match_ssd_local = getattr(self.ssd_cache_engine, "match_local", None)
+                if callable(match_ssd_local):
+                    ssd_matched_result = match_ssd_local(sequence_meta)
+        cpu_matched_count = (
+            cpu_matched_result.num_ready_matched_blocks
+            if defer_put_commit else cpu_matched_result.num_matched_blocks)
+        ssd_matched_count = (
+            ssd_matched_result.num_ready_matched_blocks
+            if defer_put_commit else ssd_matched_result.num_matched_blocks)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
-            :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
+            :cpu_matched_count][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
-            :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
+            :ssd_matched_count][block_mask_start:block_mask_end]
         remote_matched_blocks = remote_matched_result.physical_blocks[
             :remote_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
-        if fragment12_num_blocks == 0:
+        if fragment12_num_blocks == 0 and not defer_put_commit:
             return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
             fragment2_num_blocks = 0
-        fragment3_num_blocks = len(gpu_block_ids) - len(remote_matched_blocks)
+
+        # NOTE: to avoid full kv repeating write in mooncake store.
+        if self.use_mooncake_store_backend:
+            kv_hit = int(getattr(remote_matched_result, "kv_matched_blocks", 0)
+                         or remote_matched_result.num_matched_blocks)
+            remote_put_hit_blocks = max(0, min(len(gpu_block_ids), kv_hit - block_mask_start))
+            fragment3_num_blocks = len(gpu_block_ids) - remote_put_hit_blocks
+        else:
+            remote_put_hit_blocks = len(remote_matched_blocks)
+            fragment3_num_blocks = len(gpu_block_ids) - len(remote_matched_blocks)
+
+        if (fragment12_num_blocks == 0
+                and fragment2_num_blocks == 0
+                and fragment3_num_blocks == 0):
+            return self._empty_put_return(request_id)
 
         fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
 
         fragment12_cpu_blocks = self.cpu_cache_engine.take(
             num_required_blocks=fragment12_num_blocks,
-            protected_node = cpu_matched_result.last_node,
+            protected_node=(cpu_matched_result.last_ready_node
+                            if defer_put_commit else cpu_matched_result.last_node),
             strict=False
         )
         if len(fragment12_cpu_blocks) < fragment12_num_blocks:
@@ -1230,7 +2183,8 @@ class GlobalCacheEngine:
         if enable_ssd and fragment2_num_blocks > 0:
             fragment2_ssd_blocks = self.ssd_cache_engine.take(
                 num_required_blocks=fragment2_num_blocks,
-                protected_node = ssd_matched_result.last_node,
+                protected_node=(ssd_matched_result.last_ready_node
+                                if defer_put_commit else ssd_matched_result.last_node),
                 strict=False
             )
             if len(fragment2_ssd_blocks) == fragment2_num_blocks:
@@ -1253,20 +2207,72 @@ class GlobalCacheEngine:
         else:
             fragment3_remote_blocks = np.array([], dtype=np.int64)
 
+        cpu_swa_slot = -1
+        ssd_swa_slot = -1
+        remote_swa_slot = -1
+        mooncake_swa_tail_hash: Optional[str] = None
+
+        if self.swa_op_constructor.enabled:
+            cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
+                cpu_matched_result.last_ready_node
+                if defer_put_commit else cpu_matched_result.last_node)
+            if cpu_swa_slot >= 0 and put_to_ssd:
+                ssd_swa_slot = self.ssd_cache_engine._alloc_swa_slot(
+                    ssd_matched_result.last_ready_node
+                    if defer_put_commit else ssd_matched_result.last_node)
+            if (cpu_swa_slot >= 0 and
+                    (not put_to_ssd or ssd_swa_slot >= 0) and
+                    put_to_remote):
+                if self.use_mooncake_store_backend:
+                    # Key-addressed store: no remote slot to reserve / mount.
+                    # SWA snapshot keyed by the tail hash of the written prefix.
+                    tail_idx = block_mask_start + len(gpu_block_ids) - 1
+                    mooncake_swa_tail_hash = str(
+                        sequence_meta.block_hashes[tail_idx])
+                else:
+                    remote_swa_slot = self.remote_cache_engine._alloc_swa_slot(
+                        remote_matched_result.last_node)
+            if (cpu_swa_slot < 0 or
+                    (put_to_ssd and ssd_swa_slot < 0) or
+                    (put_to_remote and remote_swa_slot < 0
+                     and mooncake_swa_tail_hash is None)):
+                return self._fail_put_before_insert(
+                    request_id=request_id,
+                    reason="swa_slot_alloc_failed",
+                    cpu_blocks=fragment12_cpu_blocks,
+                    cpu_swa_slot=cpu_swa_slot,
+                    ssd_blocks=fragment2_ssd_blocks if put_to_ssd else None,
+                    ssd_swa_slot=ssd_swa_slot,
+                    remote_blocks=fragment3_remote_blocks if put_to_remote else None,
+                    remote_swa_slot=remote_swa_slot,
+                )
+
         transfer_graph = TransferOpGraph()
         finished_ops_ids = []
+        op_node_to_ready = {}
+        op_d2h = None
+        if fragment12_num_blocks > 0:
+            op_d2h = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=TransferType.D2H,
+                src_block_ids=fragment12_gpu_blocks,
+                dst_block_ids=fragment12_cpu_blocks,
+                dp_client_id=dp_client_id,
+            )
+            flexkv_logger.info(
+                "[FlexKV-SEGV-DEBUG] cache_engine create D2H op (global_put) "
+                f"request_id={request_id}, op_id={op_d2h.op_id}, "
+                f"graph_id={transfer_graph.graph_id}, dp_client_id={dp_client_id}, "
+                f"fragment12_num_blocks={fragment12_num_blocks}, "
+                f"fragment2_num_blocks={fragment2_num_blocks}, "
+                f"fragment3_num_blocks={fragment3_num_blocks}, "
+                f"{summarize_id_tensor('gpu_src', fragment12_gpu_blocks)}, "
+                f"{summarize_id_tensor('cpu_dst', fragment12_cpu_blocks)}"
+            )
+            transfer_graph.add_transfer_op(op_d2h)
+            finished_ops_ids.append(op_d2h.op_id)
 
-        op_d2h = TransferOp(
-            graph_id = transfer_graph.graph_id,
-            transfer_type = TransferType.D2H,
-            src_block_ids = fragment12_gpu_blocks,
-            dst_block_ids = fragment12_cpu_blocks,
-            layer_id = 0,
-            layer_granularity = layer_num
-        )
-        transfer_graph.add_transfer_op(op_d2h)
-        finished_ops_ids.append(op_d2h.op_id)
-
+        op_h2disk = None
         if put_to_ssd:
             if len(fragment12_cpu_blocks) < fragment2_num_blocks:
                 num_needed_from_cpu_matched = fragment2_num_blocks - len(fragment12_cpu_blocks)
@@ -1279,13 +2285,14 @@ class GlobalCacheEngine:
                 transfer_type = TransferType.H2DISK,
                 src_block_ids = fragment2_cpu_blocks,
                 dst_block_ids = fragment2_ssd_blocks,
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_h2disk)
 
-            transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
+            if op_d2h is not None:
+                transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
 
+        op_h2remote = None
         if put_to_remote:
             if fragment3_num_blocks > fragment12_num_blocks:
                 extra_num_cpu_blocks = fragment3_num_blocks - fragment12_num_blocks
@@ -1293,45 +2300,189 @@ class GlobalCacheEngine:
                                                        fragment12_cpu_blocks])
             else:
                 fragment3_cpu_blocks = fragment12_cpu_blocks[-fragment3_num_blocks:]
+            mooncake_block_hashes = None
+            if self.use_mooncake_store_backend:
+                mooncake_block_hashes = sequence_meta.block_hashes[
+                    block_mask_start + remote_put_hit_blocks:
+                    block_mask_start + remote_put_hit_blocks + fragment3_num_blocks
+                ]
             op_h2remote = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2REMOTE,
                 src_block_ids = fragment3_cpu_blocks,
                 dst_block_ids = fragment3_remote_blocks,
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
+                mooncake_store_block_hashes = mooncake_block_hashes,
             )
             transfer_graph.add_transfer_op(op_h2remote)
-            transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)
+            if op_d2h is not None:
+                transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)
 
-        cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
-                                                          fragment12_cpu_blocks,
-                                                          is_ready=False,
-                                                          match_result=cpu_matched_result)
+        if op_d2h is None:
+            assert defer_put_commit
+            if op_h2disk is not None:
+                finished_ops_ids.append(op_h2disk.op_id)
+            if op_h2remote is not None:
+                finished_ops_ids.append(op_h2remote.op_id)
+
+        if cpu_swa_slot >= 0:
+            empty = np.array([], dtype=np.int64)
+            put_remote_via_mooncake = (
+                mooncake_swa_tail_hash is not None and cpu_swa_slot >= 0)
+            if remote_swa_slot >= 0:
+                remote_slot_ids = np.array([remote_swa_slot], dtype=np.int64)
+            elif put_remote_via_mooncake:
+                remote_slot_ids = np.array([0], dtype=np.int64) # slot 0 will not be used in mooncake store backend.
+            else:
+                remote_slot_ids = empty
+            swa_ops = self.swa_op_constructor.build_put_chain(
+                transfer_graph,
+                gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+                cpu_slot_ids=np.array([cpu_swa_slot], dtype=np.int64),
+                ssd_slot_ids=(np.array([ssd_swa_slot], dtype=np.int64)
+                              if ssd_swa_slot >= 0 else empty),
+                remote_slot_ids=remote_slot_ids,
+                dp_client_id=dp_client_id,
+                return_op_ids=True,
+                mooncake_tail_hashes=(
+                    [mooncake_swa_tail_hash] if put_remote_via_mooncake else None),
+            )
+            assert swa_ops.d2h_id is not None
+            if put_to_ssd:
+                assert swa_ops.h2disk_id is not None
+            if put_to_remote and (remote_swa_slot >= 0 or put_remote_via_mooncake):
+                assert swa_ops.h2remote_id is not None
+            finished_ops_ids.append(swa_ops.d2h_id)
+
+        if defer_put_commit:
+            deferred_inserts: List[DeferredCacheInsert] = []
+            node_to_unlock = {}
+            requested_end = block_mask_start + len(gpu_block_ids)
+            if fragment12_num_blocks > 0 or cpu_swa_slot >= 0:
+                deferred_inserts.append(DeferredCacheInsert(
+                    device_type=DeviceType.CPU,
+                    sequence_meta=sequence_meta,
+                    physical_blocks=fragment12_cpu_blocks,
+                    staged_start_block=block_mask_start + num_skipped_blocks,
+                    remote_start_block=block_mask_start + num_skipped_blocks,
+                    requested_end_block=requested_end,
+                    swa_slot=cpu_swa_slot,
+                    publish_to_peer=self.cache_config.enable_p2p_cpu,
+                ))
+            if put_to_ssd:
+                deferred_inserts.append(DeferredCacheInsert(
+                    device_type=DeviceType.SSD,
+                    sequence_meta=sequence_meta,
+                    physical_blocks=fragment2_ssd_blocks,
+                    staged_start_block=block_mask_start + len(ssd_matched_blocks),
+                    remote_start_block=block_mask_start + len(ssd_matched_blocks),
+                    requested_end_block=requested_end,
+                    swa_slot=ssd_swa_slot,
+                    publish_to_peer=self.cache_config.enable_p2p_ssd,
+                ))
+
+            # Existing ready CPU blocks may feed H2DISK/H2REMOTE while the graph
+            # is running.  Pin their deepest node until every consumer finishes.
+            cpu_anchor = cpu_matched_result.last_ready_node
+            if len(cpu_matched_blocks) > 0 and cpu_anchor is not None:
+                node_to_unlock[DeviceType.CPU] = (cpu_anchor, 0)
+            ssd_anchor = ssd_matched_result.last_ready_node
+            if (put_to_ssd and len(ssd_matched_blocks) > 0
+                    and ssd_anchor is not None):
+                node_to_unlock[DeviceType.SSD] = (ssd_anchor, 0)
+            skipped_gpu_blocks = len(cpu_matched_blocks)
+            return PutTransferPlan(
+                transfer_graph=transfer_graph,
+                finished_ops_ids=finished_ops_ids,
+                node_to_unlock=node_to_unlock,
+                op_callback_dict={},
+                buffer_to_free={},
+                num_gpu_blocks_to_transfer=len(fragment12_gpu_blocks),
+                skipped_gpu_blocks=skipped_gpu_blocks,
+                deferred_inserts=deferred_inserts,
+            )
+
+        assert op_d2h is not None
+        cpu_node_to_unlock = self.cpu_cache_engine.insert(
+            sequence_meta,
+            fragment12_cpu_blocks,
+            is_ready=False,
+            match_result=cpu_matched_result,
+        )
+        op_node_to_ready[op_d2h.op_id] = (
+            DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         ssd_node_to_unlock = None
         if put_to_ssd:
-            ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
-                                                            fragment2_ssd_blocks,
-                                                            is_ready=False,
-                                                            match_result=ssd_matched_result)
+            ssd_node_to_unlock = self.ssd_cache_engine.insert(
+                sequence_meta,
+                fragment2_ssd_blocks,
+                is_ready=False,
+                match_result=ssd_matched_result,
+            )
+            op_node_to_ready[op_h2disk.op_id] = (
+                DeviceType.SSD, ssd_node_to_unlock,
+                ssd_node_to_unlock.size())
         remote_node_to_unlock = None
         if put_to_remote:
-            remote_node_to_unlock = self.remote_cache_engine.insert(sequence_meta,
-                                                                    fragment3_remote_blocks,
-                                                                    is_ready=False,
-                                                                    match_result=remote_matched_result)
+            remote_node_to_unlock = self.remote_cache_engine.insert(
+                sequence_meta,
+                fragment3_remote_blocks,
+                is_ready=False,
+                match_result=remote_matched_result,
+            )
+            op_node_to_ready[op_h2remote.op_id] = (
+                DeviceType.REMOTE,
+                remote_node_to_unlock,
+                remote_node_to_unlock.size(),
+            )
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
-            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+            node_to_unlock[DeviceType.CPU] = (
+                cpu_node_to_unlock, cpu_node_to_unlock.size())
         if ssd_node_to_unlock is not None:
-            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+            node_to_unlock[DeviceType.SSD] = (
+                ssd_node_to_unlock, ssd_node_to_unlock.size())
         if remote_node_to_unlock is not None:
-            node_to_unlock[DeviceType.REMOTE] = (remote_node_to_unlock, remote_node_to_unlock.size())
+            node_to_unlock[DeviceType.REMOTE] = (
+                remote_node_to_unlock, remote_node_to_unlock.size())
 
+        op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+        if cpu_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.d2h_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.CPU, cpu_node_to_unlock, cpu_swa_slot),
+            )
+        if ssd_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.h2disk_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.SSD, ssd_node_to_unlock, ssd_swa_slot),
+            )
+        if remote_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.h2remote_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.REMOTE, remote_node_to_unlock,
+                        remote_swa_slot),
+            )
         skipped_gpu_blocks = len(cpu_matched_blocks)
-        return (
-            transfer_graph, finished_ops_ids, node_to_unlock, {}, {},
-            len(fragment12_gpu_blocks), skipped_gpu_blocks  # op_node_to_ready: {}
+        swa_slots_to_free = [(device_type, slot) for device_type, slot in
+                             ((DeviceType.CPU, cpu_swa_slot),
+                              (DeviceType.SSD, ssd_swa_slot),
+                              (DeviceType.REMOTE, remote_swa_slot)) if slot >= 0]
+        return PutTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free={},
+            num_gpu_blocks_to_transfer=len(fragment12_gpu_blocks),
+            skipped_gpu_blocks=skipped_gpu_blocks,
+            swa_slots_to_free=swa_slots_to_free,
         )
 
     def _put_impl_local(self,
@@ -1340,9 +2491,9 @@ class GlobalCacheEngine:
             block_mask_start: int,
             block_mask_end: int,
             gpu_block_ids: np.ndarray,
-            layer_num : int,
-            temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
-                -> Tuple[TransferOpGraph, List[int], Dict, Dict, Dict, int, int]:
+            temp_cache_strategy: CacheStrategy,
+            dp_client_id: int) \
+                -> PutTransferPlan:
         """
         transfer pattern:
 
@@ -1373,11 +2524,11 @@ class GlobalCacheEngine:
             :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
         ssd_matched_blocks = ssd_matched_result.physical_blocks[
             :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
-        
+
         #if len(cpu_matched_blocks) > len(ssd_matched_blocks):
         #    print(f"[PUT_LOCAL] CPU matched blocks are greater than SSD matched blocks, skipping")
         #    return self._empty_put_return(request_id)
-        
+
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
@@ -1406,11 +2557,33 @@ class GlobalCacheEngine:
 
         if len(fragment12_cpu_blocks) < fragment12_num_blocks or \
             len(fragment2_ssd_blocks) < fragment2_num_blocks:
-            print(f"[WARNING] PUT request {request_id} FAILED: CPU={len(fragment12_cpu_blocks)}/{fragment12_num_blocks}, SSD={len(fragment2_ssd_blocks)}/{fragment2_num_blocks}")
+            print(f"[WARNING] PUT request {request_id} FAILED: "
+                  f"CPU={len(fragment12_cpu_blocks)}/{fragment12_num_blocks}, "
+                  f"SSD={len(fragment2_ssd_blocks)}/{fragment2_num_blocks}")
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
             if enable_ssd:
                 self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
             return self._empty_put_return(request_id)
+
+        cpu_swa_slot = -1
+        ssd_swa_slot = -1
+
+        if self.swa_op_constructor.enabled:
+            cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
+                cpu_matched_result.last_node)
+            if cpu_swa_slot >= 0 and fragment2_num_blocks > 0:
+                ssd_swa_slot = self.ssd_cache_engine._alloc_swa_slot(
+                    ssd_matched_result.last_node)
+            if (cpu_swa_slot < 0 or
+                    (fragment2_num_blocks > 0 and ssd_swa_slot < 0)):
+                return self._fail_put_before_insert(
+                    request_id=request_id,
+                    reason="swa_slot_alloc_failed",
+                    cpu_blocks=fragment12_cpu_blocks,
+                    cpu_swa_slot=cpu_swa_slot,
+                    ssd_blocks=fragment2_ssd_blocks if enable_ssd else None,
+                    ssd_swa_slot=ssd_swa_slot,
+                )
 
         transfer_graph = TransferOpGraph()
         finished_ops_ids = []
@@ -1421,8 +2594,16 @@ class GlobalCacheEngine:
             transfer_type = TransferType.D2H,
             src_block_ids = fragment12_gpu_blocks,
             dst_block_ids = fragment12_cpu_blocks,
-            layer_id = 0,
-            layer_granularity = layer_num
+            dp_client_id = dp_client_id,
+        )
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] cache_engine create D2H op (local_put) "
+            f"request_id={request_id}, op_id={op_d2h.op_id}, "
+            f"graph_id={transfer_graph.graph_id}, dp_client_id={dp_client_id}, "
+            f"fragment12_num_blocks={fragment12_num_blocks}, "
+            f"fragment2_num_blocks={fragment2_num_blocks}, "
+            f"{summarize_id_tensor('gpu_src', fragment12_gpu_blocks)}, "
+            f"{summarize_id_tensor('cpu_dst', fragment12_cpu_blocks)}"
         )
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
@@ -1443,25 +2624,45 @@ class GlobalCacheEngine:
                 transfer_type = TransferType.H2DISK,
                 src_block_ids = fragment2_cpu_blocks,
                 dst_block_ids = fragment2_ssd_blocks,
-                layer_id = 0,
-                layer_granularity = layer_num
+                dp_client_id = dp_client_id,
             )
             transfer_graph.add_transfer_op(op_h2disk)
 
             transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
 
+        if cpu_swa_slot >= 0:
+            empty = np.array([], dtype=np.int64)
+            swa_ops = self.swa_op_constructor.build_put_chain(
+                transfer_graph,
+                gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+                cpu_slot_ids=np.array([cpu_swa_slot], dtype=np.int64),
+                ssd_slot_ids=(np.array([ssd_swa_slot], dtype=np.int64)
+                              if ssd_swa_slot >= 0 else empty),
+                remote_slot_ids=empty,
+                dp_client_id=dp_client_id,
+                return_op_ids=True,
+            )
+            assert swa_ops.d2h_id is not None
+            if fragment2_num_blocks > 0:
+                assert swa_ops.h2disk_id is not None
+            finished_ops_ids.append(swa_ops.d2h_id)
+
         """insert and lock"""
-        cpu_node_to_unlock = self.cpu_cache_engine.insert(sequence_meta,
-                                                          fragment12_cpu_blocks,
-                                                          is_ready=False,
-                                                          match_result=cpu_matched_result)
+        cpu_node_to_unlock = self.cpu_cache_engine.insert(
+            sequence_meta,
+            fragment12_cpu_blocks,
+            is_ready=False,
+            match_result=cpu_matched_result,
+        )
         op_node_to_ready[op_d2h.op_id] = (DeviceType.CPU, cpu_node_to_unlock, cpu_node_to_unlock.size())
         ssd_node_to_unlock = None
         if len(fragment2_ssd_blocks) > 0:
-            ssd_node_to_unlock = self.ssd_cache_engine.insert(sequence_meta,
-                                                            fragment2_ssd_blocks,
-                                                            is_ready=False,
-                                                            match_result=ssd_matched_result)
+            ssd_node_to_unlock = self.ssd_cache_engine.insert(
+                sequence_meta,
+                fragment2_ssd_blocks,
+                is_ready=False,
+                match_result=ssd_matched_result,
+            )
             op_node_to_ready[op_h2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
@@ -1469,49 +2670,356 @@ class GlobalCacheEngine:
         if ssd_node_to_unlock is not None:
             node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
 
+        op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+        if cpu_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.d2h_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.CPU, cpu_node_to_unlock, cpu_swa_slot),
+            )
+        if ssd_swa_slot >= 0:
+            self._append_op_callback(
+                op_callback_dict,
+                swa_ops.h2disk_id,
+                partial(self._publish_swa_put_slot,
+                        DeviceType.SSD, ssd_node_to_unlock, ssd_swa_slot),
+            )
         skipped_gpu_blocks = len(cpu_matched_blocks)
-        return (
-            transfer_graph, finished_ops_ids, node_to_unlock, op_node_to_ready, {},
-            len(fragment12_gpu_blocks), skipped_gpu_blocks
+        swa_slots_to_free = [(device_type, slot) for device_type, slot in
+                             ((DeviceType.CPU, cpu_swa_slot),
+                              (DeviceType.SSD, ssd_swa_slot)) if slot >= 0]
+        return PutTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free={},
+            num_gpu_blocks_to_transfer=len(fragment12_gpu_blocks),
+            skipped_gpu_blocks=skipped_gpu_blocks,
+            swa_slots_to_free=swa_slots_to_free,
         )
 
+    @staticmethod
+    def _matched_boundary_node(current_match, matched_blocks: int):
+        """Return the matched node only when ``matched_blocks`` ends on it."""
+        if int(current_match.num_matched_blocks) != matched_blocks:
+            return None
+        node = current_match.last_node
+        if node is None:
+            return None
+        if int(current_match.last_node_matched_length) != int(node.size()):
+            return None
+        return node
+
+    @staticmethod
+    def _release_pending_swa_slot(engine, pending: DeferredCacheInsert) -> None:
+        if pending.swa_slot >= 0:
+            engine._free_swa_slot(pending.swa_slot)
+
+    def _discard_deferred_insert(
+            self, engine, pending: DeferredCacheInsert,
+            physical_blocks: np.ndarray) -> None:
+        """Release staging that is still wholly owned by this request."""
+        engine.recycle(physical_blocks)
+        self._release_pending_swa_slot(engine, pending)
+
+    @staticmethod
+    def _publish_pending_swa_slot(
+            engine, pending: DeferredCacheInsert, node) -> None:
+        if pending.swa_slot < 0:
+            return
+        if node is None or node.has_swa():
+            engine._free_swa_slot(pending.swa_slot)
+            return
+        engine.index.set_swa(node, int(pending.swa_slot))
+        engine._drain_unmounted_swa_slots()
+
+    @staticmethod
+    def _record_deferred_publish(
+            pending: DeferredCacheInsert,
+            published_end_block: int,
+            reason: str,
+            failed: bool = False) -> None:
+        """Report how many remote blocks became matchable after commit."""
+        publish_result = pending.publish_result
+        if publish_result is None:
+            return
+        published_remote = max(
+            0, int(published_end_block) - int(pending.remote_start_block))
+        publish_result.record(
+            published_remote, reason=reason, failed=failed)
+
+    def _commit_deferred_insert(self, pending: DeferredCacheInsert):
+        """Fresh-rematch and atomically publish one valid staging prefix.
+
+        When ``pending.publish_result`` is set (CPU Mooncake loads), every
+        normal return path records the published remote-block count so
+        prefetch finalize can clamp ``return_mask`` to what the radix tree
+        actually mounts — not only what REMOTE2H transferred.
+        """
+        engine = self.cache_engines[pending.device_type]
+        physical_blocks = np.asarray(pending.physical_blocks, dtype=np.int64)
+        staged_blocks = pending.requested_end_block - pending.staged_start_block
+        remote_blocks = pending.requested_end_block - pending.remote_start_block
+        if (staged_blocks != len(physical_blocks)
+                or pending.staged_start_block > pending.remote_start_block
+                or remote_blocks < 0):
+            self._discard_deferred_insert(engine, pending, physical_blocks)
+            flexkv_logger.error(
+                "Invalid deferred cache insert range: "
+                f"staged=[{pending.staged_start_block}, "
+                f"{pending.requested_end_block}), "
+                f"remote_start={pending.remote_start_block}, "
+                f"physical_blocks={len(physical_blocks)}")
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "invalid_range", failed=True)
+            return None
+
+        if pending.load_result is None:
+            publish_end = pending.requested_end_block
+        else:
+            successful_remote = pending.load_result.successful_prefix(remote_blocks)
+            publish_end = pending.remote_start_block + successful_remote
+
+        # Joint Full+SWA prefetch guard: SWA is mounted ONLY when Full commit
+        # reaches the SWA anchor AND the SWA op reported success. On any partial
+        # (Full short of the anchor, SWA REMOTE2H failed, or SWA result missing)
+        # we free the SWA slot and fall through to publish only the Full prefix.
+        # This preserves the tree invariant "node has SWA => Full is ready up to
+        # this node" (SWA-I1) at prefetch-commit time.
+        if pending.swa_slot >= 0 and pending.swa_anchor_block >= 0:
+            swa_covered = publish_end >= (pending.swa_anchor_block + 1)
+            swa_ok = (
+                pending.swa_load_result is not None
+                and pending.swa_load_result.block_results is not None
+                and len(pending.swa_load_result.block_results) > 0
+                and all(pending.swa_load_result.block_results)
+            )
+            if not (swa_covered and swa_ok):
+                engine._free_swa_slot(pending.swa_slot)
+                pending = replace(pending, swa_slot=-1)
+
+        # Hierarchical engines must rematch their local tree. match() may choose
+        # a distributed peer node, which is not a valid insertion anchor here.
+        match_local = getattr(engine, "match_local", None)
+        try:
+            current_match = (
+                match_local(pending.sequence_meta)
+                if callable(match_local)
+                else engine.match(pending.sequence_meta)
+            )
+        except Exception:
+            # No radix mutation has started, so all staging is still ours.
+            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "rematch_error", failed=True)
+            raise
+        current_blocks = int(current_match.num_matched_blocks)
+        ready_blocks = int(current_match.num_ready_matched_blocks)
+
+        # Never attach below, or mark ready through, another in-flight writer's
+        # unready node. The staged allocation remains ours and is safe to recycle.
+        if (current_blocks != ready_blocks
+                or current_blocks < pending.staged_start_block):
+            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "rematch_stale")
+            return None
+
+        if current_blocks >= publish_end:
+            engine.recycle(physical_blocks)
+            boundary_node = self._matched_boundary_node(
+                current_match, pending.requested_end_block)
+            if pending.swa_slot >= 0:
+                if boundary_node is None or publish_end != pending.requested_end_block:
+                    self._release_pending_swa_slot(engine, pending)
+                else:
+                    self._publish_pending_swa_slot(
+                        engine, pending, boundary_node)
+            # Tree already covers the transferred prefix — still usable.
+            self._record_deferred_publish(
+                pending, publish_end, "already_covered")
+            return boundary_node
+
+        successful_staged_blocks = publish_end - pending.staged_start_block
+        if successful_staged_blocks <= 0:
+            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "zero_prefix")
+            return None
+
+        skipped_blocks = current_blocks - pending.staged_start_block
+        blocks_to_insert = physical_blocks[
+            skipped_blocks:successful_staged_blocks]
+
+        try:
+            node = engine.insert(
+                pending.sequence_meta,
+                blocks_to_insert,
+                num_insert_blocks=publish_end,
+                is_ready=False,
+                match_result=current_match,
+            )
+        except RuntimeError as error:
+            # The radix guard raises before any mutation and deliberately leaves
+            # block ownership with the caller. Other insert failures may happen
+            # after mutation, so keep those fail-closed.
+            if not str(error).startswith("radix insert conflict:"):
+                self._release_pending_swa_slot(engine, pending)
+                self._record_deferred_publish(
+                    pending, pending.remote_start_block, "insert_error", failed=True)
+                raise
+            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "insert_conflict")
+            return None
+        except Exception:
+            self._release_pending_swa_slot(engine, pending)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "insert_error", failed=True)
+            raise
+        if node is None:
+            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "insert_none")
+            return None
+
+        unused_blocks = np.concatenate((
+            physical_blocks[:skipped_blocks],
+            physical_blocks[successful_staged_blocks:],
+        ))
+        if len(unused_blocks) > 0:
+            engine.recycle(unused_blocks)
+
+        # Keep the inserted length explicit. set_ready supports split fragments,
+        # while this transaction keeps rematch, insert, and readiness atomic.
+        try:
+            engine.set_ready(node, True, len(blocks_to_insert))
+        except Exception:
+            # Inserted blocks now belong to the unready tree node and must not
+            # be recycled, but the detached SWA slot is still ours.
+            self._release_pending_swa_slot(engine, pending)
+            self._record_deferred_publish(
+                pending, pending.remote_start_block, "set_ready_error", failed=True)
+            raise
+
+        if pending.swa_slot >= 0:
+            if publish_end == pending.requested_end_block:
+                self._publish_pending_swa_slot(engine, pending, node)
+            else:
+                self._release_pending_swa_slot(engine, pending)
+
+        if pending.publish_to_peer:
+            engine.local_index.insert_and_publish(node)
+        self._record_deferred_publish(pending, publish_end, "ok")
+        return node
+
+    @_synchronized_cache_tree
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
                            buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
+                           deferred_inserts: Optional[List[DeferredCacheInsert]] = None,
                            is_put: bool = False) -> None:
-        if DeviceType.CPU in node_to_unlock:
-            assert self.cpu_cache_engine is not None
-            cpu_node = node_to_unlock[DeviceType.CPU][0]
-            self.cpu_cache_engine.unlock(cpu_node)
-            self.cpu_cache_engine.set_ready(cpu_node, True, node_to_unlock[DeviceType.CPU][1])
-            if is_put and self.cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine.local_index.insert_and_publish(cpu_node)
-        if DeviceType.SSD in node_to_unlock:
-            assert self.ssd_cache_engine is not None
-            ssd_node = node_to_unlock[DeviceType.SSD][0]
-            self.ssd_cache_engine.unlock(ssd_node)
-            self.ssd_cache_engine.set_ready(ssd_node, True, node_to_unlock[DeviceType.SSD][1])
-            if is_put and self.cache_config.enable_p2p_ssd:
-                self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
-        if DeviceType.REMOTE in node_to_unlock:
-            assert self.remote_cache_engine is not None
-            self.remote_cache_engine.unlock(node_to_unlock[DeviceType.REMOTE][0])
-            self.remote_cache_engine.set_ready(
-                node_to_unlock[DeviceType.REMOTE][0], True, node_to_unlock[DeviceType.REMOTE][1]
-            )
-            if is_put and self.enable_kv_sharing:
-                self.remote_cache_engine.insert_and_publish(node_to_unlock[DeviceType.REMOTE][0])
-        if buffer_to_free is not None:
-            if DeviceType.CPU in buffer_to_free:
+        try:
+            for pending in deferred_inserts or []:
+                try:
+                    self._commit_deferred_insert(pending)
+                except Exception:
+                    # Never strand the request's pre-existing radix-node locks.
+                    # The commit helper recycles blocks on every known pre-insert
+                    # rejection; an unexpected post-insert exception has uncertain
+                    # ownership and must not return those blocks to the mempool.
+                    # Commit paths that raise after recording leave publish_result
+                    # set; unrecorded failures still need a zero publish report.
+                    publish_result = getattr(pending, "publish_result", None)
+                    if (publish_result is not None
+                            and publish_result.published_remote_blocks is None):
+                        publish_result.record_failure("callback_error")
+                    flexkv_logger.error(
+                        "Deferred cache publication failed: "
+                        f"device={pending.device_type.name}",
+                        exc_info=True,
+                    )
+        finally:
+            if DeviceType.CPU in node_to_unlock:
                 assert self.cpu_cache_engine is not None
-                self.cpu_cache_engine.recycle(buffer_to_free[DeviceType.CPU])
-            if DeviceType.SSD in buffer_to_free:
+                cpu_node = node_to_unlock[DeviceType.CPU][0]
+                self.cpu_cache_engine.unlock(cpu_node)
+                ready_length = node_to_unlock[DeviceType.CPU][1]
+                if ready_length > 0:
+                    self.cpu_cache_engine.set_ready(cpu_node, True, ready_length)
+                if (is_put and ready_length > 0
+                        and self.cache_config.enable_p2p_cpu):
+                    self.cpu_cache_engine.local_index.insert_and_publish(cpu_node)
+            if DeviceType.SSD in node_to_unlock:
                 assert self.ssd_cache_engine is not None
-                self.ssd_cache_engine.recycle(buffer_to_free[DeviceType.SSD])
-            if DeviceType.REMOTE in buffer_to_free:
+                ssd_node = node_to_unlock[DeviceType.SSD][0]
+                self.ssd_cache_engine.unlock(ssd_node)
+                ready_length = node_to_unlock[DeviceType.SSD][1]
+                if ready_length > 0:
+                    self.ssd_cache_engine.set_ready(ssd_node, True, ready_length)
+                if (is_put and ready_length > 0
+                        and self.cache_config.enable_p2p_ssd):
+                    self.ssd_cache_engine.local_index.insert_and_publish(node_to_unlock[DeviceType.SSD][0])
+            if DeviceType.REMOTE in node_to_unlock:
                 assert self.remote_cache_engine is not None
-                self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
+                self.remote_cache_engine.unlock(node_to_unlock[DeviceType.REMOTE][0])
+                ready_length = node_to_unlock[DeviceType.REMOTE][1]
+                if ready_length > 0:
+                    self.remote_cache_engine.set_ready(
+                        node_to_unlock[DeviceType.REMOTE][0], True, ready_length)
+                if is_put and self.enable_kv_sharing:
+                    self.remote_cache_engine.insert_and_publish(node_to_unlock[DeviceType.REMOTE][0])
+            if buffer_to_free is not None:
+                if DeviceType.CPU in buffer_to_free:
+                    assert self.cpu_cache_engine is not None
+                    self.cpu_cache_engine.recycle(buffer_to_free[DeviceType.CPU])
+                if DeviceType.SSD in buffer_to_free:
+                    assert self.ssd_cache_engine is not None
+                    self.ssd_cache_engine.recycle(buffer_to_free[DeviceType.SSD])
+                if DeviceType.REMOTE in buffer_to_free:
+                    assert self.remote_cache_engine is not None
+                    self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
 
+    @_synchronized_cache_tree
+    def _abort_transfer_plan(self,
+                             node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
+                             buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
+                             deferred_inserts: Optional[List[DeferredCacheInsert]] = None,
+                             swa_reservation: Optional[SWAReadReservation] = None,
+                             swa_slots_to_free: Optional[List[Tuple[DeviceType, int]]] = None) -> None:
+        """Roll back a planned get/put whose graph was never launched.
+
+        The completion path (:meth:`_transfer_callback`) unlocks, marks nodes
+        ready and recycles staging. On a cancelled plan no transfer ever ran,
+        so marking ready would publish unfilled blocks as valid cache — instead
+        every node is unlocked and any node this plan inserted unready is
+        removed and its blocks recycled. Nodes that pre-existed (matched, hence
+        ready) are only unlocked; ``rollback_unready_insert`` is a no-op for
+        them, so node_to_unlock can be processed uniformly.
+        """
+        for device_type, (node, _ready_length) in node_to_unlock.items():
+            engine = self.cache_engines[device_type]
+            engine.unlock(node)
+            engine.rollback_unready_insert(node)
+        if buffer_to_free is not None:
+            for device_type, blocks in buffer_to_free.items():
+                if blocks is not None and len(blocks) > 0:
+                    self.cache_engines[device_type].recycle(blocks)
+        for pending in deferred_inserts or []:
+            engine = self.cache_engines[pending.device_type]
+            physical_blocks = np.asarray(
+                pending.physical_blocks, dtype=np.int64)
+            self._discard_deferred_insert(engine, pending, physical_blocks)
+        if swa_reservation is not None:
+            self._release_swa_read_reservation(swa_reservation)
+        if swa_slots_to_free:
+            for device_type, slot in swa_slots_to_free:
+                if slot >= 0:
+                    self.cache_engines[device_type]._free_swa_slot(slot)
+
+    @_synchronized_cache_tree
     def _op_callback(self, device_type: DeviceType, node_to_ready: RadixNode, ready_length: int) -> None:
         if device_type == DeviceType.CPU:
             assert self.cpu_cache_engine is not None
@@ -1530,7 +3038,7 @@ class GlobalCacheEngine:
                         is_put: bool = False,
                         gpu_matched_blocks: int = 0) \
                             -> Tuple[MatchResultAccel, MatchResultAccel]:
-        #from flexkv.common.debug import flexkv_logger
+        #from flexkv.common.debug import flexkv_logger, summarize_id_tensor
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
         if self.cpu_cache_engine:
@@ -1556,6 +3064,205 @@ class GlobalCacheEngine:
                     ssd_matched_result = self.ssd_cache_engine.match_all(sequence_meta, gpu_matched_blocks)
 
         return cpu_matched_result, ssd_matched_result
+
+    def _is_mooncake_swa_tier(self, device_type: DeviceType) -> bool:
+        """True for the key-addressed mooncake-store REMOTE tier: SWA hits are
+        keyed by the hit block's tail hash instead of a node-mounted slot."""
+        return (self.use_mooncake_store_backend
+                and device_type == DeviceType.REMOTE)
+
+    def _select_swa_read_source(
+        self,
+        block_mask_start: int,
+        block_mask_end: int,
+        tier_match_results: Dict[DeviceType, object],
+        sequence_meta: Optional[SequenceMeta] = None,
+    ) -> Tuple[int, SWAReadSource]:
+        """Return the largest usable SWA-aware Full-KV end and its exact SWA source."""
+        if not self.swa_op_constructor.enabled or not tier_match_results:
+            return block_mask_start, SWAReadSource()
+
+        candidates: List[Tuple[int, DeviceType, object]] = []
+        for device_type, match_result in tier_match_results.items():
+            if match_result is None:
+                continue
+
+            swa_hit = int(match_result.swa_hit_blocks)
+            if swa_hit <= block_mask_start:
+                continue
+
+            if swa_hit > block_mask_end:
+                # The radix match covers the complete token sequence, while the
+                # request mask may stop earlier. A snapshot for a deeper trailing
+                # window cannot serve this request window; try another tier.
+                continue
+
+            if not self._is_mooncake_swa_tier(device_type):
+                assert match_result.last_swa_node is not None
+            candidates.append((swa_hit, device_type, match_result))
+
+        for usable_end, device_type, match_result in sorted(
+            candidates,
+            key=lambda item: item[0],
+            reverse=True,
+        ):
+            engine = self.cache_engines.get(device_type)
+            if engine is None or not getattr(engine, "swa_enabled", False):
+                continue
+
+            if self._is_mooncake_swa_tier(device_type):
+                assert sequence_meta is not None, (
+                    "mooncake SWA source selection requires sequence_meta "
+                    "for the tail hash")
+                tail_hash = str(sequence_meta.block_hashes[usable_end - 1])
+                return usable_end, SWAReadSource(
+                    hit_blocks=usable_end,
+                    device_type=device_type,
+                    mooncake_tail_hash=tail_hash,
+                )
+
+            source_node = match_result.last_swa_node
+            source_slot = int(source_node.swa_host_slot)
+            assert source_slot >= 0
+
+            return usable_end, SWAReadSource(
+                hit_blocks=usable_end,
+                host_slot=source_slot,
+                node=source_node,
+                device_type=device_type,
+                engine=engine,
+            )
+
+        return block_mask_start, SWAReadSource()
+
+    def _reserve_swa_read_source(
+        self,
+        graph: TransferOpGraph,
+        source: SWAReadSource,
+        protected_cpu_node,
+        dp_client_id: int,
+    ) -> Optional[SWAReadReservation]:
+        """Pin a source and build its SWA load chain before committing a Full hit.
+
+        Non-CPU sources need a transient CPU SWA staging slot. Allocation may
+        evict through the CPU radix, so protect the CPU Full-KV node referenced by
+        this GET. Returning ``None`` means the caller must report no cache hit;
+        Full-only restore is invalid for an SWA-aware GET.
+
+        Mooncake-store REMOTE sources are key-addressed: no pin / host slot;
+        a placeholder remote slot id and ``mooncake_tail_hashes`` key the
+        SWA ``REMOTE2H`` op.
+        """
+        assert self.cpu_cache_engine is not None
+        if not source.found:
+            return None
+
+        is_mooncake_source = source.is_mooncake
+        # Mooncake-store will skip pin_swa_node for remote source.
+        if not is_mooncake_source:
+            source.engine._pin_swa_node(source.node)
+
+        staging_slot = -1
+        cpu_swa_slots = np.array([source.host_slot], dtype=np.int64)
+        ssd_swa_slots = np.array([], dtype=np.int64)
+        remote_swa_slots = np.array([], dtype=np.int64)
+
+        if source.device_type != DeviceType.CPU:
+            staging_slot = self.cpu_cache_engine._alloc_swa_slot(
+                protected_node=protected_cpu_node)
+            if staging_slot < 0:
+                if not is_mooncake_source:
+                    self._swa_release_load_lock(
+                        node=source.node, engine=source.engine)
+                flexkv_logger.warning(
+                    "[FlexKV-SWA] GET staging allocation failed; "
+                    f"source={source.device_type}, hit_blocks={source.hit_blocks}"
+                )
+                return None
+            cpu_swa_slots = np.array([staging_slot], dtype=np.int64)
+            if is_mooncake_source:
+                remote_swa_slots = np.array([0], dtype=np.int64)
+            else:
+                source_slots = np.array([source.host_slot], dtype=np.int64)
+                if source.device_type == DeviceType.SSD:
+                    ssd_swa_slots = source_slots
+                else:
+                    remote_swa_slots = source_slots
+
+        h2d_id = self.swa_op_constructor.build_get_chain(
+            graph,
+            gpu_slot_ids=self._SWA_GPU_PLACEHOLDER.copy(),
+            cpu_slot_ids=cpu_swa_slots,
+            ssd_slot_ids=ssd_swa_slots,
+            remote_slot_ids=remote_swa_slots,
+            dp_client_id=dp_client_id,
+            mooncake_tail_hashes=(
+                [source.mooncake_tail_hash] if is_mooncake_source else None),
+        )
+        if h2d_id is None:
+            if is_mooncake_source:
+                self._swa_release_load_lock(node=None, staging_slot=staging_slot)
+            else:
+                self._swa_release_load_lock(
+                    node=source.node,
+                    staging_slot=staging_slot,
+                    engine=source.engine,
+                )
+            return None
+
+        return SWAReadReservation(
+            source=source,
+            staging_slot=staging_slot,
+            h2d_id=h2d_id,
+        )
+
+    def _release_swa_read_reservation(
+        self, reservation: Optional[SWAReadReservation]) -> None:
+        if reservation is None:
+            return
+        self._swa_release_load_lock(
+            node=reservation.source.node,
+            staging_slot=reservation.staging_slot,
+            engine=reservation.source.engine,
+        )
+
+    # The GPU-side SWA slot is a size-1 placeholder here (window == one page ==
+    # one slot on DSv4). It is rebound late from the request's swa_slot_mapping
+    # via TransferOpGraph.set_swa_gpu_blocks() in launch, mirroring the Full-KV
+    # GPU late-bind.
+
+    _SWA_GPU_PLACEHOLDER = np.array([0], dtype=np.int64)
+
+    @_synchronized_cache_tree
+    def _swa_release_load_lock(self, node, staging_slot: int = -1, engine=None) -> None:
+        """SWA H2D completion callback: release the source pin and free any
+        transient CPU staging slot.
+
+        For a CPU-sourced load, ``node`` is the matched CPU SWA node and its pin
+        is dropped with the plain dec (dec_swa_lock_ref, NOT dec_swa_lock_only):
+        the loaded window stays cached for future reuse. For a staged
+        (SSD/REMOTE) source, ``node`` is the source-tier node (same pin release)
+        and ``staging_slot`` is the transient CPU SWA slot used as the DISK2H/
+        REMOTE2H destination — it is unmounted (not a cached entry), so free it
+        back to the CPU SWA pool. No-op on parts that are absent."""
+        try:
+            if node is not None and getattr(node, "swa_lock_ref", 0) > 0:
+                node.dec_swa_lock_ref()
+                if engine is not None:
+                    engine.index.unlock(node)
+                elif hasattr(node, "unlock"):
+                    node.unlock()
+                else:
+                    node.lock_cnt -= 1
+        except Exception:  # noqa: BLE001 — never let a callback crash the loop
+            pass
+        try:
+            if staging_slot is not None and staging_slot >= 0:
+                cpu_engine = self.cpu_cache_engine
+                if cpu_engine is not None:
+                    cpu_engine._free_swa_slot(int(staging_slot))
+        except Exception:  # noqa: BLE001
+            pass
 
     @nvtx.annotate("Match Prefix", color="yellow")
     def match_local(self,
@@ -1631,6 +3338,12 @@ class GlobalCacheEngine:
     def slot_mapping_to_block_ids(slot_mapping: np.ndarray, tokens_per_block: int) -> np.ndarray:
         block_ids: np.ndarray = slot_mapping[::tokens_per_block] // tokens_per_block
         return block_ids
+
+    def swa_slot_mapping_to_slot_ids(self, swa_slot_mapping: np.ndarray) -> np.ndarray:
+        """Convert an SWA slot_mapping into page-granular SWA pool slot ids."""
+        window = self.tokens_per_block
+        sm = np.asarray(swa_slot_mapping, dtype=np.int64)
+        return sm[::window] // window
 
     def _get_block_range(self,
                          token_mask: np.ndarray) -> Tuple[int, int]:

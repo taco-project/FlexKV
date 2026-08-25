@@ -15,22 +15,33 @@
  * limitations under the License.
  */
 #include "tp_transfer_thread_group.h"
+#include "logging.h"
 #include "transfer.cuh"
+#ifdef FLEXKV_ENABLE_NVCOMP
+#include "compression/ans/nvcomp_ans_tp.h"
+#endif
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <stdexcept>
+#include <type_traits>
 
 namespace flexkv {
 
 TPTransferThreadGroup::TPTransferThreadGroup(
     int num_gpus, const std::vector<int64_t> &gpu_block_ptrs_flat,
-    int num_tensors_per_gpu, int64_t cpu_blocks_ptr, int dp_group_id,
+    int num_tensors_per_gpu, int64_t cpu_blocks_ptr,
     int num_layers, const std::vector<int64_t> &gpu_kv_strides_in_bytes,
     const std::vector<int64_t> &gpu_block_strides_in_bytes,
     const std::vector<int64_t> &gpu_layer_strides_in_bytes,
     const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
-    const std::vector<int64_t> &gpu_device_ids) {
+    const std::vector<int64_t> &gpu_device_ids,
+    bool enable_nvcomp, int nvcomp_batch_size, int nvcomp_data_type,
+    CETransferConfig ce_config)
+    : ce_config_(ce_config) {
+  const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
+
   num_gpus_ = num_gpus;
   num_tensors_per_gpu_ = num_tensors_per_gpu;
-  dp_group_id_ = dp_group_id;
 
   gpu_kv_strides_in_bytes_ = new int64_t[num_gpus];
   gpu_block_strides_in_bytes_ = new int64_t[num_gpus];
@@ -117,9 +128,42 @@ TPTransferThreadGroup::TPTransferThreadGroup(
       }
     });
   }
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  if (enable_nvcomp) {
+    init_nvcomp(nvcomp_batch_size, nvcomp_data_type);
+  }
+#endif
+
+}
+
+void TPTransferThreadGroup::update_gpu_block_ptrs(
+    const std::vector<int64_t> &gpu_block_ptrs_flat) {
+  const size_t expected =
+      static_cast<size_t>(num_gpus_) * num_tensors_per_gpu_;
+  if (gpu_block_ptrs_flat.size() != expected) {
+    throw std::invalid_argument("GPU pointer count does not match transfer group");
+  }
+  for (int i = 0; i < num_gpus_; ++i) {
+    cudaError_t err = cudaSetDevice(gpu_device_ids_[i]);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaSetDevice failed: ") +
+                               cudaGetErrorString(err));
+    }
+    err = cudaStreamSynchronize(streams_[i]);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaStreamSynchronize failed: ") +
+                               cudaGetErrorString(err));
+    }
+  }
+  for (size_t i = 0; i < expected; ++i) {
+    gpu_blocks_[i] = reinterpret_cast<void *>(gpu_block_ptrs_flat[i]);
+  }
 }
 
 TPTransferThreadGroup::~TPTransferThreadGroup() {
+  const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
+
   stop_pool_ = true;
   for (auto &cv : cvs_)
     cv.notify_all();
@@ -128,6 +172,10 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
       t.join();
 
   cudaFreeHost(gpu_blocks_);
+
+#ifdef FLEXKV_ENABLE_NVCOMP
+  destroy_nvcomp_state();
+#endif
 
   gpu_tensor_handlers_.clear();
   delete[] gpu_kv_strides_in_bytes_;
@@ -154,9 +202,12 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_kv_stride_in_bytes,
     const int64_t cpu_layer_stride_in_bytes,
     const int64_t cpu_block_stride_in_bytes,
-    const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
+    const int64_t cpu_tp_stride_in_bytes,     const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
-    const int layer_id, const int layer_granularity, const bool is_mla) {
+    const int layer_id, const int layer_granularity, const int kv_dim,
+    const int num_kv_heads,
+    const std::string &kv_shared_across_ranks_mode,
+    const int designated_rank) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -167,7 +218,65 @@ void TPTransferThreadGroup::tp_group_transfer(
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
+  // Validate kv_shared_across_ranks_mode parameter (only meaningful for shared KV)
+  std::string mode = kv_shared_across_ranks_mode;
+  if (num_kv_heads == 1 && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
+      && mode != "layer_parallel" && mode != "rank_rotate") {
+    FLEXKV_LOG_WARNING(
+        "operation=transfer_config act=fallback status=degraded "
+        "field=kv_shared_across_ranks_mode value=\"%s\" fallback=sharded",
+        mode.c_str());
+    mode = "sharded";
+  }
+
+  // In sharded D2H mode, chunk_size is divided by num_gpus_ and used as both
+  // the per-rank transfer size and the stride between ranks. If chunk_size
+  // is not divisible by num_gpus_, the integer division drops trailing bytes,
+  // leaving a hole in the assembled KV on CPU.
+  // All ranks share the same chunk_size (num_kv_heads==1 = identical KV), so check [0] once.
+  if (num_kv_heads == 1 && !is_host_to_device && mode == "sharded" && num_gpus_ > 1) {
+    if (gpu_chunk_sizes_in_bytes_[0] % num_gpus_ != 0) {
+      throw std::runtime_error(
+          "sharded kv_shared_across_ranks D2H mode requires gpu_chunk_size divisible by "
+          "num_gpus, but chunk_size=" +
+          std::to_string(gpu_chunk_sizes_in_bytes_[0]) + " and num_gpus=" +
+          std::to_string(num_gpus_) + ". Use 'all_write' or 'rank0_only' "
+          "mode, or adjust head_dim/tokens_per_block so chunk_size is "
+          "divisible.");
+    }
+  }
+
+  // rank_rotate: resolve designated rank from round-robin counter, treat as rank0_only.
+  int eff_designated_rank = designated_rank;
+  if (num_kv_heads == 1 && !is_host_to_device && mode == "rank_rotate") {
+    eff_designated_rank = rotate_counter_;
+    rotate_counter_ = (rotate_counter_ + 1) % num_gpus_;
+  }
+
   for (int i = 0; i < num_gpus_; ++i) {
+    // For rank0_only / rank_rotate mode in D2H: only the designated rank performs transfer
+    if (num_kv_heads == 1 && !is_host_to_device && (mode == "rank0_only" || mode == "rank_rotate")
+        && i != eff_designated_rank) {
+      // Skip D2H transfer for non-designated GPUs
+      futures.emplace_back(enqueue_for_gpu(i, [i]() {
+        // Empty task - non-designated GPUs do nothing in rank0_only D2H mode
+      }));
+      continue;
+    }
+
+    // round_robin D2H: skip ranks with 0 layers (layer_granularity < num_gpus_)
+    if (num_kv_heads == 1 && !is_host_to_device && mode == "layer_parallel") {
+      int L_rotate = layer_granularity, N_rotate = num_gpus_;
+      int layers_per_rank_rotate = L_rotate / N_rotate;
+      int remainder_rotate = L_rotate % N_rotate;
+      int my_count_rotate = (i < remainder_rotate) ? (layers_per_rank_rotate + 1)
+                                           : layers_per_rank_rotate;
+      if (my_count_rotate == 0) {
+        futures.emplace_back(enqueue_for_gpu(i, [i]() {}));
+        continue;
+      }
+    }
+
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
         int num_blocks = gpu_block_id_tensor.numel();
@@ -177,51 +286,76 @@ void TPTransferThreadGroup::tp_group_transfer(
         int64_t *cpu_block_ids =
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
         void *cpu_ptr = cpu_blocks_;
-        int64_t cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
-        if (is_mla && !is_host_to_device) {
-          cpu_startoff_inside_chunks =
-              i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
-        } else if (is_mla && is_host_to_device) {
-          cpu_startoff_inside_chunks = 0;
+        int64_t cpu_startoff_inside_chunks = 0;
+        int64_t gpu_startoff_inside_chunks = 0;
+        int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
+
+        if (num_kv_heads > 1) {
+          cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
+        } else if (mode == "sharded" && !is_host_to_device) {
+          // sharded D2H: per-rank shard
+          int64_t shard = gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
+          cpu_startoff_inside_chunks = i * shard;
+          gpu_startoff_inside_chunks = i * shard;
+          chunk_size = shard;
+        } else if (mode == "all_write") {
+          // per-rank full-KV region
+          cpu_startoff_inside_chunks = i * num_blocks * cpu_block_stride_in_bytes;
         }
-        int64_t gpu_startoff_inside_chunks =
-            is_mla && !is_host_to_device
-                ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_
-                : 0;
-        // we assume that the chunk size is the same for all gpus,
-        // even if they have different number of gpu_blocks
-        int64_t chunk_size = is_mla && !is_host_to_device
-                                 ? gpu_chunk_sizes_in_bytes_[i] / num_gpus_
-                                 : gpu_chunk_sizes_in_bytes_[i];
+        
+        // Effective layer range: round_robin assigns subset; else full (layer_id, layer_granularity).
+        int eff_start_layer = layer_id;
+        int eff_num_layers = layer_granularity;
+        if (num_kv_heads == 1 && !is_host_to_device && mode == "layer_parallel") {
+          int L_rotate = layer_granularity, N_rotate = num_gpus_;
+          int layers_per_rank_rotate = L_rotate / N_rotate;
+          int remainder_rotate = L_rotate % N_rotate;
+          int my_start_rotate;
+          if (i < remainder_rotate) {
+            my_start_rotate = i * (layers_per_rank_rotate + 1);
+          } else {
+            my_start_rotate = remainder_rotate * (layers_per_rank_rotate + 1) +
+                          (i - remainder_rotate) * layers_per_rank_rotate;
+          }
+          eff_start_layer = layer_id + my_start_rotate;
+          eff_num_layers = (i < remainder_rotate) ? (layers_per_rank_rotate + 1)
+                                              : layers_per_rank_rotate;
+        }
 
         // Dispatch to the appropriate template based on backend type
         switch (backend_type_) {
         case BackendType::VLLM:
           flexkv::transfer_kv_blocks<BackendType::VLLM>(
-              num_blocks, layer_id, layer_granularity, gpu_block_ids,
+              num_blocks, eff_start_layer, eff_num_layers, gpu_block_ids,
               gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+              transfer_num_cta, is_host_to_device, use_ce_transfer,
+              kv_dim, gpu_block_strides_in_bytes_[i], true,
+              ce_config_);
           break;
         case BackendType::TRTLLM:
           flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
-              num_blocks, layer_id, layer_granularity, gpu_block_ids,
+              num_blocks, eff_start_layer, eff_num_layers, gpu_block_ids,
               gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+              transfer_num_cta, is_host_to_device, use_ce_transfer,
+              kv_dim, gpu_block_strides_in_bytes_[i], true,
+              ce_config_);
           break;
         case BackendType::SGLANG:
           flexkv::transfer_kv_blocks<BackendType::SGLANG>(
-              num_blocks, layer_id, layer_granularity, gpu_block_ids,
+              num_blocks, eff_start_layer, eff_num_layers, gpu_block_ids,
               gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+              transfer_num_cta, is_host_to_device, use_ce_transfer,
+              kv_dim, gpu_block_strides_in_bytes_[i], true,
+              ce_config_);
           break;
         }
 

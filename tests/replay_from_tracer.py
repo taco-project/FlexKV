@@ -123,7 +123,7 @@ class FlexKVReplayEngine:
             num_layers=model_config_data['num_layers'],
             num_kv_heads=model_config_data['num_kv_heads'],
             head_size=8,#model_config_data['head_size'], # for local test
-            use_mla=model_config_data['use_mla'],
+            kv_dim=model_config_data.get('kv_dim', 2),
             dtype=dtype,
             tp_size=1,#model_config_data['tp_size'], # for local test
             dp_size=1,#model_config_data['dp_size'], # for local test
@@ -147,7 +147,6 @@ class FlexKVReplayEngine:
             num_remote_blocks=cache_config_data['num_remote_blocks'],
             ssd_cache_dir=cache_config_data['ssd_cache_dir'],
             gds_cache_dir=cache_config_data['gds_cache_dir'],
-            remote_cache_size_mode=cache_config_data['remote_cache_size_mode'],
             remote_file_size=cache_config_data['remote_file_size'],
             remote_file_num=cache_config_data['remote_file_num'],
             remote_file_prefix=cache_config_data['remote_file_prefix'],
@@ -164,7 +163,8 @@ class FlexKVReplayEngine:
                 tokens_per_block=gpu_layout_data['tokens_per_block'],
                 num_head=gpu_layout_data['num_head'],
                 head_size=8,#gpu_layout_data['head_size'], #for local test
-                is_mla=gpu_layout_data['is_mla'],
+                kv_dim=gpu_layout_data.get('kv_dim', 2),
+                num_kv_heads=gpu_layout_data.get('num_kv_heads', 1),
             )
             self.gpu_blocks_num = self.gpu_layout.num_block
 
@@ -200,7 +200,7 @@ class FlexKVReplayEngine:
 
             for layer_id in range(self.model_config.num_layers):
                 # Create KV cache tensor: [2, num_blocks, tokens_per_block, num_heads, head_size]
-                kv_dim = 2 if not self.model_config.use_mla else 1
+                kv_dim = self.model_config.kv_dim
                 kv_tensor = torch.zeros(  # Use zeros instead of random for reproducibility
                     size=(kv_dim, self.gpu_blocks_num, self.cache_config.tokens_per_block,
                           self.model_config.num_kv_heads // self.model_config.tp_size,
@@ -235,6 +235,8 @@ class FlexKVReplayEngine:
             # Create registration request
             register_req = RegisterTPClientRequest(
                 dp_client_id=gpu_id // self.model_config.tp_size,  # DP client ID
+                pp_rank=0,
+                intra_client_id=gpu_id % self.model_config.tp_size,
                 device_id=gpu_id,
                 handles=handles,
                 gpu_layout=self.gpu_layout
@@ -265,7 +267,8 @@ class FlexKVReplayEngine:
                 tokens_per_block=self.cache_config.tokens_per_block,
                 num_head=self.model_config.num_kv_heads // self.model_config.tp_size,
                 head_size=self.model_config.head_size,
-                is_mla=self.model_config.use_mla
+                kv_dim=self.model_config.kv_dim,
+                num_kv_heads=self.model_config.num_kv_heads,
             )
 
         # Create KVTaskEngine with gpu_register_port
@@ -305,7 +308,6 @@ class FlexKVReplayEngine:
         slot_mapping = np.array(data['slot_mapping'], dtype=np.int64)
         token_mask = np.array(data['token_mask'], dtype=bool) if data['token_mask'] else None
         layer_granularity = data.get('layer_granularity', -1)
-        dp_id = data.get('dp_id', 0)
 
         self.log(f"Replaying {request_type} request with {len(token_ids)} tokens")
 
@@ -319,7 +321,6 @@ class FlexKVReplayEngine:
                 slot_mapping=slot_mapping,
                 token_mask=token_mask,
                 layer_granularity=layer_granularity,
-                dp_id=dp_id
             )
         elif request_type == "PUT":
             print(f"✅✅✅PUT token_ids: {token_ids[:128]}")
@@ -330,7 +331,6 @@ class FlexKVReplayEngine:
                 token_ids=token_ids,
                 slot_mapping=slot_mapping,
                 token_mask=token_mask,
-                dp_id=dp_id
             )
         elif request_type == "GET_MATCH":
             print(f"🔍📝GET_MATCH token_ids: {token_ids[:128]}")
@@ -341,7 +341,6 @@ class FlexKVReplayEngine:
                 token_ids=token_ids,
                 token_mask=token_mask,
                 layer_granularity=layer_granularity,
-                dp_id=dp_id
             )
         elif request_type == "PUT_MATCH":
             print(f"✅📝PUT_MATCH token_ids: {token_ids[:128]}")
@@ -351,7 +350,6 @@ class FlexKVReplayEngine:
             task_id, return_mask = self.kvmanager.put_match(
                 token_ids=token_ids,
                 token_mask=token_mask,
-                dp_id=dp_id
             )
         else:
             raise ValueError(f"Unknown request type: {request_type}")

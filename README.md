@@ -8,6 +8,20 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 
 ## Updates
 
+- **Jul–Aug 2026**: Transfer performance and operability received a broad refresh: [adaptive multi-path GPU↔CPU transfers](https://github.com/taco-project/FlexKV/pull/203), [reliability and operational logging](https://github.com/taco-project/FlexKV/pull/233), [graceful shutdown](https://github.com/taco-project/FlexKV/pull/238), [chunked host-memory registration](https://github.com/taco-project/FlexKV/pull/240), [vectored SSD I/O](https://github.com/taco-project/FlexKV/pull/242), and [per-operation transfer tracing](https://github.com/taco-project/FlexKV/pull/247).
+
+- **Jul 24, 2026**: [Mooncake Store](https://github.com/kvcache-ai/Mooncake) can now serve as FlexKV's key-addressed remote cache tier ([#231](https://github.com/taco-project/FlexKV/pull/231)), enabling cluster-wide KV reuse with zero-copy RDMA and support for DeepSeek-V4 SWA/state sidecars.
+
+- **Jul 21, 2026**: DeepSeek-V4 support landed in FlexKV ([#225](https://github.com/taco-project/FlexKV/pull/225)), covering heterogeneous C4/C128/indexer KV groups, FullKV + SWA dual caches, attention/indexer compress-state sidecars, and layerwise restore. See the [SGLang integration guide](flexkv/integration/sglang/README.md) and [DeepSeek-V4 design notes](docs/dsv4_compress_state_io_zh.md).
+
+- **Jul 7, 2026**: 🎉 The FlexKV connector was merged into [SGLang](https://github.com/sgl-project/sglang) mainline ([PR #29701](https://github.com/sgl-project/sglang/pull/29701)), providing native CPU/SSD KV-cache offloading through `--enable-flexkv`.
+
+- **Jul 7, 2026**: Added byte-exact NVFP4 KV-cache offload and reload for vLLM on Blackwell GPUs ([#204](https://github.com/taco-project/FlexKV/pull/204)).
+
+- **Jun 24, 2026**: Added [layerwise KV transfer with SGLang/Mooncake integration](https://github.com/taco-project/FlexKV/commit/71dfa69), [Pipeline Parallel support](https://github.com/taco-project/FlexKV/commit/1a91e7f), and [HugePage-backed host cache](docs/hugepage/README_en.md).
+
+- **Jun 8, 2026**: Integrate nvcomp into FlexKV.
+
 - **Mar 17, 2026**: 🎉 FlexKV has been officially merged into [vLLM](https://github.com/vllm-project/vllm) mainline ([PR #34328](https://github.com/vllm-project/vllm/pull/34328))! Starting from **vLLM v0.17.2**, `FlexKVConnectorV1` is built in — no patch required. See [docs/vllm_adapter/README_en.md](docs/vllm_adapter/README_en.md) for updated usage.
 
 - **Mar 3, 2026**: 🎉 FlexKV has been officially merged into [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) ([PR #5858](https://github.com/ai-dynamo/dynamo/pull/5858))! FlexKV is now a native KV Cache Offloading option in Dynamo, enabling KV-aware routing + multi-level cache offloading in a unified pipeline. See [docs/dynamo_integration/README_en.md](docs/dynamo_integration/README_en.md).
@@ -32,12 +46,16 @@ Universal:
 - Support construct TensorSharedHandle directly from CUDA IPC Handle ([#44](https://github.com/taco-project/FlexKV/pull/44))
 
 
-Targeting vLLM: 
+Targeting vLLM:
 - Support dp > 1 while integrated with vLLM ([#18](https://github.com/taco-project/FlexKV/pull/18))
 - Add launch scripts for vLLM adaption ([#47](https://github.com/taco-project/FlexKV/pull/47))
 - Support TP16 for vLLM+FlexKV ([#59](https://github.com/taco-project/FlexKV/pull/59))
 
-Targeting TensorRT-LLM 
+Targeting SGLang:
+- The native FlexKV backend is available in upstream SGLang `v0.5.16` and later; no patch is required ([sglang#29701](https://github.com/sgl-project/sglang/pull/29701))
+- Support DeepSeek-V4 heterogeneous C4/C128/indexer KV groups, FullKV + SWA dual caches, compress-state sidecars, and layerwise restore ([#225](https://github.com/taco-project/FlexKV/pull/225)). Until the matching SGLang adaptation is merged, use [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) pinned to [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac). See the [SGLang integration guide](flexkv/integration/sglang/README.md)
+
+Targeting TensorRT-LLM
 - Support using FlexKV on TensorRT-LLM ([#48](https://github.com/taco-project/FlexKV/pull/48))
 - Support TP16 for TensorRT-LLM+FlexKV ([#53](https://github.com/taco-project/FlexKV/pull/53))
 
@@ -146,6 +164,13 @@ FlexKV natively integrates a Prometheus-based runtime monitoring framework that 
 
 For the full list of supported metrics, environment variable configuration, deployment guide for the monitoring stack (Prometheus + Grafana), see [docs/monitoring/README_en.md](docs/monitoring/README_en.md).
 
+## Continuous Integration
+
+Pull requests and protected-branch pushes build the release wheel and run the
+CPU unit-test tier on GitHub Actions. See the
+[CI guide](docs/ci/README_en.md) for the runner configuration, test scope,
+reference duration, local reproduction steps, and artifact-upload policy.
+
 ## Branching Strategy
 
 The branch management strategy of this project is as follows:
@@ -159,6 +184,6 @@ Note: Critical fixes discovered in released versions are applied directly to the
 ## Roadmap
 
 - **In-Process Cache Engine Integration**: In the dev branch, the implementation, integration, and invocation of the Cache Engine will be further optimized, along with synchronized updates to related APIs.
-- **Framework Integration**: Support works for vLLM, SGLang, and other acceleration frameworks will be updated soon.
+- **Framework Integration**: Deepen the native vLLM, SGLang, and TensorRT-LLM integrations and expand support to more inference engines.
 - **Distributed Query Support**: Enable scalable, distributed KVCache lookup.
 - **Latency Optimization**: Further reduce *get* latency via smarter prefetching and compression.

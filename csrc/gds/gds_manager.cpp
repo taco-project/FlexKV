@@ -1,5 +1,6 @@
 #include "gds_manager.h"
 #include "layout_transform.cuh"
+#include "logging.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
@@ -610,7 +611,7 @@ void transfer_kv_blocks_gds(
     int64_t total_layers,
     bool is_read,
     bool verbose,
-    bool is_mla
+    int kv_dim
 ) {
     const int num_transfers = ssd_block_ids.size(0);
     
@@ -653,9 +654,11 @@ void transfer_kv_blocks_gds(
     }
 
     if (verbose) {
-        std::cerr << "GDS: Allocated GPU buffer of " << total_buffer_size 
-                  << " bytes (" << num_slots << " slots x " 
-                  << ssd_block_stride_in_bytes << " bytes/slot)" << std::endl;
+        FLEXKV_LOG_DEBUG(
+            "operation=gds_buffer act=allocate status=success "
+            "buffer_bytes=%ld slots=%d slot_bytes=%ld",
+            static_cast<long>(total_buffer_size), num_slots,
+            static_cast<long>(ssd_block_stride_in_bytes));
     }
     
     // Create per-slot CUDA streams and mutexes
@@ -682,20 +685,30 @@ void transfer_kv_blocks_gds(
     
     std::vector<std::future<void>> futures;
     futures.reserve(num_transfers);
-    
+
+    size_t max_block_partition = 0;
     for (int device_id = 0; device_id < num_devices; device_id++) {
         const std::vector<int>& gpu_blocks = gpu_blocks_partition[device_id];
-        const std::vector<int>& ssd_blocks = ssd_blocks_partition[device_id];
-        const std::vector<std::string>& file_list = gds_manager.get_file_paths(device_id);
-        
-        for (size_t j = 0; j < gpu_blocks.size(); j++) {
+        max_block_partition = std::max(max_block_partition, gpu_blocks.size());
+    }
+
+    size_t task_index = 0;
+    for (size_t j = 0; j < max_block_partition; j++) {
+        for (int device_id = 0; device_id < num_devices; device_id++) {
+            const std::vector<int>& gpu_blocks = gpu_blocks_partition[device_id];
+            if (gpu_blocks.size() <= j)
+                continue;
+
+            const std::vector<int>& ssd_blocks = ssd_blocks_partition[device_id];
+            assert(ssd_blocks.size() == gpu_blocks.size());
             const int gpu_block_id = gpu_blocks[j];
             const int ssd_block_id = ssd_blocks[j];
-            const int slot_id = (device_id * gpu_blocks.size() + j) % num_slots;
+            const int slot_id = static_cast<int>(task_index++ % num_slots);
             
             futures.push_back(gds_manager.enqueue_task([&, device_id, gpu_block_id, ssd_block_id, slot_id, gpu_id]() {
                 // Set correct CUDA device for this worker thread
                 cudaSetDevice(gpu_id);
+                const std::vector<std::string>& file_list = gds_manager.get_file_paths(device_id);
                 
                 std::lock_guard<std::mutex> slot_lock(slot_mutexes[slot_id]);
                 // Sync stream to ensure previous kernel on this slot completed
@@ -734,7 +747,7 @@ void transfer_kv_blocks_gds(
                         d_my_block_id,
                         1,  // num_blocks
                         num_layers,
-                        is_mla,
+                        kv_dim,
                         true,
                         slot_stream
                     );
@@ -751,7 +764,7 @@ void transfer_kv_blocks_gds(
                         d_my_block_id,
                         1,  // num_blocks
                         num_layers,
-                        is_mla,
+                        kv_dim,
                         false,
                         slot_stream
                     );
@@ -760,14 +773,6 @@ void transfer_kv_blocks_gds(
                     gds_manager.write(filename.c_str(), buffer_slot_ptr, gpu_buffer_size_in_bytes, ssd_block_offset);
                 }
                 
-                if (verbose) {
-                    std::cerr << "GDS: " << (is_read ? "Read" : "Write")
-                              << " SSD: " << ssd_block_id
-                              << " GPU: " << gpu_block_id
-                              << " Slot: " << slot_id
-                              << " Device: " << device_id
-                              << std::endl;
-                }
             }));
         }
     }
@@ -787,6 +792,14 @@ void transfer_kv_blocks_gds(
     }
     cudaFree(d_gpu_block_ids);
     cudaFree(buffer_ptr);
+
+    if (verbose) {
+        FLEXKV_LOG_DEBUG(
+            "operation=gds_transfer act=complete status=success "
+            "direction=%s blocks=%ld devices=%d worker_threads=%d",
+            is_read ? "SSD2D" : "D2SSD", static_cast<long>(num_transfers),
+            num_devices, num_worker_threads);
+    }
     
     gds_manager.synchronize();
 }
@@ -795,16 +808,16 @@ void transfer_kv_blocks_gds(
 template void transfer_kv_blocks_gds<BackendType::VLLM>(
     GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
     const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int, int, int64_t, bool, bool, bool);
+    int, int, int64_t, bool, bool, int);
 
 template void transfer_kv_blocks_gds<BackendType::TRTLLM>(
     GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
     const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int, int, int64_t, bool, bool, bool);
+    int, int, int64_t, bool, bool, int);
 
 template void transfer_kv_blocks_gds<BackendType::SGLANG>(
     GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
     const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-    int, int, int64_t, bool, bool, bool);
+    int, int, int64_t, bool, bool, int);
 
 }

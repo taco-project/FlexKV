@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <iostream>
+#include <stdexcept>
 
 namespace flexkv {
 DistributedRadixTree::DistributedRadixTree(int tokens_per_block, unsigned int max_num_blocks,
@@ -33,10 +34,37 @@ DistributedRadixTree::DistributedRadixTree(int tokens_per_block, unsigned int ma
 
 DistributedRadixTree::~DistributedRadixTree() {
   stop();
-  // Drain renew_lease_queue; nodes are owned by RefRadixTree, do not delete here
+  reset();
+}
+
+void DistributedRadixTree::reset() {
+  if (refresh_started) {
+    throw std::runtime_error(
+        "DistributedRadixTree::reset requires the refresh worker to be stopped");
+  }
+
   QueuedNode queued_node;
   while (renew_lease_queue.pop(queued_node)) {
-    // discard
+  }
+
+  RefRadixTree *current = nullptr;
+  RefRadixTree *previous = nullptr;
+  {
+    std::unique_lock<std::shared_mutex> lock(index_mutex);
+    current = c_index.exchange(nullptr, std::memory_order_acq_rel);
+    previous = old_index.exchange(nullptr, std::memory_order_acq_rel);
+    c_index_generation.store(0, std::memory_order_release);
+    old_index_generation.store(0, std::memory_order_release);
+  }
+
+  while (renew_lease_queue.pop(queued_node)) {
+  }
+
+  if (current != nullptr) {
+    current->dec_ref_cnt();
+  }
+  if (previous != nullptr && previous != current) {
+    previous->dec_ref_cnt();
   }
 }
 
@@ -70,7 +98,7 @@ void* DistributedRadixTree::refresh_worker_trampoline(void* arg) {
 bool DistributedRadixTree::start(RedisMetaChannel *ch) {
   if (refresh_started) return true;
   channel = ch;
-  refresh_should_stop = false;
+  refresh_should_stop.store(false, std::memory_order_release);
   refresh_started = true;
   int result = pthread_create(&refresh_tid, nullptr, &DistributedRadixTree::refresh_worker_trampoline, this);
   if (result != 0) {
@@ -83,7 +111,7 @@ bool DistributedRadixTree::start(RedisMetaChannel *ch) {
 
 void DistributedRadixTree::stop() {
   if (!refresh_started) return;
-  refresh_should_stop = true;
+  refresh_should_stop.store(true, std::memory_order_release);
   pthread_join(refresh_tid, nullptr);
   refresh_started = false;
 }
@@ -95,7 +123,7 @@ void DistributedRadixTree::refresh_worker() {
   struct timeval tv_start; gettimeofday(&tv_start, nullptr);
   uint64_t last_rebuild_ms = (uint64_t)tv_start.tv_sec * 1000 + (uint64_t)(tv_start.tv_usec / 1000);
   
-  while (!refresh_should_stop) {
+  while (!refresh_should_stop.load(std::memory_order_acquire)) {
     std::vector<CRadixNode*> batch;
     batch.reserve(batch_size);
     QueuedNode queued_node;
@@ -571,6 +599,7 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   auto last_ready_node = root;
   auto prefix_blocks_num = 0;
   auto ready_prefix_blocks_num = 0;
+  bool ready_prefix_open = true;
   auto last_node_matched_length = 0;
   auto physical_blocks_tensor = torch::empty({num_blocks}, torch::dtype(torch::kInt64));
   auto *pb_out = physical_blocks_tensor.data_ptr<int64_t>();
@@ -643,9 +672,11 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
           ni_out[ni_write++] = (*bnis)[i];
         }
         
-        if (current_node->is_ready()) {
+        if (ready_prefix_open && current_node->is_ready()) {
           last_ready_node = current_node;
           ready_prefix_blocks_num += matched;
+        } else if (matched > 0) {
+          ready_prefix_open = false;
         }
         
         prefix_blocks_num += matched;
@@ -674,7 +705,7 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
   auto node_ids = node_ids_tensor.narrow(0, 0, ni_write);
   
-  return std::make_shared<CMatchResult>(prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
+  return std::make_shared<CMatchResult>(ready_prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
     last_ready_node, current_node, physical_blocks, node_ids);
 }
 
@@ -1040,5 +1071,4 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
 }
 
 } // namespace flexkv
-
 

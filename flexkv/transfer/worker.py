@@ -1,6 +1,9 @@
 import contextlib
+import logging
 import os
 import copy
+import signal
+
 import torch.multiprocessing as mp
 import threading
 import time
@@ -11,7 +14,6 @@ from multiprocessing.connection import Connection
 from threading import Thread
 from typing import List, Any, Dict, Union, Optional, Tuple
 
-import ctypes
 import numpy as np
 import nvtx
 import torch
@@ -30,12 +32,63 @@ except ImportError:
     TPGDSTransferThreadGroup = None
 
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.memory_handle import TensorSharedHandle, release_vmm_tensor
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
-from flexkv.common.transfer import get_nvtx_range_color
-from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
+from flexkv.common.transfer import get_nvtx_range_color, LayerwiseTransferOp
+from flexkv.common.config import (
+    CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig, LayerGroupSpec,
+)
+from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
+from flexkv.transfer.host_buffer import (
+    allocate_host_buffer,
+    cudaHostRegister,
+    safe_cuda_host_unregister,
+)
+
+
+def ensure_cuda_device(device: Union[int, torch.device, None]) -> None:
+    """Bind this process's CUDA context before IPC import / host register / Stream.
+
+    Workers must call this *before* any CUDA API. Otherwise the default device
+    (usually GPU 0) gets a context from every worker, which under DP exhausts
+    GPU0 and makes ``torch.cuda.Stream()`` OOM while ``ready_event.wait()`` hangs.
+    """
+    if device is None:
+        return
+    if isinstance(device, torch.device):
+        if device.type != "cuda":
+            return
+        idx = 0 if device.index is None else int(device.index)
+    else:
+        idx = int(device)
+        if idx < 0:
+            return
+    torch.cuda.set_device(idx)
+
+
+def import_tensor_handles(
+    handles: List["TensorSharedHandle"],
+) -> List[torch.Tensor]:
+    """Import CUDA IPC tensors after switching to their owning device."""
+    if handles:
+        ensure_cuda_device(handles[0].device)
+    return [h.get_tensor() for h in handles]
+from flexkv.transfer.compression.common.strategy import (
+    CompressionStrategy,
+    NullCompressionStrategy,
+)
+from flexkv.transfer.worker_op import (
+    WorkerLayerwiseTransferOp,
+    WorkerTransferOp,
+    WorkerTransferResult,
+)
+from flexkv.transfer import trace
+trace.configure(GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace)
+
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
+from flexkv.external.mooncake_store_keys import PoolKind, build_key
+from flexkv.external.mooncake_fault_inject import inject_mooncake_fault, is_mooncake_fault_inject_enabled
 from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.transfer.utils import (
@@ -66,60 +119,18 @@ except ImportError:
     shared_transfer_kv_blocks_remote_read = None
 
 
-cudart = ctypes.CDLL('libcudart.so')
-
-def cudaHostRegister(tensor: torch.Tensor) -> None:
-    """Register a CPU tensor with CUDA for pinned memory access"""
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 1) # 1 means cudaHostRegisterPortable
-    if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
-
-def cudaHostUnregister(tensor: torch.Tensor) -> None:
-    """Unregister a CPU tensor from CUDA for pinned memory access"""
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
-
-@dataclass
-class WorkerTransferOp:
-    transfer_op_id: int
-    transfer_graph_id: int
-    transfer_type: TransferType
-    layer_id: int
-    layer_granularity: int
-    src_slot_id: int
-    dst_slot_id: int
-    valid_block_num: int
-    src_block_ids: np.ndarray
-    dst_block_ids: np.ndarray
-    src_block_node_ids: Optional[np.ndarray]
-    # successors: List[int]
-
-    def __init__(self, transfer_op: TransferOp):
-        self.transfer_op_id = transfer_op.op_id
-        self.transfer_graph_id = transfer_op.graph_id
-        self.transfer_type = transfer_op.transfer_type
-        self.layer_id = transfer_op.layer_id
-        self.layer_granularity = transfer_op.layer_granularity
-        self.src_slot_id = transfer_op.src_slot_id
-        self.dst_slot_id = transfer_op.dst_slot_id
-        self.valid_block_num = transfer_op.valid_block_num
-        # Always preserve optional src_block_node_ids from TransferOp
-        self.src_block_node_ids = transfer_op.src_block_node_ids
-
-        if self.src_slot_id == -1 or self.dst_slot_id == -1:
-            self.src_block_ids = transfer_op.src_block_ids
-            self.dst_block_ids = transfer_op.dst_block_ids
-        else:
-            self.src_block_ids = np.empty(0)
-            self.dst_block_ids = np.empty(0)
-        # self.successors = list(transfer_op.successors)  # for nvtx
-
 class TransferWorkerBase(ABC):
     _worker_id_counter = 0
     _worker_id_lock = threading.Lock()
+
+    def __new__(cls, *args: Any, **kwargs: Any):
+        # Allocate first so ``_worker_process`` can always hold a reference and
+        # call shutdown() even when ``__init__`` fails mid-way after some pins.
+        obj = super().__new__(cls)
+        obj._host_registered = []
+        obj._shutdown_done = False
+        obj._op_buffer_pinned = False
+        return obj
 
     def __init__(self,
                  worker_id: int,
@@ -128,10 +139,104 @@ class TransferWorkerBase(ABC):
                  op_buffer_tensor: torch.Tensor):
         self.worker_id = worker_id
         self.transfer_conn = transfer_conn  # receive end of pipe
-        self.finished_ops_queue: MPQueue[int] = finished_ops_queue
+        self.finished_ops_queue: MPQueue = finished_ops_queue
 
         self.op_buffer_tensor = op_buffer_tensor
-        cudaHostRegister(self.op_buffer_tensor)
+        self._op_buffer_pinned = False
+        # (tensor, label) pairs registered via _register_host_tensor / _pin_op_buffer.
+        self._host_registered: List[Tuple[torch.Tensor, str]] = []
+        self._shutdown_done = False
+
+    def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
+        """cudaHostRegister and track for paired unregister in shutdown()."""
+        size_gb = tensor.numel() * tensor.element_size() / (1024 ** 3)
+        flexkv_logger.info(
+            f"[worker {self.worker_id}] cudaHostRegister {label or 'host'}: "
+            f"ptr=0x{tensor.data_ptr():x} size={size_gb:.3f} GiB"
+        )
+        cudaHostRegister(tensor)
+        self._host_registered.append((tensor, label or "host"))
+
+    def _pin_op_buffer(self) -> None:
+        """Pin the shared op buffer after the worker has bound its CUDA device.
+
+        Must not run before ``ensure_cuda_device`` / ``import_tensor_handles``,
+        or every worker creates a default CUDA context on GPU0.
+        """
+        if not self._op_buffer_pinned:
+            self._register_host_tensor(self.op_buffer_tensor, "op_buffer")
+            self._op_buffer_pinned = True
+
+    def shutdown(self) -> None:
+        """Unregister all host tensors pinned by this worker. Idempotent.
+
+        Safe to call after a partially-failed ``__init__`` (only unregisters
+        whatever was tracked in ``_host_registered``).
+        """
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        registered = getattr(self, "_host_registered", None) or []
+        worker_id = getattr(self, "worker_id", "-1")
+        msg = (
+            f"[worker {worker_id}] shutdown: unregistering "
+            f"{len(registered)} host region(s)"
+        )
+        flexkv_logger.info(msg)
+        # Drain in-flight CUDA work before unpinning host memory that
+        # DMA / kernels may still be touching.
+        #
+        # torch.cuda.synchronize() releases the GIL and blocks in the driver;
+        # if the GPU is wedged (hung kernel, TDR, faulty NVLink) it can hang
+        # forever. We run it in a daemon thread with a bounded join so a
+        # wedged GPU cannot prevent cudaHostUnregister from firing — the
+        # kernel behind the DMA is already dead, so proceeding with unpin
+        # is the correct action; the sentinel thread dies with the process.
+        self._drain_cuda_bounded(worker_id, timeout_s=30.0)
+        # Unregister in reverse order of registration.
+        while registered:
+            tensor, label = registered.pop()
+            safe_cuda_host_unregister(tensor, label=f"worker={worker_id} {label}")
+        self._op_buffer_pinned = False
+        self._host_registered = registered
+
+    @staticmethod
+    def _drain_cuda_bounded(worker_id: Any, timeout_s: float) -> None:
+        """Best-effort torch.cuda.synchronize() with a wall-clock cap.
+
+        Returns whether the sync actually completed. Failure / timeout is
+        logged but not raised — unpin must proceed either way.
+        """
+        if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+            return
+        done = threading.Event()
+        err: List[BaseException] = []
+
+        def _run() -> None:
+            try:
+                torch.cuda.synchronize()
+            except BaseException as e:  # noqa: BLE001
+                err.append(e)
+            finally:
+                done.set()
+
+        t = threading.Thread(
+            target=_run,
+            name=f"flexkv-worker-{worker_id}-cuda-drain",
+            daemon=True,
+        )
+        t.start()
+        if not done.wait(timeout=timeout_s):
+            flexkv_logger.warning(
+                f"[worker {worker_id}] cuda synchronize did not finish in "
+                f"{timeout_s:.0f}s (GPU likely wedged); proceeding with unpin"
+            )
+            return
+        if err:
+            flexkv_logger.warning(
+                f"[worker {worker_id}] cuda synchronize before unpin failed: "
+                f"{err[0]!r}"
+            )
 
     @classmethod
     def _get_worker_id(cls) -> int:
@@ -152,6 +257,53 @@ class TransferWorkerBase(ABC):
         for lay_id in range(len(layer_blocks)):
             layer_ptrs[lay_id] = layer_blocks[lay_id][0].data_ptr()
         return layer_ptrs
+
+    @staticmethod
+    def _get_gpu_strides_from_tensor(
+        tensor: torch.Tensor,
+        tokens_per_block: int,
+        dtype_size: int,
+        kv_dim: int,
+    ) -> tuple:
+        """Compute (kv_stride, block_stride, layer_stride) in bytes from a GPU
+        KV cache tensor's actual memory layout.
+
+        Different attention backends use different dim orders for the 5D tensor:
+          flash_attn:        [2, num_blocks, block_size, num_kv_heads, head_size]
+          triton/flashinfer: [num_blocks, 2, block_size, num_kv_heads, head_size]
+
+        Returns (gpu_kv_stride_bytes, gpu_block_stride_bytes, gpu_layer_stride_bytes).
+        """
+        if kv_dim == 1 or tensor.ndim != 5:
+            return None  # caller should fall back to layout-based strides
+
+        # Last 2 dims are always (num_kv_heads, head_size).
+        # First 3 dims are a permutation of (num_blocks, kv_dim=2, block_size).
+        dim_sizes = [tensor.shape[i] for i in range(3)]
+        kv_dim_idx = None
+        block_size_idx = None
+        block_dim_idx = None
+
+        # Identify kv_dim (size 2) and block_size (size tokens_per_block)
+        for i in range(3):
+            if dim_sizes[i] == 2 and kv_dim_idx is None:
+                kv_dim_idx = i
+        for i in range(3):
+            if i != kv_dim_idx and dim_sizes[i] == tokens_per_block and block_size_idx is None:
+                block_size_idx = i
+        # Remaining dim is num_blocks
+        for i in range(3):
+            if i != kv_dim_idx and i != block_size_idx:
+                block_dim_idx = i
+                break
+
+        if kv_dim_idx is None or block_dim_idx is None:
+            return None  # ambiguous, fall back
+
+        kv_stride = tensor.stride(kv_dim_idx) * dtype_size
+        block_stride = tensor.stride(block_dim_idx) * dtype_size
+        layer_stride = tensor.numel() * dtype_size
+        return (kv_stride, block_stride, layer_stride)
 
     @classmethod
     def create_worker(cls,
@@ -179,10 +331,55 @@ class TransferWorkerBase(ABC):
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
                         op_buffer_tensor: torch.Tensor, ready_event: Any, *args: Any, **kwargs: Any) -> None:
         # Note: MPI initialization prevention is handled by create_safe_process
-        # Environment variables are set before this function is called
-        worker = cls(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs)
-        ready_event.set()
-        worker.run()
+        # Environment variables are set before this function is called.
+        #
+        # Use ``__new__`` + ``__init__`` (not ``cls(...)``) so we keep a live
+        # reference if ``__init__`` raises after partial cudaHostRegister; the
+        # ``finally`` block can still unpin. ``run()`` only exits the loop —
+        # this finally owns shutdown().
+        worker: Optional["TransferWorkerBase"] = None
+
+        def _on_sigterm(signum: int, frame: Any) -> None:
+            # Raise SystemExit so the ``finally`` below still runs shutdown().
+            flexkv_logger.warning(
+                f"[worker {worker_id}] received signal {signum}; exiting for graceful cleanup"
+            )
+            raise SystemExit(0)
+
+        try:
+            # Ignore Ctrl+C (SIGINT): the foreground process group receives it
+            # together with sglang/tee. Workers must only unpin when the parent
+            # sends a shutdown sentinel / SIGTERM, otherwise they race and get
+            # SIGKILL mid-unregister, leaking pinned CPU buffers.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        except Exception as e:
+            flexkv_logger.warning(
+                f"[worker {worker_id}] failed to install shutdown signal handlers: {e}"
+            )
+
+
+        try:
+            worker = cls.__new__(cls)
+            worker.__init__(
+                worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs
+            )
+            ready_event.set()
+            worker.run()
+        except Exception as e:
+            # Init / run failure: log then re-raise so process exitcode != 0.
+            # SIGTERM → SystemExit is BaseException and bypasses this handler,
+            # still hitting ``finally`` for unpin.
+            flexkv_logger.error(
+                f"[worker {worker_id}] exited with error during init/run: {e}"
+            )
+            raise
+        finally:
+            if worker is not None:
+                try:
+                    worker.shutdown()
+                except Exception as e:
+                    flexkv_logger.error(f"[worker {worker_id}] final shutdown error: {e}")
 
     @abstractmethod
     def _transfer_impl(
@@ -190,8 +387,6 @@ class TransferWorkerBase(ABC):
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
         transfer_type: TransferType,
-        layer_id: int,
-        layer_granularity: int,
         **kwargs: Any
     ) -> None:
         pass
@@ -231,71 +426,211 @@ class TransferWorkerBase(ABC):
                                   transfer_op: WorkerTransferOp,
                                   transfer_size: int,
                                   start_time: float,
-                                  end_time: float) -> None:
-        """Common method to log transfer performance"""
-        flexkv_logger.info(
-            f"{transfer_op.transfer_type.name} transfer request: {transfer_op.transfer_op_id} finished "
-            f"transfer data size: {transfer_size / (1024 * 1024 * 1024)} GB "
-            f"transfer time: {end_time - start_time:.4f} s "
-            f"transfer bandwidth: {transfer_size / (end_time - start_time) / 1e9:.2f} GB/s"
+                                  end_time: float,
+                                  uncompressed_size: Optional[int] = None) -> None:
+        """Emit one terminal record per transfer op."""
+        if not flexkv_logger.is_enabled_for(logging.INFO):
+            return
+        duration_s = max(end_time - start_time, 1e-9)
+        is_layerwise = transfer_op.transfer_type == TransferType.LAYERWISE
+        direction = "H2D" if is_layerwise else transfer_op.transfer_type.value
+        blocks = (
+            len(transfer_op.src_block_ids_h2d)
+            if is_layerwise
+            else transfer_op.valid_block_num
         )
+        transfer_mode = "layerwise" if is_layerwise else "no-layerwise"
+        bandwidth = transfer_size / duration_s / 1e9
+
+        if (
+            uncompressed_size is not None
+            and transfer_size > 0
+            and uncompressed_size != transfer_size
+        ):
+            flexkv_logger.info(
+                "[FlexKV-IO] operation=transfer act=complete status=success "
+                "direction=%s blocks=%d op_id=%d graph_id=%d mode=%s "
+                "compressed_size=%.6gGB original_size=%.6gGB "
+                "compression_ratio=%.2fx transfer_time=%.4fs "
+                "bandwidth=%.2fGB/s",
+                direction,
+                blocks,
+                transfer_op.transfer_op_id,
+                transfer_op.transfer_graph_id,
+                transfer_mode,
+                transfer_size / (1024**3),
+                uncompressed_size / (1024**3),
+                uncompressed_size / transfer_size,
+                duration_s,
+                bandwidth,
+            )
+        else:
+            flexkv_logger.info(
+                "[FlexKV-IO] operation=transfer act=complete status=success "
+                "direction=%s blocks=%d op_id=%d graph_id=%d mode=%s "
+                "data_size=%.6gGB transfer_time=%.4fs bandwidth=%.2fGB/s",
+                direction,
+                blocks,
+                transfer_op.transfer_op_id,
+                transfer_op.transfer_graph_id,
+                transfer_mode,
+                transfer_size / (1024**3),
+                duration_s,
+                bandwidth,
+            )
 
     @abstractmethod
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+    def launch_transfer(
+        self, transfer_op: WorkerTransferOp
+    ) -> Union[bool, WorkerTransferResult]:
         pass
 
+    def _handle_control(self, command: str, payload: Any) -> Any:
+        handler = getattr(self, f"_control_{command}", None)
+        if handler is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support control {command}"
+            )
+        return handler(payload)
+
+    def _reply_control(self, op: Dict[str, Any]) -> None:
+        request_id = op["request_id"]
+        try:
+            reply = {
+                "type": "control_ack",
+                "request_id": request_id,
+                "result": self._handle_control(
+                    op["command"], op.get("payload")
+                ),
+            }
+        except Exception as exc:
+            flexkv_logger.exception(
+                f"Worker control {op.get('command')} failed"
+            )
+            reply = {
+                "type": "control_ack",
+                "request_id": request_id,
+                "error": str(exc),
+            }
+        self.transfer_conn.send(reply)
+
     def run(self) -> None:
-        """main loop for worker process"""
-        should_shutdown = False
+        """Main loop for the worker process.
+
+        Exit paths (``None`` sentinel, pipe EOF, or return) do not unregister
+        themselves — ``_worker_process`` owns a single ``shutdown()`` in its
+        ``finally`` block so cleanup is not duplicated.
+        """
         while True:
             try:
-                if self.transfer_conn.poll(timeout=0.0001):  # check if data available
+                if not self.transfer_conn.poll(timeout=0.0001):
+                    continue
+
+                op = self.transfer_conn.recv()
+                if op is None:
+                    return
+                if not isinstance(op, dict):
+                    op._received_ns = time.perf_counter_ns()
+
+                # Drain any already-queued ops into one batch, then process.
+                # The for-loop MUST sit outside the drain while: a single-op
+                # submit leaves poll() False immediately, and a while-else
+                # continue would otherwise drop the first op forever (which
+                # stalls D2H → H2REMOTE and leaves mooncake PutStart=0).
+                batch_ops = [op]
+                shutdown_after_batch = False
+                while self.transfer_conn.poll(timeout=0):
                     op = self.transfer_conn.recv()
                     if op is None:
-                        # shut down zmq listening server of peer2cpuTransferWorker
-                        if hasattr(self, "shutdown") and callable(self.shutdown):
-                            try:
-                                self.shutdown()
-                            except Exception as e:
-                                flexkv_logger.error(f"Error when shut down worker: {e}")
+                        shutdown_after_batch = True
                         break
-                    batch_ops = [op]
-                    while self.transfer_conn.poll(timeout=0):
-                        op = self.transfer_conn.recv()
-                        if op is None:
-                            should_shutdown = True
-                            break
-                        batch_ops.append(op)
-                    for op in batch_ops:
-                        transfer_status = False
-                        try:
-                            nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
-                                                f"graph_id: {op.transfer_graph_id}, "
-                                                f"num_blocks: {op.valid_block_num}",
-                                                color=get_nvtx_range_color(op.transfer_graph_id))
-                            transfer_status = self.launch_transfer(op)
+                    if not isinstance(op, dict):
+                        op._received_ns = time.perf_counter_ns()
+                    batch_ops.append(op)
+                for op in batch_ops:
+                    if isinstance(op, dict) and op.get("type") == "control":
+                        self._reply_control(op)
+                        continue
+                    transfer_status = False
+                    transfer_start_ns = time.perf_counter_ns()
+                    nvtx_pushed = False
+                    try:
+                        nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
+                                            f"graph_id: {op.transfer_graph_id}",
+                                            color=get_nvtx_range_color(op.transfer_graph_id))
+                        nvtx_pushed = True
+                        transfer_status = self.launch_transfer(op)
+                    except Exception as e:
+                        is_layerwise = op.transfer_type == TransferType.LAYERWISE
+                        direction = "H2D" if is_layerwise else op.transfer_type.value
+                        blocks = (
+                            len(op.src_block_ids_h2d)
+                            if is_layerwise
+                            else op.valid_block_num
+                        )
+                        flexkv_logger.error(
+                            "[FlexKV-IO] operation=transfer act=complete "
+                            "status=failed direction=%s blocks=%d op_id=%d "
+                            "graph_id=%d mode=%s transfer_time=%.4fs "
+                            "error=%r",
+                            direction,
+                            blocks,
+                            op.transfer_op_id,
+                            op.transfer_graph_id,
+                            "layerwise" if is_layerwise else "no-layerwise",
+                            (time.perf_counter_ns() - transfer_start_ns) / 1e9,
+                            str(e),
+                            exc_info=True,
+                        )
+                    finally:
+                        if nvtx_pushed:
                             nvtx.pop_range()
+                    launched_ns = time.perf_counter_ns()
+                    is_h2d = (op.transfer_type == TransferType.H2D
+                              or op.transfer_type == TransferType.LAYERWISE)
+                    metrics = trace.build_worker_metrics(
+                        op,
+                        getattr(op, "prof_submitted_ns", 0),
+                        getattr(op, "_received_ns", launched_ns),
+                        transfer_start_ns,
+                        launched_ns,
+                        self.worker_id,
+                        getattr(self, "_bytes_per_block", 0),
+                        getattr(self, "kv_dim", 2),
+                        is_h2d,
+                    )
+                    if isinstance(transfer_status, WorkerTransferResult):
+                        # Partial-capable backends report completion even when
+                        # zero blocks succeeded, so the graph can clean up and
+                        # the caller can fall back instead of hanging forever.
+                        # Carry metrics so FLEXKV_TRANSFER_TRACE still works.
+                        self.finished_ops_queue.put(
+                            (transfer_status, True, metrics))
+                    elif transfer_status:
+                        self.finished_ops_queue.put(
+                            (op.transfer_op_id, True, metrics))
+                    else:
+                        # Report the failure instead of dropping it: a
+                        # dropped op leaves its graph incomplete forever
+                        # and leaks every resource its plan holds. A bare
+                        # int still means success, so the queue format
+                        # stays compatible.
+                        self.finished_ops_queue.put(
+                            (op.transfer_op_id, False, None))
+                if shutdown_after_batch:
+                    if hasattr(self, "shutdown") and callable(self.shutdown):
+                        try:
+                            self.shutdown()
                         except Exception as e:
-                            flexkv_logger.error(f"Error launching transfer: {e}\n"
-                                        f"Failed transfer op: {op}")
-                        if transfer_status:
-                            ## only put the op when transfer success
-                            self.finished_ops_queue.put(op.transfer_op_id)
-                    if should_shutdown:
-                        if hasattr(self, "shutdown") and callable(self.shutdown):
-                            try:
-                                self.shutdown()
-                            except Exception as e:
-                                flexkv_logger.error(f"Error when shut down worker: {e}")
-                        break
-                else:
-                    continue
+                            flexkv_logger.error(f"Error when shut down worker: {e}")
+                    break
             except EOFError:
-                # Connection closed
-                break
+                flexkv_logger.warning(
+                    f"[worker {self.worker_id}] transfer pipe EOF; exiting run loop"
+                )
+                return
             except Exception as e:
                 flexkv_logger.error(f"Error in worker run loop: {e}")
-                continue
 
 class WorkerHandle:
     """handle for worker process"""
@@ -305,25 +640,71 @@ class WorkerHandle:
         self.process = process
         self.ready_event = ready_event
 
-    def submit_transfer(self, op: TransferOp) -> None:
-        self.transfer_conn.send(WorkerTransferOp(op))
+    def submit_transfer(self, op: Union[TransferOp, LayerwiseTransferOp]) -> None:
+        if isinstance(op, LayerwiseTransferOp):
+            worker_op = WorkerLayerwiseTransferOp(op)
+        else:
+            worker_op = WorkerTransferOp(op)
+        if trace._TRACE_ON:
+            submitted_ns = time.perf_counter_ns()
+            worker_op.prof_submitted_ns = submitted_ns
+            trace.set_submit_ns(op.op_id, submitted_ns)
+            trace.inc_inflight()
+        self.transfer_conn.send(worker_op)
+
+    def control(
+        self, command: str, payload: Any = None, timeout: float = 120.0
+    ) -> Any:
+        request_id = f"{self.worker_id}:{time.monotonic_ns()}"
+        self.transfer_conn.send({
+            "type": "control",
+            "command": command,
+            "payload": payload,
+            "request_id": request_id,
+        })
+        if not self.transfer_conn.poll(timeout):
+            raise TimeoutError(
+                f"Worker {self.worker_id} timed out handling {command}"
+            )
+        reply = self.transfer_conn.recv()
+        if reply.get("request_id") != request_id:
+            raise RuntimeError(f"Unexpected worker control reply: {reply}")
+        if "error" in reply:
+            raise RuntimeError(
+                f"Worker {self.worker_id} {command} failed: {reply['error']}"
+            )
+        return reply.get("result")
 
     def shutdown(self) -> None:
         try:
             self.transfer_conn.send(None)
-            self.transfer_conn.close()
-        except (BrokenPipeError, OSError):
-            pass  # Pipe already closed
-        # set timeout to 5 seconds
-        self.process.join(timeout=5)
+        except (BrokenPipeError, OSError, EOFError):
+            pass  # Pipe already closed / peer gone
+
+        timeout = float(GLOBAL_CONFIG_FROM_ENV.worker_shutdown_timeout_s)
+        self.process.join(timeout=timeout)
         if self.process.is_alive():
-            print("force terminate the worker process")
+            flexkv_logger.warning(
+                f"[WorkerHandle] worker {self.worker_id} still alive after "
+                f"{timeout:.0f}s graceful shutdown; force terminate"
+            )
             self.process.terminate()
-            self.process.join()
+            self.process.join(timeout=30)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join()
+
+        try:
+            self.transfer_conn.close()
+        except Exception:
+            pass
 
     def __del__(self) -> None:
-        if self.process.is_alive():
-            self.shutdown()
+        try:
+            if getattr(self, "process", None) is not None and self.process.is_alive():
+                self.shutdown()
+        except Exception:
+            pass
 
 class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non-tp and non-dp case
     def __init__(self,
@@ -332,7 +713,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
                  gpu_blocks: List[TensorSharedHandle],
-                 cpu_blocks: torch.Tensor,
+                 cpu_blocks: Union[torch.Tensor, HugePageTensorHandle],
                  gpu_kv_layout: KVCacheLayout,
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
@@ -340,13 +721,26 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
-                 transfer_num_cta_d2h: int = 4) -> None:
+                 transfer_num_cta_d2h: int = 4,
+                 compressor: Optional[CompressionStrategy] = None,
+                 layer_groups: Optional[List[LayerGroupSpec]] = None,
+                 gpu_blocks_per_group: Optional[List[List[TensorSharedHandle]]] = None,
+                 gpu_layouts_per_group: Optional[List[KVCacheLayout]] = None) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+
+        # Bind CUDA device BEFORE host-register / IPC import / Stream creation.
+        ensure_cuda_device(gpu_device_id)
+
+        self._pin_op_buffer()
         # Register CPU tensors with CUDA
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        cudaHostRegister(cpu_blocks)
-        self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
+        self._register_host_tensor(cpu_blocks, "cpu_kv_pool")
+
+        self.gpu_device_id = gpu_device_id
+        self._gpu_block_count = len(gpu_blocks)
+        self.gpu_blocks = import_tensor_handles(gpu_blocks)
         # Get pointers first
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
         self.gpu_tensor_ptrs = self.gpu_blocks_ptrs
@@ -354,44 +748,223 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.cpu_tensor = cpu_blocks
 
         self.dtype = dtype
-        self.is_mla = gpu_kv_layout.is_mla
+        self.kv_dim = gpu_kv_layout.kv_dim
+        self.num_kv_heads = gpu_kv_layout.num_kv_heads
+        self.cpu_is_blockfirst = (
+            cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
+        )
 
         self.num_layers = gpu_kv_layout.num_layer
+        self.layer_groups = layer_groups
 
-        # a chunk can be located by layer_id * layer_stride + kv_id * kv_stride + block_id * block_stride
-        self.chunk_size_in_bytes = gpu_kv_layout.get_chunk_size() * self.dtype.itemsize
-        self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
-        self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
-        self.gpu_layer_stride_in_bytes = gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+        if layer_groups is not None and gpu_blocks_per_group is not None and gpu_layouts_per_group is not None:
+            # Multi-group mode: compute per-group strides
+            self._init_multi_group(
+                gpu_blocks_per_group, gpu_layouts_per_group,
+                cpu_kv_layout, layer_groups,
+            )
+        else:
+            # Uniform mode: existing code path
+            self.group_transfer_params = None
 
-        self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
-        self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
-        self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+            # a chunk can be located by layer_id * layer_stride + kv_id * kv_stride + block_id * block_stride
+            self.chunk_size_in_bytes = gpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+            # Bytes per KV block (all layers); used by transfer tracing for bw.
+            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
 
-        if len(self.gpu_blocks) == 1:
+            # Compute GPU strides from actual tensor to handle different attention
+            # backend layouts (flash_attn: [2,N,B,H,D], triton: [N,2,B,H,D]).
+            gpu_strides = self._get_gpu_strides_from_tensor(
+                self.gpu_blocks[0], gpu_kv_layout.tokens_per_block,
+                self.dtype.itemsize, self.kv_dim,
+            ) if len(self.gpu_blocks) > 1 else None
+            if gpu_strides is not None:
+                self.gpu_kv_stride_in_bytes = gpu_strides[0]
+                self.gpu_block_stride_in_bytes = gpu_strides[1]
+                self.gpu_layer_stride_in_bytes = gpu_strides[2]
+            else:
+                self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+                self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
+                self.gpu_layer_stride_in_bytes = gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+
+            self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+            self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+            self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+
+        # gpu_block_type_ is a framework-level tag (0=VLLM, 1=TRTLLM, 2=SGLANG).
+        # In multi-group mode all groups share the same per-layer GPU layout, so
+        # judge from any one group; the flat self.gpu_blocks would over-count.
+        if self.group_transfer_params is None:
+            ref_blocks_len = len(self.gpu_blocks)
+            ref_num_layers = self.num_layers
+        else:
+            ref_blocks_len = len(gpu_blocks_per_group[0])
+            ref_num_layers = layer_groups[0].num_layers
+
+        if ref_blocks_len == 1:
             self.gpu_block_type_ = 1
-        elif len(self.gpu_blocks) == self.num_layers:
+        elif ref_blocks_len == ref_num_layers:
             self.gpu_block_type_ = 0
-        elif len(self.gpu_blocks) == self.num_layers * 2:
+        elif ref_blocks_len == ref_num_layers * 2:
             self.gpu_block_type_ = 2
         else:
-            raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
-        # set GPU device
-        if gpu_device_id != -1:
-            torch.cuda.set_device(gpu_device_id)
+            raise ValueError(
+                f"Invalid GPU block type: ref_blocks_len={ref_blocks_len}, "
+                f"ref_num_layers={ref_num_layers}"
+            )
+
         self.transfer_stream = torch.cuda.Stream()
         self.transfer_num_cta_h2d = transfer_num_cta_h2d
         self.transfer_num_cta_d2h = transfer_num_cta_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
+        self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.ce_path_opt
+        self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold
+        self.ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
+
+        self._compressor = compressor or NullCompressionStrategy()
+        self._compressor.attach(self)
+
+    def _init_multi_group(
+        self,
+        gpu_blocks_per_group: List[List[TensorSharedHandle]],
+        gpu_layouts_per_group: List[KVCacheLayout],
+        cpu_kv_layout: KVCacheLayout,
+        layer_groups: List[LayerGroupSpec],
+    ) -> None:
+        """Initialize per-group transfer parameters for models with mixed KV shapes."""
+        kv_dim = self.kv_dim
+        tpb = cpu_kv_layout.tokens_per_block
+        cpu_layout_type = cpu_kv_layout.type
+        num_cpu_blocks = cpu_kv_layout.num_block
+
+        # CPU buffer is sized in BYTES per block (see KVCacheLayout._compute_kv_shape).
+        # cpu_kv_layout.get_block_stride() returns bytes_per_block directly for
+        # multi-group BLOCKFIRST.  For LAYERFIRST, num_cpu_blocks is the contiguous
+        # dim count and we keep elements-based per-group accumulation below.
+        total_block_bytes = (
+            cpu_kv_layout.get_block_stride()
+            if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST else None
+        )
+
+        self.group_transfer_params: list = []
+        # Keep the imported CUDA-IPC tensors alive for the worker's lifetime.
+        # _get_layer_ptrs() below records only their raw data_ptr()s; if the
+        # tensors themselves were allowed to go out of scope, PyTorch would
+        # release the underlying CUDA IPC mapping and the stored pointers would
+        # dangle, so the per-group transfer would read/write freed device
+        # memory (observed as the indexer group silently restoring zeros).
+        self._multi_group_gpu_blocks_keepalive: list = []
+        cpu_offset_bytes = 0  # byte offset of this group within a CPU block
+
+        for gi, (g, gpu_layout) in enumerate(zip(layer_groups, gpu_layouts_per_group)):
+            # Per-group dtype: indexer uses uint8 even when main KV is bf16/fp16.
+            dtype_size_g = g.dtype.itemsize
+
+            # Resolve GPU tensors for this group
+            group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+            self._multi_group_gpu_blocks_keepalive.append(group_gpu_blocks)
+            group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
+
+            # Compressed groups: GPU tensor's tokens dim equals tpb_g, not tpb.
+            tpb_g = tpb // g.compress_ratio
+            chunk_elements = tpb_g * g.num_kv_heads * g.head_size
+
+            # GPU strides: compute from actual tensor to handle different
+            # attention backend layouts (flash_attn vs triton/flashinfer).
+            gpu_chunk_size = chunk_elements * dtype_size_g
+            t0 = group_gpu_blocks[0]
+            gpu_strides = self._get_gpu_strides_from_tensor(t0, tpb_g, dtype_size_g, self.kv_dim)
+            if gpu_strides is not None:
+                gpu_kv_stride, gpu_block_stride, gpu_layer_stride = gpu_strides
+            else:
+                gpu_kv_stride = gpu_layout.get_kv_stride() * dtype_size_g
+                gpu_block_stride = gpu_layout.get_block_stride() * dtype_size_g
+                gpu_layer_stride = gpu_layout.get_layer_stride() * dtype_size_g
+
+            # CPU strides: depend on layout type.  All values are in bytes; the
+            # CPU buffer underlying self.cpu_tensor is uint8 for multi-group.
+            if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
+                # BLOCKFIRST: [num_block, bytes_per_block]; within a block,
+                # data is laid out group-by-group (each group's region holds
+                # its own layer0_k, layer0_v, layer1_k, ... bytes).
+                cpu_layer_stride = kv_dim * chunk_elements * dtype_size_g
+                cpu_block_stride = total_block_bytes
+                cpu_kv_stride = chunk_elements * dtype_size_g
+            else:
+                # LAYERFIRST: [all_layers, kv_dim, num_block, tpb, heads, head_dim]
+                cpu_layer_stride = kv_dim * num_cpu_blocks * chunk_elements * dtype_size_g
+                cpu_block_stride = chunk_elements * dtype_size_g
+                cpu_kv_stride = num_cpu_blocks * chunk_elements * dtype_size_g
+
+            self.group_transfer_params.append({
+                'gpu_ptrs': group_gpu_ptrs,
+                'chunk_size': gpu_chunk_size,
+                'gpu_kv_stride': gpu_kv_stride,
+                'gpu_block_stride': gpu_block_stride,
+                'gpu_layer_stride': gpu_layer_stride,
+                'cpu_layer_stride': cpu_layer_stride,
+                'cpu_block_stride': cpu_block_stride,
+                'cpu_kv_stride': cpu_kv_stride,
+                'cpu_offset_bytes': cpu_offset_bytes,
+                'num_layers': g.num_layers,
+                'kv_dim': gpu_layout.kv_dim,
+            })
+
+            # Advance CPU byte offset for next group.
+            if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
+                cpu_offset_bytes += g.num_layers * kv_dim * chunk_elements * dtype_size_g
+            else:
+                cpu_offset_bytes += (
+                    g.num_layers * kv_dim * num_cpu_blocks * chunk_elements * dtype_size_g
+                )
+
+        flexkv_logger.info(
+            f"Multi-group transfer initialized: {len(layer_groups)} groups, "
+            f"total_block_bytes={total_block_bytes}"
+        )
+
+    def _control_suspend_gpu(self, payload: Any) -> int:
+        if self.group_transfer_params is not None:
+            raise NotImplementedError(
+                "GPU hot remap does not support multi-group KV layouts"
+            )
+        if not self.gpu_blocks:
+            return 0
+        with torch.cuda.device(self.gpu_device_id):
+            torch.cuda.synchronize()
+        old_blocks = self.gpu_blocks
+        self.gpu_blocks = []
+        self.gpu_blocks_ptrs.zero_()
+        self.gpu_tensor_ptrs = self.gpu_blocks_ptrs
+        released = sum(release_vmm_tensor(tensor) for tensor in old_blocks)
+        if released != len(old_blocks):
+            raise RuntimeError(
+                f"Expected {len(old_blocks)} VMM mappings, released {released}"
+            )
+        return released
+
+    def _control_resume_gpu(
+        self, gpu_blocks: List[TensorSharedHandle]
+    ) -> int:
+        if self.gpu_blocks:
+            raise RuntimeError("GPU blocks are already registered")
+        if len(gpu_blocks) != self._gpu_block_count:
+            raise ValueError(
+                f"Expected {self._gpu_block_count} GPU blocks, "
+                f"got {len(gpu_blocks)}"
+            )
+        self.gpu_blocks = import_tensor_handles(gpu_blocks)
+        self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
+        self.gpu_tensor_ptrs = self.gpu_blocks_ptrs
+        return len(self.gpu_blocks)
+
     def _transfer_impl(
         self,
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
         transfer_type: TransferType,
-        layer_id: int,
-        layer_granularity: int,
         **kwargs: Any,
     ) -> None:
         assert src_block_ids.dtype == torch.int64
@@ -416,63 +989,110 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         if len(gpu_block_id_list) == 0:
             return
 
-        gpu_tensor_ptrs = self.gpu_blocks_ptrs.contiguous().pin_memory()
+        if self.group_transfer_params is not None:
+            # Multi-group transfer: one call per group
+            for gp in self.group_transfer_params:
+                gpu_ptrs = gp['gpu_ptrs'].contiguous().pin_memory()
+                # Offset the CPU tensor to this group's region.  cpu_tensor is
+                # uint8 in multi-group mode, so this slice is byte-addressed.
+                cpu_tensor_for_group = self.cpu_tensor.view(-1)[
+                    gp['cpu_offset_bytes']:
+                ]
 
-        transfer_kv_blocks(
-            gpu_block_id_list,
-            gpu_tensor_ptrs,
-            self.gpu_kv_stride_in_bytes,
-            self.gpu_block_stride_in_bytes,
-            self.gpu_layer_stride_in_bytes,
-            cpu_block_id_list,
-            self.cpu_tensor,
-            self.cpu_kv_stride_in_bytes,
-            self.cpu_layer_stride_in_bytes,
-            self.cpu_block_stride_in_bytes,
-            self.chunk_size_in_bytes,
-            layer_id,
-            layer_granularity,
-            transfer_num_cta,
-            transfer_type == TransferType.H2D,
-            use_ce_transfer,
-            self.is_mla,
-            self.gpu_block_type_,
-        )
+                transfer_kv_blocks(
+                    gpu_block_id_list,
+                    gpu_ptrs,
+                    gp['gpu_kv_stride'],
+                    gp['gpu_block_stride'],
+                    gp['gpu_layer_stride'],
+                    cpu_block_id_list,
+                    cpu_tensor_for_group,
+                    gp['cpu_kv_stride'],
+                    gp['cpu_layer_stride'],
+                    gp['cpu_block_stride'],
+                    gp['chunk_size'],
+                    0,                   # start_layer_id (always 0 within group)
+                    gp['num_layers'],    # all layers in this group
+                    transfer_num_cta,
+                    transfer_type == TransferType.H2D,
+                    use_ce_transfer,
+                    self.kv_dim,
+                    self.num_kv_heads,
+                    self.gpu_block_type_,
+                    True,  # sync
+                    self.ce_path_opt,
+                    self.ce_segment_threshold,
+                    -1,  # ce_force_path
+                    self.ce_enable_memcpy2d,
+                    self.cpu_is_blockfirst,
+                    enable_transfer_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
+                )
+        else:
+            # Uniform transfer: single call (whole-model)
+            transfer_kv_blocks(
+                gpu_block_id_list,
+                self.gpu_blocks_ptrs,
+                self.gpu_kv_stride_in_bytes,
+                self.gpu_block_stride_in_bytes,
+                self.gpu_layer_stride_in_bytes,
+                cpu_block_id_list,
+                self.cpu_tensor,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.chunk_size_in_bytes,
+                0,                  # start_layer_id (whole-model)
+                self.num_layers,    # layer_granularity = all layers
+                transfer_num_cta,
+                transfer_type == TransferType.H2D,
+                use_ce_transfer,
+                self.kv_dim,
+                self.num_kv_heads,
+                self.gpu_block_type_,
+                True,  # sync
+                self.ce_path_opt,
+                self.ce_segment_threshold,
+                -1,  # ce_force_path
+                self.ce_enable_memcpy2d,
+                self.cpu_is_blockfirst,
+                enable_transfer_trace=GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
+            )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         nvtx_range = nvtx.start_range(
             message=f"GPUCPUWorker.launch_transfer[{transfer_op.transfer_op_id}]",
             color="purple")
-        layer_id = transfer_op.layer_id
-        layer_granularity = transfer_op.layer_granularity
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
 
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
-        with torch.cuda.stream(self.transfer_stream):
-            start_time = time.time()
-            self._transfer_impl(
-                src_block_ids,
-                dst_block_ids,
-                transfer_op.transfer_type,
-                layer_id,
-                layer_granularity,
-            )
-            end_time = time.time()
-
-            kv_dim = 2 if not self.is_mla else 1
-            transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
-
-            self._log_transfer_performance(
-                transfer_op,
-                transfer_size,
-                start_time,
-                end_time,
-            )
-        nvtx.end_range(nvtx_range)
+        try:
+            with torch.cuda.stream(self.transfer_stream):
+                if self.group_transfer_params is not None:
+                    # Multi-group (heterogeneous KV) path — compression is not
+                    # supported here; issue the per-group transfers inline.
+                    start_time = time.time()
+                    self._transfer_impl(
+                        src_block_ids,
+                        dst_block_ids,
+                        transfer_op.transfer_type,
+                    )
+                    end_time = time.time()
+                    transfer_size = 0
+                    for gp in self.group_transfer_params:
+                        transfer_size += gp['chunk_size'] * gp['num_layers'] * transfer_op.valid_block_num * self.kv_dim
+                    self._log_transfer_performance(
+                        transfer_op,
+                        transfer_size,
+                        start_time,
+                        end_time,
+                    )
+                else:
+                    # Uniform path — supports (optional) nvcomp compression.
+                    self._compressor.run(
+                        self, src_block_ids=src_block_ids,
+                        dst_block_ids=dst_block_ids, op=transfer_op)
+        finally:
+            nvtx.end_range(nvtx_range)
 
         return True
 
@@ -483,98 +1103,336 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
                  gpu_blocks: List[List[TensorSharedHandle]],
-                 cpu_blocks: torch.Tensor,
+                 cpu_blocks: Union[torch.Tensor, HugePageTensorHandle],
                  gpu_kv_layouts: List[KVCacheLayout],
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  tp_group_size: int,
-                 dp_group_id: int,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
-                 transfer_num_cta_d2h: int = 4):
+                 transfer_num_cta_d2h: int = 4,
+                 compressor: Optional[CompressionStrategy] = None,
+                 layer_groups: Optional[List[LayerGroupSpec]] = None,
+                 gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]] = None,
+                 gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
-        # Handle tensor import for multi-process case
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
+        # Bind primary GPU + pin op buffer before any CUDA IPC import.
+        if gpu_blocks and gpu_blocks[0]:
+            ensure_cuda_device(gpu_blocks[0][0].device)
+        self._pin_op_buffer()
+        # Handle tensor import for multi-process case — set_device per GPU first.
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
-            blocks_in_one_gpu = []
-            for handle in handles_in_one_gpu:
-                blocks_in_one_gpu.append(handle.get_tensor())
-            imported_gpu_blocks.append(blocks_in_one_gpu)
+            imported_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
+        self._gpu_block_counts = [len(handles) for handles in gpu_blocks]
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
-        self.is_mla = gpu_kv_layouts[0].is_mla
+        self.kv_dim = gpu_kv_layouts[0].kv_dim
+        self.num_kv_heads = gpu_kv_layouts[0].num_kv_heads
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
-        self.dp_group_id = dp_group_id
+        self.layer_groups = layer_groups
+        self.cpu_tensor = cpu_blocks
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        cudaHostRegister(cpu_blocks)
+        self._register_host_tensor(cpu_blocks, "tp_cpu_kv_pool")
 
         self.num_layers = gpu_kv_layouts[0].num_layer
-        # here the chunk size doesn't include the layer info
-        self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
-                                for gpu_kv_layout in gpu_kv_layouts]
-        self.gpu_kv_strides_in_bytes = [gpu_kv_layout.get_kv_stride() * self.dtype.itemsize \
-                                for gpu_kv_layout in gpu_kv_layouts]
-        self.gpu_block_strides_in_bytes = [gpu_kv_layout.get_block_stride() * self.dtype.itemsize \
-                                for gpu_kv_layout in gpu_kv_layouts]
-        self.gpu_layer_strides_in_bytes = [gpu_kv_layout.get_layer_stride() * self.dtype.itemsize \
-                                for gpu_kv_layout in gpu_kv_layouts]
-
-        self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
-        self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
-        # tp has effect on the layout of the cpu tensor
-        # the tp dim should always be right after the block dim
-        # on both blockfirst layout and layerfirst layout
-        if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and not self.is_mla:
-            cpu_kv_layout = cpu_kv_layout.div_head(self.tp_group_size)
-
-        self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
-        self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
-        self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
 
         self.transfer_num_cta_h2d = transfer_num_cta_h2d
         self.transfer_num_cta_d2h = transfer_num_cta_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
-        # Resolve pointers in Python (where storage is valid); pass them to C++ so we avoid
-        # "Tensor that doesn't have storage" when C++ calls .data_ptr() on tensors passed
-        # across the pybind11 boundary from a spawn'd subprocess (shared memory / CUDA IPC).
-        gpu_block_ptrs_flat = [
-            self.gpu_blocks[i][j].data_ptr()
-            for i in range(self.num_gpus)
-            for j in range(len(self.gpu_blocks[i]))
-        ]
-        cpu_blocks_ptr = cpu_blocks.data_ptr()
-        gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
-        num_tensors_per_gpu = len(self.gpu_blocks[0])
+        # Read KV shared across ranks D2H mode from global config
+        self.kv_shared_across_ranks_mode = GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode
+        flexkv_logger.debug(f"[tpGPUCPUTransferWorker] kv_shared_across_ranks_mode={self.kv_shared_across_ranks_mode}")
 
-        self.tp_transfer_thread_group = TPTransferThreadGroup(
-            self.num_gpus,
-            gpu_block_ptrs_flat,
-            num_tensors_per_gpu,
-            cpu_blocks_ptr,
-            dp_group_id,
-            self.num_layers,
-            self.gpu_kv_strides_in_bytes,
-            self.gpu_block_strides_in_bytes,
-            self.gpu_layer_strides_in_bytes,
-            self.gpu_chunk_sizes_in_bytes,
-            gpu_device_ids,
+        if layer_groups is not None and gpu_blocks_per_group is not None and gpu_layouts_per_group is not None:
+            self._init_tp_multi_group(
+                gpu_blocks_per_group, gpu_layouts_per_group,
+                cpu_kv_layout, layer_groups,
+            )
+        else:
+            self.tp_group_transfer_groups = None
+
+            # Compute GPU strides from actual tensor to handle different attention
+            # backend layouts (flash_attn: [2,N,B,H,D], triton: [N,2,B,H,D]).
+            # Each GPU may have different strides, so compute per-GPU.
+            dtype_sz = self.dtype.itemsize
+            tpb = gpu_kv_layouts[0].tokens_per_block
+            self.gpu_chunk_sizes_in_bytes = []
+            self.gpu_kv_strides_in_bytes = []
+            self.gpu_block_strides_in_bytes = []
+            self.gpu_layer_strides_in_bytes = []
+            for i, gpu_kv_layout in enumerate(gpu_kv_layouts):
+                gpu_strides = self._get_gpu_strides_from_tensor(
+                    self.gpu_blocks[i][0], tpb, dtype_sz, self.kv_dim,
+                ) if len(self.gpu_blocks[i]) > 1 else None
+                if gpu_strides is not None:
+                    kv_s, blk_s, layer_s = gpu_strides
+                else:
+                    kv_s = gpu_kv_layout.get_kv_stride() * dtype_sz
+                    blk_s = gpu_kv_layout.get_block_stride() * dtype_sz
+                    layer_s = gpu_kv_layout.get_layer_stride() * dtype_sz
+                self.gpu_chunk_sizes_in_bytes.append(gpu_kv_layout.get_chunk_size() * dtype_sz)
+                self.gpu_kv_strides_in_bytes.append(kv_s)
+                self.gpu_block_strides_in_bytes.append(blk_s)
+                self.gpu_layer_strides_in_bytes.append(layer_s)
+
+            self.cpu_is_blockfirst = (
+                cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
+            )
+            self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+            self.cpu_chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+            self.chunk_size_in_bytes = self.cpu_chunk_size_in_bytes
+            # Bytes per KV block (all layers); used by transfer tracing for bw.
+            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
+            # tp has effect on the layout of the cpu tensor
+            # the tp dim should always be right after the block dim
+            # on both blockfirst layout and layerfirst layout
+            if cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST and self.num_kv_heads > 1:
+                cpu_kv_layout = cpu_kv_layout.div_head(self.tp_group_size)
+
+            self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+            self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+            self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
+
+            # Resolve pointers in Python (where storage is valid); pass them to C++ so we avoid
+            # "Tensor that doesn't have storage" when C++ calls .data_ptr() on tensors passed
+            # across the pybind11 boundary from a spawn'd subprocess (shared memory / CUDA IPC).
+            gpu_block_ptrs_flat = [
+                self.gpu_blocks[i][j].data_ptr()
+                for i in range(self.num_gpus)
+                for j in range(len(self.gpu_blocks[i]))
+            ]
+            cpu_blocks_ptr = cpu_blocks.data_ptr()
+            gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
+            num_tensors_per_gpu = len(self.gpu_blocks[0])
+
+            self.tp_transfer_thread_group = TPTransferThreadGroup(
+                self.num_gpus,
+                gpu_block_ptrs_flat,
+                num_tensors_per_gpu,
+                cpu_blocks_ptr,
+                self.num_layers,
+                self.gpu_kv_strides_in_bytes,
+                self.gpu_block_strides_in_bytes,
+                self.gpu_layer_strides_in_bytes,
+                self.gpu_chunk_sizes_in_bytes,
+                gpu_device_ids,
+                GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+                GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+                GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+                self.cpu_is_blockfirst,
+                self.num_kv_heads,
+                ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
+                ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
+            )
+
+        self._compressor = compressor or NullCompressionStrategy()
+        self._compressor.attach(self)
+
+    def _init_tp_multi_group(
+        self,
+        gpu_blocks_per_group: List[List[List[TensorSharedHandle]]],
+        gpu_layouts_per_group: List[List[KVCacheLayout]],
+        cpu_kv_layout: KVCacheLayout,
+        layer_groups: List[LayerGroupSpec],
+    ) -> None:
+        """Initialize per-group TPTransferThreadGroup instances.
+
+        CPU buffer is byte-flat (uint8) in multi-group mode: each block has
+        size kv_shape[1] = bytes_per_block (see KVCacheLayout._compute_kv_shape).
+        Per-group strides use g.dtype.itemsize so groups with different element
+        sizes (e.g. bf16 main + uint8 indexer) interleave correctly within a
+        block.
+        """
+        kv_dim = self.kv_dim
+        tpb = cpu_kv_layout.tokens_per_block
+        cpu_layout_type = cpu_kv_layout.type
+        num_cpu_blocks = cpu_kv_layout.num_block
+
+        # For BLOCKFIRST multi-group, get_block_stride() returns bytes_per_block
+        # directly (already accounts for tp_size and per-group dtype sizes).
+        total_block_bytes = (
+            cpu_kv_layout.get_block_stride()
+            if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST else None
         )
 
+        self.tp_group_transfer_groups: list = []
+        # Keep imported CUDA-IPC tensors alive for the worker's lifetime:
+        # TPTransferThreadGroup below stores only their raw data_ptr()s, so if
+        # the tensors were dropped PyTorch would release the IPC mapping and the
+        # pointers would dangle (mirrors GPUCPUTransferWorker._init_multi_group
+        # and LayerwiseWorker._init_multi_group).
+        self._multi_group_gpu_blocks_keepalive: list = []
+        cpu_offset_bytes = 0
+
+        for gi, g in enumerate(layer_groups):
+            # Per-group dtype: indexer uses uint8 even when main KV is bf16/fp16.
+            dtype_size_g = g.dtype.itemsize
+
+            # gpu_blocks_per_group[gi] = list of per-GPU handle lists for this group
+            # gpu_blocks_per_group[gi][gpu_idx] = handles for this group on GPU gpu_idx
+            group_gpu_blocks_per_gpu = gpu_blocks_per_group[gi]
+
+            # Import tensors from handles (bind CUDA device per GPU first)
+            imported_group_blocks = []
+            for handles_in_one_gpu in group_gpu_blocks_per_gpu:
+                imported_group_blocks.append(import_tensor_handles(handles_in_one_gpu))
+            self._multi_group_gpu_blocks_keepalive.append(imported_group_blocks)
+
+            # Build flat pointer list for this group
+            gpu_block_ptrs_flat = [
+                imported_group_blocks[i][j].data_ptr()
+                for i in range(self.num_gpus)
+                for j in range(len(imported_group_blocks[i]))
+            ]
+            gpu_device_ids = [imported_group_blocks[i][0].device.index for i in range(self.num_gpus)]
+            num_tensors_per_gpu = len(imported_group_blocks[0])
+
+            # Compressed groups: GPU tensor's tokens dim equals tpb_g.
+            tpb_g = tpb // g.compress_ratio
+
+            # Per-group GPU strides: compute from actual tensor to handle different
+            # attention backend layouts (flash_attn vs triton/flashinfer).
+            group_gpu_layouts = gpu_layouts_per_group[gi]  # one layout per GPU
+            gpu_kv_strides = []
+            gpu_block_strides = []
+            gpu_layer_strides = []
+            gpu_chunk_sizes = []
+            for i, layout in enumerate(group_gpu_layouts):
+                gpu_strides = self._get_gpu_strides_from_tensor(
+                    imported_group_blocks[i][0], tpb_g, dtype_size_g, self.kv_dim,
+                ) if len(imported_group_blocks[i]) > 1 else None
+                if gpu_strides is not None:
+                    kv_s, blk_s, layer_s = gpu_strides
+                else:
+                    kv_s = layout.get_kv_stride() * dtype_size_g
+                    blk_s = layout.get_block_stride() * dtype_size_g
+                    layer_s = layout.get_layer_stride() * dtype_size_g
+                gpu_kv_strides.append(kv_s)
+                gpu_block_strides.append(blk_s)
+                gpu_layer_strides.append(layer_s)
+                gpu_chunk_sizes.append(layout.get_chunk_size() * dtype_size_g)
+
+            chunk_elements = tpb_g * g.num_kv_heads * g.head_size
+
+            # CPU strides for this group (all in bytes)
+            if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
+                cpu_block_stride = total_block_bytes
+                cpu_layer_stride = kv_dim * chunk_elements * dtype_size_g
+                cpu_kv_stride = chunk_elements * dtype_size_g
+                cpu_tp_stride = cpu_block_stride // self.tp_group_size
+            else:
+                cpu_block_stride = chunk_elements * dtype_size_g
+                cpu_layer_stride = kv_dim * num_cpu_blocks * chunk_elements * dtype_size_g
+                cpu_kv_stride = num_cpu_blocks * chunk_elements * dtype_size_g
+                cpu_tp_stride = cpu_block_stride // self.tp_group_size
+
+            # CPU tensor offset for this group (cpu_tensor is uint8 in multi-group)
+            cpu_blocks_ptr = self.cpu_tensor.view(-1)[cpu_offset_bytes:].data_ptr()
+
+            tp_thread_group = TPTransferThreadGroup(
+                self.num_gpus,
+                gpu_block_ptrs_flat,
+                num_tensors_per_gpu,
+                cpu_blocks_ptr,
+                g.num_layers,
+                gpu_kv_strides,
+                gpu_block_strides,
+                gpu_layer_strides,
+                gpu_chunk_sizes,
+                gpu_device_ids,
+                GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+                GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+                GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+                (cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
+                self.num_kv_heads,
+            )
+
+            self.tp_group_transfer_groups.append({
+                'tp_thread_group': tp_thread_group,
+                'cpu_kv_stride': cpu_kv_stride,
+                'cpu_layer_stride': cpu_layer_stride,
+                'cpu_block_stride': cpu_block_stride,
+                'cpu_tp_stride': cpu_tp_stride,
+                'cpu_offset_bytes': cpu_offset_bytes,
+                'num_layers': g.num_layers,
+                'chunk_size': chunk_elements * dtype_size_g,
+            })
+
+            # Advance CPU byte offset for next group
+            if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
+                cpu_offset_bytes += g.num_layers * kv_dim * chunk_elements * dtype_size_g
+            else:
+                cpu_offset_bytes += (
+                    g.num_layers * kv_dim * num_cpu_blocks * chunk_elements * dtype_size_g
+                )
+
+        flexkv_logger.info(
+            f"TP multi-group transfer initialized: {len(layer_groups)} groups, "
+            f"total_block_bytes={total_block_bytes}"
+        )
+
+
+    def _control_suspend_gpu(self, payload: Any) -> int:
+        if self.tp_group_transfer_groups is not None:
+            raise NotImplementedError(
+                "GPU hot remap does not support multi-group KV layouts"
+            )
+        if not self.gpu_blocks:
+            return 0
+        zero_ptrs = [0] * sum(self._gpu_block_counts)
+        self.tp_transfer_thread_group.update_gpu_block_ptrs(zero_ptrs)
+        old_blocks = self.gpu_blocks
+        self.gpu_blocks = []
+        released = sum(
+            release_vmm_tensor(tensor)
+            for blocks_in_one_gpu in old_blocks
+            for tensor in blocks_in_one_gpu
+        )
+        expected = sum(self._gpu_block_counts)
+        if released != expected:
+            raise RuntimeError(
+                f"Expected {expected} VMM mappings, released {released}"
+            )
+        return released
+
+    def _control_resume_gpu(
+        self, gpu_blocks: List[List[TensorSharedHandle]]
+    ) -> int:
+        if self.gpu_blocks:
+            raise RuntimeError("GPU blocks are already registered")
+        counts = [len(handles) for handles in gpu_blocks]
+        if counts != self._gpu_block_counts:
+            raise ValueError(
+                f"Expected GPU block counts {self._gpu_block_counts}, got {counts}"
+            )
+        imported_gpu_blocks = [
+            import_tensor_handles(handles) for handles in gpu_blocks
+        ]
+        gpu_block_ptrs_flat = [
+            tensor.data_ptr()
+            for blocks_in_one_gpu in imported_gpu_blocks
+            for tensor in blocks_in_one_gpu
+        ]
+        self.tp_transfer_thread_group.update_gpu_block_ptrs(
+            gpu_block_ptrs_flat
+        )
+        self.gpu_blocks = imported_gpu_blocks
+        return len(gpu_block_ptrs_flat)
 
     def _transfer_impl(self,
                        src_block_ids: torch.Tensor,
                        dst_block_ids: torch.Tensor,
                        transfer_type: TransferType,
-                       layer_id: int,
-                       layer_granularity: int,
                        **kwargs: Any,
                        )->None:
         assert src_block_ids.dtype == torch.int64
@@ -600,51 +1458,74 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         if len(gpu_block_id_list) == 0:
             return
 
-        self.tp_transfer_thread_group.tp_group_transfer(
-            gpu_block_id_list,
-            cpu_block_id_list,
-            self.cpu_kv_stride_in_bytes,
-            self.cpu_layer_stride_in_bytes,
-            self.cpu_block_stride_in_bytes,
-            self.cpu_tp_stride_in_bytes,
-            transfer_num_cta,
-            transfer_type == TransferType.H2D,
-            use_ce_transfer,
-            layer_id,
-            layer_granularity,
-            self.is_mla,
-        )
+        if self.tp_group_transfer_groups is not None:
+            # Multi-group transfer: one call per group
+            for gp in self.tp_group_transfer_groups:
+                g_gpu = gpu_block_id_list
+                g_cpu = cpu_block_id_list
+
+                gp['tp_thread_group'].tp_group_transfer(
+                    g_gpu,
+                    g_cpu,
+                    gp['cpu_kv_stride'],
+                    gp['cpu_layer_stride'],
+                    gp['cpu_block_stride'],
+                    gp['cpu_tp_stride'],
+                    transfer_num_cta,
+                    transfer_type == TransferType.H2D,
+                    use_ce_transfer,
+                    0,                 # start_layer_id (always 0 within group)
+                    gp['num_layers'],  # all layers in this group
+                    self.kv_dim,
+                    self.num_kv_heads,
+                    self.kv_shared_across_ranks_mode,
+                )
+        else:
+            self.tp_transfer_thread_group.tp_group_transfer(
+                gpu_block_id_list,
+                cpu_block_id_list,
+                self.cpu_kv_stride_in_bytes,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_block_stride_in_bytes,
+                self.cpu_tp_stride_in_bytes,
+                transfer_num_cta,
+                transfer_type == TransferType.H2D,
+                use_ce_transfer,
+                0,                  # start_layer_id (whole-model)
+                self.num_layers,    # layer_granularity = all layers
+                self.kv_dim,
+                self.num_kv_heads,
+                self.kv_shared_across_ranks_mode,
+            )
 
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
-        layer_id = transfer_op.layer_id
-        layer_granularity = transfer_op.layer_granularity
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+        if self.tp_group_transfer_groups is not None:
+            # Multi-group (heterogeneous KV) path — compression not supported here.
+            start_time = time.time()
+            self._transfer_impl(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type,
+            )
+            end_time = time.time()
 
-        start_time = time.time()
-        self._transfer_impl(
-            src_block_ids,
-            dst_block_ids,
-            transfer_op.transfer_type,
-            layer_id,
-            layer_granularity,
-        )
-        end_time = time.time()
+            transfer_size = 0
+            for gp in self.tp_group_transfer_groups:
+                transfer_size += gp['chunk_size'] * gp['num_layers'] * transfer_op.valid_block_num * self.kv_dim
 
-        kv_dim = 2 if not self.is_mla else 1
-        transfer_size = self.cpu_chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
-
-        self._log_transfer_performance(
-            transfer_op,
-            transfer_size,
-            start_time,
-            end_time,
-        )
+            self._log_transfer_performance(
+                transfer_op,
+                transfer_size,
+                start_time,
+                end_time,
+            )
+        else:
+            # Uniform path — supports (optional) nvcomp compression.
+            self._compressor.run(
+                self, src_block_ids=src_block_ids,
+                dst_block_ids=dst_block_ids, op=transfer_op)
         return True
 
 class CPUSSDDiskTransferWorker(TransferWorkerBase):
@@ -653,14 +1534,18 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  transfer_conn: Connection,
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
-                 cpu_blocks: torch.Tensor,
+                 cpu_blocks: Union[torch.Tensor, HugePageTensorHandle],
                  ssd_files: Dict[int, List[str]],  # ssd_device_id -> file_paths
                  cpu_kv_layout: KVCacheLayout,
                  ssd_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  num_blocks_per_file: int,
-                 cache_config: CacheConfig):
+                 cache_config: CacheConfig,
+                 compressor: Optional[CompressionStrategy] = None,
+                 layer_groups: Optional[List[LayerGroupSpec]] = None):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self._pin_op_buffer()
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
         self.ssd_files = ssd_files
         self.num_blocks_per_file = num_blocks_per_file
         self.num_files = sum(len(file_list) for file_list in ssd_files.values())
@@ -674,19 +1559,27 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.cpu_blocks = cpu_blocks
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
 
-        self.is_mla = cpu_kv_layout.is_mla
+        self.kv_dim = cpu_kv_layout.kv_dim
+        self.num_kv_heads = cpu_kv_layout.num_kv_heads
+        self.cpu_layout_type = cpu_kv_layout.type
+        self.has_multi_group = layer_groups is not None
 
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
 
-        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
+        if self.has_multi_group:
+            self._init_multi_group_ssd(cpu_kv_layout, ssd_kv_layout, layer_groups)
+        else:
+            ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
 
-        self.chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
-        self.block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
-        self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
-        self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
-        self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-        self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+            self.chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+            self.block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+            self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+            self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+            self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
+            self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+            # Bytes per KV block (all layers); used by transfer tracing for bw.
+            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
 
         try:
             self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), GLOBAL_CONFIG_FROM_ENV.iouring_entries,
@@ -695,13 +1588,35 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
             raise RuntimeError("SSD Worker init failed") from e
 
+        self._compressor = compressor or NullCompressionStrategy()
+        self._compressor.attach(self)
+
+    def _init_multi_group_ssd(
+        self,
+        cpu_kv_layout: KVCacheLayout,
+        ssd_kv_layout: KVCacheLayout,
+        layer_groups: List[LayerGroupSpec],
+    ) -> None:
+        """Initialize CPU<->SSD multi-group parameters.
+
+        CPU and SSD share an identical per-block byte layout (BLOCKFIRST),
+        so multi-group SSD transfers move whole blocks as opaque blobs —
+        no per-group / per-tp_rank slicing needed at the IO layer.
+        """
+        # Multi-group BLOCKFIRST: get_block_stride() returns bytes_per_block
+        # directly (already accounts for tp_size and per-group dtype sizes).
+        self.block_stride_in_bytes = cpu_kv_layout.get_block_stride()
+
+        flexkv_logger.info(
+            f"CPUSSDDiskTransferWorker multi-group initialized: {len(layer_groups)} groups, "
+            f"block_stride={self.block_stride_in_bytes} bytes"
+        )
+
     def _transfer_impl(
         self,
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
         transfer_type: TransferType,
-        layer_id: int,
-        layer_granularity: int,
         **kwargs: Any,
     ) -> None:
         assert src_block_ids.dtype == torch.int64
@@ -717,58 +1632,84 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for CPUSSDDiskTransferWorker")
 
+        is_read = (transfer_type == TransferType.DISK2H)
+        cpu_base_ptr = self.cpu_layer_ptrs[0].item()
 
-        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
+        if self.has_multi_group:
+            # CPU and SSD share an identical per-block byte layout in multi-group
+            # mode, so each block can be transferred as one opaque blob — no
+            # per-group / per-tp_rank loop needed. num_layers=1,
+            # layer_stride=chunk_size=block_stride, one KV region makes
+            # the kernel issue exactly one pread/pwrite of block_stride bytes
+            # per block, sidestepping the sub-4KiB chunk hazard for highly
+            # compressed groups (e.g. DSv4 indexer at compress_ratio=128).
+            one_layer_id = torch.tensor([0], dtype=torch.int32)
+            transfer_kv_blocks_ssd(
+                self.ioctx,
+                one_layer_id,
+                cpu_base_ptr,
+                ssd_block_id_list,
+                cpu_block_id_list,
+                self.block_stride_in_bytes,
+                0,
+                self.block_stride_in_bytes,
+                0,
+                self.block_stride_in_bytes,
+                self.block_stride_in_bytes,
+                is_read,
+                self.num_blocks_per_file,
+                self.round_robin,
+                32,
+                True,
+                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
+            )
+        else:
+            layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
 
-        transfer_kv_blocks_ssd(
-            ioctx=self.ioctx,
-            cpu_layer_id_list=layer_id_list,
-            cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
-            ssd_block_ids=ssd_block_id_list,
-            cpu_block_ids=cpu_block_id_list,
-            cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-            cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-            ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
-            ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
-            chunk_size_in_bytes=self.chunk_size_in_bytes,
-            block_stride_in_bytes=self.block_stride_in_bytes,
-            is_read=(transfer_type == TransferType.DISK2H),
-            num_blocks_per_file=self.num_blocks_per_file,
-            round_robin=self.round_robin,
-            num_threads_per_device=32,
-            is_mla=self.is_mla,
-        )
+            transfer_kv_blocks_ssd(
+                self.ioctx,
+                layer_id_list,
+                cpu_base_ptr,
+                ssd_block_id_list,
+                cpu_block_id_list,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_kv_stride_in_bytes,
+                self.ssd_layer_stride_in_bytes,
+                self.ssd_kv_stride_in_bytes,
+                self.chunk_size_in_bytes,
+                self.block_stride_in_bytes,
+                is_read,
+                self.num_blocks_per_file,
+                self.round_robin,
+                32,
+                self.kv_dim,
+                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
+            )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
-        layer_id = transfer_op.layer_id
-        layer_granularity = transfer_op.layer_granularity
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-
-        src_block_ids , dst_block_ids = self.get_transfer_block_ids(transfer_op)
-
-        start_time = time.time()
-        self._transfer_impl(
-            src_block_ids,
-            dst_block_ids,
-            transfer_op.transfer_type,
-            layer_id,           # Use corrected value, not transfer_op.layer_id
-            layer_granularity,  # Use corrected value, not transfer_op.layer_granularity
-        )
-        end_time = time.time()
-
-        kv_dim = 2 if not self.is_mla else 1
-        transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
-
-        self._log_transfer_performance(
-            transfer_op,
-            transfer_size,
-            start_time,
-            end_time,
-        )
-
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+        if self.has_multi_group:
+            # Multi-group (heterogeneous KV) path — compression not supported here.
+            start_time = time.time()
+            self._transfer_impl(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type,
+            )
+            end_time = time.time()
+            # Total transfer size across all groups
+            transfer_size = self.block_stride_in_bytes * transfer_op.valid_block_num
+            self._log_transfer_performance(
+                transfer_op,
+                transfer_size,
+                start_time,
+                end_time,
+            )
+        else:
+            # Uniform path — supports (optional) nvcomp compression.
+            self._compressor.run(
+                self, src_block_ids=src_block_ids,
+                dst_block_ids=dst_block_ids, op=transfer_op)
         return True
 
 class CPURemoteTransferWorker(TransferWorkerBase):
@@ -777,7 +1718,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
                  transfer_conn: Connection,
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor,
-                 cpu_blocks: List[torch.Tensor],
+                 cpu_blocks: Union[List[torch.Tensor], torch.Tensor, HugePageTensorHandle],
                  remote_file: List[str],
                  cpu_kv_layout: KVCacheLayout,
                  remote_kv_layout: KVCacheLayout,
@@ -787,6 +1728,9 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         if transfer_kv_blocks_remote is None:
             raise RuntimeError("transfer_kv_blocks_remote not available, please build with FLEXKV_ENABLE_CFS=1")
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self._pin_op_buffer()
+
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
 
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.remote_files = remote_file
@@ -806,27 +1750,37 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             raise ValueError(f"num_remote_blocks_per_file {self.num_remote_blocks_per_file} "
                              f"is not divisible by round_robin {self.round_robin}")
 
-        # For multi-group layouts, get_chunk_size() is not valid.
-        # CPURemoteTransferWorker uses LAYERFIRST which is single-group only,
-        # but guard for safety.
-        if cpu_kv_layout.layer_groups is not None:
+        self.has_multi_group = (
+            getattr(cpu_kv_layout, "layer_groups", None) is not None
+        )
+        if self.has_multi_group:
+            if (
+                cpu_kv_layout.type != KVCacheLayoutType.BLOCKFIRST
+                or remote_kv_layout.type != KVCacheLayoutType.BLOCKFIRST
+            ):
+                raise ValueError(
+                    "Multi-group CPU/remote transfer requires BLOCKFIRST layouts"
+                )
+            # A heterogeneous BLOCKFIRST block is already one byte-flat blob.
+            # Present it to the existing remote kernel as one MLA layer.
             self.block_size = cpu_kv_layout.get_block_stride()
+            self.num_layers = 1
         else:
             self.block_size = cpu_kv_layout.get_chunk_size()
         self.dtype = dtype
 
-        self.is_mla = cpu_kv_layout.is_mla
-        kv_dim = 2 if not self.is_mla else 1
+        self.kv_dim = 1 if self.has_multi_group else cpu_kv_layout.kv_dim
+        self.num_kv_heads = cpu_kv_layout.num_kv_heads
 
         self.cpu_blocks = cpu_blocks
 
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
 
         self.cpu_layer_stride_in_bytes = (
-            self.num_cpu_blocks * self.block_size * self.dtype.itemsize * kv_dim
+            self.num_cpu_blocks * self.block_size * self.dtype.itemsize * self.kv_dim
         )
         self.remote_layer_stride_in_bytes = (
-            self.num_remote_blocks * self.block_size * self.dtype.itemsize * kv_dim
+            self.num_remote_blocks * self.block_size * self.dtype.itemsize * self.kv_dim
         )
         self.remote_layer_stride_in_bytes_per_file = self.remote_layer_stride_in_bytes // self.num_remote_files
         self.cpu_kv_stride_in_bytes = (
@@ -840,6 +1794,8 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         self.cpu_block_stride_in_bytes = self.block_size * self.dtype.itemsize
 
         self.chunk_size_in_bytes = self.block_size * self.dtype.itemsize
+        # Bytes per KV block (all layers); used by transfer tracing for bw.
+        self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
         # 144115188075855883 only use int not c_types.u_int64
         if not remote_config_custom:
             raise RuntimeError("remote_config_custom is not provided")
@@ -869,18 +1825,11 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
         transfer_type: TransferType,
-        layer_id: int,
-        layer_granularity: int,
         **kwargs: Any
     ) -> None:
         assert src_block_ids.dtype == torch.int64
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
-
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
 
         # this means partial read hit cpu and other hit remote
         # or partial write hit remote and none hit cpu
@@ -894,7 +1843,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for CPUSSDDiskTransferWorker")
 
-        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
+        layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
                 # Use PCFS shared transfer for read operations when PCFS sharing is enabled
         if self.enable_pcfs_sharing and transfer_type == TransferType.REMOTE2H:
             # For PCFS sharing, we need to construct cfs_blocks_partition and cpu_blocks_partition
@@ -938,52 +1887,45 @@ class CPURemoteTransferWorker(TransferWorkerBase):
 
             # Use the new shared transfer function
             shared_transfer_kv_blocks_remote_read(
-                file_nodeid_list=file_nodeids_list,
-                cfs_blocks_partition_list=cfs_blocks_partition,
-                cpu_blocks_partition_list=cpu_blocks_partition,
-                cpu_layer_id_list=layer_id_list,
-                cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
-                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-                cfs_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
-                cfs_block_stride_in_bytes=self.remote_block_stride_in_bytes,
-                cfs_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
-                block_size_in_bytes=self.chunk_size_in_bytes,
-                total_layers=self.num_layers,
-                is_mla=self.is_mla,
+                file_nodeids_list,
+                cfs_blocks_partition,
+                cpu_blocks_partition,
+                layer_id_list,
+                self.cpu_layer_ptrs[0].item(),
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_kv_stride_in_bytes,
+                self.remote_layer_stride_in_bytes_per_file,
+                self.remote_block_stride_in_bytes,
+                self.remote_kv_stride_in_bytes_per_file,
+                self.chunk_size_in_bytes,
+                self.num_layers,
+                self.kv_dim,
                 num_threads_per_file=32,
             )
         else:
             transfer_kv_blocks_remote(
-                file_nodeid_list=self.file_nodeid_list,
-                cpu_layer_id_list=layer_id_list,
-                cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
-                remote_block_ids=remote_block_id_list,
-                cpu_block_ids=cpu_block_id_list,
-                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-                remote_layer_stride_in_bytes=self.remote_layer_stride_in_bytes_per_file,
-                remote_block_stride_in_bytes=self.remote_block_stride_in_bytes,
-                remote_kv_stride_in_bytes=self.remote_kv_stride_in_bytes_per_file,
-                block_size_in_bytes=self.chunk_size_in_bytes,
-                total_layers=self.num_layers,
-                is_read=(transfer_type == TransferType.REMOTE2H),
-                partition_block_type=PartitionBlockType.SEQUENTIAL.value, # use sequential
-                round_robin=self.round_robin,
-                num_remote_blocks_per_file=self.num_remote_blocks_per_file,
-                use_mmap=False,  # TODO: fix bug when use mmap
-                num_threads_per_file=32,
-                is_mla=self.is_mla,
+                self.file_nodeid_list,
+                layer_id_list,
+                self.cpu_layer_ptrs[0].item(),
+                remote_block_id_list,
+                cpu_block_id_list,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_kv_stride_in_bytes,
+                self.remote_layer_stride_in_bytes_per_file,
+                self.remote_block_stride_in_bytes,
+                self.remote_kv_stride_in_bytes_per_file,
+                self.chunk_size_in_bytes,
+                self.num_layers,
+                (transfer_type == TransferType.REMOTE2H),
+                PartitionBlockType.SEQUENTIAL.value,
+                self.round_robin,
+                self.num_remote_blocks_per_file,
+                False,
+                32,
+                self.kv_dim,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
-        layer_id = transfer_op.layer_id
-        layer_granularity = transfer_op.layer_granularity
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         start_time = time.time()
@@ -991,14 +1933,10 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             src_block_ids,
             dst_block_ids,
             transfer_op.transfer_type,
-            layer_id,           # Use corrected value, not transfer_op.layer_id
-            layer_granularity,  # Use corrected value, not transfer_op.layer_granularity
             src_block_node_ids=transfer_op.src_block_node_ids,
         )
         end_time = time.time()
-
-        kv_dim = 2 if not self.is_mla else 1
-        transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
+        transfer_size = self.chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
 
         self._log_transfer_performance(
             transfer_op,
@@ -1021,26 +1959,19 @@ class GDSTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         gpu_device_id: int = 0,
+        layer_groups: Optional[List[LayerGroupSpec]] = None,
+        gpu_blocks_per_group: Optional[List[List[TensorSharedHandle]]] = None,
+        gpu_layouts_per_group: Optional[List[KVCacheLayout]] = None,
     ) -> None:
         """
         Initialize GDS Transfer Worker
-
-        Args:
-            worker_id: Worker ID
-            transfer_queue: Queue for incoming transfer operations
-            finished_ops_queue: Queue for completed operations
-            gpu_blocks: GPU memory block handles
-            ssd_files: Dict of SSD file paths (ssd_device_id -> file_paths)
-            num_blocks_per_file: Number of blocks per file
-            gpu_kv_layout: Layout of GPU KV cache
-            ssd_kv_layout: Layout of SSD KV cache
-            dtype: Data type
-            gpu_device_id: GPU device ID
         """
         # Initialize base class first
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
 
-        self.gpu_blocks = [wrapper.get_tensor() for wrapper in gpu_blocks]
+        ensure_cuda_device(gpu_device_id)
+        self._pin_op_buffer()
+        self.gpu_blocks = import_tensor_handles(gpu_blocks)
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
         self.gpu_layer_ptrs = self.gpu_blocks_ptrs
         self.num_blocks_per_file = num_blocks_per_file
@@ -1060,23 +1991,43 @@ class GDSTransferWorker(TransferWorkerBase):
                                f"{self.gds_manager.get_last_error()}")
 
         self.dtype = dtype
-        self.is_mla = gpu_kv_layout.is_mla
+        self.kv_dim = gpu_kv_layout.kv_dim
+        self.num_kv_heads = gpu_kv_layout.num_kv_heads
+        self.has_multi_group = layer_groups is not None
 
         # Layout information
         self.num_layers = gpu_kv_layout.num_layer
-        gpu_kv_layout_per_layer = gpu_kv_layout.div_layer(self.num_layers)
-        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
 
-        # GPU layout calculations
-        self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
-        self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
-        self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
-        self.gpu_layer_stride_in_bytes = gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+        if self.has_multi_group:
+            self._init_multi_group_gds(
+                gpu_kv_layout, ssd_kv_layout, layer_groups,
+                gpu_blocks_per_group, gpu_layouts_per_group)
+        else:
+            gpu_kv_layout_per_layer = gpu_kv_layout.div_layer(self.num_layers)
+            ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
 
-        # SSD layout calculations
-        self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
-        self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-        self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+            # GPU layout calculations — compute strides from actual tensor to handle
+            # different attention backend layouts (flash_attn vs triton/flashinfer).
+            self.chunk_size_in_bytes = gpu_kv_layout_per_layer.get_chunk_size() * self.dtype.itemsize
+            # Bytes per KV block (all layers); used by transfer tracing for bw.
+            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
+            gpu_strides = self._get_gpu_strides_from_tensor(
+                self.gpu_blocks[0], gpu_kv_layout.tokens_per_block,
+                self.dtype.itemsize, self.kv_dim,
+            ) if len(self.gpu_blocks) > 1 else None
+            if gpu_strides is not None:
+                self.gpu_kv_stride_in_bytes = gpu_strides[0]
+                self.gpu_block_stride_in_bytes = gpu_strides[1]
+                self.gpu_layer_stride_in_bytes = gpu_strides[2]
+            else:
+                self.gpu_kv_stride_in_bytes = gpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+                self.gpu_block_stride_in_bytes = gpu_kv_layout.get_block_stride() * self.dtype.itemsize
+                self.gpu_layer_stride_in_bytes = gpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+
+            # SSD layout calculations
+            self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+            self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
+            self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
 
         if len(self.gpu_blocks) == 1:
             self.gpu_block_type_ = 1  # TRTLLM
@@ -1089,17 +2040,98 @@ class GDSTransferWorker(TransferWorkerBase):
 
         # Set GPU device and create stream
         self.gpu_device_id = gpu_device_id
-        if gpu_device_id != -1:
-            torch.cuda.set_device(gpu_device_id)
         self.transfer_stream = torch.cuda.Stream()
+
+    def _init_multi_group_gds(
+        self,
+        gpu_kv_layout: KVCacheLayout,
+        ssd_kv_layout: KVCacheLayout,
+        layer_groups: List[LayerGroupSpec],
+        gpu_blocks_per_group: Optional[List[List[TensorSharedHandle]]],
+        gpu_layouts_per_group: Optional[List[KVCacheLayout]],
+    ) -> None:
+        """Initialize per-group GDS transfer parameters.
+
+        SSD buffer is byte-flat (uint8) in multi-group mode; per-group strides
+        use g.dtype.itemsize so groups with different element sizes (e.g.
+        bf16 main + uint8 indexer) interleave correctly within a block.
+        """
+        kv_dim = self.kv_dim
+        tpb = ssd_kv_layout.tokens_per_block
+
+        # Multi-group BLOCKFIRST: get_block_stride() returns bytes_per_block
+        # directly (already accounts for tp_size and per-group dtype sizes).
+        self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride()
+
+        self.group_gds_params: list = []
+        # Keep imported CUDA-IPC tensors alive: _get_layer_ptrs() records only
+        # raw data_ptr()s below, so dropping the tensors would free the IPC
+        # mapping and dangle the stored pointers.
+        self._multi_group_gpu_blocks_keepalive: list = []
+        ssd_offset_bytes = 0
+
+        for gi, g in enumerate(layer_groups):
+            # Per-group dtype: indexer uses uint8 even when main KV is bf16/fp16.
+            dtype_size_g = g.dtype.itemsize
+            # Compressed groups: tpb_g = tpb // compress_ratio.
+            tpb_g = tpb // g.compress_ratio
+            chunk_elements = tpb_g * g.num_kv_heads * g.head_size
+            ssd_layer_stride = kv_dim * chunk_elements * dtype_size_g
+            ssd_kv_stride = chunk_elements * dtype_size_g
+
+            # GPU strides from per-group layout — compute from actual tensor to
+            # handle different attention backend layouts (flash_attn vs triton).
+            if gpu_layouts_per_group is not None:
+                gpu_layout = gpu_layouts_per_group[gi]
+                group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+                gpu_strides = self._get_gpu_strides_from_tensor(
+                    group_gpu_blocks[0], tpb_g, dtype_size_g, self.kv_dim,
+                ) if len(group_gpu_blocks) > 1 else None
+                if gpu_strides is not None:
+                    gpu_kv_stride, gpu_block_stride, gpu_layer_stride = gpu_strides
+                else:
+                    gpu_kv_stride = gpu_layout.get_kv_stride() * dtype_size_g
+                    gpu_block_stride = gpu_layout.get_block_stride() * dtype_size_g
+                    gpu_layer_stride = gpu_layout.get_layer_stride() * dtype_size_g
+                gpu_chunk_size = chunk_elements * dtype_size_g
+            else:
+                gpu_kv_stride = self.gpu_kv_stride_in_bytes
+                gpu_block_stride = self.gpu_block_stride_in_bytes
+                gpu_layer_stride = self.gpu_layer_stride_in_bytes
+                gpu_chunk_size = chunk_elements * dtype_size_g
+
+            # GPU pointers for this group
+            if gpu_blocks_per_group is not None:
+                group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+                self._multi_group_gpu_blocks_keepalive.append(group_gpu_blocks)
+                group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
+            else:
+                group_gpu_ptrs = self.gpu_layer_ptrs
+
+            self.group_gds_params.append({
+                'num_layers': g.num_layers,
+                'gpu_ptrs': group_gpu_ptrs,
+                'gpu_kv_stride': gpu_kv_stride,
+                'gpu_block_stride': gpu_block_stride,
+                'gpu_layer_stride': gpu_layer_stride,
+                'chunk_size': gpu_chunk_size,
+                'ssd_layer_stride': ssd_layer_stride,
+                'ssd_kv_stride': ssd_kv_stride,
+                'ssd_copy_offset': ssd_offset_bytes,
+            })
+
+            ssd_offset_bytes += g.num_layers * kv_dim * chunk_elements * dtype_size_g
+
+        flexkv_logger.info(
+            f"GDSTransferWorker multi-group initialized: {len(layer_groups)} groups, "
+            f"ssd_block_stride={self.ssd_block_stride_in_bytes} bytes"
+        )
 
     def _transfer_impl(
         self,
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
         transfer_type: TransferType,
-        layer_id: int,
-        layer_granularity: int,
         **kwargs: Any,
     ) -> None:
         """Implement actual transfer between GPU and SSD"""
@@ -1107,19 +2139,11 @@ class GDSTransferWorker(TransferWorkerBase):
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
 
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-
-        # Convert to tensors
         # SSD uses DISK2D/D2DISK transfer types (same as traditional SSD I/O)
         if transfer_type == TransferType.DISK2D:
-            # SSD to GPU via GDS path: src=SSD, dst=GPU
             ssd_block_id_list = src_block_ids
             gpu_block_id_list = dst_block_ids
         elif transfer_type == TransferType.D2DISK:
-            # GPU to SSD via GDS path: src=GPU, dst=SSD
             gpu_block_id_list = src_block_ids
             ssd_block_id_list = dst_block_ids
         else:
@@ -1129,37 +2153,62 @@ class GDSTransferWorker(TransferWorkerBase):
         if len(ssd_block_id_list) == 0:
             return
 
-        # Process transfer for each layer
-        layer_id_list = torch.arange(layer_id, layer_id + layer_granularity, dtype=torch.int32)
-
-        # Determine if this is a read operation
         is_read = (transfer_type == TransferType.DISK2D)
 
-        # Use the optimized C++ function for KV block transfers
-        # Note: topology information (files, devices, round_robin) is now encapsulated in gds_manager
         try:
-            transfer_kv_blocks_gds(
-                self.gds_manager,               # GDS manager (contains topology info)
-                layer_id_list,                  # GPU layer IDs to process
-                self.gpu_layer_ptrs,            # GPU layer pointers tensor
-                ssd_block_id_list,              # SSD block IDs
-                gpu_block_id_list,              # GPU block IDs
-                self.gpu_kv_stride_in_bytes,    # GPU K-V stride
-                self.gpu_block_stride_in_bytes, # GPU block stride
-                self.gpu_layer_stride_in_bytes, # GPU layer stride
-                self.ssd_layer_stride_in_bytes, # SSD layer stride
-                self.ssd_block_stride_in_bytes, # SSD block stride
-                self.ssd_kv_stride_in_bytes,    # SSD K-V stride
-                self.chunk_size_in_bytes,       # Chunk size
-                0,                              # SSD copy offset
-                self.num_blocks_per_file,       # Blocks per file
-                self.num_layers,                # Total layers
-                is_read,                        # Read or write
-                False,                          # Verbose logging
-                self.is_mla,                    # MLA
-                self.gpu_block_type_,            # GPU block type
-                self.gpu_device_id              # GPU device ID
-            )
+            if self.has_multi_group:
+                for gp in self.group_gds_params:
+                    g_gpu = gpu_block_id_list
+                    g_ssd = ssd_block_id_list
+
+                    layer_id_list = torch.arange(0, gp['num_layers'], dtype=torch.int32)
+                    transfer_kv_blocks_gds(
+                        self.gds_manager,
+                        layer_id_list,
+                        gp['gpu_ptrs'],
+                        g_ssd,
+                        g_gpu,
+                        gp['gpu_kv_stride'],
+                        gp['gpu_block_stride'],
+                        gp['gpu_layer_stride'],
+                        gp['ssd_layer_stride'],
+                        self.ssd_block_stride_in_bytes,
+                        gp['ssd_kv_stride'],
+                        gp['chunk_size'],
+                        gp['ssd_copy_offset'],
+                        self.num_blocks_per_file,
+                        gp['num_layers'],
+                        is_read,
+                        False,
+                        self.kv_dim,
+                        self.gpu_block_type_,
+                        self.gpu_device_id,
+                    )
+            else:
+                # Uniform: whole-model transfer
+                layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
+                transfer_kv_blocks_gds(
+                    self.gds_manager,
+                    layer_id_list,
+                    self.gpu_layer_ptrs,
+                    ssd_block_id_list,
+                    gpu_block_id_list,
+                    self.gpu_kv_stride_in_bytes,
+                    self.gpu_block_stride_in_bytes,
+                    self.gpu_layer_stride_in_bytes,
+                    self.ssd_layer_stride_in_bytes,
+                    self.ssd_block_stride_in_bytes,
+                    self.ssd_kv_stride_in_bytes,
+                    self.chunk_size_in_bytes,
+                    0,
+                    self.num_blocks_per_file,
+                    self.num_layers,
+                    is_read,
+                    False,
+                    self.kv_dim,
+                    self.gpu_block_type_,
+                    self.gpu_device_id,
+                )
 
         except Exception as e:
             flexkv_logger.error(f"GDS transfer failed: {e}")
@@ -1167,13 +2216,6 @@ class GDSTransferWorker(TransferWorkerBase):
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         """Launch a GDS transfer operation"""
-        layer_id = transfer_op.layer_id
-        layer_granularity = transfer_op.layer_granularity
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         with torch.cuda.stream(self.transfer_stream):
@@ -1182,13 +2224,15 @@ class GDSTransferWorker(TransferWorkerBase):
                 src_block_ids,
                 dst_block_ids,
                 transfer_op.transfer_type,
-                layer_id,
-                layer_granularity,
             )
             end_time = time.time()
 
-            kv_dim = 2 if not self.is_mla else 1
-            transfer_size = self.chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
+            if self.has_multi_group:
+                transfer_size = 0
+                for gp in self.group_gds_params:
+                    transfer_size += gp['chunk_size'] * gp['num_layers'] * transfer_op.valid_block_num * self.kv_dim
+            else:
+                transfer_size = self.chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
 
             self._log_transfer_performance(
                 transfer_op,
@@ -1213,7 +2257,9 @@ class tpGDSTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         tp_group_size: int,
-        dp_group_id: int,
+        layer_groups: Optional[List[LayerGroupSpec]] = None,
+        gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]] = None,
+        gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None,
     ) -> None:
         """
         Initialize TP GDS Transfer Worker
@@ -1228,104 +2274,253 @@ class tpGDSTransferWorker(TransferWorkerBase):
             gpu_kv_layouts: Layout of GPU KV cache
             ssd_kv_layout: Layout of SSD KV cache
             dtype: Data type
-            tp_group_size: Size of tensor parallel group
-            dp_group_id: Data parallel group ID
+            tp_group_size: Effective tp-group size on this node
+                (``effective_tp_size_per_node`` =
+                ``tp_size_per_node × cp_size_per_node``).
+            layer_groups: Optional per-group KV layouts for heterogeneous models
+                (including DSA/NSA indexer-as-group).
         """
         # Initialize base class first
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
 
         assert len(gpu_blocks) == tp_group_size
-        # Handle tensor import for multi-process case
+        if gpu_blocks and gpu_blocks[0]:
+            ensure_cuda_device(gpu_blocks[0][0].device)
+        self._pin_op_buffer()
+        # Handle tensor import for multi-process case — set_device per GPU first.
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
-            blocks_in_one_gpu = []
-            for handle in handles_in_one_gpu:
-                blocks_in_one_gpu.append(handle.get_tensor())
-            imported_gpu_blocks.append(blocks_in_one_gpu)
+            imported_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
         self.gpu_blocks = imported_gpu_blocks
         self.num_blocks_per_file = num_blocks_per_file
         self.num_files = sum(len(file_list) for file_list in ssd_files.values())
 
         self.dtype = dtype
-        self.is_mla = gpu_kv_layouts[0].is_mla
+        self.kv_dim = gpu_kv_layouts[0].kv_dim
+        self.num_kv_heads = gpu_kv_layouts[0].num_kv_heads
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
-        self.dp_group_id = dp_group_id
+        self.has_multi_group = layer_groups is not None
 
         # Layout information
         self.num_layers = gpu_kv_layouts[0].num_layer
-        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
-        self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
-        self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
-        if not self.is_mla:
-            ssd_kv_layout_per_file = ssd_kv_layout_per_file.div_head(self.tp_group_size)
 
-        # GPU layout calculations
-        self.gpu_chunk_sizes_in_bytes = [gpu_kv_layout.get_chunk_size() * self.dtype.itemsize \
-                                         for gpu_kv_layout in gpu_kv_layouts]
-        self.gpu_kv_strides_in_bytes = [gpu_kv_layout.get_kv_stride() * self.dtype.itemsize \
-                                        for gpu_kv_layout in gpu_kv_layouts]
-        self.gpu_block_strides_in_bytes = [gpu_kv_layout.get_block_stride() * self.dtype.itemsize \
-                                           for gpu_kv_layout in gpu_kv_layouts]
-        self.gpu_layer_strides_in_bytes = [gpu_kv_layout.get_layer_stride() * self.dtype.itemsize \
-                                           for gpu_kv_layout in gpu_kv_layouts]
+        if self.has_multi_group:
+            self._init_tp_multi_group_gds(
+                gpu_kv_layouts, ssd_kv_layout, layer_groups,
+                gpu_blocks_per_group, gpu_layouts_per_group,
+                ssd_files)
+        else:
+            ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
+            self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
+            self.chunk_size_in_bytes = self.ssd_chunk_size_in_bytes
+            self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
+            # Bytes per KV block (all layers); used by transfer tracing for bw.
+            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
+            if self.num_kv_heads > 1:
+                ssd_kv_layout_per_file = ssd_kv_layout_per_file.div_head(self.tp_group_size)
 
-        # SSD layout calculations
-        self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
-        self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-        self.ssd_tp_stride_in_bytes = (
-            self.ssd_block_stride_in_bytes // self.tp_group_size
-            if not self.is_mla
-            else self.ssd_block_stride_in_bytes
-        )
+            # GPU layout calculations — compute strides from actual tensor to handle
+            # different attention backend layouts (flash_attn vs triton/flashinfer).
+            dtype_sz = self.dtype.itemsize
+            tpb = gpu_kv_layouts[0].tokens_per_block
+            self.gpu_chunk_sizes_in_bytes = []
+            self.gpu_kv_strides_in_bytes = []
+            self.gpu_block_strides_in_bytes = []
+            self.gpu_layer_strides_in_bytes = []
+            for i, gpu_kv_layout in enumerate(gpu_kv_layouts):
+                gpu_strides = self._get_gpu_strides_from_tensor(
+                    self.gpu_blocks[i][0], tpb, dtype_sz, self.kv_dim,
+                ) if len(self.gpu_blocks[i]) > 1 else None
+                if gpu_strides is not None:
+                    kv_s, blk_s, layer_s = gpu_strides
+                else:
+                    kv_s = gpu_kv_layout.get_kv_stride() * dtype_sz
+                    blk_s = gpu_kv_layout.get_block_stride() * dtype_sz
+                    layer_s = gpu_kv_layout.get_layer_stride() * dtype_sz
+                self.gpu_chunk_sizes_in_bytes.append(gpu_kv_layout.get_chunk_size() * dtype_sz)
+                self.gpu_kv_strides_in_bytes.append(kv_s)
+                self.gpu_block_strides_in_bytes.append(blk_s)
+                self.gpu_layer_strides_in_bytes.append(layer_s)
 
-        # Resolve pointers in Python (where storage is valid); pass them to C++ so we avoid
-        # "Tensor that doesn't have storage" when C++ calls .data_ptr() on tensors passed
-        # across the pybind11 boundary from a spawn'd subprocess (shared memory / CUDA IPC).
-        gpu_block_ptrs_flat = [
-            self.gpu_blocks[i][j].data_ptr()
-            for i in range(self.num_gpus)
-            for j in range(len(self.gpu_blocks[i]))
-        ]
+            # SSD layout calculations
+            self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+            self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
+            self.ssd_tp_stride_in_bytes = (self.ssd_block_stride_in_bytes // self.tp_group_size
+                                           if self.num_kv_heads > 1 else self.ssd_block_stride_in_bytes)
+
+            # Resolve pointers in Python
+            gpu_block_ptrs_flat = [
+                self.gpu_blocks[i][j].data_ptr()
+                for i in range(self.num_gpus)
+                for j in range(len(self.gpu_blocks[i]))
+            ]
+            gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
+            num_tensors_per_gpu = len(self.gpu_blocks[0])
+
+            # Create TP GDS Transfer Thread Group
+            self.tp_gds_transfer_thread_group = TPGDSTransferThreadGroup(
+                self.num_gpus,
+                gpu_block_ptrs_flat,
+                num_tensors_per_gpu,
+                ssd_files,
+                self.num_layers,
+                self.gpu_kv_strides_in_bytes,
+                self.gpu_block_strides_in_bytes,
+                self.gpu_layer_strides_in_bytes,
+                self.gpu_chunk_sizes_in_bytes,
+                gpu_device_ids,
+            )
+
+    def _init_tp_multi_group_gds(
+        self,
+        gpu_kv_layouts: List[KVCacheLayout],
+        ssd_kv_layout: KVCacheLayout,
+        layer_groups: List[LayerGroupSpec],
+        gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]],
+        gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]],
+        ssd_files: Dict[int, List[str]],
+    ) -> None:
+        """Initialize per-group TPGDSTransferThreadGroup instances.
+
+        SSD buffer is byte-flat (uint8) in multi-group mode; per-group strides
+        use g.dtype.itemsize so groups with different element sizes (e.g.
+        bf16 main + uint8 indexer) interleave correctly within a block.
+        """
+        kv_dim = self.kv_dim
+        tpb = ssd_kv_layout.tokens_per_block
+
+        # Multi-group BLOCKFIRST: get_block_stride() returns bytes_per_block
+        # directly (already accounts for tp_size and per-group dtype sizes).
+        self.ssd_block_stride_in_bytes = ssd_kv_layout.get_block_stride()
+
+        self.group_tp_gds_params: list = []
+        # Keep imported CUDA-IPC tensors alive: only data_ptr()s are recorded
+        # below, so dropping the tensors would free the IPC mapping and dangle
+        # the stored pointers.
+        self._multi_group_gpu_blocks_keepalive: list = []
+        ssd_offset_bytes = 0
+
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
-        num_tensors_per_gpu = len(self.gpu_blocks[0])
 
-        # Create TP GDS Transfer Thread Group
-        self.tp_gds_transfer_thread_group = TPGDSTransferThreadGroup(
-            self.num_gpus,
-            gpu_block_ptrs_flat,
-            num_tensors_per_gpu,
-            ssd_files,
-            dp_group_id,
-            self.num_layers,
-            self.gpu_kv_strides_in_bytes,
-            self.gpu_block_strides_in_bytes,
-            self.gpu_layer_strides_in_bytes,
-            self.gpu_chunk_sizes_in_bytes,
-            gpu_device_ids,
+        for gi, g in enumerate(layer_groups):
+            # Per-group dtype: indexer uses uint8 even when main KV is bf16/fp16.
+            dtype_size_g = g.dtype.itemsize
+            # Compressed groups: tpb_g = tpb // compress_ratio.
+            tpb_g = tpb // g.compress_ratio
+            chunk_elements = tpb_g * g.num_kv_heads * g.head_size
+            ssd_layer_stride = kv_dim * chunk_elements * dtype_size_g
+            ssd_kv_stride = chunk_elements * dtype_size_g
+            # TP stride for SSD: partition the block across TP ranks
+            ssd_tp_stride = self.ssd_block_stride_in_bytes // self.tp_group_size if self.num_kv_heads > 1 \
+                else self.ssd_block_stride_in_bytes
+
+            # Per-group GPU strides and pointers
+            if gpu_blocks_per_group is not None and gpu_layouts_per_group is not None:
+                gpu_kv_strides = []
+                gpu_block_strides = []
+                gpu_layer_strides = []
+                gpu_chunk_sizes = []
+                gpu_ptrs_flat = []
+                num_tensors = None
+
+                for gpu_idx in range(self.num_gpus):
+                    grp_layout = gpu_layouts_per_group[gi][gpu_idx]
+                    grp_handles = gpu_blocks_per_group[gi][gpu_idx]
+                    grp_tensors = [h.get_tensor() for h in grp_handles]
+                    self._multi_group_gpu_blocks_keepalive.append(grp_tensors)
+
+                    gpu_strides = self._get_gpu_strides_from_tensor(
+                        grp_tensors[0], tpb_g, dtype_size_g, self.kv_dim,
+                    ) if len(grp_tensors) > 1 else None
+                    if gpu_strides is not None:
+                        kv_s, blk_s, layer_s = gpu_strides
+                    else:
+                        kv_s = grp_layout.get_kv_stride() * dtype_size_g
+                        blk_s = grp_layout.get_block_stride() * dtype_size_g
+                        layer_s = grp_layout.get_layer_stride() * dtype_size_g
+                    gpu_kv_strides.append(kv_s)
+                    gpu_block_strides.append(blk_s)
+                    gpu_layer_strides.append(layer_s)
+                    gpu_chunk_sizes.append(chunk_elements * dtype_size_g)
+
+                    for t in grp_tensors:
+                        gpu_ptrs_flat.append(t.data_ptr())
+                    if num_tensors is None:
+                        num_tensors = len(grp_tensors)
+            else:
+                gpu_kv_strides = []
+                gpu_block_strides = []
+                gpu_layer_strides = []
+                for i, layout in enumerate(gpu_kv_layouts):
+                    gpu_strides = self._get_gpu_strides_from_tensor(
+                        self.gpu_blocks[i][0], tpb_g, dtype_size_g, self.kv_dim,
+                    ) if len(self.gpu_blocks[i]) > 1 else None
+                    if gpu_strides is not None:
+                        kv_s, blk_s, layer_s = gpu_strides
+                    else:
+                        kv_s = layout.get_kv_stride() * dtype_size_g
+                        blk_s = layout.get_block_stride() * dtype_size_g
+                        layer_s = layout.get_layer_stride() * dtype_size_g
+                    gpu_kv_strides.append(kv_s)
+                    gpu_block_strides.append(blk_s)
+                    gpu_layer_strides.append(layer_s)
+                gpu_chunk_sizes = [chunk_elements * dtype_size_g] * self.num_gpus
+                gpu_ptrs_flat = [
+                    self.gpu_blocks[i][j].data_ptr()
+                    for i in range(self.num_gpus)
+                    for j in range(len(self.gpu_blocks[i]))
+                ]
+                num_tensors = len(self.gpu_blocks[0])
+
+            tp_gds_group = TPGDSTransferThreadGroup(
+                self.num_gpus,
+                gpu_ptrs_flat,
+                num_tensors,
+                ssd_files,
+                g.num_layers,
+                gpu_kv_strides,
+                gpu_block_strides,
+                gpu_layer_strides,
+                gpu_chunk_sizes,
+                gpu_device_ids,
+            )
+
+            self.group_tp_gds_params.append({
+                'num_layers': g.num_layers,
+                'tp_gds_group': tp_gds_group,
+                'ssd_layer_stride': ssd_layer_stride,
+                'ssd_kv_stride': ssd_kv_stride,
+                'ssd_tp_stride': ssd_tp_stride,
+                'ssd_copy_offset': ssd_offset_bytes,
+            })
+
+            ssd_offset_bytes += g.num_layers * kv_dim * chunk_elements * dtype_size_g
+
+        flexkv_logger.info(
+            f"tpGDSTransferWorker multi-group initialized: {len(layer_groups)} groups, "
+            f"ssd_block_stride={self.ssd_block_stride_in_bytes} bytes"
         )
 
     def _transfer_impl(self,
                        src_block_ids: torch.Tensor,
                        dst_block_ids: torch.Tensor,
                        transfer_type: TransferType,
-                       layer_id: int,
-                       layer_granularity: int,
                        **kwargs: Any,
                        ) -> None:
         assert src_block_ids.dtype == torch.int64
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
 
-        # GDS uses DISK2D/D2DISK transfer types (same as traditional SSD I/O)
+        # GDS uses DISK2D/D2DISK transfer types
         if transfer_type == TransferType.D2DISK:
             gpu_block_ids = src_block_ids
             ssd_block_ids = dst_block_ids
-            is_read = False  # GPU -> SSD via GDS (write)
+            is_read = False
         elif transfer_type == TransferType.DISK2D:
             gpu_block_ids = dst_block_ids
             ssd_block_ids = src_block_ids
-            is_read = True   # SSD -> GPU via GDS (read)
+            is_read = True
         else:
             raise ValueError(f"Invalid transfer type: {transfer_type} for tpGDSTransferWorker. "
                              f"Expected DISK2D or D2DISK.")
@@ -1338,29 +2533,40 @@ class tpGDSTransferWorker(TransferWorkerBase):
         if len(gpu_block_id_list) == 0:
             return
 
-        self.tp_gds_transfer_thread_group.tp_group_transfer(
-            gpu_block_id_list,
-            ssd_block_id_list,
-            self.ssd_layer_stride_in_bytes,
-            self.ssd_kv_stride_in_bytes,
-            self.ssd_block_stride_in_bytes,
-            self.ssd_tp_stride_in_bytes,
-            self.num_blocks_per_file,
-            is_read,
-            layer_id,
-            layer_granularity,
-            self.is_mla,
-        )
+        if self.has_multi_group:
+            for gp in self.group_tp_gds_params:
+                gp['tp_gds_group'].tp_group_transfer(
+                    gpu_block_id_list,
+                    ssd_block_id_list,
+                    gp['ssd_layer_stride'],
+                    gp['ssd_kv_stride'],
+                    self.ssd_block_stride_in_bytes,
+                    gp['ssd_tp_stride'],
+                    self.num_blocks_per_file,
+                    is_read,
+                    0,  # layer_id always 0 for per-group
+                    gp['num_layers'],
+                    self.kv_dim,
+                    self.num_kv_heads,
+                )
+        else:
+            self.tp_gds_transfer_thread_group.tp_group_transfer(
+                gpu_block_id_list,
+                ssd_block_id_list,
+                self.ssd_layer_stride_in_bytes,
+                self.ssd_kv_stride_in_bytes,
+                self.ssd_block_stride_in_bytes,
+                self.ssd_tp_stride_in_bytes,
+                self.num_blocks_per_file,
+                is_read,
+                0,
+                self.num_layers,
+                self.kv_dim,
+                self.num_kv_heads,
+            )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         """Launch a TP GDS transfer operation"""
-        layer_id = transfer_op.layer_id
-        layer_granularity = transfer_op.layer_granularity
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         start_time = time.time()
@@ -1368,13 +2574,15 @@ class tpGDSTransferWorker(TransferWorkerBase):
             src_block_ids,
             dst_block_ids,
             transfer_op.transfer_type,
-            layer_id,
-            layer_granularity,
         )
         end_time = time.time()
 
-        kv_dim = 2 if not self.is_mla else 1
-        transfer_size = self.ssd_chunk_size_in_bytes * layer_granularity * transfer_op.valid_block_num * kv_dim
+        if self.has_multi_group:
+            transfer_size = 0
+            for gp in self.group_tp_gds_params:
+                transfer_size += gp['ssd_kv_stride'] * gp['num_layers'] * transfer_op.valid_block_num * self.kv_dim
+        else:
+            transfer_size = self.ssd_chunk_size_in_bytes * self.num_layers * transfer_op.valid_block_num * self.kv_dim
 
         self._log_transfer_performance(
             transfer_op,
@@ -1417,18 +2625,26 @@ class NixlTransferWorker(TransferWorkerBase):
         be = normalize_nixl_file_plugin_name(str(nixl_backend).upper())
         if be not in NIXL_GPU_FILE_BACKENDS and be not in NIXL_CPU_FILE_BACKENDS:
             raise ValueError(
-                f"nixl_backend must be one of {sorted(NIXL_GPU_FILE_BACKENDS | NIXL_CPU_FILE_BACKENDS)}, got {nixl_backend}"
+                f"nixl_backend must be one of "
+                f"{sorted(NIXL_GPU_FILE_BACKENDS | NIXL_CPU_FILE_BACKENDS)}, got {nixl_backend}"
             )
         if be in NIXL_GPU_FILE_BACKENDS and gpu_blocks is None:
             raise ValueError("GDS_MT requires gpu_blocks")
         if be in NIXL_CPU_FILE_BACKENDS and cpu_blocks is None:
             raise ValueError("POSIX/3FS require cpu_blocks")
+
+        # Pin after optional GPU bind so GPU backends do not create a GPU0 context.
+        if be in NIXL_GPU_FILE_BACKENDS:
+            ensure_cuda_device(gpu_device_id)
+        self._pin_op_buffer()
         if (
             gpu_kv_layout.num_layer != cpu_kv_layout.num_layer
-            or gpu_kv_layout.is_mla != cpu_kv_layout.is_mla
+            or gpu_kv_layout.kv_dim != cpu_kv_layout.kv_dim
+            or gpu_kv_layout.num_kv_heads != cpu_kv_layout.num_kv_heads
         ):
             raise ValueError(
-                "gpu_kv_layout and cpu_kv_layout must match on num_layer and is_mla"
+                "gpu_kv_layout and cpu_kv_layout must match on num_layer, "
+                "kv_dim and num_kv_heads"
             )
 
         self.nixl_backend = be
@@ -1441,7 +2657,8 @@ class NixlTransferWorker(TransferWorkerBase):
         self.dtype = dtype
 
         self.num_layers = gpu_kv_layout.num_layer
-        self.is_mla = gpu_kv_layout.is_mla
+        self.kv_dim = gpu_kv_layout.kv_dim
+        self.num_kv_heads = gpu_kv_layout.num_kv_heads
 
         # SSD / file-side layout (same for every NIXL FILE backend).
         ssd_pf = ssd_kv_layout.div_block(self.num_files, padding=True)
@@ -1483,7 +2700,7 @@ class NixlTransferWorker(TransferWorkerBase):
         self._session = NixlAgentSession(be, nixl_extra_config or {})
 
         if be in NIXL_GPU_FILE_BACKENDS:
-            self.gpu_blocks = [h.get_tensor() for h in gpu_blocks]  # type: ignore[union-attr, arg-type]
+            self.gpu_blocks = import_tensor_handles(gpu_blocks)  # type: ignore[arg-type]
             if len(self.gpu_blocks) == 1:
                 self.gpu_block_type_ = 1
             elif len(self.gpu_blocks) == self.num_layers:
@@ -1496,8 +2713,6 @@ class NixlTransferWorker(TransferWorkerBase):
                 )
             self.chunk_size_in_bytes = self.gpu_chunk_size_in_bytes
             self.gpu_device_id = gpu_device_id
-            if gpu_device_id != -1:
-                torch.cuda.set_device(gpu_device_id)
             self.transfer_stream = torch.cuda.Stream()
             if not self._session.prepare_all_ssd_files(self.ssd_files):
                 raise RuntimeError("NIXL: prepare_all_ssd_files failed")
@@ -1509,7 +2724,7 @@ class NixlTransferWorker(TransferWorkerBase):
                 f"NixlTransferWorker ({be}): pinning CPU pool "
                 f"{cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GiB"
             )
-            cudaHostRegister(cpu_blocks)  # type: ignore[arg-type]
+            self._register_host_tensor(cpu_blocks, "nixl_cpu_pool")  # type: ignore[arg-type]
             if cpu_kv_layout.type != ssd_kv_layout.type:
                 raise ValueError(
                     "CPU and SSD KV layout types must match for NIXL FILE transfer"
@@ -1519,6 +2734,9 @@ class NixlTransferWorker(TransferWorkerBase):
                 raise RuntimeError("NIXL: prepare_all_ssd_files failed")
             if not self._session.prepare_dram_cpu(self.cpu_blocks):
                 raise RuntimeError("NIXL: prepare_dram_cpu failed")
+
+        # Bytes per KV block (all layers); used by transfer tracing for bw.
+        self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
 
     def _transfer_impl(
         self,
@@ -1565,7 +2783,7 @@ class NixlTransferWorker(TransferWorkerBase):
         if n == 0:
             return
 
-        kv_dim = 1 if self.is_mla else 2
+        kv_dim = self.kv_dim
         layer_end = layer_id + layer_granularity
 
         file_paths: List[str] = []
@@ -1593,7 +2811,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.ssd_layer_stride_in_bytes,
                             self.ssd_kv_stride_in_bytes,
                             self.ssd_block_stride_in_bytes,
-                            self.is_mla,
+                            self.kv_dim,
                         )
                         gview = gpu_chunk_u8_view(
                             self.gpu_blocks,
@@ -1606,7 +2824,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.gpu_block_stride_in_bytes,
                             self.gpu_layer_stride_in_bytes,
                             self.chunk_size_in_bytes,
-                            self.is_mla,
+                            self.kv_dim,
                         )
                         gpu_tensors.append(gview)
                         file_paths.append(path)
@@ -1641,7 +2859,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.mem_layer_stride_in_bytes,
                             self.mem_kv_stride_in_bytes,
                             self.mem_block_stride_in_bytes,
-                            self.is_mla,
+                            self.kv_dim,
                         )
                         sob = ssd_chunk_byte_offset_in_file(
                             lid,
@@ -1650,7 +2868,7 @@ class NixlTransferWorker(TransferWorkerBase):
                             self.ssd_layer_stride_in_bytes,
                             self.ssd_kv_stride_in_bytes,
                             self.ssd_block_stride_in_bytes,
-                            self.is_mla,
+                            self.kv_dim,
                         )
                         dram_ptr_len.append((base + cob, self.chunk_size_in_bytes))
                         file_paths.append(path)
@@ -1689,7 +2907,7 @@ class NixlTransferWorker(TransferWorkerBase):
                 lg,
             )
             end_time = time.time()
-            kv_dim = 2 if not self.is_mla else 1
+            kv_dim = self.kv_dim
             transfer_size = (
                 self.chunk_size_in_bytes * lg * transfer_op.valid_block_num * kv_dim
             )
@@ -1705,7 +2923,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         transfer_conn: Connection,
         finished_ops_queue: MPQueue,
         op_buffer_tensor: torch.Tensor,
-        cpu_blocks: torch.Tensor,
+        cpu_blocks: Union[torch.Tensor, HugePageTensorHandle],
         cpu_kv_layout: KVCacheLayout,
         remote_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
@@ -1716,12 +2934,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         mooncake_config_path: str = None,
     ):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self._pin_op_buffer()
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.num_layers = cpu_kv_layout.num_layer
         self.num_cpu_blocks = cpu_kv_layout.num_block
-        # For multi-group layouts (e.g. gemma4), get_chunk_size() is invalid;
+        # For multi-group layouts, get_chunk_size() is invalid;
         # use get_block_stride() which works for both single and multi-group BLOCKFIRST.
-        if cpu_kv_layout.layer_groups is not None:
+        if getattr(cpu_kv_layout, "layer_groups", None) is not None:
             self.block_size = cpu_kv_layout.get_block_stride()
         else:
             self.block_size = cpu_kv_layout.get_chunk_size()
@@ -1729,8 +2949,10 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self.cpu_kv_layout = cpu_kv_layout
         self.remote_kv_layout = remote_kv_layout
 
-        self.is_mla = cpu_kv_layout.is_mla
-        self.kv_dim = 2 if not self.is_mla else 1
+        self.kv_dim = cpu_kv_layout.kv_dim
+        self.num_kv_heads = cpu_kv_layout.num_kv_heads
+        # Bytes per KV block (all layers); used by transfer tracing for bw.
+        self._bytes_per_block = self.block_size * self.dtype.itemsize * self.num_layers * self.kv_dim
 
         self.cpu_blocks = cpu_blocks  ## shared memory
         self.cache_config = cache_config
@@ -1813,21 +3035,33 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             ## init the cpu buffer for ssd to cpu copy
             # NOTE: now we allocate 500 blocks for test
             self.tmp_cpu_buffer_layout = KVCacheLayout(
-                self.cpu_kv_layout.type,
-                self.cpu_kv_layout.num_layer,
-                self.cache_config.num_tmp_cpu_blocks,
-                self.cpu_kv_layout.tokens_per_block,
-                self.cpu_kv_layout.num_head,
-                self.cpu_kv_layout.head_size,
-                self.cpu_kv_layout.is_mla,
-                self.cpu_kv_layout._kv_shape,
+                type=self.cpu_kv_layout.type,
+                num_layer=self.cpu_kv_layout.num_layer,
+                num_block=self.cache_config.num_tmp_cpu_blocks,
+                tokens_per_block=self.cpu_kv_layout.tokens_per_block,
+                num_head=self.cpu_kv_layout.num_head,
+                head_size=self.cpu_kv_layout.head_size,
+                kv_dim=self.cpu_kv_layout.kv_dim,
+                num_kv_heads=self.cpu_kv_layout.num_kv_heads,
+                _kv_shape=self.cpu_kv_layout.kv_shape,
             )
-            self.tmp_cpu_buffer = torch.empty(
-                self.tmp_cpu_buffer_layout.get_total_elements(),
+            # Allocate the temporary SSD->CPU staging buffer.
+            #
+            # Two backends are supported:
+            #  (a) HugePage-backed mmap (when ``cache_config.use_hugepage_tmp_buffer``
+            #      is True and the kernel has huge pages reserved). We still need
+            #      to pin it for CUDA via ``cudaHostRegister`` because the region
+            #      is not allocated through PyTorch's pinned-memory allocator.
+            #  (b) Pinned ``torch.empty`` (the original behavior, default).
+            tmp_num_elements = self.tmp_cpu_buffer_layout.get_total_elements()
+            self._tmp_cpu_buffer_handle = allocate_host_buffer(
+                num_elements=tmp_num_elements,
                 dtype=self.dtype,
-                device="cpu",
-                pin_memory=True,
+                use_hugepage=self.cache_config.use_hugepage_tmp_buffer,
+                hugepage_size_bytes=self.cache_config.hugepage_size_bytes,
             )
+            self.tmp_cpu_buffer = self._tmp_cpu_buffer_handle.tensor
+
             self.mooncake_transfer_engine.regist_buffer(
                 self.tmp_cpu_buffer.data_ptr(),
                 self.tmp_cpu_buffer.numel() * self.tmp_cpu_buffer.element_size(),
@@ -1909,23 +3143,55 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             return old_value
 
     def shutdown(self):
-        self.zmq_server.shutdown()
-        self.zmq_client.shutdown()
-        # unregist buffer in mooncake engine
-        self.mooncake_transfer_engine.unregist_buffer(self.cpu_blocks.data_ptr())
-        if self.cache_config.enable_p2p_ssd:
-            self.mooncake_transfer_engine.unregist_buffer(self.tmp_cpu_buffer.data_ptr())
-        # unregist node info from redis server
-        self.unregist_node_meta()
+        """Best-effort cleanup; tolerant of partially-failed ``__init__``."""
+        try:
+            zmq_server = getattr(self, "zmq_server", None)
+            if zmq_server is not None:
+                zmq_server.shutdown()
+            zmq_client = getattr(self, "zmq_client", None)
+            if zmq_client is not None:
+                zmq_client.shutdown()
+            engine = getattr(self, "mooncake_transfer_engine", None)
+            cpu_blocks = getattr(self, "cpu_blocks", None)
+            if engine is not None and cpu_blocks is not None:
+                try:
+                    engine.unregist_buffer(cpu_blocks.data_ptr())
+                except Exception as e:
+                    flexkv_logger.warning(
+                        f"PEER2CPUTransferWorker unregist cpu buffer failed: {e}"
+                    )
+                cache_config = getattr(self, "cache_config", None)
+                if cache_config is not None and getattr(cache_config, "enable_p2p_ssd", False):
+                    tmp_buf = getattr(self, "tmp_cpu_buffer", None)
+                    if tmp_buf is not None:
+                        try:
+                            engine.unregist_buffer(tmp_buf.data_ptr())
+                        except Exception as e:
+                            flexkv_logger.warning(
+                                f"PEER2CPUTransferWorker unregist tmp buffer failed: {e}"
+                            )
+                    tmp_handle = getattr(self, "_tmp_cpu_buffer_handle", None)
+                    if tmp_handle is not None:
+                        try:
+                            tmp_handle.release()
+                        except Exception as e:
+                            flexkv_logger.warning(
+                                f"PEER2CPUTransferWorker release tmp handle failed: {e}"
+                            )
+            if getattr(self, "redis_meta_client", None) is not None:
+                try:
+                    self.unregist_node_meta()
+                except Exception as e:
+                    flexkv_logger.warning(
+                        f"PEER2CPUTransferWorker unregist_node_meta failed: {e}"
+                    )
+        except Exception as e:
+            flexkv_logger.error(f"PEER2CPUTransferWorker shutdown error: {e}")
+        finally:
+            super().shutdown()
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
-        layer_id = transfer_op.layer_id
-        layer_granularity = transfer_op.layer_granularity
-        if layer_id == -1:
-            layer_id = 0
-        if layer_granularity == -1:
-            layer_granularity = self.num_layers
-        task_info_list = self.op_parser(transfer_op, layer_id, layer_granularity)
+        task_info_list = self.op_parser(transfer_op)
 
         start_time = time.time()
         transfered_size = 0
@@ -1936,8 +3202,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             ret = self._batch_transfer_impl(
                 task_info,
                 transfer_op.transfer_type,
-                layer_id,
-                layer_granularity,
             )
             if not ret:
                 transfer_finished = False
@@ -1945,11 +3209,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             transfered_size += task_info.data_size
 
         end_time = time.time()
-
-        # kv_dim = 2 if not self.is_mla else 1
-        # transfer_size = (
-        #     self.block_size * layer_granularity * transfer_op.valid_block_num * kv_dim
-        # )
 
         self._log_transfer_performance(
             transfer_op,
@@ -1967,8 +3226,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
     def _batch_transfer_impl(self,
         task_info: RDMATaskInfo,
         transfer_type: TransferType,
-        layer_id: int,
-        layer_granularity: int,
         **kwargs,):
         if transfer_type == TransferType.PEERH2H:
             import concurrent.futures
@@ -1999,8 +3256,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 peer_cpu_base_ptr=self.dst_buffer_ptr,
                 peer_zmq_status_addr=self.zmq_client.get_addr(),
                 data_size=task_info.data_size,
-                layer_id=layer_id,
-                layer_granularity=layer_granularity,
             )
             #flexkv_logger.info(
             #    f"[PEERSSD2H] Sending meta: task_id={task_info.task_id}, "
@@ -2034,8 +3289,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self,
         task_info: RDMATaskInfo,
         transfer_type: TransferType,
-        layer_id: int,
-        layer_granularity: int,
         **kwargs,
     ):
         if transfer_type == TransferType.PEERH2H:
@@ -2061,8 +3314,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                 peer_cpu_base_ptr=self.dst_buffer_ptr,
                 peer_zmq_status_addr=self.zmq_client.get_addr(),
                 data_size=task_info.data_size,
-                layer_id=layer_id,
-                layer_granularity=layer_granularity,
             )
             flexkv_logger.info(
                 f"[_transfer_impl] Sending task_id={task_info.task_id}, "
@@ -2095,7 +3346,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         return True
 
     def op_parser(
-        self, transfer_op: WorkerTransferOp, layer_id: int, layer_granularity: int
+        self, transfer_op: WorkerTransferOp
     ) -> List[RDMATaskInfo]:
         """
         parse the transfer op to a list of RDMATaskInfo
@@ -2118,6 +3369,10 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         assert len(src_block_ids) == len(dst_block_ids)
 
         src_block_node_ids = transfer_op.src_block_node_ids
+        # Convert to plain list — the compiled utils.so (pybind11) requires list,
+        # not numpy.ndarray.
+        if hasattr(src_block_node_ids, 'tolist'):
+            src_block_node_ids = src_block_node_ids.tolist()
 
         # step1: group the blocks by remote node id and remote block source type,
         # each segment is a list of continuous blocks
@@ -2132,9 +3387,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             groups = group_blocks_by_node_and_segment(
                 src_block_ids, dst_block_ids, src_block_node_ids
             )
-            task_info_list = self._dist_cpu_op_parser(
-                groups, layer_id, layer_granularity
-            )
+            task_info_list = self._dist_cpu_op_parser(groups)
         elif transfer_op.transfer_type == TransferType.PEERSSD2H:
             groups = group_blocks_by_node(
                 src_block_ids, dst_block_ids, src_block_node_ids
@@ -2301,10 +3554,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     ]
                     local_cpu_start_idx += len(ssd_block_ids_per_seg)
 
-                    layer_id = recv_meta.layer_id
-                    layer_granularity = recv_meta.layer_granularity
                     layer_id_list = torch.arange(
-                        layer_id, layer_id + layer_granularity, dtype=torch.int32
+                        0, self.num_layers, dtype=torch.int32
                     )
                     if not self.copy_ssd_data_to_dram(
                         layer_id_list, ssd_block_ids_per_seg, local_cpu_buffer_block_ids_per_seg
@@ -2316,15 +3567,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     src_ptrs, src_block_size = self.get_cpu_buffer_block_start_ptr(
                         local_cpu_buffer_block_ids_per_seg,
                         self.tmp_cpu_buffer.data_ptr(),
-                        layer_id,
-                        layer_granularity,
                     )
 
                     dst_ptrs, dst_block_size = self.get_cpu_buffer_block_start_ptr(
                         dst_cpu_block_ids_per_seg,
                         recv_meta.peer_cpu_base_ptr,
-                        layer_id,
-                        layer_granularity,
                     )
                     assert src_block_size == dst_block_size, "Block size mismatch between src and dst"
 
@@ -2369,22 +3616,23 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         flexkv_logger.info(f"copy ssd blocks:{ssd_block_id_list} to cpu blocks: {cpu_block_id_list}" )
         try:
             transfer_kv_blocks_ssd(
-                ioctx=self.ioctx,
-                cpu_layer_id_list=layer_id_list,
-                cpu_tensor_ptr=self.tmp_cpu_buffer.data_ptr(),  ## copy ssd data to tmp cpu buffer
-                ssd_block_ids=ssd_block_id_list,
-                cpu_block_ids=cpu_block_id_list,
-                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-                ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
-                ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
-                chunk_size_in_bytes=self.chunk_size_in_bytes,
-                block_stride_in_bytes=self.block_stride_in_bytes,
-                is_read=True,
-                num_blocks_per_file=self.num_blocks_per_file,
-                round_robin=self.round_robin,
-                num_threads_per_device=32,
-                is_mla=self.is_mla,
+                self.ioctx,
+                layer_id_list,
+                self.tmp_cpu_buffer.data_ptr(),  ## copy ssd data to tmp cpu buffer
+                ssd_block_id_list,
+                cpu_block_id_list,
+                self.cpu_layer_stride_in_bytes,
+                self.cpu_kv_stride_in_bytes,
+                self.ssd_layer_stride_in_bytes,
+                self.ssd_kv_stride_in_bytes,
+                self.chunk_size_in_bytes,
+                self.block_stride_in_bytes,
+                True,
+                self.num_blocks_per_file,
+                self.round_robin,
+                32,
+                self.kv_dim,
+                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
         except Exception as e:
             flexkv_logger.error(f"Copy data from ssd to cpu failed: {e}")
@@ -2412,8 +3660,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
     def _dist_cpu_op_parser(
         self,
         groups: Dict[int, List[Dict[str, List[int]]]],
-        layer_id: int,
-        layer_granularity: int,
     ):
         """
         Distributed cpu op parser
@@ -2422,8 +3668,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         Inputs:
             groups (Dict[int, List[Dict[str, List[int]]]]): the grouped blocks
-            layer_id (int): start layer id
-            layer_granularity (int): number of layers to be transferred
 
         Returns:
             task_info_list: the list of RDMATaskInfo, each task refers to the data transfer of one node
@@ -2456,8 +3700,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     self.get_cpu_buffer_block_start_ptr(
                         src_blocks,
                         src_meta.cpu_bufer_base_ptr,  # the cpu buffer ptr on remote machine
-                        layer_id,
-                        layer_granularity,
                     )
                 )
 
@@ -2466,8 +3708,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     self.get_cpu_buffer_block_start_ptr(
                         dst_blocks,
                         self.dst_buffer_ptr,  # the cpu buffer ptr on local machine
-                        layer_id,
-                        layer_granularity,
                     )
                 )
 
@@ -2490,8 +3730,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             # step3: create RDMATaskInfo for each segment
             # NOTE: block wise layout: only one start ptr for each segment
             #       layer wise layout: multiple start ptrs for each segment,
-            #       the number of start ptrs equals to layer_granularity * kv_dim
-
+            #       the number of start ptrs equals num_layers * kv_dim
             task_info_list.append(
                   RDMATaskInfo(
                     0,
@@ -2500,8 +3739,8 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
                     "",
                     src_ptr_list,
                     dst_ptr_list,
-                    None,
-                    None,
+                    [],    # src_block_ids unused for PEERH2H (uses ptrs)
+                    [],    # dst_block_ids unused for PEERH2H (uses ptrs)
                     data_size_list,
                     data_size = sum(data_size_list)
                 )
@@ -2514,15 +3753,13 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         self,
         cpu_blocks: List[int],
         cpu_base_ptr: int,
-        layer_start_id: int = 0,
-        layer_granularity: int = -1,
     ) -> Tuple[List[int], int]:
         """
         Get the cpu buffer block start ptrs for the given cpu blocks.
         We have two layout types in flexkv, layerwise and blockwise.
-        1) For layerwise layout, although the cpu blocks are continous, we need to
+        1) For layerwise layout, although the cpu blocks are continuous, we need to
         calculate the start ptrs for each layer and each kv dim. So
-        the number of start ptrs equals to layer_granularity * kv_dim.
+        the number of start ptrs equals self.num_layers * kv_dim.
         2) For blockwise layout, the cpu blocks are continuous, so we only need to
         calculate the start ptr for the first block. So
         the number of start ptrs is 1.
@@ -2531,8 +3768,6 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         Parameters:
             cpu_blocks (List[int]): the list of cpu block ids, continuous
             cpu_base_ptr (int): the base ptr of the cpu buffer
-            layer_start_id (int): the start layer id, only used for layerwise layout
-            layer_granularity (int): the number of layers to be transferred, only used for layerwise layout
         Returns:
             Tuple(List[int], int): the list of cpu buffer block start ptrs and
                 data size per block (used for calculate total data size)
@@ -2555,7 +3790,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             raise ValueError(f"Invalid cpu_blocks type: {type(cpu_blocks)}")
 
         if self.cpu_kv_layout.type == KVCacheLayoutType.LAYERFIRST:
-            for layer_id in range(layer_start_id, layer_start_id + layer_granularity):
+            for layer_id in range(0, self.num_layers):
                 for kv_id in range(self.kv_dim):
                     element_offset = (
                         (
@@ -2603,7 +3838,7 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
     def get_node_meta(self, node_id: int) -> Optional[NodeMetaInfo]:
         """Get the node meta info by node id.
-        
+
         Before returning cached or freshly-fetched meta, we verify that the
         node is still active (its node:<id> key exists in Redis and has not
         expired).  This prevents RDMA transfers to stale addresses after a
@@ -2636,3 +3871,222 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.info(f"Fetched node {node_id} meta from Redis.")
 
         return self.node_metas[node_id]
+
+class MooncakeStoreTransferWorker(TransferWorkerBase):
+    """Mooncake-store remote KV I/O worker (main KV and SWA pools)."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        cpu_blocks: Union[List[torch.Tensor], torch.Tensor],
+        cpu_kv_layout: "KVCacheLayout",
+        dtype: torch.dtype,
+        cache_config: "CacheConfig",
+        pool_kind: PoolKind = PoolKind.KV,
+        override_global_segment_size: Optional[int] = None,
+    ) -> None:
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self.pp_rank = int(getattr(cache_config, 'mooncake_store_pp_rank', 0) or 0)
+        self.pp_size = int(getattr(cache_config, 'mooncake_store_pp_size', 1) or 1)
+        self.node_layer_start = int(getattr(cache_config, 'mooncake_store_node_layer_start', 0) or 0)
+        self.node_layer_end = int(getattr(cache_config, 'mooncake_store_node_layer_end', 0) or 0)
+        self.total_layers = int(getattr(cache_config, 'mooncake_store_total_layers', 0) or 0)
+        self.pool_kind = pool_kind
+
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
+        self._register_host_tensor(cpu_blocks, "mooncake_store_cpu_pool")
+        self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
+        self.num_layers: int = cpu_kv_layout.num_layer
+        self.num_cpu_blocks: int = cpu_kv_layout.num_block
+        self.dtype = dtype
+        self.cpu_kv_layout = cpu_kv_layout
+        assert self.cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
+        self.kv_dim = cpu_kv_layout.kv_dim
+        self.num_kv_heads = cpu_kv_layout.num_kv_heads
+        self.cpu_blocks = cpu_blocks
+        self.cache_config = cache_config
+        self._cpu_buffer = cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks
+        # Opaque whole-block I/O: multi-group CPU layout is byte-flat
+        # ([num_block, bytes_per_block]); get_chunk_size() is invalid there.
+        self.block_size_bytes = self._block_size_bytes(cpu_kv_layout, dtype)
+        # Bytes per KV block (all layers); used by transfer tracing for bw.
+        self._bytes_per_block = self.block_size_bytes
+
+        from flexkv.external.mooncake_store_utils import MooncakeStoreClient, MooncakeStoreConfig
+        store_config = MooncakeStoreConfig.from_file(
+            self.cache_config,
+            override_global_segment_size=override_global_segment_size,
+        )
+        self.mooncake_client = MooncakeStoreClient(store_config)
+        self.mooncake_client.register_buffer(self._cpu_buffer)
+
+    def shutdown(self) -> None:
+        """Best-effort cleanup; tolerant of partially-failed ``__init__``."""
+        try:
+            client = getattr(self, "mooncake_client", None)
+            buf = getattr(self, "_cpu_buffer", None)
+            if client is not None and buf is not None:
+                try:
+                    client.unregister_buffer(buf)
+                except Exception as e:
+                    flexkv_logger.error(
+                        f"[MooncakeStoreTransferWorker] unregister_buffer failed: {e}"
+                    )
+        finally:
+            super().shutdown()
+
+    @staticmethod
+    def _block_size_bytes(cpu_kv_layout: "KVCacheLayout", dtype: torch.dtype) -> int:
+        """Bytes per CPU block for mooncake put/get addressing.
+
+        Multi-group BLOCKFIRST stores ``bytes_per_block`` directly in
+        ``kv_shape[1]`` (via ``get_block_stride()``) — do not multiply by
+        ``dtype.itemsize``. Single-group layouts still use element count ×
+        itemsize.
+        """
+        if cpu_kv_layout.layer_groups is not None:
+            return int(cpu_kv_layout.get_block_stride())
+        return int(cpu_kv_layout.get_elements_per_block() * dtype.itemsize)
+
+    def _transfer_impl(self, cpu_ptrs, block_sizes, keys,
+                       transfer_type: TransferType) -> List[bool]:
+        if transfer_type == TransferType.H2REMOTE:
+            put_results = self.mooncake_client.batch_put(keys, cpu_ptrs, block_sizes)
+            if not all(put_results):
+                flexkv_logger.warning(f"Mooncake-store batch put partially failed: {put_results}")
+            return put_results
+        elif transfer_type == TransferType.REMOTE2H:
+            get_results = self.mooncake_client.batch_get(keys, cpu_ptrs, block_sizes)
+
+            if is_mooncake_fault_inject_enabled():
+                get_results = inject_mooncake_fault(get_results, transfer_type)
+                flexkv_logger.info(f"Mooncake-store batch get results after fault injection: {get_results}")
+
+            if not all(get_results):
+                flexkv_logger.warning(
+                    f"Mooncake-store batch get partially failed: {get_results}")
+            return get_results
+        else:
+            raise ValueError(
+                f"MooncakeStoreTransferWorker only supports H2REMOTE/REMOTE2H, got {transfer_type}")
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> WorkerTransferResult:
+        expected_blocks = len(transfer_op.src_block_ids)
+        block_sizes: List[int] = []
+        start_time = time.time()
+        try:
+            if self.pool_kind == PoolKind.SWA:
+                cpu_ptrs, block_sizes, keys = self._preprocess_swa(transfer_op)
+            else:
+                cpu_ptrs, block_sizes, keys = self._preprocess_kv(transfer_op)
+            if len(keys) != expected_blocks:
+                raise ValueError(
+                    "Mooncake key count does not match transfer block count: "
+                    f"keys={len(keys)}, blocks={expected_blocks}")
+            block_results = self._transfer_impl(
+                cpu_ptrs, block_sizes, keys, transfer_op.transfer_type)
+            if len(block_results) != expected_blocks:
+                raise ValueError(
+                    "Mooncake result count does not match transfer block count: "
+                    f"results={len(block_results)}, blocks={expected_blocks}")
+            normalized_results = tuple(bool(result) for result in block_results)
+        except Exception:
+            # A completed failure must still reach the scheduler. Otherwise the
+            # graph never completes and its reserved cache blocks remain leaked.
+            flexkv_logger.error(
+                "Mooncake transfer failed; reporting all blocks unsuccessful "
+                f"for op_id={transfer_op.transfer_op_id}",
+                exc_info=True,
+            )
+            normalized_results = (False,) * expected_blocks
+        end_time = time.time()
+        try:
+            transfer_size = sum(block_sizes)
+            self._log_transfer_performance(
+                transfer_op, transfer_size, start_time, end_time)
+        except Exception:
+            flexkv_logger.error(
+                "Mooncake transfer performance logging failed; reporting the "
+                f"operation unsuccessful for op_id={transfer_op.transfer_op_id}",
+                exc_info=True,
+            )
+            normalized_results = (False,) * expected_blocks
+        if not all(normalized_results):
+            flexkv_logger.warning(
+                "Mooncake transfer partially failed: "
+                f"op_id={transfer_op.transfer_op_id}, "
+                f"successful={sum(normalized_results)}/{len(normalized_results)}")
+        return WorkerTransferResult(
+            transfer_op_id=transfer_op.transfer_op_id,
+            block_results=normalized_results,
+        )
+
+    def _preprocess_kv(self, transfer_op: WorkerTransferOp):
+        cpu_block_ids = (
+            transfer_op.dst_block_ids
+            if transfer_op.transfer_type == TransferType.REMOTE2H
+            else transfer_op.src_block_ids
+        )
+        assert transfer_op.mooncake_store_block_hashes is not None
+        block_size_bytes = self.block_size_bytes
+        base_ptr = self._cpu_buffer.data_ptr()
+        cpu_ptrs, block_sizes, keys = [], [], []
+        for i, blk_id in enumerate(cpu_block_ids):
+            key = build_key(
+                transfer_op.mooncake_store_block_hashes[i],
+                PoolKind.KV,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                node_layer_start=self.node_layer_start,
+                node_layer_end=self.node_layer_end,
+                total_layers=self.total_layers,
+            )
+            cpu_ptrs.append(base_ptr + int(blk_id) * block_size_bytes)
+            block_sizes.append(block_size_bytes)
+            keys.append(key)
+        return cpu_ptrs, block_sizes, keys
+
+    def _preprocess_swa(self, transfer_op: WorkerTransferOp):
+        """Build (cpu_ptrs, sizes, keys) for the SWA mooncake lane.
+
+        Each request contributes one (CPU slot id, tail_hash) pair; after batch
+        merging, ``cpu_block_ids`` and ``mooncake_store_swa_block_hashes`` both
+        hold N entries in the same order (one key per slot).
+        """
+        tail_hashes = transfer_op.mooncake_store_swa_block_hashes
+        if tail_hashes is None:
+            raise ValueError(
+                "SWA mooncake transfer requires mooncake_store_swa_block_hashes")
+        cpu_block_ids = (
+            transfer_op.dst_block_ids
+            if transfer_op.transfer_type == TransferType.REMOTE2H
+            else transfer_op.src_block_ids
+        )
+        if len(tail_hashes) != len(cpu_block_ids):
+            raise ValueError(
+                "SWA mooncake transfer requires len(swa_block_hashes) == "
+                f"len(cpu_block_ids): got {len(tail_hashes)} vs {len(cpu_block_ids)}")
+        block_size_bytes = self.block_size_bytes
+        base_ptr = self._cpu_buffer.data_ptr()
+        cpu_ptrs: List[int] = []
+        block_sizes: List[int] = []
+        keys: List[str] = []
+        for i, blk_id in enumerate(cpu_block_ids):
+            cpu_ptrs.append(base_ptr + int(blk_id) * block_size_bytes)
+            block_sizes.append(block_size_bytes)
+            keys.append(build_key(
+                str(tail_hashes[i]),
+                PoolKind.SWA,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                node_layer_start=self.node_layer_start,
+                node_layer_end=self.node_layer_end,
+                total_layers=self.total_layers,
+            ))
+        return cpu_ptrs, block_sizes, keys
+
+    def _postprocess(self, transfer_op: WorkerTransferOp) -> None:
+        pass

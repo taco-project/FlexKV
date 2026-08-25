@@ -9,7 +9,7 @@ import torch
 import zmq
 import numpy as np
 
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import ModelConfig, CacheConfig, LayerGroupSpec
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
@@ -30,6 +30,8 @@ from flexkv.server.request import (
     CheckRunningRequest,
     StartRequest,
     ShutdownRequest,
+    UnregisterDPClientRequest,
+    ResetRequest,
     PrefetchRequest,
     Response
 )
@@ -56,6 +58,7 @@ class KVDPClient:
         self._task_id_range = (self.dp_client_id * 10000000, (self.dp_client_id + 1) * 10000000)
         self._task_id_counter = self._task_id_range[0]
         self._task_id_lock = Lock()
+        self._rpc_lock = Lock()
         flexkv_logger.info(f"KVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
 
     def _get_task_id(self) -> int:
@@ -77,7 +80,11 @@ class KVDPClient:
         model_config: ModelConfig,
         client_recv_port: str,
     ) -> None:
-        register_req = RegisterDPClientRequest(self.dp_client_id, model_config, client_recv_port)
+        register_req = RegisterDPClientRequest(
+            dp_client_id=self.dp_client_id,
+            model_config=model_config,
+            client_recv_port=client_recv_port,
+        )
         self.send_to_server.send_pyobj(register_req)
         flexkv_logger.info(f"DP client {self.dp_client_id} registered to server request sent!")
 
@@ -89,6 +96,20 @@ class KVDPClient:
         response: Response = self.recv_from_server.recv_pyobj()
         return response.is_ready
 
+    def reset(self) -> None:
+        """Invalidate the shared FlexKV cache on the server (drop radix tree +
+        mempool on every tier).
+
+        Synchronous round-trip (mirrors is_ready): blocks until the server has
+        finished resetting. Only ONE client needs to call this — the cache is
+        global to the server process.
+        """
+        req = ResetRequest(self.dp_client_id)
+        self.send_to_server.send_pyobj(req)
+        response: Response = self.recv_from_server.recv_pyobj()
+        if response.error_msg:
+            raise RuntimeError(f"flexkv reset failed on server: {response.error_msg}")
+
     def put_async(
         self,
         token_ids: np.ndarray,
@@ -96,12 +117,14 @@ class KVDPClient:
         token_mask: Optional[np.ndarray],
         namespace: Optional[List[str]] = None,
     ) -> int:
-        req = PutRequest(self.dp_client_id,
-                         token_ids,
-                         slot_mapping,
-                         token_mask if token_mask is not None else None,
-                         self._get_task_id(),
-                         namespace)
+        req = PutRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask if token_mask is not None else None,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+        )
         self.send_to_server.send_pyobj(req)
         return req.task_id
 
@@ -111,11 +134,13 @@ class KVDPClient:
         token_mask: Optional[np.ndarray],
         namespace: Optional[List[str]] = None,
     ) -> Optional[Tuple[int, np.ndarray]]:
-        req = PutMatchRequest(self.dp_client_id,
-                              token_ids,
-                              token_mask if token_mask is not None else None,
-                              self._get_task_id(),
-                              namespace)
+        req = PutMatchRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            token_mask=token_mask if token_mask is not None else None,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+        )
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
         if response.error_msg is None:
@@ -128,8 +153,15 @@ class KVDPClient:
         self,
         token_ids: np.ndarray,
         namespace: Optional[List[str]] = None,
+        swa_aware: bool = False,
     ) -> int:
-        req = PrefetchRequest(self.dp_client_id, token_ids, self._get_task_id(), namespace)
+        req = PrefetchRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+            swa_aware=swa_aware,
+        )
         self.send_to_server.send_pyobj(req)
         return req.task_id
 
@@ -138,16 +170,16 @@ class KVDPClient:
         token_ids: np.ndarray,
         slot_mapping: np.ndarray,
         token_mask: Optional[np.ndarray],
-        layer_granularity: int,
         namespace: Optional[List[str]] = None,
     ) -> int:
-        req = GetRequest(self.dp_client_id,
-                         token_ids,
-                         slot_mapping,
-                         token_mask if token_mask is not None else None,
-                         self._get_task_id(),
-                         layer_granularity,
-                         namespace)
+        req = GetRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask if token_mask is not None else None,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+        )
         self.send_to_server.send_pyobj(req)
         return req.task_id
 
@@ -155,17 +187,19 @@ class KVDPClient:
         self,
         token_ids: np.ndarray,
         token_mask: Optional[np.ndarray],
-        layer_granularity: int,
         cpu_only: bool = False,
         namespace: Optional[List[str]] = None,
+        swa_aware: bool = False,
     ) -> Optional[Tuple[int, np.ndarray]]:
-        req = GetMatchRequest(self.dp_client_id,
-                              token_ids,
-                              token_mask if token_mask is not None else None,
-                              layer_granularity,
-                              cpu_only,
-                              self._get_task_id(),
-                              namespace)
+        req = GetMatchRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            token_mask=token_mask if token_mask is not None else None,
+            cpu_only=cpu_only,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+            swa_aware=swa_aware,
+        )
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
         if response.error_msg is None:
@@ -179,15 +213,28 @@ class KVDPClient:
         task_ids: List[int],
         slot_mappings: List[np.ndarray],
         as_batch: bool = False,
+        layerwise_transfer: bool = False,
+        counter_id: int = 0,
+        swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None,
     ) -> List[int]:
-        batch_id = -1
-        if as_batch:
-            batch_id = self._get_task_id()
-        req = LaunchTaskRequest(self.dp_client_id, task_ids, slot_mappings, as_batch, batch_id)
-        self.send_to_server.send_pyobj(req)
-        return [batch_id] if as_batch else task_ids
+        with self._rpc_lock:
+            batch_id = -1
+            if as_batch:
+                batch_id = self._get_task_id()
+            req = LaunchTaskRequest(
+                dp_client_id=self.dp_client_id,
+                task_ids=task_ids,
+                slot_mappings=slot_mappings,
+                swa_slot_mappings=swa_slot_mappings,
+                as_batch=as_batch,
+                batch_id=batch_id,
+                layerwise_transfer=layerwise_transfer,
+                counter_id=counter_id,
+            )
+            self.send_to_server.send_pyobj(req)
+            return [batch_id] if as_batch else task_ids
 
-    def cancel_task(
+    def cancel_tasks(
         self,
         task_ids: List[int],
     ) -> None:
@@ -200,7 +247,7 @@ class KVDPClient:
         wait_timeout: float = 20.0,
         completely: bool = False,
     ) -> Optional[Dict[int, KVResponse]]:
-        req = WaitRequest(self.dp_client_id, None, wait_task_ids, wait_timeout, completely)
+        req = WaitRequest(self.dp_client_id, wait_task_ids, wait_timeout, completely)
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
         if response.status is not None:
@@ -209,29 +256,36 @@ class KVDPClient:
                     flexkv_logger.error(f"wait task {k} failed: {v.status}")
             return response.status
         else:
-            flexkv_logger.error(f"wait tasks: {wait_task_ids} in DP {self.dp_client_id} failed.")
+            flexkv_logger.error(f"wait tasks: {wait_task_ids} in dp_client_id={self.dp_client_id} failed.")
             return None
 
     def try_wait(
         self,
         try_wait_task_ids: List[int],
     ) -> Optional[Dict[int, KVResponse]]:
-        req = TryWaitRequest(self.dp_client_id, None, try_wait_task_ids)
+        req = TryWaitRequest(self.dp_client_id, try_wait_task_ids)
 
-        self.send_to_server.send_pyobj(req)
-        response: Response = self.recv_from_server.recv_pyobj()
+        with self._rpc_lock:
+            self.send_to_server.send_pyobj(req)
+            response: Response = self.recv_from_server.recv_pyobj()
         if response.status is not None:
             for k, v in response.status.items():
                 if v.status != KVResponseStatus.SUCCESS:
                     flexkv_logger.error(f"try_wait task {k} failed: {v.status}")
             return response.status
         else:
-            flexkv_logger.error(f"try_wait tasks: {try_wait_task_ids} in DP {self.dp_client_id} failed.")
+            flexkv_logger.error(f"try_wait tasks: {try_wait_task_ids} in dp_client_id={self.dp_client_id} failed.")
             return None
 
     def shutdown(self) -> None:
         req = ShutdownRequest(self.dp_client_id)
         self.send_to_server.send_pyobj(req)
+
+    def unregister(self) -> None:
+        """Detach this client without stopping the shared KVServer."""
+        req = UnregisterDPClientRequest(self.dp_client_id)
+        self.send_to_server.send_pyobj(req)
+
 
 class KVTPClient:
     def __init__(
@@ -239,26 +293,111 @@ class KVTPClient:
         gpu_register_port: str,
         dp_client_id: int,
         device_id: int,
+        pp_rank: int = 0,
+        intra_client_id: int = 0,
     ):
+        """A TP-level GPU registration client."""
         # Init inter-process communication
         context = zmq.Context(2)
         self.send_to_server = get_zmq_socket(
             context, zmq.SocketType.PUSH, gpu_register_port, False
         )
+        self.gpu_control_socket = get_zmq_socket(
+            context, zmq.SocketType.REQ,
+            f"{gpu_register_port}_control", False,
+        )
+        self.gpu_control_socket.setsockopt(zmq.RCVTIMEO, 120000)
+        self.gpu_control_socket.setsockopt(zmq.SNDTIMEO, 120000)
+        self._exported_handles: List[TensorSharedHandle] = []
 
         self.dp_client_id = dp_client_id
+        self.pp_rank = pp_rank
+        self.intra_client_id = intra_client_id
         self.device_id = device_id
 
-        flexkv_logger.info(f"KVTPClient {device_id} of KVDPClient {self.dp_client_id} Initialized!")
+        flexkv_logger.info(
+            f"KVTPClient {device_id} Initialized! "
+            f"(gpu_register_port={gpu_register_port}, "
+            f"dp_client_id={dp_client_id}, pp_rank={pp_rank}, "
+            f"intra_client_id={intra_client_id})")
+
+    def set_slot_mapping(self, task_id: int, slot_mapping: np.ndarray) -> None:
+        """Send set_slot_mapping message to TransferManagerOnRemote via existing ZMQ channel.
+
+        Reuses the same PUSH socket (send_to_server) that connects to
+        TransferManagerOnRemote's command_socket — no separate IPC socket needed.
+        """
+        message = {
+            'type': 'set_slot_mapping',
+            'task_id': task_id,
+            'slot_mapping': slot_mapping,
+        }
+        try:
+            self.send_to_server.send_pyobj(message, flags=zmq.NOBLOCK)
+            flexkv_logger.debug(
+                f"KVTPClient {self.device_id}: set_slot_mapping sent for task_id={task_id}"
+            )
+        except zmq.Again:
+            flexkv_logger.warning(
+                f"KVTPClient {self.device_id}: zmq.Again when sending set_slot_mapping, "
+                f"retrying with blocking send..."
+            )
+            self.send_to_server.send_pyobj(message)
+            flexkv_logger.info(
+                f"KVTPClient {self.device_id}: set_slot_mapping sent (blocking retry) "
+                f"for task_id={task_id}"
+            )
+
+    def suspend_gpu_mappings(self) -> int:
+        self.gpu_control_socket.send_pyobj({
+            "type": "suspend_gpu",
+            "registration_key": (self.dp_client_id, self.intra_client_id),
+        })
+        response = self.gpu_control_socket.recv_pyobj()
+        if not response.get("ok"):
+            raise RuntimeError(
+                f"FlexKV GPU unmap failed: {response.get('error')}"
+            )
+        for handle in self._exported_handles:
+            handle.release_exported_vmm_handle()
+        self._exported_handles = []
+        return int(response.get("released_mappings", 0))
 
     def register_to_server(
         self,
         kv_caches: List[torch.Tensor],
         kv_layout: KVCacheLayout,
         override_device_id: Optional[int] = None,
+        layer_groups: Optional[List[LayerGroupSpec]] = None,
+        gpu_layouts: Optional[List[KVCacheLayout]] = None,
+        handles_per_group: Optional[List[List[torch.Tensor]]] = None,
+        swa_caches: Optional[List[torch.Tensor]] = None,
+        swa_layout: Optional[KVCacheLayout] = None,
+        swa_layer_groups: Optional[List[LayerGroupSpec]] = None,
+        swa_gpu_layouts: Optional[List[KVCacheLayout]] = None,
+        swa_handles_per_group: Optional[List[List[torch.Tensor]]] = None,
+        resume: bool = False,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
+        swa_group_fields = (
+            swa_layer_groups,
+            swa_gpu_layouts,
+            swa_handles_per_group,
+        )
+        if any(value is not None for value in swa_group_fields) and not all(
+            value is not None for value in swa_group_fields
+        ):
+            raise ValueError(
+                "swa_layer_groups, swa_gpu_layouts, and "
+                "swa_handles_per_group must be provided together"
+            )
+        if swa_layer_groups is not None and not (
+            len(swa_layer_groups)
+            == len(swa_gpu_layouts)
+            == len(swa_handles_per_group)
+        ):
+            raise ValueError("SWA multi-group registration length mismatch")
 
         # Use override_device_id if provided, otherwise use self.device_id
         device_id = override_device_id if override_device_id is not None else self.device_id
@@ -268,14 +407,93 @@ class KVTPClient:
             handle = TensorSharedHandle(tensor, device_id)
             handles.append(handle)
 
+        # Build per-group shared handles when multi-group registration is requested
+        # (heterogeneous KV layouts, including DSA/NSA indexer-as-group).
+        handles_per_group_shared: Optional[List[List[TensorSharedHandle]]] = None
+        if handles_per_group is not None:
+            handles_per_group_shared = []
+            for group_tensors in handles_per_group:
+                group_handles = [TensorSharedHandle(t, device_id) for t in group_tensors]
+                handles_per_group_shared.append(group_handles)
+
+        # SWA dedicated pool handles (channel B): build CUDA IPC handles for
+        # the sliding-window-attention GPU buffers so the FlexKV worker process
+        # can map them independently of the main-KV pool.
+        swa_handles_shared: Optional[List[TensorSharedHandle]] = None
+        if swa_caches is not None and len(swa_caches) > 0:
+            if not swa_caches[0].is_cuda:
+                raise ValueError("SWA blocks must be CUDA tensors")
+            swa_handles_shared = [TensorSharedHandle(t, device_id) for t in swa_caches]
+
+        swa_handles_per_group_shared: Optional[
+            List[List[TensorSharedHandle]]
+        ] = None
+        if swa_handles_per_group is not None:
+            swa_handles_per_group_shared = []
+            for group_tensors in swa_handles_per_group:
+                if not group_tensors or not group_tensors[0].is_cuda:
+                    raise ValueError("SWA group blocks must be non-empty CUDA tensors")
+                swa_handles_per_group_shared.append(
+                    [TensorSharedHandle(t, device_id) for t in group_tensors]
+                )
+
         register_req = RegisterTPClientRequest(
-            self.dp_client_id,
-            device_id,
-            handles,
-            kv_layout
+            dp_client_id=self.dp_client_id,
+            pp_rank=self.pp_rank,
+            intra_client_id=self.intra_client_id,
+            device_id=device_id,
+            handles=handles,
+            gpu_layout=kv_layout,
+            layer_groups=layer_groups,
+            gpu_layouts=gpu_layouts,
+            handles_per_group=handles_per_group_shared,
+            swa_handles=swa_handles_shared,
+            swa_layout=swa_layout,
+            swa_layer_groups=swa_layer_groups,
+            swa_gpu_layouts=swa_gpu_layouts,
+            swa_handles_per_group=swa_handles_per_group_shared,
         )
 
-        self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
+        exported_handles = list(handles)
+        for group in handles_per_group_shared or []:
+            exported_handles.extend(group)
+        exported_handles.extend(swa_handles_shared or [])
+        for group in swa_handles_per_group_shared or []:
+            exported_handles.extend(group)
+
+        if resume:
+            self.gpu_control_socket.send_pyobj({
+                "type": "resume_gpu",
+                "registration": register_req,
+            })
+            response = self.gpu_control_socket.recv_pyobj()
+            if not response.get("ok"):
+                raise RuntimeError(
+                    f"FlexKV GPU remap failed: {response.get('error')}"
+                )
+            self._exported_handles = exported_handles
+            flexkv_logger.info(
+                f"KVTPClient {device_id}: post-wake registration accepted "
+                f"(ready={response.get('ready')}, "
+                f"registered={response.get('registered')})"
+            )
+            return
+
+        try:
+            self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
+            self._exported_handles = exported_handles
+            flexkv_logger.info(
+                f"KVTPClient {device_id}: registration message sent "
+                f"(dp_client_id={self.dp_client_id}, pp_rank={self.pp_rank}, "
+                f"intra_client_id={self.intra_client_id}, "
+                f"num_kv_caches={len(kv_caches)})")
+        except zmq.Again:
+            flexkv_logger.error(
+                f"KVTPClient {device_id}: zmq.Again when sending registration "
+                f"(send buffer full or no connection). Retrying with blocking send...")
+            self.send_to_server.send_pyobj(register_req)
+            self._exported_handles = exported_handles
+            flexkv_logger.info(f"KVTPClient {device_id}: registration message sent (blocking retry)")
 
 
 if __name__ == "__main__":
@@ -289,8 +507,11 @@ if __name__ == "__main__":
     model_config = ModelConfig(num_layers=num_layers,
                                 num_kv_heads=num_kv_heads,
                                 head_size=head_size,
-                                use_mla=False,
+                                kv_dim=2,
                                 tp_size=tp_size,
                                 dtype=torch.float16)
-
-    dp_client = KVDPClient("ipc:///tmp/tmp6isie_et", model_config)
+    dp_client = KVDPClient(
+        "ipc:///tmp/tmp6isie_et",
+        model_config=model_config,
+        dp_client_id=0,
+    )

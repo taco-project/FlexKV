@@ -28,7 +28,8 @@ class BenchmarkConfig:
 def run_tp_client(dp_client_id, tp_rank, gpu_register_port, model_config, cache_config):
     """Run tp_client process"""
     device_id = tp_rank + dp_client_id * model_config.tp_size
-    tp_client = KVTPClient(gpu_register_port, dp_client_id, device_id)
+    tp_client = KVTPClient(gpu_register_port, dp_client_id, device_id,
+                           intra_client_id=tp_rank)
 
     num_gpu_blocks = cache_config.num_gpu_blocks
 
@@ -39,7 +40,7 @@ def run_tp_client(dp_client_id, tp_rank, gpu_register_port, model_config, cache_
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
 
     # Create GPU blocks for this tp_rank in the tp_client process
@@ -139,7 +140,7 @@ def benchmark_flexkv(model_config: ModelConfig,
                                       token_mask=None)
         batch_get_ids.append(task_id)
     get_match_time = time.time() - start_time
-    kvmanager.launch(batch_get_ids, batch_slot_mapping)
+    kvmanager.launch(batch_get_ids, batch_slot_mapping, as_batch=True, layerwise_transfer=False)
     get_result = kvmanager.wait(batch_get_ids)
     elapsed_time_get = time.time() - start_time
     cached_tokens = 0

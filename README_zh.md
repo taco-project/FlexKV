@@ -8,6 +8,18 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 ## Updates
 
+- **2026 年 7–8 月**：传输性能与可运维性全面增强，包括 [GPU↔CPU 自适应多路径传输](https://github.com/taco-project/FlexKV/pull/203)、[可靠性与运行日志增强](https://github.com/taco-project/FlexKV/pull/233)、[优雅退出](https://github.com/taco-project/FlexKV/pull/238)、[分块注册 Host Memory](https://github.com/taco-project/FlexKV/pull/240)、[SSD 向量化 I/O](https://github.com/taco-project/FlexKV/pull/242) 和 [Op 级传输 Trace](https://github.com/taco-project/FlexKV/pull/247)。
+
+- **2026 年 7 月 24 日**：支持将 [Mooncake Store](https://github.com/kvcache-ai/Mooncake) 作为基于 Key 的远端缓存层（[#231](https://github.com/taco-project/FlexKV/pull/231)），通过零拷贝 RDMA 实现集群级 KV 复用，并支持 DeepSeek-V4 的 SWA/state sidecar。
+
+- **2026 年 7 月 21 日**：FlexKV 完成 DeepSeek-V4 适配（[#225](https://github.com/taco-project/FlexKV/pull/225)），支持异构 C4/C128/indexer KV group、FullKV + SWA 双缓存、attention/indexer compress-state sidecar 以及逐层恢复。详见 [SGLang 集成说明](flexkv/integration/sglang/README.md)和 [DeepSeek-V4 设计文档](docs/dsv4_compress_state_io_zh.md)。
+
+- **2026 年 7 月 7 日**：🎉 FlexKV Connector 正式合入 [SGLang](https://github.com/sgl-project/sglang) 主干（[PR #29701](https://github.com/sgl-project/sglang/pull/29701)），可通过 `--enable-flexkv` 原生启用 CPU/SSD KV Cache Offloading。
+
+- **2026 年 7 月 7 日**：新增 vLLM 在 Blackwell GPU 上的 NVFP4 KV Cache 字节级无损卸载与恢复支持（[#204](https://github.com/taco-project/FlexKV/pull/204)）。
+
+- **2026 年 6 月 24 日**：新增 [逐层 KV 传输及 SGLang/Mooncake 集成](https://github.com/taco-project/FlexKV/commit/71dfa69)、[Pipeline Parallel 支持](https://github.com/taco-project/FlexKV/commit/1a91e7f)和 [HugePage Host Cache](docs/hugepage/README_zh.md)。
+
 - **2026 年 3 月 17 日**：🎉 FlexKV 正式合并进入 [vLLM](https://github.com/vllm-project/vllm) 官方主干（[PR #34328](https://github.com/vllm-project/vllm/pull/34328)）！从 **vLLM v0.17.2** 起，`FlexKVConnectorV1` 已内置，**无需再手动打 patch**。详见 [docs/vllm_adapter/README_zh.md](docs/vllm_adapter/README_zh.md)。
 
 - **2026 年 3 月 3 日**：🎉 FlexKV 正式合并进入 [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo)（[PR #5858](https://github.com/ai-dynamo/dynamo/pull/5858)）！FlexKV 成为 Dynamo 原生支持的 KV Cache Offloading 方案，实现 KV 感知路由与多级缓存卸载联合部署。详见 [docs/dynamo_integration/README_zh.md](docs/dynamo_integration/README_zh.md)。
@@ -36,6 +48,10 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 - 在 vLLM 集成中支持 dp > 1 ([#18](https://github.com/taco-project/FlexKV/pull/18))
 - 添加 vLLM 适配的启动脚本 ([#47](https://github.com/taco-project/FlexKV/pull/47))
 - 支持 vLLM+FlexKV 的 TP16 ([#59](https://github.com/taco-project/FlexKV/pull/59))
+
+针对 SGLang:
+- SGLang `v0.5.16` 及以上版本已原生内置 FlexKV backend，无需再应用 patch（[sglang#29701](https://github.com/sgl-project/sglang/pull/29701)）
+- 支持 DeepSeek-V4 异构 C4/C128/indexer KV group、FullKV + SWA 双缓存、compress-state sidecar 和逐层恢复（[#225](https://github.com/taco-project/FlexKV/pull/225)）。在配套的 SGLang 适配合入前，请使用 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 并固定到 [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac)。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)
 
 针对 TensorRT-LLM
 - 在 TensorRT-LLM 上支持使用 FlexKV ([#48](https://github.com/taco-project/FlexKV/pull/48))
@@ -145,6 +161,12 @@ FlexKV 原生集成了基于 Prometheus 的运行时监控框架，覆盖 Python
 
 完整的指标列表、环境变量配置、监控栈（Prometheus + Grafana）部署指南，请参阅 [docs/monitoring/README_zh.md](docs/monitoring/README_zh.md)。
 
+## 持续集成
+
+Pull Request 和受保护分支 push 会在 GitHub Actions 中构建 release wheel，并运行 CPU
+单元测试。Runner 配置、测试范围、参考耗时、本地复现步骤和产物上传规则详见
+[CI 文档](docs/ci/README_zh.md)。
+
 ## 分支策略
 
 本项目的分支管理策略如下：
@@ -158,6 +180,6 @@ FlexKV 原生集成了基于 Prometheus 的运行时监控框架，覆盖 Python
 ## Roadmap
 
 - **缓存引擎共进程化**：dev 分支将进一步优化 Cache Engine 的实现、集成和调用，并同步更新相关 API 支持
-- **加速框架支持**：对 vLLM、SGLang 等主流推理框架的适配将陆续发布
+- **加速框架支持**：深化 vLLM、SGLang 和 TensorRT-LLM 原生集成，并扩展更多推理引擎支持
 - **分布式查询支持**：实现可扩展的分布式 KVCache 查询能力
 - **延迟优化**：通过预取、压缩等手段进一步降低 *get* 请求延迟

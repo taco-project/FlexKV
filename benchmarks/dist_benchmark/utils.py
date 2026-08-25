@@ -109,7 +109,7 @@ def load_config(config_path: str) -> Tuple[ModelConfig, CacheConfig]:
         model_config.num_kv_heads = config["num_kv_heads"]
         model_config.head_size = config["head_size"]
         model_config.dtype = eval(f"torch.{config['dtype']}")
-        model_config.use_mla = config["use_mla"]
+        model_config.kv_dim = config.get("kv_dim", 2)
         model_config.tp_size = config["tp_size"]
         model_config.dp_size = config["dp_size"]
         cache_config.tokens_per_block = config["tokens_per_block"]
@@ -122,7 +122,7 @@ def load_config(config_path: str) -> Tuple[ModelConfig, CacheConfig]:
             user_config.ssd_cache_dir = parse_path_list(config["ssd_cache_dir"])
         if "enable_gds" in config:
             user_config.enable_gds = config["enable_gds"]
-        update_default_config_from_user_config(model_config, cache_config, user_config)
+        update_default_config_from_user_config(RankInfo(model_config=model_config), cache_config, user_config)
         return model_config, cache_config
 
 if __name__ == "__main__":

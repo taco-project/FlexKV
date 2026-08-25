@@ -1,11 +1,14 @@
 #pragma once
 #include <errno.h>
 #include <liburing.h>
-#include <linux/ioprio.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
+#include <fcntl.h>
 #include <torch/extension.h>
 #include <unistd.h>
 #include <vector>
+
+#include "logging.h"
 
 #ifndef IOPRIO_CLASS_SHIFT
 #define IOPRIO_CLASS_SHIFT 13
@@ -34,9 +37,10 @@ public:
       if (!io_uring_queue_init(_entries, &ring, flags)) {
         entries = _entries;
       } else {
-        fprintf(stderr,
-                "IOUring(%p) init failed, entries(%d), flags(%d), errno(%d)\n",
-                this, _entries, flags, errno);
+        FLEXKV_LOG_ERROR(
+            "operation=io_uring_init act=complete status=failed "
+            "entries=%d flags=%d errno=%d",
+            _entries, flags, errno);
       }
     }
 
@@ -50,8 +54,10 @@ public:
     }
     write_ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 4);
 
-    fprintf(stdout, "IOUring(%p) : RT ioprio %s\n", this,
-            rt_supported ? "supported" : "not supported, using BE");
+    FLEXKV_LOG_DEBUG(
+        "operation=io_uring_priority act=configure status=success "
+        "rt_ioprio=%s",
+        rt_supported ? "supported" : "unsupported fallback=best_effort");
   }
 
   ~IOUring() {
@@ -152,14 +158,52 @@ public:
     return 0;
   }
 
+  // Vectored I/O: readv/writev from a single offset into multiple buffers
+  int prep_readv(int fd, const struct iovec *iovs, int iovcnt, uint64_t offset) {
+    if (prepare()) {
+      total_over_limit++;
+      return -1;
+    }
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) return -1;
+    io_uring_prep_readv(sqe, fd, iovs, iovcnt, offset);
+    sqe->ioprio = read_ioprio;
+    prepared++;
+    return 0;
+  }
+
+  int prep_writev(int fd, const struct iovec *iovs, int iovcnt, uint64_t offset) {
+    if (prepare()) {
+      total_over_limit++;
+      return -1;
+    }
+    sqe = io_uring_get_sqe(&ring);
+    if (!sqe) return -1;
+    io_uring_prep_writev(sqe, fd, iovs, iovcnt, offset);
+    sqe->ioprio = write_ioprio;
+    prepared++;
+    return 0;
+  }
+
   void dump(int force) {
     if (force || total_cqe_err || total_over_limit) {
-      fprintf(
-          stdout,
-          "IOUring(%p) : entries = %d, inflight = %d, prepared = %d, "
-          "submitted = %lu, completed = %lu, over_limit = %lu, cqe_err = %lu\n",
-          this, entries, inflight, prepared, total_submitted, total_completed,
-          total_over_limit, total_cqe_err);
+      const char *status =
+          total_cqe_err || total_over_limit ? "degraded" : "success";
+      if (total_cqe_err || total_over_limit) {
+        FLEXKV_LOG_WARNING(
+            "operation=io_uring act=summary status=%s entries=%d "
+            "inflight=%d prepared=%d submitted=%lu completed=%lu "
+            "over_limit=%lu cqe_errors=%lu",
+            status, entries, inflight, prepared, total_submitted,
+            total_completed, total_over_limit, total_cqe_err);
+      } else {
+        FLEXKV_LOG_DEBUG(
+            "operation=io_uring act=summary status=%s entries=%d "
+            "inflight=%d prepared=%d submitted=%lu completed=%lu "
+            "over_limit=%lu cqe_errors=%lu",
+            status, entries, inflight, prepared, total_submitted,
+            total_completed, total_over_limit, total_cqe_err);
+      }
     }
   }
 
@@ -221,8 +265,10 @@ public:
         fd_direct_io = open(ssd_files[i][j].c_str(), O_RDWR | O_DIRECT);
 
         if (fd_buffer_io < 0 || fd_direct_io < 0) {
-          std::cerr << "open file failed, path = " << ssd_files[i][j]
-                    << std::endl;
+          FLEXKV_LOG_ERROR(
+              "operation=ssd_file_open act=complete status=failed "
+              "path=\"%s\" buffered_fd=%d direct_fd=%d errno=%d",
+              ssd_files[i][j].c_str(), fd_buffer_io, fd_direct_io, errno);
           throw std::runtime_error("Failed to open file");
         } else {
           posix_fadvise(fd_buffer_io, 0, 0, POSIX_FADV_SEQUENTIAL);
@@ -283,6 +329,7 @@ void transfer_kv_blocks_ssd(
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_kv_stride_in_bytes, int64_t chunk_size_in_bytes,
     int64_t block_stride_in_bytes, bool is_read, int num_blocks_per_file,
-    int round_robin = 1, int num_threads_per_device = 16, bool is_mla = false);
+    int round_robin = 1, int num_threads_per_device = 16,
+    int kv_dim = 2, bool ssd_io_opt = true);
 
 } // namespace flexkv
