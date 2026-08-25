@@ -1811,7 +1811,19 @@ class FlexKVConnector:
         kv_caches: List[torch.Tensor],
         indexer_buffers: List[torch.Tensor],
     ) -> List[LayerGroupSpec]:
-        _, num_kv_heads, head_size = kv_caches[0].shape
+        # Accept both GPU KV cache ranks (see _register_standard_to_server):
+        # 3D token-major (num_tokens, num_kv_heads, head_size) and 4D page-major
+        # (num_pages, num_kv_heads, page_size, head_size). Only the head and
+        # head_size axes are needed here, and both live at dim 1 and dim -1
+        # respectively in either form.
+        kv_tensor = kv_caches[0]
+        if kv_tensor.ndim not in (3, 4):
+            raise ValueError(
+                f"Expected 3D or 4D KV cache tensor, "
+                f"got shape={tuple(kv_tensor.shape)}"
+            )
+        num_kv_heads = kv_tensor.shape[1]
+        head_size = kv_tensor.shape[-1]
         return [
             LayerGroupSpec(
                 num_layers=self.rank_info.num_layers_per_pp_stage,
@@ -1965,21 +1977,56 @@ class FlexKVConnector:
         kv_caches: List[torch.Tensor],
         indexer_buffers: Optional[List[torch.Tensor]] = None,
     ) -> None:
-        assert (
-            kv_caches[0].ndim == 3
-        ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
+        # Two GPU KV cache shapes are supported, distinguished by rank:
+        #
+        #   3D — token-major (upstream sglang MHATokenToKVPool):
+        #        (size + page_size, num_kv_heads, head_size)
+        #        Dim 0 counts *tokens*, so the block count is size // page_size.
+        #
+        #   4D — page-major (Baidu Kunlun KlxMHATokenToKVPool):
+        #        (num_pages + 1, num_kv_heads, page_size, head_size)
+        #        Dim 0 already counts *pages*, so it must NOT be divided again.
+        #
+        # Note the 4D form is HND (head before page) whereas KVCacheLayout
+        # describes NHD (page before head). That mismatch is harmless here:
+        # transfers move whole blocks as opaque byte ranges, and every quantity
+        # the transfer path derives from the layout is a product over a shape
+        # suffix -- get_chunk_size() is tokens_per_block * num_head * head_size,
+        # and get_{block,kv,layer}_stride() are kv_shape[i:].numel() -- so the
+        # values are identical under either dim order. The per-block byte image
+        # differs, but it is written and read back through the same layout, so
+        # it stays self-consistent. Sub-block slicing would break this, and the
+        # only such path (kv_shared_across_ranks all_write) offsets by whole
+        # chunks, never into the head axis.
+        kv_tensor = kv_caches[0]
+        assert kv_tensor.ndim in (3, 4), (
+            f"Expected 3D (token-major) or 4D (page-major) KV cache tensor, "
+            f"got shape={tuple(kv_tensor.shape)}"
+        )
 
         # kv_dim from ModelConfig (MLA→1, non-MLA plain MHA→2). num_kv_heads is
         # the per-rank physical head count read from the GPU tensor (same value
         # used for num_head); for MLA the tensor's head axis is 1.
         kv_dim = self.model_config.kv_dim
-        num_blocks, num_kv_heads, head_size = kv_caches[0].shape
+
+        if kv_tensor.ndim == 4:
+            num_blocks, num_kv_heads, tokens_per_block, head_size = kv_tensor.shape
+            if tokens_per_block != self.page_size:
+                raise ValueError(
+                    f"4D KV cache tensor has page axis {tokens_per_block}, which "
+                    f"does not match sglang page_size={self.page_size}; "
+                    f"shape={tuple(kv_tensor.shape)}"
+                )
+        else:
+            num_tokens, num_kv_heads, head_size = kv_tensor.shape
+            tokens_per_block = self.page_size
+            num_blocks = num_tokens // self.page_size
 
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=self.rank_info.num_layers_per_pp_stage,
-            num_block=num_blocks // self.page_size,
-            tokens_per_block=self.page_size,
+            num_block=num_blocks,
+            tokens_per_block=tokens_per_block,
             num_head=num_kv_heads,
             head_size=head_size,
             kv_dim=kv_dim,
