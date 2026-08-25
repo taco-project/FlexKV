@@ -3,7 +3,7 @@
 #include <atomic>
 #include <cstdio>
 #include <fcntl.h>
-#include <nvtx3/nvToolsExt.h>
+#include "flexkv_nvtx.h"
 #include <stdexcept>
 #include <sys/eventfd.h>
 #include <unistd.h>

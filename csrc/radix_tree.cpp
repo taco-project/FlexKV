@@ -324,7 +324,7 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
   }
   assert(num_insert_blocks >= 0);
   assert(num_insert_blocks <= num_blocks);
-  assert(physical_block_ids.ndim() == 1);
+  assert(physical_block_ids.dim() == 1);
 
   if (last_node == nullptr) {
     auto match_result = match_prefix(block_hashes, num_blocks, true);
@@ -334,7 +334,7 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
   }
 
   assert(last_node != nullptr);
-  assert(physical_block_ids.size() == num_insert_blocks - num_matched_blocks);
+  assert(physical_block_ids.numel() == num_insert_blocks - num_matched_blocks);
 
   if (num_matched_blocks >= num_insert_blocks) {
     return nullptr;

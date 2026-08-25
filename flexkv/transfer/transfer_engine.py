@@ -21,7 +21,7 @@ import os
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import contextlib
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import numpy as np
 import torch
 

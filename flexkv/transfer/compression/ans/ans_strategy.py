@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional
 
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import torch
 
 from flexkv.common.storage import KVCacheLayoutType

@@ -5,7 +5,7 @@
 #include <fcntl.h>
 #include <map>
 #include <memory>
-#include <nvtx3/nvToolsExt.h>
+#include "flexkv_nvtx.h"
 #include <string>
 #include <sys/eventfd.h>
 #include <thread>

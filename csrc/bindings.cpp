@@ -9,7 +9,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
-#include <nvtx3/nvToolsExt.h>
+#include "flexkv_nvtx.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <sys/mman.h>

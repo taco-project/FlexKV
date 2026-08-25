@@ -8,7 +8,7 @@ from typing import Callable
 import multiprocessing as mp
 import copy
 from expiring_dict import ExpiringDict
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import numpy as np
 
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV

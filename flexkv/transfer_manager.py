@@ -11,7 +11,7 @@ from multiprocessing import Process, Pipe, Event
 from sympy.assumptions.assume import true
 import torch
 import zmq
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import tempfile
 import threading
 import numpy as np

@@ -22,7 +22,7 @@ from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field, replace
 
 import numpy as np
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import torch
 from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
 from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine

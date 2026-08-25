@@ -10,6 +10,187 @@ from setuptools import find_packages, setup
 from torch.utils import cpp_extension
 
 
+# ===========================================================================
+# Platform / capability detection
+# ===========================================================================
+#
+# FlexKV supports two classes of accelerator:
+#
+#   1. NVIDIA GPUs -- full functionality. nvcc compiles the custom PTX copy
+#      kernels in csrc/transfer.cu, and NVTX annotations feed Nsight Systems.
+#
+#   2. CUDA-like accelerators without an NVIDIA GPU, notably Baidu Kunlun
+#      P800. These expose a partial CUDA runtime (cudaMemcpyAsync, streams,
+#      events, IPC) through a vendor toolchain, but:
+#        * there is no nvcc and no PTX support, so device kernels cannot be
+#          compiled at all;
+#        * host<->device traffic can only use the Copy Engine, so a
+#          kernel-driven H2D/D2H would be impossible even if it compiled;
+#        * NVTX headers/libraries are absent.
+#      For these platforms FlexKV builds "CE-only": every .cu file compiles as
+#      ordinary host C++, and csrc/ce_transfer.cu (pure cudaMemcpyAsync, no
+#      kernel launches) provides the sole transfer path.
+#
+# Both modes are produced from the same sources, gated by two macros:
+#
+#   FLEXKV_ENABLE_KERNEL_TRANSFER  custom PTX kernels in transfer.cu
+#   FLEXKV_ENABLE_NVTX             real NVTX instead of the csrc/flexkv_nvtx.h
+#                                  no-op shim
+#
+# Detection is automatic; both can be forced with same-named environment
+# variables (set to 1/0).
+# ===========================================================================
+
+
+def _env_tristate(name):
+    """Read an optional boolean env var.
+
+    Returns True/False when the variable is set to a recognised value, and None
+    when it is unset -- letting the caller fall back to auto-detection.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _find_nvcc():
+    """Return the path to a usable nvcc, or None."""
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        return nvcc
+    candidate = os.path.join(
+        os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "nvcc")
+    return candidate if os.path.isfile(candidate) else None
+
+
+# Python modules whose mere presence identifies a vendor accelerator that
+# emulates CUDA rather than being one. These runtimes deliberately masquerade as
+# CUDA -- they ship a CUDA toolkit for headers/libcudart, report a
+# ``torch.version.cuda``, and even install shims named ``nvidia-smi`` -- so
+# neither nvcc's presence nor torch's CUDA version can distinguish them.
+#
+#   torch_xmlir : Baidu Kunlun (P800 and friends), via XPU/XCCL/BKCL
+#   torch_npu   : Huawei Ascend
+#
+# On such platforms device kernels cannot be compiled for the real accelerator,
+# and host<->device traffic is Copy-Engine-only, so FlexKV must build CE-only.
+_EMULATED_CUDA_MODULES = ("torch_xmlir", "torch_npu")
+
+
+def _detect_emulated_cuda_backend():
+    """Return the name of a detected non-NVIDIA CUDA-like backend, or None."""
+    for name in _EMULATED_CUDA_MODULES:
+        try:
+            if importlib.util.find_spec(name) is not None:
+                return name
+        except (ImportError, ValueError):
+            # find_spec can raise for half-installed packages; treat as absent.
+            continue
+    return None
+
+
+def _find_nvtx_header():
+    """Return an include dir containing nvtx3/nvToolsExt.h, or None.
+
+    torch always adds the CUDA include dir when building a CUDAExtension, so a
+    plain existence check against the usual locations is enough; we only need to
+    know whether the header is *available*, not to add a new -I flag.
+    """
+    roots = []
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home:
+        roots.append(os.path.join(cuda_home, "include"))
+    roots.extend([
+        "/usr/local/cuda/include",
+        "/usr/include",
+    ])
+    try:
+        import torch
+        roots.append(os.path.join(os.path.dirname(torch.__file__), "include"))
+    except ImportError:
+        pass
+
+    for root in roots:
+        if os.path.isfile(os.path.join(root, "nvtx3", "nvToolsExt.h")):
+            return root
+    return None
+
+
+def detect_kernel_transfer():
+    """Decide whether to compile the custom PTX copy kernels.
+
+    Three signals, checked in order of reliability:
+
+    1. An emulated-CUDA backend (torch_xmlir / torch_npu) is installed. This is
+       conclusive: the accelerator is not an NVIDIA GPU, so PTX kernels are
+       useless even if nvcc happens to be available. Kunlun P800 containers do
+       ship a full CUDA toolkit and a cu118 torch build, which is exactly why
+       this check must come first.
+    2. No nvcc -> nothing can compile device code.
+    3. torch is not a CUDA build -> device code could compile but not link.
+    """
+    forced = _env_tristate("FLEXKV_ENABLE_KERNEL_TRANSFER")
+    if forced is not None:
+        print("FLEXKV_ENABLE_KERNEL_TRANSFER forced to "
+              f"{int(forced)} by environment")
+        return forced
+
+    emulated = _detect_emulated_cuda_backend()
+    if emulated:
+        print(f"Detected {emulated} (CUDA-like non-NVIDIA accelerator) "
+              "-> CE-only build (custom copy kernels disabled)")
+        return False
+
+    nvcc = _find_nvcc()
+    if not nvcc:
+        print("No nvcc found -> CE-only build (custom copy kernels disabled)")
+        return False
+
+    try:
+        import torch
+        torch_cuda = torch.version.cuda
+    except ImportError:
+        torch_cuda = None
+
+    if not torch_cuda:
+        print(f"nvcc found at {nvcc} but torch is not a CUDA build "
+              "-> CE-only build (custom copy kernels disabled)")
+        return False
+
+    print(f"nvcc found at {nvcc} (torch CUDA {torch_cuda}) "
+          "-> enabling custom copy kernels")
+    return True
+
+
+def detect_nvtx():
+    """Decide whether to compile against real NVTX.
+
+    NVTX is only meaningful on NVIDIA hardware: the events are consumed by
+    Nsight Systems talking to the NVIDIA driver. Kunlun P800 images do ship the
+    CUDA toolkit (and therefore the NVTX header), so the emulated-backend check
+    has to take precedence over header discovery -- otherwise every P800 build
+    would link NVTX that can never emit anything useful.
+    """
+    forced = _env_tristate("FLEXKV_ENABLE_NVTX")
+    if forced is not None:
+        print(f"FLEXKV_ENABLE_NVTX forced to {int(forced)} by environment")
+        return forced
+
+    emulated = _detect_emulated_cuda_backend()
+    if emulated:
+        print(f"Detected {emulated} (CUDA-like non-NVIDIA accelerator) "
+              "-> using no-op NVTX shim")
+        return False
+
+    header_root = _find_nvtx_header()
+    if header_root:
+        print(f"NVTX header found under {header_root} -> enabling NVTX")
+        return True
+    print("NVTX header (nvtx3/nvToolsExt.h) not found -> using no-op NVTX shim")
+    return False
+
+
 class NvcompInfo(NamedTuple):
     include_dirs: list
     lib_dir: str
@@ -305,11 +486,31 @@ enable_nvcomp = os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") == "1"
 # FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
 enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 
+# Platform capabilities (see the block at the top of this file).
+enable_kernel_transfer = detect_kernel_transfer()
+enable_nvtx = detect_nvtx()
+
+if enable_gds and not enable_kernel_transfer:
+    raise RuntimeError(
+        "FLEXKV_ENABLE_GDS=1 requires the custom-kernel build: the GDS layout "
+        "transform (csrc/gds/layout_transform.cu) is a CUDA kernel and needs "
+        "nvcc. Disable GDS on Copy-Engine-only platforms."
+    )
+if enable_nvcomp and not enable_kernel_transfer:
+    raise RuntimeError(
+        "FLEXKV_ENABLE_NVCOMP=1 requires the custom-kernel build: nvCOMP ANS "
+        "compression runs in CUDA kernels and needs nvcc plus libnvcomp. "
+        "Disable nvCOMP on Copy-Engine-only platforms."
+    )
+
 # Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
     "csrc/bindings.cpp",
     "csrc/logging.cpp",
-    "csrc/transfer.cu",  # Skip CUDA file for now
+    # transfer.cu holds both the custom PTX kernels (compiled only when
+    # FLEXKV_ENABLE_KERNEL_TRANSFER is defined) and the host dispatcher that
+    # routes to the CE implementation, so it is always built.
+    "csrc/transfer.cu",
     "csrc/ce_transfer.cu",
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
@@ -320,9 +521,70 @@ cpp_sources = [
     "csrc/monitoring/metrics_manager.cpp",  # Monitoring support
 ]
 
+
+def _host_compile_cuda_sources(sources):
+    """Route .cu sources through the host compiler for CE-only builds.
+
+    torch's ``BuildExtension`` dispatches purely on file extension: any ``.cu``
+    entry is handed to nvcc, and nvcc invocations always go through
+    ``_get_cuda_arch_flags()``. On a machine with no NVIDIA GPU that helper
+    finds an empty arch list and dies with::
+
+        File ".../torch/utils/cpp_extension.py", line 1984, in _get_cuda_arch_flags
+            arch_list[-1] += '+PTX'
+        IndexError: list index out of range
+
+    In a CE-only build the two ``.cu`` files contain no device code at all --
+    the kernels in transfer.cu are behind ``FLEXKV_ENABLE_KERNEL_TRANSFER`` and
+    ce_transfer.cu is pure ``cudaMemcpyAsync`` host code -- so nvcc is not
+    merely unavailable, it is unnecessary.
+
+    Rather than pinning a fake ``TORCH_CUDA_ARCH_LIST`` (which would bake
+    -gencode flags for GPUs that do not exist, and still route the files through
+    a toolchain that cannot target the real accelerator), mirror each ``.cu``
+    into ``build/host_src`` under a ``.cpp`` name and compile that instead.
+
+    Symlinks are used so the mirrored files always track the originals; ``#line``
+    accuracy is preserved because the compiler still reads the real content, and
+    diagnostics point at the link path which resolves to the true source. Plain
+    copies are used as a fallback on filesystems without symlink support.
+    """
+    mirror_dir = os.path.join(build_dir, "host_src")
+    os.makedirs(mirror_dir, exist_ok=True)
+
+    rerouted = []
+    for src in sources:
+        if not src.endswith(".cu"):
+            rerouted.append(src)
+            continue
+
+        # Keep the original stem so object files and diagnostics stay readable,
+        # e.g. csrc/transfer.cu -> build/host_src/transfer.cu.cpp
+        mirrored = os.path.join(mirror_dir, os.path.basename(src) + ".cpp")
+        abs_src = os.path.abspath(src)
+
+        if os.path.islink(mirrored) or os.path.exists(mirrored):
+            os.remove(mirrored)
+        try:
+            os.symlink(abs_src, mirrored)
+        except (OSError, NotImplementedError):
+            shutil.copy2(abs_src, mirrored)
+
+        print(f"CE-only build: compiling {src} as host C++ via {mirrored}")
+        rerouted.append(mirrored)
+
+    return rerouted
+
+
+if not enable_kernel_transfer:
+    cpp_sources = _host_compile_cuda_sources(cpp_sources)
+
 hpp_sources = [
     "csrc/logging.h",
     "csrc/cache_utils.h",
+    "csrc/flexkv_nvtx.h",
+    "csrc/gtensor_handler.cuh",
+    "csrc/transfer.cuh",
     "csrc/tp_transfer_thread_group.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
@@ -344,16 +606,40 @@ if enable_cputest:
     # Set TORCH_CUDA_ARCH_LIST to avoid IndexError when no GPU is available
     os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
 
+# libcuda is the NVIDIA *driver* API (cuInit/cuMemCreate/cuIpc*/...). FlexKV
+# never calls it: all device interaction goes through the CUDA *runtime*
+# (cudaMemcpyAsync, cudaStream*, cudaEvent*, cudaMallocHost), which lives in
+# libcudart and is linked by torch's CUDAExtension already.
+#
+# On CUDA-like non-NVIDIA accelerators there is no real libcuda.so at all -- a
+# Kunlun P800 image only ships the toolkit's stub under lib64/stubs. Linking
+# that stub is worse than not linking it: the build would succeed and then abort
+# at dlopen/first-call time with an unhelpful error. Dropping the flag keeps the
+# link honest, and costs nothing because no symbol from it is referenced.
+if not enable_kernel_transfer and "-lcuda" in extra_link_args:
+    extra_link_args.remove("-lcuda")
+    print("CE-only build: dropping -lcuda (driver API unused; no libcuda.so "
+          "outside NVIDIA platforms)")
+
 
 # Prometheus libraries only when metrics enabled
 if enable_metrics:
     extra_link_args.extend(["-lprometheus-cpp-pull", "-lprometheus-cpp-core"])
 else:
     print("FLEXKV_ENABLE_METRICS=0: building without Prometheus monitoring")
-# Auto-detect GPU architecture if TORCH_CUDA_ARCH_LIST is not explicitly set
-if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
-    os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
-print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
+
+# TORCH_CUDA_ARCH_LIST drives nvcc's -gencode flags, so it is only meaningful
+# when device code is actually compiled. On CE-only builds nvcc never runs;
+# probing arches there would either fail (no nvcc) or, worse, succeed against an
+# unrelated CUDA toolkit and bake in -gencode flags for GPUs that do not exist.
+if enable_kernel_transfer:
+    # Auto-detect GPU architecture if TORCH_CUDA_ARCH_LIST is not explicitly set
+    if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
+    print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
+else:
+    print("CE-only build: skipping TORCH_CUDA_ARCH_LIST detection "
+          "(no device code is compiled)")
 
 extra_compile_args = [
     "-std=c++17",
@@ -419,6 +705,36 @@ if not enable_gds:
     print("ENABLE_GDS = false: Skipping GDS code")
 if not enable_p2p:
     print("ENABLE_P2P = false: Skipping distributed (P2P/Redis) code; no libhiredis or Redis deps required")
+
+# ---------------------------------------------------------------------------
+# Apply the platform-capability macros to both compilers.
+#
+# Every macro must be passed to the cxx *and* nvcc arg lists: torch's
+# CUDAExtension routes .cu files through nvcc and .cpp files through the host
+# compiler, and headers such as csrc/layerwise.h (which declares
+# nvtxRangeId_t parameters) are included from both kinds of translation unit.
+# A macro visible to only one of them would produce mismatched declarations and
+# fail at link time -- or worse, silently produce an ODR violation.
+# ---------------------------------------------------------------------------
+_capability_macros = []
+if enable_kernel_transfer:
+    _capability_macros.append("-DFLEXKV_ENABLE_KERNEL_TRANSFER")
+    print("ENABLE_KERNEL_TRANSFER = true: compiling custom PTX copy kernels")
+else:
+    print("ENABLE_KERNEL_TRANSFER = false: Copy-Engine-only transfer "
+          "(csrc/transfer.cu kernels are compiled out). "
+          "Remember to set FLEXKV_USE_CE_TRANSFER_H2D=1 and "
+          "FLEXKV_USE_CE_TRANSFER_D2H=1 at runtime.")
+
+if enable_nvtx:
+    _capability_macros.append("-DFLEXKV_ENABLE_NVTX")
+    print("ENABLE_NVTX = true: compiling with real NVTX ranges")
+else:
+    print("ENABLE_NVTX = false: NVTX ranges compile to no-ops "
+          "(csrc/flexkv_nvtx.h shim)")
+
+extra_compile_args.extend(_capability_macros)
+nvcc_compile_args.extend(_capability_macros)
 
 cpp_extensions = [
     cpp_extension.CUDAExtension(
@@ -491,8 +807,24 @@ class CustomBuildExt(cpp_extension.BuildExtension):
                     shutil.copy2(source_file, dest_file)
                     print(f"Copied {source_file} to {dest_file}")
 
-with open("requirements.txt") as f:
-    install_requires = f.read().splitlines()
+def _parse_requirements(path):
+    """Read a pip requirements file, dropping comments and blank lines.
+
+    requirements.txt documents why nvtx is optional, so it contains comment and
+    blank lines that must not reach ``install_requires`` -- setuptools would
+    otherwise try to parse them as requirement specifiers and fail.
+    """
+    reqs = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            reqs.append(line)
+    return reqs
+
+
+install_requires = _parse_requirements("requirements.txt")
 
 setup(
     name="flexkv",
@@ -504,6 +836,12 @@ setup(
     },
     include_package_data=True,
     install_requires=install_requires,
+    extras_require={
+        # NVIDIA-only profiling annotations; see requirements.txt and
+        # flexkv/common/nvtx_compat.py. Omitted from install_requires so that
+        # FlexKV installs cleanly on Copy-Engine-only accelerators.
+        "nvtx": ["nvtx>=0.2.8"],
+    },
     ext_modules=ext_modules,  # Now contains both C++ and Cython modules as needed
     cmdclass={
         "build_ext": CustomBuildExt.with_options(

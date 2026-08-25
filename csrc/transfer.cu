@@ -26,6 +26,26 @@
 
 namespace flexkv {
 
+// ============================================================================
+// Custom-kernel copy path (NVIDIA-only)
+// ============================================================================
+//
+// The kernels below move KV chunks with hand-written inline PTX
+// (``ld.global.nc`` / ``st.global.cg``). PTX is NVIDIA's virtual ISA, so this
+// code can only be compiled by nvcc and can only run on NVIDIA GPUs.
+//
+// Accelerators that expose a partial CUDA runtime without an NVIDIA GPU --
+// Baidu Kunlun P800 in particular -- cannot compile PTX at all, and cannot
+// perform H2D/D2H via device kernels even in principle: their only host<->device
+// path is the Copy Engine (i.e. ``cudaMemcpyAsync``). For those platforms the
+// whole block is compiled out and the CE implementation in ce_transfer.cu
+// becomes the only transfer path.
+//
+// ``FLEXKV_ENABLE_KERNEL_TRANSFER`` is defined by setup.py whenever a usable
+// nvcc is detected; see the notes there. Everything outside this guard is plain
+// host code that compiles with a normal C++ compiler.
+#if defined(FLEXKV_ENABLE_KERNEL_TRANSFER)
+
 #define FLOAT4_PTR(ptr) reinterpret_cast<float4 *>(ptr)
 
 constexpr int kFloat4AlignBytes = 16;
@@ -157,6 +177,8 @@ __global__ void transfer_kv_blocks_kernel(
   }
 }
 
+#endif // FLEXKV_ENABLE_KERNEL_TRANSFER
+
 // ============================================================================
 // Main host function
 // ============================================================================
@@ -173,9 +195,6 @@ void transfer_kv_blocks(
     int64_t gpu_block_stride_in_bytes, bool sync,
     const CETransferConfig &ce_config, bool enable_trace) {
 
-  int block_size = 1024;
-  int block_count = transfer_num_cta;
-
   int64_t *cpu_ptr_int64 = reinterpret_cast<int64_t *>(cpu_ptr);
   int64_t cpu_kv_stride_int64 = cpu_kv_stride_in_bytes / sizeof(int64_t);
   int64_t cpu_block_stride_int64 = cpu_block_stride_in_bytes / sizeof(int64_t);
@@ -184,10 +203,20 @@ void transfer_kv_blocks(
       cpu_startoff_inside_chunks / sizeof(int64_t);
   int64_t gpu_startoff_inside_chunks_int64 =
       gpu_startoff_inside_chunks / sizeof(int64_t);
+
+#if defined(FLEXKV_ENABLE_KERNEL_TRANSFER)
+  // Launch geometry and the int64-element chunk size are only consumed by the
+  // custom-kernel branch below; declaring them unconditionally would trip
+  // -Wunused-variable (and thus -Werror) on CE-only builds.
+  int block_size = 1024;
+  int block_count = transfer_num_cta;
   int64_t chunk_size_in_int64 = chunk_size_in_bytes / sizeof(int64_t);
 
   dim3 blockDim(block_size);
   dim3 gridDim(block_count);
+#else
+  (void)transfer_num_cta;
+#endif
 
   // CE transfer mode
   if (use_ce_transfer) {
@@ -275,6 +304,7 @@ void transfer_kv_blocks(
       }
     }  // end else (path_opt_enabled)
   } else {
+#if defined(FLEXKV_ENABLE_KERNEL_TRANSFER)
     // Custom kernel transfer. Choose the float4 (16B) vs int64 (8B) copy path
     // based on alignment; the 8b path handles kv_shared_across_ranks D2H (num_kv_heads==1) where per-TP
     // shard offsets are 8-aligned but not 16-aligned (e.g. DSv4).
@@ -297,6 +327,19 @@ void transfer_kv_blocks(
           cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
           chunk_size_in_int64, kv_dim, is_host_to_device);
     }
+#else
+    // CE-only build (e.g. Kunlun P800): there is no device-kernel H2D/D2H path.
+    // Reaching here means the caller left use_ce_transfer=false, which cannot
+    // be honoured. Fail loudly with an actionable message instead of silently
+    // copying nothing -- a silent no-op would surface much later as corrupted
+    // KV cache contents.
+    TORCH_CHECK(false,
+                "FlexKV was built without the custom-kernel transfer path "
+                "(FLEXKV_ENABLE_KERNEL_TRANSFER undefined), but "
+                "transfer_kv_blocks was called with use_ce_transfer=false. "
+                "On Copy-Engine-only platforms set FLEXKV_USE_CE_TRANSFER_H2D=1 "
+                "and FLEXKV_USE_CE_TRANSFER_D2H=1.");
+#endif
   }
   if (sync) {
     auto sync_t0 = std::chrono::steady_clock::now();

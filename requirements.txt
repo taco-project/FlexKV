@@ -3,7 +3,6 @@ torch>=1.10.0
 numpy>=1.20.0
 pyzmq>=22.0.0
 psutil>=5.8.0
-nvtx>=0.2.8
 pyyaml>=5.4.0
 Cython>=3.0.10
 pytest>=6.0.0
@@ -11,3 +10,18 @@ pytest-benchmark>=3.0.0
 expiring-dict==1.1.2
 redis>=4.0.0
 requests>=2.0.0
+
+# --- Optional / platform-specific ---
+#
+# nvtx (NVIDIA Tools Extension) provides the Nsight Systems annotations used by
+# flexkv.common.nvtx_compat. It is NVIDIA-only and is deliberately NOT a hard
+# requirement: on CUDA-like accelerators without an NVIDIA GPU (e.g. Baidu
+# Kunlun P800) the wheel is generally not installable, and there is no profiler
+# to consume the events. flexkv.common.nvtx_compat transparently falls back to
+# zero-overhead no-op stubs when the package is missing, so FlexKV runs
+# unchanged either way.
+#
+# Install it explicitly on NVIDIA hosts to get profiler timelines:
+#     pip install 'nvtx>=0.2.8'
+# ...or via the extra declared in setup.py:
+#     pip install '.[nvtx]'
