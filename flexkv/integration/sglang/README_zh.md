@@ -6,12 +6,12 @@
 
 SGLang 目前有两条不同的 FlexKV 集成路径，请根据模型选择。
 
-> 状态最后确认日期：2026 年 8 月 6 日。
+> 状态最后确认日期：2026 年 8 月 26 日。
 
 | 使用场景 | SGLang 版本 | 是否需要 patch |
 | --- | --- | --- |
 | 普通模型 | SGLang `v0.5.16` 及以上版本，或较新的 `main` | 不需要 |
-| DeepSeek V4 | SGLang PR [#31781](https://github.com/sgl-project/sglang/pull/31781)，固定到 commit [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac) | 不需要本地 patch；使用指定的 SGLang commit |
+| DeepSeek V4 | SGLang PR [#31781](https://github.com/sgl-project/sglang/pull/31781) 及其 [radix restore 后续修复](https://github.com/XingLiu1/sglang/pull/3)，固定到 commit [`2764e91`](https://github.com/XingLiu1/sglang/commit/2764e9198ec258a26be89bea633d432d18a5f926) | 不需要本地 patch；使用指定的 SGLang commit |
 
 ### 普通模型：直接使用 SGLang 官方版本
 
@@ -38,8 +38,18 @@ SGLang 正式版本或 `main`，而应拉取该 PR 并固定到下面的 commit�
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 git fetch origin pull/31781/head
-git checkout -b flexkv-dsv4 ee0465a09196421a6e4d53a3103eccdef1dd32ac
+git remote add xingliu https://github.com/XingLiu1/sglang.git
+git fetch xingliu fix/flexkv-radix-restore-ownership
+git checkout -b flexkv-dsv4 2764e9198ec258a26be89bea633d432d18a5f926
 ```
+
+该后续修复会让 layerwise restore 的所有权一直保留在已 admission 的请求上，直到正常的
+cache completion；避免在 admission 前的 prefix lookup 阶段把 GPU slot 挂入 radix tree，
+从而防止相同 prefix 的并发请求留下失效但仍可被驱逐的叶子节点。与当前固定 commit
+功能一致的格式化前版本已在 MI308X 通过针对性单测，最终 pin 只补充 Black 格式化；它的
+前一候选还通过了 Day 675 缩小规模和全量崩溃验证。两者仅
+相差通用 `radix_cache.py` 中一处纯防御校验，该改动在最终 review 时已移除，移除后未重复
+执行全量回放。
 
 同时使用当前 FlexKV `main` 分支：
 

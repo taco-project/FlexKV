@@ -7,12 +7,12 @@
 There are two different SGLang integration paths. Choose the one that matches
 your model.
 
-> Status last checked: August 6, 2026.
+> Status last checked: August 26, 2026.
 
 | Use case | SGLang version | Patch required? |
 | --- | --- | --- |
 | Standard models | SGLang `v0.5.16` or later, or a recent `main` | No |
-| DeepSeek V4 | SGLang PR [#31781](https://github.com/sgl-project/sglang/pull/31781), pinned to commit [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac) | No local patch; use the pinned SGLang commit |
+| DeepSeek V4 | SGLang PR [#31781](https://github.com/sgl-project/sglang/pull/31781) plus the [radix-restore follow-up](https://github.com/XingLiu1/sglang/pull/3), pinned to commit [`2764e91`](https://github.com/XingLiu1/sglang/commit/2764e9198ec258a26be89bea633d432d18a5f926) | No local patch; use the pinned SGLang commit |
 
 ### Standard models: use upstream SGLang directly
 
@@ -40,8 +40,20 @@ alone:
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 git fetch origin pull/31781/head
-git checkout -b flexkv-dsv4 ee0465a09196421a6e4d53a3103eccdef1dd32ac
+git remote add xingliu https://github.com/XingLiu1/sglang.git
+git fetch xingliu fix/flexkv-radix-restore-ownership
+git checkout -b flexkv-dsv4 2764e9198ec258a26be89bea633d432d18a5f926
 ```
+
+The follow-up keeps layerwise restore ownership with the admitted request until
+normal cache completion. This avoids attaching GPU slots to the radix tree
+during pre-admission prefix lookup and prevents duplicate-prefix requests from
+leaving a stale evictable leaf. The functionally identical pre-format commit
+passed the focused tests on MI308X; the final pin only adds Black formatting.
+Its preceding candidate also passed the reduced/full Day 675 crash
+validation; that candidate differed only by a defensive check in generic
+`radix_cache.py`, which was removed during final review. The full replay was not
+repeated after that review-only removal.
 
 Use this with the current FlexKV `main` branch:
 
