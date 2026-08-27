@@ -11,9 +11,10 @@ import numpy as np
 import torch
 
 from flexkv.common.transfer import TransferOp, TransferType, LayerwiseTransferOp
-from flexkv.transfer.worker import GPUCPUTransferWorker, CPUSSDDiskTransferWorker, WorkerHandle, tpGPUCPUTransferWorker, \
-    GDSTransferWorker, tpGDSTransferWorker
-from flexkv.transfer.layerwise import LayerwiseTransferWorker, build_layerwise_eventfd_socket_path
+from flexkv.transfer.worker import GPUCPUTransferWorker, CPUSSDDiskTransferWorker, WorkerHandle, \
+    GDSTransferWorker
+from flexkv.transfer.layer_eventfd import build_layerwise_eventfd_socket_path
+from flexkv.transfer.completion import CompletionContract
 from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator
 from flexkv.common.storage import KVCacheLayoutType, KVCacheLayout
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV
@@ -129,38 +130,22 @@ def create_cpu_gpu_worker(
     max_block_num = max(1024, cache_config.num_cpu_blocks)
     op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
 
-    if model_config.tp_size == 1:
-        worker_handle = GPUCPUTransferWorker.create_worker(
-            mp_ctx=mp.get_context('spawn'),
-            finished_ops_queue=finished_ops_queue,
-            op_buffer_tensor=op_buffer_tensor,
-            gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-            cpu_blocks=cpu_handle.get_tensor(),
-            gpu_kv_layout=gpu_handles[0].kv_layout,
-            cpu_kv_layout=cpu_handle.kv_layout,
-            dtype=model_config.dtype,
-            gpu_device_id=0,
-            use_ce_transfer_h2d=use_ce_transfer,
-            use_ce_transfer_d2h=use_ce_transfer,
-            transfer_num_cta_h2d=transfer_num_cta,
-            transfer_num_cta_d2h=transfer_num_cta,
-        )
-    else:
-        worker_handle = tpGPUCPUTransferWorker.create_worker(
-            mp_ctx=mp.get_context('spawn'),
-            finished_ops_queue=finished_ops_queue,
-            op_buffer_tensor=op_buffer_tensor,
-            gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
-            cpu_blocks=cpu_handle.get_tensor(),
-            gpu_kv_layouts=[gpu_handles[tp_id].kv_layout for tp_id in range(model_config.tp_size)],
-            cpu_kv_layout=cpu_handle.kv_layout,
-            dtype=model_config.dtype,
-            tp_group_size=model_config.tp_size,
-            use_ce_transfer_h2d=use_ce_transfer,
-            use_ce_transfer_d2h=use_ce_transfer,
-            transfer_num_cta_h2d=transfer_num_cta,
-            transfer_num_cta_d2h=transfer_num_cta,
-        )
+    # One worker class for every TP width, tp_size==1 included.
+    worker_handle = GPUCPUTransferWorker.create_worker(
+        mp_ctx=mp.get_context('spawn'),
+        finished_ops_queue=finished_ops_queue,
+        op_buffer_tensor=op_buffer_tensor,
+        gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
+        cpu_blocks=cpu_handle.get_tensor(),
+        gpu_kv_layouts=[gpu_handles[tp_id].kv_layout for tp_id in range(model_config.tp_size)],
+        cpu_kv_layout=cpu_handle.kv_layout,
+        dtype=model_config.dtype,
+        tp_group_size=model_config.tp_size,
+        use_ce_transfer_h2d=use_ce_transfer,
+        use_ce_transfer_d2h=use_ce_transfer,
+        transfer_num_cta_h2d=transfer_num_cta,
+        transfer_num_cta_d2h=transfer_num_cta,
+    )
     return (
         worker_handle,
         finished_ops_queue,
@@ -288,32 +273,21 @@ def create_gpu_ssd_worker(
     max_block_num = max(1024, cache_config.num_ssd_blocks)
     op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
 
-    if model_config.tp_size == 1:
-        worker_handle = GDSTransferWorker.create_worker(
-            mp_ctx=mp.get_context('spawn'),
-            finished_ops_queue=finished_ops_queue,
-            op_buffer_tensor=op_buffer_tensor,
-            gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-            ssd_files=ssd_handle.get_file_list(),
-            num_blocks_per_file=ssd_handle.num_blocks_per_file,
-            gpu_kv_layout=gpu_handles[0].kv_layout,
-            ssd_kv_layout=ssd_handle.kv_layout,
-            dtype=model_config.dtype,
-            gpu_device_id=0,
-        )
-    else:
-        worker_handle = tpGDSTransferWorker.create_worker(
-            mp_ctx=mp.get_context('spawn'),
-            finished_ops_queue=finished_ops_queue,
-            op_buffer_tensor=op_buffer_tensor,
-            gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
-            ssd_files=ssd_handle.get_file_list(),
-            num_blocks_per_file=ssd_handle.num_blocks_per_file,
-            gpu_kv_layouts=[gpu_handles[tp_id].kv_layout for tp_id in range(model_config.tp_size)],
-            ssd_kv_layout=ssd_handle.kv_layout,
-            dtype=model_config.dtype,
-            tp_group_size=model_config.tp_size,
-        )
+    # One worker class for every TP width, tp_size==1 included: the thread
+    # group spawns one thread/stream/GDSManager per GPU either way.
+    worker_handle = GDSTransferWorker.create_worker(
+        mp_ctx=mp.get_context('spawn'),
+        finished_ops_queue=finished_ops_queue,
+        op_buffer_tensor=op_buffer_tensor,
+        gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
+        ssd_files=ssd_handle.get_file_list(),
+        num_blocks_per_file=ssd_handle.num_blocks_per_file,
+        gpu_kv_layouts=[gpu_handles[tp_id].kv_layout for tp_id in range(model_config.tp_size)],
+        ssd_kv_layout=ssd_handle.kv_layout,
+        dtype=model_config.dtype,
+        tp_group_size=model_config.tp_size,
+        dp_group_id=0,
+    )
     return (
         worker_handle,
         finished_ops_queue,
@@ -324,10 +298,10 @@ def create_layerwise_worker(
                   cache_config: CacheConfig,
                   num_gpu_blocks: int,
                   gpu_layout_type: int = 0) -> Tuple[WorkerHandle, mp.Queue]:
-    """Create a LayerwiseTransferWorker for benchmarking CPU->GPU H2D transfers.
+    """Create a CPU<->GPU worker on the layerwise path, for H2D benchmarking.
 
-    Uses ``enable_eventfd=False`` so no sglang eventfd session is required —
-    the worker uses an empty eventfd tensor and the benchmark drives transfers
+    Uses ``completion=WHOLE`` so no sglang eventfd session is required — the
+    worker uses an empty eventfd tensor and the benchmark drives transfers
     purely via ``launch_transfer`` + ``sync_all``.
     """
     mp.set_start_method('spawn', force=True)
@@ -384,26 +358,23 @@ def create_layerwise_worker(
     max_block_num = max(1024, cache_config.num_cpu_blocks)
     op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
 
-    # Build the eventfd socket path (not actually used when enable_eventfd=False,
+    # Build the eventfd socket path (not actually used under completion=WHOLE,
     # but __init__ still expects a string).
     layerwise_eventfd_socket = build_layerwise_eventfd_socket_path(
         dp_client_id=0, pp_rank=0, model_config=model_config)
 
-    worker_handle = LayerwiseTransferWorker.create_worker(
+    worker_handle = GPUCPUTransferWorker.create_worker(
         mp_ctx=mp.get_context('spawn'),
         finished_ops_queue=finished_ops_queue,
         op_buffer_tensor=op_buffer_tensor,
         gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
         cpu_blocks=cpu_handle.get_tensor(),
-        ssd_files={},
         gpu_kv_layouts=[gpu_handles[tp_id].kv_layout for tp_id in range(model_config.tp_size)],
         cpu_kv_layout=cpu_handle.kv_layout,
-        ssd_kv_layout=cpu_handle.kv_layout,
         dtype=model_config.dtype,
         tp_group_size=model_config.tp_size,
         layerwise_eventfd_socket=layerwise_eventfd_socket,
-        num_blocks_per_file=0,
-        enable_eventfd=False,
+        completion=CompletionContract.WHOLE,
     )
     return (
         worker_handle,
@@ -477,8 +448,6 @@ def bench_worker(args):
                 graph_id=0,
                 src_block_ids_h2d=block_ids,
                 dst_block_ids_h2d=block_ids,
-                src_block_ids_disk2h=np.array([], dtype=np.int64),
-                dst_block_ids_disk2h=np.array([], dtype=np.int64),
                 dp_client_id=0,
                 counter_id=0,
             )
