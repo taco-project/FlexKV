@@ -62,8 +62,6 @@ def _make_layerwise_op(**kwargs) -> LayerwiseTransferOp:
         graph_id=0,
         src_block_ids_h2d=np.array([0, 1], dtype=np.int64),
         dst_block_ids_h2d=np.array([2, 3], dtype=np.int64),
-        src_block_ids_disk2h=np.array([], dtype=np.int64),
-        dst_block_ids_disk2h=np.array([], dtype=np.int64),
         dp_client_id=0,
     )
     defaults.update(kwargs)
