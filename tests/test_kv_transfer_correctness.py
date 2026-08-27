@@ -22,10 +22,18 @@ import pytest
 import torch
 import gc
 
-from flexkv.c_ext import TPTransferThreadGroup, LayerwiseTransferGroup, TPGDSTransferThreadGroup
+from flexkv.c_ext import TPTransferThreadGroup, TPGDSTransferThreadGroup
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.storage.allocator import SSDAllocator
+from flexkv.transfer.region_batch import (
+    RegionSpec,
+    build_region_batch,
+    make_requests,
+    rank_share_mode,
+)
+
+from eventfd_probe import Fds
 
 
 # Skip conditions
@@ -133,6 +141,12 @@ MLA_SIZES = [
     pytest.param((61, 256, 16, 1, 512), id="ds3"),         # DeepSeek-V3: 61 layers
     pytest.param((80, 512, 16, 1, 512), id="llama3-70b"), # 80 layers like Llama-3-70B
     pytest.param((2, 4, 1, 1, 512), id="edge"),           # tpb=1 edge case
+    # DeepSeek-V3.2 / GLM-5.2 cache the *whole* MLA latent: kv_lora_rank 512 +
+    # qk_rope_head_dim 64 = 576. Worth its own entries rather than reusing 512:
+    # every other size here is a power of two, so a chunk size that is only
+    # correct under 128B alignment passes all of them and fails these.
+    pytest.param((61, 256, 16, 1, 576), id="dsv32"),      # DeepSeek-V3.2-Exp
+    pytest.param((78, 256, 16, 1, 576), id="glm52"),      # GLM-5.2 (GlmMoeDsa)
 ]
 MHA_SIZES = [
     # Llama-3 scale: 32 layers, kv_heads=8, head_dim=128
@@ -141,6 +155,12 @@ MHA_SIZES = [
     pytest.param((80, 256, 16, 8, 128), id="llama3-70b"),
     pytest.param((2, 4, 1, 8, 128), id="edge"),            # tpb=1 edge case
     pytest.param((4, 4, 16, 16, 128), id="16head"),       # 16 heads variant
+    # Qwen3-8B: 36 layers, 8 kv heads, head_dim 128 (GQA, full attention).
+    pytest.param((36, 64, 16, 8, 128), id="qwen3-8b"),
+    # Qwen3.5-397B-A17B: only the 15 full_attention layers cache; head_dim 256
+    # is the widest head here, so it is the only case where one (layer, kv)
+    # chunk exceeds 8 KiB per rank.
+    pytest.param((15, 64, 16, 4, 256), id="qwen3.5-397b"),
 ]
 
 CPU_LAYOUTS = [
@@ -349,17 +369,24 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
                          is_blockfirst=None,
                          kv_dim=None,
                          num_kv_heads=None,
-                         ssd_io_opt=None,
-                         layer_eventfds_tensor=None):
-    """Create LayerwiseTransferGroup for H2D-only testing (no SSD).
+                         cpu_kv_stride=None,
+                         cpu_layer_stride=None,
+                         cpu_block_stride=None,
+                         cpu_tp_stride=None):
+    """A one-region ``RegionBatchGroup``, standing in for the old layerwise one.
 
-    Mirrors LayerwiseTransferWorker construction in layerwise.py. GPU chunk_size
-    does NOT include kv_dim (same as tp_group). SSD disabled via empty ssd_files.
-    eventfd disabled by default (empty layer_eventfds_tensor); pass a non-empty
-    tensor to exercise the notify-mode path (upstream #199).
+    Per-layer completion is no longer a group of its own: it is
+    ``RegionBatchGroup::submit_layerwise``, so the group these tests build is
+    the same one the whole-block tests build.  The old ``LayerwiseTransferGroup``
+    carried the CPU strides in the *call*; ``RegionDesc`` carries them in the
+    region, which is why they are constructor arguments here.  They default to
+    ``gpu_layout``-derived values only so callers that never varied them stay
+    short.
 
-    CE config defaults from GLOBAL_CONFIG_FROM_ENV (same as production).
-    ssd_io_opt defaults from GLOBAL_CONFIG_FROM_ENV.ssd_io_opt (same as production).
+    GPU chunk_size does NOT include kv_dim (same as tp_group). The group is used
+    CPU->GPU only here -- the SSD read is a separate DISK2H op the engine
+    schedules before it.  CE config defaults from GLOBAL_CONFIG_FROM_ENV (same
+    as production).
     """
     if ce_segment_threshold is None:
         ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold
@@ -377,47 +404,61 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
         kv_dim = gpu_layout.kv_dim
     if num_kv_heads is None:
         num_kv_heads = gpu_layout.num_kv_heads
-    if ssd_io_opt is None:
-        ssd_io_opt = GLOBAL_CONFIG_FROM_ENV.ssd_io_opt
-    if layer_eventfds_tensor is None:
-        layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
-    def strides_tensor(getter):
-        return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
 
-    # Pass every trailing optional parameter explicitly. This exercises the
-    # same SWA-capable + adaptive-CE constructor used by production.
-    empty_tensor = torch.empty(0)
-    return LayerwiseTransferGroup(
-        num_gpus=num_gpus,
-        gpu_blocks=all_gpu,
-        cpu_blocks=cpu_tensor,
-        ssd_files={},
+    spec = RegionSpec(
+        name="kv",
+        cpu_ptr=cpu_tensor.data_ptr(),
+        cpu_kv_stride=cpu_kv_stride,
+        cpu_layer_stride=cpu_layer_stride,
+        cpu_block_stride=cpu_block_stride,
+        cpu_tp_stride=cpu_tp_stride,
+        gpu_block_ptrs_flat=[all_gpu[g][l].data_ptr()
+                             for g in range(num_gpus)
+                             for l in range(num_layers)],
+        num_tensors_per_gpu=num_layers,
+        gpu_kv_strides=[gpu_layout.get_kv_stride() * ES] * num_gpus,
+        gpu_block_strides=[gpu_layout.get_block_stride() * ES] * num_gpus,
+        gpu_layer_strides=[gpu_layout.get_layer_stride() * ES] * num_gpus,
+        gpu_chunk_sizes=[gpu_layout.get_chunk_size() * ES] * num_gpus,
         num_layers=num_layers,
-        gpu_kv_strides_tensor=strides_tensor(gpu_layout.get_kv_stride),
-        gpu_block_strides_tensor=strides_tensor(gpu_layout.get_block_stride),
-        gpu_layer_strides_tensor=strides_tensor(gpu_layout.get_layer_stride),
-        gpu_chunk_sizes_tensor=strides_tensor(gpu_layout.get_chunk_size),
-        iouring_entries=0,
-        iouring_flags=0,
-        layer_eventfds_tensor=layer_eventfds_tensor,
-        tp_size=num_gpus,
-        has_swa=False,
-        swa_gpu_blocks=[],
-        swa_cpu_blocks=empty_tensor,
-        swa_ssd_files={},
-        swa_gpu_kv_strides_tensor=empty_tensor,
-        swa_gpu_block_strides_tensor=empty_tensor,
-        swa_gpu_layer_strides_tensor=empty_tensor,
-        swa_gpu_chunk_sizes_tensor=empty_tensor,
+        kv_dim=kv_dim,
+        num_kv_heads=num_kv_heads,
+    )
+    return build_region_batch(
+        [spec], list(range(num_gpus)),
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
         ce_enable_memcpy2d=ce_enable_memcpy2d,
-        ce_gather_threads=ce_gather_threads,
-        ce_gather_nt=ce_gather_nt,
         is_blockfirst=is_blockfirst,
         num_kv_heads=num_kv_heads,
-        ssd_io_opt=ssd_io_opt,
+        ce_gather_threads=ce_gather_threads,
+        ce_gather_nt=ce_gather_nt,
     )
+
+
+def layerwise_requests(num_layers, ids, use_ce, mode, layer_granularity=1,
+                       designated_rank=0):
+    """One request per layer chunk, each tagged with the milestone it closes.
+
+    ``layer_granularity`` is what the old call took: layers go out in chunks of
+    that size, and the chunk's first layer is the milestone, so a consumer is
+    told about a chunk only once every layer in it is on the stream.  The
+    production contract pins this to 1 (``CompletionContract.PER_LAYER``);
+    larger values exist here only because the CE sweep varies them to exercise
+    different launch sizes.
+    """
+    requests = []
+    for start in range(0, num_layers, layer_granularity):
+        count = min(layer_granularity, num_layers - start)
+        req = make_requests(
+            1, ids, ids, True,
+            transfer_num_cta=4, use_ce_transfer=use_ce,
+            layer_id=start, layer_granularity=count,
+            share_mode=rank_share_mode(mode),
+            designated_rank=designated_rank)[0]
+        req.milestone_layer = start
+        requests.append(req)
+    return requests
 
 
 def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
@@ -431,54 +472,52 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                            ce_gather_threads=None,
                            ce_gather_nt=None,
                            use_ce=True):
-    """Run a single H2D via LayerwiseTransferGroup, reading `cpu_kv` back
-    into `all_gpu` with block-id list `ids`.
+    """Run a single per-layer H2D, reading `cpu_kv` back into `all_gpu`.
 
-    LayerwiseTransferGroup is H2D-only; use_ce selects the CE adaptive path
-    (True) or the baseline PER_BLOCK cuda kernel (False). Shared by the
-    CE/cuda layerwise roundtrip twins and the notify-mode test.
+    use_ce selects the CE adaptive path (True) or the baseline PER_BLOCK cuda
+    kernel (False). Shared by the CE/cuda layerwise roundtrip twins and the
+    notify-mode test.
 
     notify_mode: "hostfunc" (default, uses CUDA hostfunc callback) or
     "polling" (uses a CPU polling thread that queries cudaEventQuery per
     batch).  Polling mode exercises the async GATHER_SCATTER/SEGMENT_SCATTER
     path (sync=false) that was previously deadlocked.
+
+    Real eventfds are registered on every call, not just the notify-mode test.
+    ``LayerNotifier::record`` returns immediately when no table is registered,
+    so an empty table would mean neither mode is actually exercised anywhere --
+    the marker/callback machinery would be compiled out of every one of these
+    round-trips, and only the copies would be under test.
     """
-    lw_group = make_layerwise_group(cpu_kv, all_gpu, num_gpus,
-                                    gpu_layout, num_layers,
-                                    ce_path_opt=ce_path_opt,
-                                    ce_segment_threshold=ce_segment_threshold,
-                                    ce_gather_threads=ce_gather_threads,
-                                    ce_gather_nt=ce_gather_nt,
-                                    is_blockfirst=is_blockfirst,
-                                    ce_enable_memcpy2d=enable_memcpy2d)
-    empty_ids = torch.empty(0, dtype=torch.int64).pin_memory()
-    lw_group.layerwise_transfer(
-        ssd_block_ids=empty_ids,
-        cpu_block_ids_d2h=empty_ids,
-        ssd_layer_stride_in_bytes=0,
-        ssd_kv_stride_in_bytes=0,
-        num_blocks_per_file=0, round_robin=0, num_threads_per_device=0,
-        gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
-        cpu_kv_stride_in_bytes=cpu_stride_kv,
-        cpu_layer_stride_in_bytes=cpu_stride_layer,
-        cpu_block_stride_in_bytes=cpu_stride_block,
-        cpu_chunk_size_in_bytes=chunk_size,
-        h2d_cpu_kv_stride_in_bytes=cpu_stride_kv,
-        h2d_cpu_layer_stride_in_bytes=cpu_stride_layer,
-        cpu_tp_stride_in_bytes=cpu_stride_tp,
-        transfer_cta_num=4, use_ce_transfer=use_ce,
-        num_layers=num_layers, layer_granularity=num_layers if layer_granularity is None else layer_granularity,
-        kv_dim=kv_dim, num_kv_heads=num_kv_heads,
-        counter_id=0,
-        swa_h2d_src=empty_ids,
-        swa_h2d_dst=empty_ids,
-        swa_disk2h_src=empty_ids,
-        swa_disk2h_dst=empty_ids,
-        kv_shared_across_ranks_mode=mode,
-        notify_mode=notify_mode,
-    )
-    sync_all(num_gpus)
-    del lw_group
+    group = make_layerwise_group(cpu_kv, all_gpu, num_gpus,
+                                 gpu_layout, num_layers,
+                                 ce_path_opt=ce_path_opt,
+                                 ce_segment_threshold=ce_segment_threshold,
+                                 ce_gather_threads=ce_gather_threads,
+                                 ce_gather_nt=ce_gather_nt,
+                                 is_blockfirst=is_blockfirst,
+                                 ce_enable_memcpy2d=enable_memcpy2d,
+                                 kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+                                 cpu_kv_stride=cpu_stride_kv,
+                                 cpu_layer_stride=cpu_stride_layer,
+                                 cpu_block_stride=cpu_stride_block,
+                                 cpu_tp_stride=cpu_stride_tp)
+    requests = layerwise_requests(
+        num_layers, ids, use_ce, mode,
+        layer_granularity=1 if layer_granularity is None else layer_granularity)
+    milestones = [r.milestone_layer for r in requests]
+    with Fds(num_counters=1, tp_size=num_gpus, num_layers=num_layers) as fds:
+        group.set_layer_eventfds(fds.tensor(), num_gpus, num_layers,
+                                 notify_mode)
+        group.submit_layerwise(requests, [], 0)
+        ok, err = group.wait_layer_completion(120.0)
+        assert ok, f"layerwise H2D did not complete: {err}"
+        sync_all(num_gpus)
+        for layer in milestones:
+            assert fds.units(layer) == [1] * num_gpus, (
+                f"notify={notify_mode}: layer {layer} did not get exactly one "
+                f"semaphore unit on every rank")
+        del group
 
 
 def block_ids(n):
@@ -866,39 +905,19 @@ def test_layerwise_h2d_notify_modes(data_config, kv_dim, engine_name, use_ce, no
     sync_all(num_gpus)
 
     # H2D via layerwise with the requested notify mode
-    lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
-                                is_blockfirst=True,
-                                kv_dim=kv_dim)
-    lw.layerwise_transfer(
-        torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64),
-        0, 0, 0, 0, 0,
-        gpu_block_ids, cpu_block_ids,
-        cpu_stride_kv, cpu_stride_layer, cpu_stride_block,
-        gpu_layout.get_chunk_size() * ES,
-        cpu_stride_kv, cpu_stride_layer, cpu_stride_tp,
-        4, use_ce, num_layers, 1, kv_dim, num_kv_heads,
-        counter_id=0,
-        # pybind cannot fill the SWA tensor defaults (torch::Tensor() -> None
-        # can't cast back to a non-optional `torch.Tensor` param), so the four
-        # swa_* tensors must be passed explicitly even for this non-SWA test.
-        # Mirrors production LayerwiseTransfer._swa_transfer_kwargs().
-        swa_h2d_src=torch.empty(0, dtype=torch.int64),
-        swa_h2d_dst=torch.empty(0, dtype=torch.int64),
-        swa_disk2h_src=torch.empty(0, dtype=torch.int64),
-        swa_disk2h_dst=torch.empty(0, dtype=torch.int64),
-        kv_shared_across_ranks_mode="sharded",
-        notify_mode=notify_mode,
-    )
-    sync_all(num_gpus)
+    layerwise_h2d_readback(
+        all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, gpu_block_ids,
+        cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
+        gpu_layout.get_chunk_size() * ES, kv_dim, num_kv_heads, "sharded",
+        notify_mode=notify_mode, is_blockfirst=True, use_ce=use_ce)
 
     spot_check_gpu(all_gpu, 0, num_gpus, num_layers, num_blocks,
                    tpb, head_dim, kv_dim, label=f"notify={notify_mode}")
-    del lw
 
 
-# Round-trip tests via LayerwiseTransferGroup H2D
+# Round-trip tests via per-layer (submit_layerwise) H2D
 #
-# LayerwiseTransferGroup is H2D-only (no independent D2H), so these twins
+# The layerwise path is H2D-only (no independent D2H), so these twins
 # prepare the CPU reference with a verified TPTransferThreadGroup D2H, then
 # read it back with layerwise H2D and check correctness. Same size matrix /
 # modes / layouts as the TP-group round-trips above, so layerwise H2D is
@@ -912,7 +931,7 @@ def test_layerwise_h2d_notify_modes(data_config, kv_dim, engine_name, use_ce, no
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("engine_name,use_ce", ENGINES)
 def test_non_mla_roundtrip_layerwise(data_config, kv_dim, cpu_layout_name, engine_name, use_ce):
-    """Multi-head: TP-group D2H prepares CPU, LayerwiseTransferGroup H2D
+    """Multi-head: TP-group D2H prepares CPU, per-layer H2D
     reads it back; verify each rank recovers its own data.
     Covers packed MHA (kv_dim=1) and plain MHA (kv_dim=2), cuda + ce."""
     skip_if_engine_unsupported(use_ce)
@@ -996,7 +1015,7 @@ def test_non_mla_roundtrip_layerwise(data_config, kv_dim, cpu_layout_name, engin
 @pytest.mark.parametrize("mode", MLA_MODES)
 @pytest.mark.parametrize("engine_name,use_ce", ENGINES)
 def test_mla_roundtrip_modes_layerwise(data_config, kv_dim, cpu_layout_name, mode, engine_name, use_ce):
-    """Shared-across-ranks: TP-group D2H prepares CPU, LayerwiseTransferGroup
+    """Shared-across-ranks: TP-group D2H prepares CPU, per-layer
     H2D reads it back; verify all ranks recover GPU 0's data. Covers all D2H
     modes. Covers MLA (kv_dim=1) and plain MHA, single head (kv_dim=2), cuda + ce."""
     skip_if_engine_unsupported(use_ce)
@@ -1171,6 +1190,8 @@ _MLA_SIZES = [
     ((61, 256, 16, 1, 512), "ds3"),
     ((80, 512, 16, 1, 512), "llama70b"),
     ((2, 4, 1, 1, 512), "edge"),
+    ((61, 256, 16, 1, 576), "dsv32"),    # 512 lora + 64 rope, not a power of 2
+    ((78, 256, 16, 1, 576), "glm52"),
 ]
 _MHA_SIZES = [
     ((4, 8, 16, 8, 128), "mha-mini"),
@@ -1178,6 +1199,12 @@ _MHA_SIZES = [
     ((80, 256, 16, 8, 128), "mha-llama70b"),
     ((2, 4, 1, 8, 128), "mha-edge"),
     ((4, 4, 16, 16, 128), "mha-16head"),
+    # Qwen3.5-397B-A17B: only its 15 full_attention layers cache, 2 kv heads,
+    # head_dim 256. The head_dim/head-count pair differs from every entry
+    # above, and 2 kv heads is the narrowest multi-head TP split that still
+    # shards (NUM_GPUS=4 would not divide it, so it stays a shared-mode case
+    # in MLA_SIZES terms; here it exercises head_dim=256 packing).
+    ((15, 64, 16, 4, 256), "mha-qwen35"),
 ]
 # Four-quadrant: MLA (kv_dim=1, nkh=1), kv_sep_1h (kv_dim=2, nkh=1),
 # packed MHA (kv_dim=1, nkh=H), plain MHA (kv_dim=2, nkh=H).
@@ -1449,10 +1476,10 @@ def test_ce_paths_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name, 
 def test_ce_paths_layerwise_h2d(data_config, kv_dim, num_kv_heads, cpu_layout_name, pattern,
                                 path_opt, mode, segment_threshold,
                                 notify_mode, layer_granularity, enable_memcpy2d):
-    """CE strategy correctness for LayerwiseTransferGroup H2D.
+    """CE strategy correctness for the per-layer H2D path.
 
     Uses TPTransferThreadGroup D2H (already verified correct) to prepare
-    CPU data, then LayerwiseTransferGroup H2D to read it back with the
+    CPU data, then per-layer H2D to read it back with the
     same block-id pattern.  Verifies that the layerwise CE strategy produces
     identical results to the TP-group CE strategy.
 
@@ -1533,7 +1560,7 @@ def test_ce_paths_layerwise_h2d(data_config, kv_dim, num_kv_heads, cpu_layout_na
             all_gpu[g][l].zero_()
     sync_all(num_gpus)
 
-    # Step 2: H2D via LayerwiseTransferGroup (test target). path_opt selects
+    # Step 2: H2D via submit_layerwise (test target). path_opt selects
     # baseline (PER_BLOCK) vs optimized (CONTIG_DIRECT / SEGMENT_DIRECT /
     # SEGMENT_SCATTER / GATHER_SCATTER) on the H2D path.
     # (Step 1 above intentionally keeps default config -- it only prepares the
@@ -1657,42 +1684,17 @@ def test_mla_designated_rank_d2h(data_config, designated_rank):
         for l in range(num_layers):
             all_gpu[g][l].zero_()
     sync_all(num_gpus)
-    lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers, is_blockfirst=True, kv_dim=kv_dim)
-    empty_ids = torch.empty(0, dtype=torch.int64)
-    lw.layerwise_transfer(
-        ssd_block_ids=empty_ids,
-        cpu_block_ids_d2h=empty_ids,
-        ssd_layer_stride_in_bytes=0,
-        ssd_kv_stride_in_bytes=0,
-        num_blocks_per_file=0,
-        round_robin=0,
-        num_threads_per_device=0,
-        gpu_block_id_tensor=ids,
-        cpu_block_id_tensor=ids,
-        cpu_kv_stride_in_bytes=cpu_layout_tp.get_kv_stride() * ES,
-        cpu_layer_stride_in_bytes=cpu_layout_tp.get_layer_stride() * ES,
-        cpu_block_stride_in_bytes=cpu_stride_block,
-        cpu_chunk_size_in_bytes=gpu_layout.get_chunk_size() * ES,
-        h2d_cpu_kv_stride_in_bytes=cpu_layout_tp.get_kv_stride() * ES,
-        h2d_cpu_layer_stride_in_bytes=cpu_layout_tp.get_layer_stride() * ES,
-        cpu_tp_stride_in_bytes=cpu_stride_tp,
-        transfer_cta_num=4,
-        use_ce_transfer=True,
-        num_layers=num_layers,
-        layer_granularity=1,
-        kv_dim=kv_dim,
-        num_kv_heads=num_kv_heads,
-        counter_id=0,
-        swa_h2d_src=empty_ids,
-        swa_h2d_dst=empty_ids,
-        swa_disk2h_src=empty_ids,
-        swa_disk2h_dst=empty_ids,
-        kv_shared_across_ranks_mode="rank0_only",
-        notify_mode="hostfunc",
-    )
-    sync_all(num_gpus)
+    # H2D is direction-symmetric on rank share modes: every rank needs the whole
+    # thing regardless of who wrote it, so this reads back with the default
+    # sharded mode even though the D2H above was rank0_only.
+    layerwise_h2d_readback(
+        all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
+        cpu_layout_tp.get_kv_stride() * ES,
+        cpu_layout_tp.get_layer_stride() * ES,
+        cpu_stride_block, cpu_stride_tp,
+        gpu_layout.get_chunk_size() * ES, kv_dim, num_kv_heads, "rank0_only",
+        is_blockfirst=True, use_ce=True)
     spot_check_gpu(all_gpu, 0, num_gpus, num_layers, num_blocks, tpb, head_dim, kv_dim, label=f"designated={designated_rank}")
-    del lw
 
 
 def test_ce_strategy_coverage():
@@ -1867,7 +1869,7 @@ def test_gather_nt_layerwise_h2d(data_config, kv_dim, num_kv_heads, cpu_layout_n
                                  gather_threads, gather_nt):
     """CE gather threads and NT store correctness for layerwise H2D.
 
-    TP-group CE D2H prepares CPU, LayerwiseTransferGroup CE H2D reads back
+    TP-group CE D2H prepares CPU, per-layer CE H2D reads back
     with swept gather_threads and gather_nt settings.
     """
     skip_if_engine_unsupported(use_ce=True)
@@ -2385,13 +2387,17 @@ def test_ssd_io_opt_on_off_byte_identical(data_config, kv_dim, cpu_layout_name, 
 @pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
 def test_ssd_transfer_layerwise_disk2h(data_config, kv_dim, cpu_layout_name, ssd_io_opt,
                                        iouring_entries, tmp_path):
-    """Layerwise SSD disk2h: SSD -> CPU (staging) -> GPU via LayerwiseTransferGroup. Covers thread/io_uring engines (iouring_entries=0/512).
+    """Layerwise SSD disk2h: SSD -> CPU (standalone read) -> GPU (layerwise).
 
-    Mirrors production LayerwiseWorker single-group wiring: ssd_files set and
-    ssd_io_opt threaded into the C++ SSD read (Step 0 of layerwise_transfer). The
-    SSD read writes the KV into the CPU staging buffer, then the CE H2D loop
-    copies CPU -> GPU. Verifies the CPU staging buffer recovers the original
-    source for both opt/baseline (the direct output of the SSD path).
+    Covers thread/io_uring engines (iouring_entries=0/512).
+
+    Mirrors production wiring after the SSD read was hoisted out of the fused
+    op: the engine schedules a standalone DISK2H (transfer_kv_blocks_ssd,
+    is_read=True) that fills the CPU staging buffer, and only then does the
+    LAYERWISE op run its CE H2D loop CPU -> GPU. Verifies the CPU staging
+    buffer recovers the original source for both opt/baseline (the direct
+    output of the SSD path), which is exactly the precondition the dependency
+    edge in merge_to_batch_graph guarantees.
 
     Shared-across-ranks + sharded: all ranks hold identical data, so the SSD
     read's full CPU layout is consistent with the H2D sharded offset (0).
@@ -2428,13 +2434,6 @@ def test_ssd_transfer_layerwise_disk2h(data_config, kv_dim, cpu_layout_name, ssd
                for g in range(num_gpus)]
     sync_all(num_gpus)
 
-    def _gstride(getter):
-        return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
-    gpu_kv_strides = _gstride(gpu_layout.get_kv_stride)
-    gpu_block_strides = _gstride(gpu_layout.get_block_stride)
-    gpu_layer_strides = _gstride(gpu_layout.get_layer_stride)
-    gpu_chunk_sizes = _gstride(gpu_layout.get_chunk_size)
-
     # SSD layout mirrors CPU layout (1 file holds all blocks).
     ssd_layer_bytes = cpu_layout.get_layer_stride() * ES
     ssd_kv_bytes = cpu_layout.get_kv_stride() * ES
@@ -2461,60 +2460,28 @@ def test_ssd_transfer_layerwise_disk2h(data_config, kv_dim, cpu_layout_name, ssd
                  kv_dim=kv_dim, ssd_io_opt=ssd_io_opt)
     cpu_kv.zero_()
 
-    group = LayerwiseTransferGroup(
-        num_gpus=num_gpus, gpu_blocks=all_gpu, cpu_blocks=cpu_kv,
-        ssd_files=ssd_files, num_layers=num_layers,
-        gpu_kv_strides_tensor=gpu_kv_strides,
-        gpu_block_strides_tensor=gpu_block_strides,
-        gpu_layer_strides_tensor=gpu_layer_strides,
-        gpu_chunk_sizes_tensor=gpu_chunk_sizes,
-        iouring_entries=0, iouring_flags=0,
-        layer_eventfds_tensor=torch.empty(0, dtype=torch.int32),
-        tp_size=num_gpus, has_swa=False,
-        swa_gpu_blocks=[], swa_cpu_blocks=torch.empty(0),
-        swa_ssd_files={},
-        swa_gpu_kv_strides_tensor=torch.empty(0),
-        swa_gpu_block_strides_tensor=torch.empty(0),
-        swa_gpu_layer_strides_tensor=torch.empty(0),
-        swa_gpu_chunk_sizes_tensor=torch.empty(0),
-        ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
-        ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
-        ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
-        is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
-        ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
-        ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
-        ssd_io_opt=ssd_io_opt,
-    )
+    # Step 1 -- the hoisted DISK2H op: SSD -> CPU staging.  In production this
+    # is a separate op the engine runs first; the LAYERWISE op below depends on
+    # it, so by the time it starts every CPU block it reads is already filled.
+    _ssd_xfer_fn(ioctx=ioctx, cpu_layer_id_list=layer_ids,
+                 cpu_tensor_ptr=cpu_kv.data_ptr(),
+                 ssd_block_ids=block_ids, cpu_block_ids=block_ids,
+                 cpu_layer_stride_in_bytes=cpu_stride_layer,
+                 cpu_kv_stride_in_bytes=cpu_stride_kv,
+                 ssd_layer_stride_in_bytes=ssd_layer_bytes,
+                 ssd_kv_stride_in_bytes=ssd_kv_bytes,
+                 chunk_size_in_bytes=cpu_chunk_bytes,
+                 block_stride_in_bytes=cpu_stride_block,
+                 is_read=True, num_blocks_per_file=num_blocks,
+                 round_robin=1, num_threads_per_device=32,
+                 kv_dim=kv_dim, ssd_io_opt=ssd_io_opt)
 
-    # SSD -> CPU -> GPU. Positional args mirror LayerwiseWorker.layerwise_transfer.
-    group.layerwise_transfer(
-        block_ids,        # ssd_block_ids (src disk2h)
-        block_ids,        # cpu_block_ids_d2h (dst disk2h)
-        ssd_layer_bytes,  # ssd_layer_stride_in_bytes
-        ssd_kv_bytes,     # ssd_kv_stride_in_bytes
-        num_blocks,       # num_blocks_per_file
-        1,                # round_robin
-        32,               # num_threads_per_device
-        block_ids,        # gpu_block_id_tensor (dst h2d)
-        block_ids,        # cpu_block_id_tensor (src h2d)
-        cpu_stride_kv,    # cpu_kv_stride_in_bytes
-        cpu_stride_layer,  # cpu_layer_stride_in_bytes
-        cpu_stride_block,  # cpu_block_stride_in_bytes
-        cpu_chunk_bytes,   # cpu_chunk_size_in_bytes
-        cpu_stride_kv,    # h2d_cpu_kv_stride_in_bytes
-        cpu_stride_layer,  # h2d_cpu_layer_stride_in_bytes
-        cpu_stride_tp,    # cpu_tp_stride_in_bytes
-        4,                # transfer_cta_num
-        True,             # use_ce_transfer
-        num_layers,
-        1,                # layer_granularity
-        kv_dim,
-        num_kv_heads,
-        0,                # counter_id
-        kv_shared_across_ranks_mode="sharded",
-        notify_mode="hostfunc",
-    )
-    sync_all(num_gpus)
+    # Step 2 -- the LAYERWISE op: CPU -> GPU only.
+    layerwise_h2d_readback(
+        all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, block_ids,
+        cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
+        cpu_chunk_bytes, kv_dim, num_kv_heads, "sharded",
+        is_blockfirst=(cpu_layout_name == "BLOCKFIRST"), use_ce=True)
 
     # The SSD read wrote the staging buffer; H2D only read from it. So the CPU
     # staging buffer must equal the original source for both opt/baseline.
@@ -2525,7 +2492,7 @@ def test_ssd_transfer_layerwise_disk2h(data_config, kv_dim, cpu_layout_name, ssd
         f"ssd_io_opt={ssd_io_opt}): " \
         f"{(orig_bytes != read_bytes).sum().item()} / {orig_bytes.numel()} bytes differ"
 
-    del ioctx, group
+    del ioctx
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 @pytest.fixture
@@ -2654,11 +2621,10 @@ def test_ssd_transfer_layerwise_h2disk(data_config, kv_dim, cpu_layout_name, ssd
     the write itself by reading the SSD file back into a fresh CPU buffer and
     checking byte-level equality.
 
-    NOTE: LayerwiseTransferGroup::layerwise_transfer is disk2host-only
-    (SSD->CPU->GPU; see csrc/layerwise.h:135, csrc/layerwise.cpp:1060 Step 0).
-    There is no CPU->SSD path inside layerwise_transfer. Production H2Disk uses
-    the standalone transfer_kv_blocks_ssd with is_read=False via
-    CPUSSDDiskTransferWorker (flexkv/transfer/transfer_engine.py:565), so this
+    NOTE: RegionBatchGroup::submit_layerwise touches no SSD at all
+    -- it is CPU->GPU only. Both directions of SSD I/O go through the standalone
+    transfer_kv_blocks_ssd: is_read=True as the hoisted DISK2H op, is_read=False
+    via CPUSSDDiskTransferWorker (flexkv/transfer/transfer_engine.py), so this
     test exercises that same path with the layerwise-style strides/config to
     match the disk2h twin's wiring.
 

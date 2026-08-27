@@ -324,5 +324,4 @@ def test_nvcomp_engine_rejects_too_small_chunks(monkeypatch):
         cpu_handle=cpu_handle)
 
     assert isinstance(engine._compressors["gpu_cpu"], NullCompressionStrategy)
-    assert isinstance(engine._compressors["gpu_cpu_tp"], NullCompressionStrategy)
     assert isinstance(engine._compressors["cpu_ssd"], NullCompressionStrategy)
