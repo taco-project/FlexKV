@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import math
 import os
 import copy
 import signal
@@ -95,6 +96,132 @@ def _validate_multi_group_chunk_layout(
             f"head_size={head_size}, compress_ratio={compress_ratio}"
         )
 
+
+
+def _split_mooncake_registration_regions(
+    base_ptr: int,
+    logical_size: int,
+    mapped_size: int,
+    block_size: int,
+    max_mr_size: int,
+    size_alignment: int,
+    pointer_alignment: int,
+) -> List[Tuple[int, int]]:
+    """Split a mapped KV pool into aligned MRs without splitting KV blocks."""
+    values = {
+        "base_ptr": base_ptr,
+        "logical_size": logical_size,
+        "mapped_size": mapped_size,
+        "block_size": block_size,
+        "max_mr_size": max_mr_size,
+        "size_alignment": size_alignment,
+        "pointer_alignment": pointer_alignment,
+    }
+    for name, value in values.items():
+        if value <= 0:
+            raise ValueError(f"{name} must be positive, got {value}")
+    if mapped_size < logical_size:
+        raise ValueError(
+            "HugePage mapped length is smaller than the logical CPU pool: "
+            f"mapped={mapped_size}, logical={logical_size}"
+        )
+    if logical_size % block_size != 0:
+        raise ValueError(
+            "Logical CPU pool must contain whole KV blocks: "
+            f"logical_size={logical_size}, block_size={block_size}"
+        )
+    if base_ptr % pointer_alignment != 0:
+        raise ValueError(
+            "Mooncake MR base pointer is not HugePage aligned: "
+            f"ptr=0x{base_ptr:x}, alignment={pointer_alignment}"
+        )
+    if mapped_size % size_alignment != 0:
+        raise ValueError(
+            "Mooncake mapped size is not externally aligned: "
+            f"mapped_size={mapped_size}, alignment={size_alignment}"
+        )
+    if mapped_size <= max_mr_size:
+        return [(base_ptr, mapped_size)]
+
+    region_unit = math.lcm(block_size, size_alignment, pointer_alignment)
+    region_size = (max_mr_size // region_unit) * region_unit
+    if region_size <= 0:
+        raise ValueError(
+            "Mooncake max MR size cannot hold one aligned KV region: "
+            f"max_mr_size={max_mr_size}, region_unit={region_unit}"
+        )
+
+    regions: List[Tuple[int, int]] = []
+    offset = 0
+    while offset < mapped_size:
+        remaining = mapped_size - offset
+        size = remaining if remaining <= max_mr_size else region_size
+        ptr = base_ptr + offset
+        is_last = offset + size == mapped_size
+        if not is_last and size % block_size != 0:
+            raise ValueError(
+                "Non-final Mooncake MR is not KV-block aligned: "
+                f"offset={offset}, size={size}, block_size={block_size}"
+            )
+        if ptr % pointer_alignment != 0:
+            raise ValueError(
+                "Mooncake MR pointer is not HugePage aligned: "
+                f"ptr=0x{ptr:x}, alignment={pointer_alignment}"
+            )
+        if size % size_alignment != 0:
+            raise ValueError(
+                "Mooncake MR size is not externally aligned: "
+                f"size={size}, alignment={size_alignment}"
+            )
+        if size > max_mr_size:
+            raise ValueError(
+                "Mooncake MR exceeds configured maximum: "
+                f"size={size}, max_mr_size={max_mr_size}"
+            )
+        regions.append((ptr, size))
+        offset += size
+
+    if regions[-1][0] + regions[-1][1] != base_ptr + mapped_size:
+        raise ValueError("Mooncake MR split does not cover mapped extent")
+    if base_ptr + logical_size > regions[-1][0] + regions[-1][1]:
+        raise ValueError("Mooncake MR split does not cover logical KV pool")
+    return regions
+
+
+def _register_mooncake_regions(
+    client: Any, regions: List[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """Register regions transactionally and roll back a partial failure."""
+    registered: List[Tuple[int, int]] = []
+    try:
+        for ptr, size in regions:
+            client.register_buffer(ptr, size)
+            registered.append((ptr, size))
+    except Exception:
+        for ptr, _ in reversed(registered):
+            try:
+                client.unregister_buffer(ptr)
+            except Exception as rollback_error:
+                flexkv_logger.error(
+                    "Mooncake MR rollback failed for "
+                    f"ptr=0x{ptr:x}: {rollback_error}"
+                )
+        raise
+    return registered
+
+
+def _unregister_mooncake_regions(
+    client: Any, regions: List[Tuple[int, int]]
+) -> None:
+    """Best-effort reverse-order cleanup for registered Mooncake MRs."""
+    for ptr, size in reversed(regions):
+        try:
+            client.unregister_buffer(ptr)
+        except Exception as error:
+            flexkv_logger.error(
+                "Mooncake MR unregister failed for "
+                f"ptr=0x{ptr:x} size={size}: {error}"
+            )
 
 from flexkv.transfer.compression.common.strategy import (
     CompressionStrategy,
@@ -3922,7 +4049,7 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         transfer_conn: Connection,
         finished_ops_queue: MPQueue,
         op_buffer_tensor: torch.Tensor,
-        cpu_blocks: Union[List[torch.Tensor], torch.Tensor],
+        cpu_blocks: Union[List[torch.Tensor], torch.Tensor, HugePageTensorHandle],
         cpu_kv_layout: "KVCacheLayout",
         dtype: torch.dtype,
         cache_config: "CacheConfig",
@@ -3937,8 +4064,19 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         self.total_layers = int(getattr(cache_config, 'mooncake_store_total_layers', 0) or 0)
         self.pool_kind = pool_kind
 
+        mapped_size = (
+            int(cpu_blocks.aligned)
+            if isinstance(cpu_blocks, HugePageTensorHandle)
+            else None
+        )
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
-        self._register_host_tensor(cpu_blocks, "mooncake_store_cpu_pool")
+        # Mooncake owns the RDMA registration and this worker only uses host
+        # pointers. A second CUDA/HIP registration of the same shared pool is
+        # redundant and can exhaust the host mapping budget for large caches.
+        flexkv_logger.info(
+            "[MooncakeStoreTransferWorker] skip CUDA host registration for "
+            "the CPU KV pool; Mooncake owns the external MR"
+        )
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
         self.num_layers: int = cpu_kv_layout.num_layer
         self.num_cpu_blocks: int = cpu_kv_layout.num_block
@@ -3962,20 +4100,50 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
             override_global_segment_size=override_global_segment_size,
         )
         self.mooncake_client = MooncakeStoreClient(store_config)
-        self.mooncake_client.register_buffer(self._cpu_buffer)
+        self._mooncake_registered_regions: List[Tuple[int, int]] = []
+        base_ptr = self._cpu_buffer.data_ptr()
+        logical_size = self._cpu_buffer.numel() * self._cpu_buffer.element_size()
+        if mapped_size is None:
+            regions = [(base_ptr, logical_size)]
+        else:
+            hugepage_size = int(
+                os.getenv("FLEXKV_HUGEPAGE_SIZE_BYTES", str(2 << 20))
+            )
+            size_alignment = int(
+                os.getenv(
+                    "FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES",
+                    str(hugepage_size),
+                )
+            )
+            max_mr_size = int(
+                os.getenv("FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES", str(512 << 30))
+            )
+            regions = _split_mooncake_registration_regions(
+                base_ptr=base_ptr,
+                logical_size=logical_size,
+                mapped_size=mapped_size,
+                block_size=self.block_size_bytes,
+                max_mr_size=max_mr_size,
+                size_alignment=size_alignment,
+                pointer_alignment=hugepage_size,
+            )
+        flexkv_logger.info(
+            "[MooncakeStoreTransferWorker] registering external MRs: "
+            f"logical_size={logical_size} mapped_size={mapped_size or logical_size} "
+            f"regions={regions}"
+        )
+        self._mooncake_registered_regions = _register_mooncake_regions(
+            self.mooncake_client, regions
+        )
 
     def shutdown(self) -> None:
         """Best-effort cleanup; tolerant of partially-failed ``__init__``."""
         try:
             client = getattr(self, "mooncake_client", None)
-            buf = getattr(self, "_cpu_buffer", None)
-            if client is not None and buf is not None:
-                try:
-                    client.unregister_buffer(buf)
-                except Exception as e:
-                    flexkv_logger.error(
-                        f"[MooncakeStoreTransferWorker] unregister_buffer failed: {e}"
-                    )
+            regions = getattr(self, "_mooncake_registered_regions", [])
+            if client is not None:
+                _unregister_mooncake_regions(client, regions)
+            self._mooncake_registered_regions = []
         finally:
             super().shutdown()
 

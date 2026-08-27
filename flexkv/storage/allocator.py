@@ -342,6 +342,42 @@ def _align_to_page(num_bytes: int, page_size_bytes: int) -> int:
     return (num_bytes + page_size_bytes - 1) & ~(page_size_bytes - 1)
 
 
+def _shareable_mapping_alignment(page_size_bytes: int) -> int:
+    """Return the requested alignment for a shareable HugePage mapping.
+
+    Some external-memory backends split one registered buffer into equal
+    subregions. Padding the mapping to a larger opt-in boundary keeps each
+    derived subregion HugePage-aligned without exposing the padding through
+    the logical tensor length.
+    """
+    value = os.environ.get("FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES")
+    if value is None:
+        return page_size_bytes
+    try:
+        alignment = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES must be an integer, "
+            f"got {value!r}"
+        ) from exc
+    if alignment < page_size_bytes:
+        raise ValueError(
+            "FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES must be at least the "
+            f"HugePage size ({page_size_bytes}), got {alignment}"
+        )
+    if alignment & (alignment - 1):
+        raise ValueError(
+            "FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES must be a power of two, "
+            f"got {alignment}"
+        )
+    if alignment % page_size_bytes != 0:
+        raise ValueError(
+            "FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES must be a multiple of "
+            f"the HugePage size ({page_size_bytes}), got {alignment}"
+        )
+    return alignment
+
+
 def _read_hugepages_free(page_size_bytes: int) -> int:
     """Return the number of free huge pages for *page_size_bytes*."""
     try:
@@ -450,7 +486,14 @@ def alloc_hugepage_tensor(num_elements: int,
     num_bytes = num_elements * dtype.itemsize
 
     if shareable:
-        aligned = _align_to_page(num_bytes, page_size_bytes)
+        mapping_alignment = _shareable_mapping_alignment(page_size_bytes)
+        aligned = _align_to_page(num_bytes, mapping_alignment)
+        if mapping_alignment != page_size_bytes:
+            flexkv_logger.info(
+                "HugePage shareable mapping: "
+                f"logical_bytes={num_bytes}, mapped_bytes={aligned}, "
+                f"mapping_alignment={mapping_alignment}"
+            )
         path, fd = _create_hugetlbfs_file(aligned)
         try:
             mm = mmap.mmap(
