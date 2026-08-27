@@ -17,6 +17,7 @@
 #include "tp_transfer_thread_group.h"
 #include "logging.h"
 #include "transfer.cuh"
+#include "transfer_backend.h"
 #ifdef FLEXKV_ENABLE_NVCOMP
 #include "compression/ans/nvcomp_ans_tp.h"
 #endif
@@ -53,10 +54,6 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     gpu_layer_strides_in_bytes_[i] = gpu_layer_strides_in_bytes[i];
     gpu_chunk_sizes_in_bytes_[i] = gpu_chunk_sizes_in_bytes[i];
   }
-
-  queues_.resize(num_gpus_);
-  mtxs_ = std::vector<std::mutex>(num_gpus_);
-  cvs_ = std::vector<std::condition_variable>(num_gpus_);
 
   cudaError_t malloc_err = cudaMallocHost(
       (void **)&gpu_blocks_, num_gpus_ * num_tensors_per_gpu_ * sizeof(void *));
@@ -95,38 +92,12 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     gpu_device_ids_[i] = static_cast<int>(gpu_device_ids[i]);
   }
 
+  // Threads and streams: one per rank, device bound once. The pool owns the
+  // streams and destroys them after joining its threads.
+  pool_ = std::make_unique<DeviceThreadPool>(gpu_device_ids_);
   streams_.resize(num_gpus_);
-  for (int i = 0; i < num_gpus_; i += 1) {
-    cudaError_t err = cudaSetDevice(gpu_device_ids_[i]);
-    if (err != cudaSuccess)
-      throw std::runtime_error(std::string("cudaSetDevice failed: ") +
-                               cudaGetErrorString(err));
-    err = cudaStreamCreate(&streams_[i]);
-    if (err != cudaSuccess)
-      throw std::runtime_error(std::string("cudaStreamCreate failed: ") +
-                               cudaGetErrorString(err));
-  }
-  // create the thread pool
-  stop_pool_ = false;
   for (int i = 0; i < num_gpus_; ++i) {
-    threads_.emplace_back([this, i]() {
-      int device_id = gpu_device_ids_[i];
-      cudaSetDevice(device_id); // only once
-
-      while (true) {
-        Task task;
-        {
-          std::unique_lock<std::mutex> lk(mtxs_[i]);
-          cvs_[i].wait(lk, [&] { return stop_pool_ || !queues_[i].empty(); });
-          if (stop_pool_ && queues_[i].empty())
-            return;
-
-          task = std::move(queues_[i].front());
-          queues_[i].pop();
-        }
-        task(); //
-      }
-    });
+    streams_[i] = pool_->stream(i);
   }
 
 #ifdef FLEXKV_ENABLE_NVCOMP
@@ -163,13 +134,18 @@ void TPTransferThreadGroup::update_gpu_block_ptrs(
 
 TPTransferThreadGroup::~TPTransferThreadGroup() {
   const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
-
-  stop_pool_ = true;
-  for (auto &cv : cvs_)
-    cv.notify_all();
-  for (auto &t : threads_)
-    if (t.joinable())
-      t.join();
+  // CUDAGuard only restores c10's view of the current device; the raw
+  // cudaSetDevice calls below bypass that cache, so snapshot and restore the
+  // driver-level device explicitly as well.
+  // Destroying the pool joins its threads, then syncs and destroys every
+  // stream. It must happen *before* the pinned buffers are freed below: an
+  // in-flight copy may still be reading gpu_blocks_. streams_ only mirrors
+  // the pool's handles, so it is dangling from here on.
+  pool_.reset();
+  streams_.clear();
+  // Swallow any error raised by the teardown above so it is not mistaken for
+  // a transfer failure by the next cudaGetLastError() caller.
+  cudaGetLastError();
 
   cudaFreeHost(gpu_blocks_);
 
@@ -186,14 +162,7 @@ TPTransferThreadGroup::~TPTransferThreadGroup() {
 
 std::future<void> TPTransferThreadGroup::enqueue_for_gpu(int gpu_idx,
                                                          Task task) {
-  auto pkg = std::make_shared<std::packaged_task<void()>>(std::move(task));
-  auto fut = pkg->get_future();
-  {
-    std::lock_guard<std::mutex> lk(mtxs_[gpu_idx]);
-    queues_[gpu_idx].emplace([pkg] { (*pkg)(); });
-  }
-  cvs_[gpu_idx].notify_one();
-  return fut;
+  return pool_->enqueue(gpu_idx, std::move(task));
 }
 
 void TPTransferThreadGroup::tp_group_transfer(
@@ -207,14 +176,24 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int layer_id, const int layer_granularity, const int kv_dim,
     const int num_kv_heads,
     const std::string &kv_shared_across_ranks_mode,
-    const int designated_rank) {
+    const int designated_rank, const bool sync) {
 
   std::atomic<bool> failed{false};
+  // error_msg is written from up to num_gpus_ worker threads concurrently.
+  // Guard it: an unsynchronized std::string assignment from several threads
+  // is a data race (torn read / double free of the heap buffer), not merely
+  // a "last writer wins" ambiguity. The first message is kept because it is
+  // the one closest to the root cause; later ranks usually just report the
+  // downstream fallout.
+  std::mutex error_mtx;
   std::string error_msg;
-  // threads_.clear();
-  // threads_.reserve(num_gpus_);
-
-  // Barrier sync_point(num_gpus_);
+  auto record_error = [&](const std::string &msg) {
+    std::lock_guard<std::mutex> lk(error_mtx);
+    failed = true;
+    if (error_msg.empty()) {
+      error_msg = msg;
+    }
+  };
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
@@ -322,62 +301,89 @@ void TPTransferThreadGroup::tp_group_transfer(
                                               : layers_per_rank_rotate;
         }
 
-        // Dispatch to the appropriate template based on backend type
-        switch (backend_type_) {
-        case BackendType::VLLM:
-          flexkv::transfer_kv_blocks<BackendType::VLLM>(
-              num_blocks, eff_start_layer, eff_num_layers, gpu_block_ids,
-              gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
-              cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
-              cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-              cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer,
-              kv_dim, gpu_block_strides_in_bytes_[i], true,
-              ce_config_);
-          break;
-        case BackendType::TRTLLM:
-          flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
-              num_blocks, eff_start_layer, eff_num_layers, gpu_block_ids,
-              gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
-              cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
-              cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-              cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer,
-              kv_dim, gpu_block_strides_in_bytes_[i], true,
-              ce_config_);
-          break;
-        case BackendType::SGLANG:
-          flexkv::transfer_kv_blocks<BackendType::SGLANG>(
-              num_blocks, eff_start_layer, eff_num_layers, gpu_block_ids,
-              gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
-              cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
-              cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
-              cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer,
-              kv_dim, gpu_block_strides_in_bytes_[i], true,
-              ce_config_);
-          break;
+        // One region's arguments, this rank's slice. The three-arm switch on
+        // backend_type_ that used to be written out here lives once in
+        // transfer_backend.cpp; this call site now says only *what* to move
+        // and *by which mechanism*.
+        RegionTransferArgs args;
+        args.num_blocks = num_blocks;
+        args.gpu_block_ids = gpu_block_ids;
+        args.cpu_block_ids = cpu_block_ids;
+        args.start_layer_id = eff_start_layer;
+        args.num_layers = eff_num_layers;
+        args.kv_dim = kv_dim;
+        args.chunk_size_in_bytes = chunk_size;
+        args.is_host_to_device = is_host_to_device;
+        args.tensor_kind = backend_type_;
+        args.gpu_tensor_handler = gpu_tensor_handlers_[i];
+        args.gpu_block_stride_in_bytes = gpu_block_strides_in_bytes_[i];
+        args.gpu_startoff_inside_chunks = gpu_startoff_inside_chunks;
+        args.cpu_ptr = cpu_ptr;
+        args.cpu_kv_stride_in_bytes = cpu_kv_stride_in_bytes;
+        args.cpu_layer_stride_in_bytes = cpu_layer_stride_in_bytes;
+        args.cpu_block_stride_in_bytes = cpu_block_stride_in_bytes;
+        args.cpu_startoff_inside_chunks = cpu_startoff_inside_chunks;
+        args.transfer_num_cta = transfer_num_cta;
+
+        // A backend never synchronizes, so sync=true is honoured here rather
+        // than inside transfer_kv_blocks. Same observable contract: this
+        // returns only once the rank's copy has landed.
+        launch_region(TransferBackendKind::AUTO, use_ce_transfer, args,
+                      streams_[i], ce_config_);
+        if (sync) {
+          cudaError_t sync_err = cudaStreamSynchronize(streams_[i]);
+          if (sync_err != cudaSuccess) {
+            record_error(std::string("rank ") + std::to_string(i) +
+                         ": stream sync: " + cudaGetErrorString(sync_err));
+          }
         }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-          failed = true;
-          error_msg = cudaGetErrorString(err);
+          record_error(std::string("rank ") + std::to_string(i) + ": " +
+                       cudaGetErrorString(err));
         }
       } catch (const std::exception &e) {
-        failed = true;
-        error_msg = e.what();
+        record_error(std::string("rank ") + std::to_string(i) + ": " + e.what());
+      } catch (...) {
+        // A non-std::exception throw previously escaped the packaged_task and
+        // resurfaced at f.get() as an opaque failure with `failed` still
+        // false, so the caller saw success.
+        record_error(std::string("rank ") + std::to_string(i) +
+                     ": unknown exception");
       }
     }));
   }
 
+  // Every future must be waited on, even after one of them reports a
+  // failure: returning early would let the lambdas' captured references
+  // (block-id tensors, error_msg) die while worker threads still read them.
   for (auto &f : futures) {
-    f.get();
+    try {
+      f.get();
+    } catch (const std::exception &e) {
+      record_error(std::string("future: ") + e.what());
+    } catch (...) {
+      record_error("future: unknown exception");
+    }
   }
 
   if (failed) {
-    throw std::runtime_error("tp_group_transfer failed: " + error_msg);
+    std::string msg;
+    {
+      std::lock_guard<std::mutex> lk(error_mtx);
+      msg = error_msg;
+    }
+    throw std::runtime_error("tp_group_transfer failed: " + msg);
   }
+}
+
+void TPTransferThreadGroup::wait_all_streams() {
+  // Drains from the pool threads rather than the caller: each pool thread has
+  // already had cudaSetDevice() applied once at start-up, so this needs no
+  // device juggling on the calling thread and cannot disturb its current
+  // device. With sync=false, a copy failure only surfaces here.
+  pool_->sync_all_streams();
 }
 
 } // namespace flexkv

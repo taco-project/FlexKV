@@ -4,6 +4,7 @@
  */
 #include "compression/ans/nvcomp_ans_tp.h"
 #include "tp_transfer_thread_group.h"
+#include "transfer_backend.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -207,29 +208,15 @@ size_t TPTransferThreadGroup::tp_group_transfer_ans(
                                 int64_t cur_cpu_block_stride,
                                 int64_t cur_chunk_size,
                                 uint32_t *cur_size_table_base) {
-          switch (backend_type_) {
-          case BackendType::VLLM:
-            dispatch_nvcomp(
-                std::integral_constant<BackendType, BackendType::VLLM>{},
-                cur_num_blocks, cur_gpu_block_ids, cur_cpu_block_ids,
-                cur_cpu_ptr, cur_cpu_kv_stride, cur_cpu_layer_stride,
-                cur_cpu_block_stride, cur_chunk_size, cur_size_table_base);
-            break;
-          case BackendType::TRTLLM:
-            dispatch_nvcomp(
-                std::integral_constant<BackendType, BackendType::TRTLLM>{},
-                cur_num_blocks, cur_gpu_block_ids, cur_cpu_block_ids,
-                cur_cpu_ptr, cur_cpu_kv_stride, cur_cpu_layer_stride,
-                cur_cpu_block_stride, cur_chunk_size, cur_size_table_base);
-            break;
-          case BackendType::SGLANG:
-            dispatch_nvcomp(
-                std::integral_constant<BackendType, BackendType::SGLANG>{},
-                cur_num_blocks, cur_gpu_block_ids, cur_cpu_block_ids,
-                cur_cpu_ptr, cur_cpu_kv_stride, cur_cpu_layer_stride,
-                cur_cpu_block_stride, cur_chunk_size, cur_size_table_base);
-            break;
-          }
+          // dispatch_nvcomp already takes the layout as an integral_constant
+          // tag; with_tensor_kind is exactly the function that produces one
+          // from the runtime enum, so the three arms collapse to this.
+          with_tensor_kind(backend_type_, [&](auto tag) {
+            dispatch_nvcomp(tag, cur_num_blocks, cur_gpu_block_ids,
+                            cur_cpu_block_ids, cur_cpu_ptr, cur_cpu_kv_stride,
+                            cur_cpu_layer_stride, cur_cpu_block_stride,
+                            cur_chunk_size, cur_size_table_base);
+          });
         };
 
         if (num_kv_heads == 1) {

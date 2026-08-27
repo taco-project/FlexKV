@@ -393,23 +393,49 @@ class TransferWorkerBase(ABC):
         if backend is not None:
             backend.attach(self)
 
-    def _run_backend(self, transfer_op: WorkerTransferOp) -> bool:
+    def _run_backend(
+        self, transfer_op: WorkerTransferOp
+    ) -> Union[bool, WorkerTransferResult]:
         """One timed backend transfer plus its perf record.
 
         The backend returns the byte count, which is what removes the
         per-engine ``transfer_size`` formula from every ``launch_transfer``.
+
+        A backend that ``reports_block_results`` returns per-block outcomes
+        alongside the byte count; those become a ``WorkerTransferResult`` so
+        the engine can keep the blocks that landed instead of failing the
+        whole op. Everything else stays on the plain bool path.
         """
         backend = self._backend
         assert backend is not None
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(
             transfer_op, pinned=backend.needs_pinned_block_ids)
         start_time = time.time()
-        transfer_size = backend.transfer(
-            self, transfer_op, src_block_ids, dst_block_ids)
+        if backend.reports_block_results:
+            block_results, transfer_size = backend.transfer_blocks(
+                self, transfer_op, src_block_ids, dst_block_ids)
+        else:
+            block_results = None
+            transfer_size = backend.transfer(
+                self, transfer_op, src_block_ids, dst_block_ids)
         end_time = time.time()
-        self._log_transfer_performance(
-            transfer_op, transfer_size, start_time, end_time)
-        return True
+        # Diagnostics must not decide the outcome: a throw here would lose the
+        # per-block results the caller needs to fall back selectively.
+        try:
+            self._log_transfer_performance(
+                transfer_op, transfer_size, start_time, end_time)
+        except Exception as e:  # noqa: BLE001
+            flexkv_logger.error(
+                f"[worker {self.worker_id}] transfer performance logging "
+                f"failed for op {transfer_op.transfer_op_id}: {e}",
+                exc_info=True,
+            )
+        if block_results is None:
+            return True
+        return WorkerTransferResult(
+            transfer_op_id=transfer_op.transfer_op_id,
+            block_results=block_results,
+        )
 
     def get_transfer_block_ids(self,
                                transfer_op: WorkerTransferOp,

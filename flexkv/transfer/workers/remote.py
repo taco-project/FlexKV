@@ -14,7 +14,7 @@ from torch.multiprocessing import Queue as MPQueue
 from flexkv.common.storage import KVCacheLayout
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 from flexkv.transfer.backends import StorageBackend
-from flexkv.transfer.worker_op import WorkerTransferOp
+from flexkv.transfer.worker_op import WorkerTransferOp, WorkerTransferResult
 from flexkv.transfer.workers.runtime import TransferWorkerBase
 
 
@@ -50,6 +50,14 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         if backend.needs_pinned_block_ids:
             self._pin_op_buffer()
 
+        # Read before materializing: only the handle knows the mapping's
+        # aligned length, which is >= the logical pool and is what an external
+        # RDMA registration must cover. A plain tensor pool maps exactly what
+        # it holds, so None means "logical size is the mapped size".
+        self.cpu_blocks_mapped_size = (
+            int(cpu_blocks.aligned)
+            if isinstance(cpu_blocks, HugePageTensorHandle) else None
+        )
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         self.cpu_blocks = cpu_blocks
         self.cpu_layer_ptrs = self._get_layer_ptrs(cpu_blocks)
@@ -66,5 +74,7 @@ class CPURemoteTransferWorker(TransferWorkerBase):
 
         self._attach_backend(backend)
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+    def launch_transfer(
+        self, transfer_op: WorkerTransferOp
+    ) -> Union[bool, WorkerTransferResult]:
         return self._run_backend(transfer_op)

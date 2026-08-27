@@ -3,6 +3,7 @@
  * All rights reserved. SPDX-License-Identifier: Apache-2.0
  */
 #include "compression/ans/nvcomp_ans.cuh"
+#include "transfer_backend.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
@@ -78,31 +79,24 @@ static size_t transfer_kv_blocks_ans_binding(
 
   size_t compressed_bytes = 0;
 
-#define ANS_DISPATCH(func, Type)                                             \
-  compressed_bytes = flexkv::func<Type>(                                      \
-      &ctx, num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,   \
-      cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,                         \
-      cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,                   \
-      chunk_size_in_bytes, kv_dim, cpu_size_table,                            \
-      cpu_size_table_block_stride, cpu_size_table_layer_stride, stream)
-#define ANS_SWITCH(func)                                                     \
-  switch (bt) {                                                              \
-    case flexkv::BackendType::VLLM:                                          \
-      ANS_DISPATCH(func, flexkv::BackendType::VLLM);                         \
-      break;                                                                 \
-    case flexkv::BackendType::TRTLLM:                                        \
-      ANS_DISPATCH(func, flexkv::BackendType::TRTLLM);                       \
-      break;                                                                 \
-    case flexkv::BackendType::SGLANG:                                        \
-      ANS_DISPATCH(func, flexkv::BackendType::SGLANG);                       \
-      break;                                                                 \
-  }
+  // The only thing that varied between the two switches was the function
+  // name, and the only thing that varied between their arms was the layout.
+  // with_tensor_kind supplies the layout, so what is left is one macro that
+  // names the function.
+#define ANS_DISPATCH(func)                                                    \
+  flexkv::with_tensor_kind(bt, [&](auto tag) {                                \
+    compressed_bytes = flexkv::func<decltype(tag)::value>(                    \
+        &ctx, num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, \
+        cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,                       \
+        cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,                 \
+        chunk_size_in_bytes, kv_dim, cpu_size_table,                          \
+        cpu_size_table_block_stride, cpu_size_table_layer_stride, stream);    \
+  })
   if (is_d2h) {
-    ANS_SWITCH(transfer_kv_blocks_ans_comp);
+    ANS_DISPATCH(transfer_kv_blocks_ans_comp);
   } else {
-    ANS_SWITCH(transfer_kv_blocks_ans_decomp);
+    ANS_DISPATCH(transfer_kv_blocks_ans_decomp);
   }
-#undef ANS_SWITCH
 #undef ANS_DISPATCH
 
   cudaError_t err = cudaGetLastError();
