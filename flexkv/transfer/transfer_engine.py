@@ -1465,15 +1465,14 @@ class TransferEngine:
                 graph_id=op.graph_id,
                 src_block_ids_h2d=op.src_block_ids_h2d.copy(),
                 dst_block_ids_h2d=op.dst_block_ids_h2d.copy(),
-                src_block_ids_disk2h=op.src_block_ids_disk2h.copy(),
-                dst_block_ids_disk2h=op.dst_block_ids_disk2h.copy(),
+                # No disk2h ids: a merged DISK2H is hoisted to an op of its own
+                # on the graph and dispatched to the CPU<->SSD worker, so a
+                # layerwise replica carries only the H2D half.
                 # SWA ids must be carried through PP fan-out replicas, otherwise
                 # each PP sibling's worker would only see main-KV ids and the SWA
                 # layer-fused branch in cpp would be silently skipped.
                 swa_src_block_ids_h2d=op.swa_src_block_ids_h2d.copy(),
                 swa_dst_block_ids_h2d=op.swa_dst_block_ids_h2d.copy(),
-                swa_src_block_ids_disk2h=op.swa_src_block_ids_disk2h.copy(),
-                swa_dst_block_ids_disk2h=op.swa_dst_block_ids_disk2h.copy(),
                 dp_client_id=op.dp_client_id,
                 counter_id=op.counter_id,
             )
