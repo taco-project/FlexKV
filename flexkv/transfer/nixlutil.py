@@ -74,7 +74,7 @@ def build_nixl_extra_config(cache_config: Any) -> Dict[str, Any]:
 def require_nixl() -> None:
     if nixl_agent is None or nixl_agent_config is None:
         raise ImportError(
-            "NIXL is required for NixlTransferWorker. Install per "
+            "NIXL is required for NixlFileBackend. Install per "
             "https://github.com/ai-dynamo/nixl/blob/main/README.md"
         ) from _NIXL_IMPORT_ERROR
 

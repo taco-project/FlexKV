@@ -158,7 +158,7 @@ class KVTaskManager:
         if cache_config.enable_nixl and model_config.effective_tp_size_per_node > 1:
             raise ValueError(
                 "enable_nixl GPU-SSD path currently requires effective_tp_size_per_node==1 "
-                "(no tpNixlTransferWorker)"
+                "(NixlFileBackend addresses one device's tensors)"
             )
         self.model_config = model_config
         self.cache_config = cache_config
