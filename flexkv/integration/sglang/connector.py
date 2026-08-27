@@ -1824,9 +1824,14 @@ class FlexKVConnector:
             LayerGroupSpec(
                 num_layers=len(indexer_buffers),
                 num_kv_heads=1,
+                # GLM DSA stores one flattened index+scale row per complete
+                # KV page: [num_pages, page_size * (head + scale)]. The
+                # physical GPU layout therefore has tokens_per_block=1.
+                # Describe that row as one page so the worker does not
+                # multiply it by page_size a second time.
                 head_size=indexer_buffers[0].shape[1],
                 layer_indices=list(range(len(indexer_buffers))),
-                compress_ratio=1,
+                compress_ratio=self.page_size,
                 dtype=indexer_buffers[0].dtype,
             ),
         ]
