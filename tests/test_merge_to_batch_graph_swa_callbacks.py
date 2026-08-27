@@ -60,7 +60,12 @@ def _graph_with_get_ops(*, with_swa: bool) -> tuple[TransferOpGraph, dict[int, o
     return graph, {"fired": fired, "callbacks": callbacks}
 
 
-def test_layerwise_merge_combines_main_and_swa_callbacks():
+def test_layerwise_moves_disk2h_callbacks_onto_the_hoisted_ops():
+    """The DISK2H callbacks ride the hoisted reads; the H2D ones stay fused.
+
+    Firing them at CPU-ready instead of GPU-ready is the point -- they publish
+    CPU blocks -- but none may be dropped, which is what this pins.
+    """
     graph, ctx = _graph_with_get_ops(with_swa=True)
     merged, batch_end_op_id, op_callbacks = merge_to_batch_graph(
         batch_id=99,
@@ -70,14 +75,22 @@ def test_layerwise_merge_combines_main_and_swa_callbacks():
         layerwise_transfer=True,
     )
 
-    lw_op = next(iter(merged._op_map.values()))
-    assert batch_end_op_id == lw_op.op_id
-    assert merged.num_ops == 1
+    lw_op = merged._op_map[batch_end_op_id]
     assert isinstance(lw_op, LayerwiseTransferOp)
-    assert lw_op.op_id in op_callbacks
+    # LAYERWISE + hoisted main DISK2H + hoisted SWA DISK2H.
+    assert merged.num_ops == 3
+    disk2h_ops = [op for op in merged._op_map.values()
+                  if op.transfer_type == TransferType.DISK2H]
+    assert len(disk2h_ops) == 2
+    assert all(op.op_id in lw_op.predecessors for op in disk2h_ops)
 
+    for op in disk2h_ops:
+        assert op.op_id in op_callbacks, "a hoisted DISK2H lost its callback"
+        op_callbacks[op.op_id]()
     op_callbacks[lw_op.op_id]()
-    assert ctx["fired"] == ["main_disk2h", "main_h2d", "swa_disk2h", "swa_h2d"]
+
+    assert sorted(ctx["fired"]) == [
+        "main_disk2h", "main_h2d", "swa_disk2h", "swa_h2d"]
 
 
 def test_non_layerwise_put_swa_callbacks_on_merged_ops():

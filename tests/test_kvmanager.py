@@ -1202,12 +1202,11 @@ def _mock_sglang_eventfd_client(socket_path: str,
                                 num_counters: int = 3,
                                 max_retries: int = 120,
                                 retry_interval: float = 0.5):
-    """Simulate SGLang sending eventfds to the LayerwiseTransferWorker.
+    """Simulate SGLang handing its per-layer eventfds to the worker.
 
-    Runs in a background thread. Creates real eventfds so the C++
-    LayerwiseTransferGroup receives valid file descriptors. The worker gets
-    its own copies through SCM_RIGHTS; the sender copies are closed after the
-    handshake.
+    Runs in a background thread. Creates real eventfds so the C++ region batch
+    receives valid file descriptors. The worker gets its own copies through
+    SCM_RIGHTS; the sender copies are closed after the handshake.
     """
     created_fds = []
     sock = None
@@ -1299,8 +1298,8 @@ def test_kvmanager_with_indexer_layerwise(model_config, cache_config, test_confi
     Data correctness is verified for both the main KV cache and the
     indexer (DSA) KV cache after the round-trip.
 
-    A background thread simulates the SGLang eventfd client so the
-    LayerwiseTransferWorker can complete its initialization handshake
+    A background thread simulates the SGLang eventfd client so the worker's
+    per-layer completion contract can complete its initialization handshake
     without any source-code changes.
     """
     from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV

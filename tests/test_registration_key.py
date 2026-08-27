@@ -1,19 +1,19 @@
-import sys
-import types
 from types import SimpleNamespace
 
 import zmq
 
 from flexkv.common.config import ModelConfig, RankInfo
 from flexkv.server.request import RegisterTPClientRequest
-
-
-# Registration tests do not need the CUDA/liburing transfer workers.
-transfer_engine_module = types.ModuleType("flexkv.transfer.transfer_engine")
-transfer_engine_module.TransferEngine = object
-sys.modules["flexkv.transfer.transfer_engine"] = transfer_engine_module
-
 from flexkv.transfer_manager import TransferManager
+
+# Imported plainly, on purpose. An earlier version of this file stubbed
+# flexkv.transfer.transfer_engine in sys.modules to skip the CUDA/liburing
+# import cost, then tried to unwind the stub afterwards. Either half breaks the
+# suite: leaving the stub in binds TransferEngine to `object` for every module
+# collected after this one, and popping flexkv.transfer_manager to undo it
+# makes a later import build a *second* module object, so pickling
+# TransferManagerInterProcessHandle fails its class-identity check in ~48
+# unrelated tests. The real import works and costs little.
 
 
 def _request(dp_client_id: int, intra_client_id: int, device_id: int):
