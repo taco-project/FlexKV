@@ -244,31 +244,21 @@ class LayerwiseTransferOp(TransferOp):
 
     src_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     dst_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
-    src_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
-    dst_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     # SWA fields
     swa_src_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     swa_dst_block_ids_h2d: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
-    swa_src_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
-    swa_dst_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     counter_id: int = 0  # Counter set index for triple buffering eventfd notification
 
     def __init__(self,
                 graph_id: int,
                 src_block_ids_h2d: np.ndarray,
                 dst_block_ids_h2d: np.ndarray,
-                src_block_ids_disk2h: np.ndarray,
-                dst_block_ids_disk2h: np.ndarray,
                 swa_src_block_ids_h2d: Optional[np.ndarray] = None,
                 swa_dst_block_ids_h2d: Optional[np.ndarray] = None,
-                swa_src_block_ids_disk2h: Optional[np.ndarray] = None,
-                swa_dst_block_ids_disk2h: Optional[np.ndarray] = None,
                 dp_client_id: int = 0,
                 counter_id: int = 0) -> None:
         self.src_block_ids_h2d = src_block_ids_h2d
         self.dst_block_ids_h2d = dst_block_ids_h2d
-        self.src_block_ids_disk2h = src_block_ids_disk2h
-        self.dst_block_ids_disk2h = dst_block_ids_disk2h
         # SWA ids default to empty arrays so callers that only need the main-KV
         # path can omit them and __post_init__ assertions still hold (.size on None
         # would AttributeError). Empty SWA arrays drive the cpp fused layer loop
@@ -276,8 +266,6 @@ class LayerwiseTransferOp(TransferOp):
         _empty = lambda: np.array([], dtype=np.int64)
         self.swa_src_block_ids_h2d = swa_src_block_ids_h2d if swa_src_block_ids_h2d is not None else _empty()
         self.swa_dst_block_ids_h2d = swa_dst_block_ids_h2d if swa_dst_block_ids_h2d is not None else _empty()
-        self.swa_src_block_ids_disk2h = swa_src_block_ids_disk2h if swa_src_block_ids_disk2h is not None else _empty()
-        self.swa_dst_block_ids_disk2h = swa_dst_block_ids_disk2h if swa_dst_block_ids_disk2h is not None else _empty()
         self.counter_id = counter_id
 
         super().__init__(
@@ -296,18 +284,12 @@ class LayerwiseTransferOp(TransferOp):
         super().__post_init__(is_swa)
 
         assert self.src_block_ids_h2d.size == self.dst_block_ids_h2d.size
-        assert self.src_block_ids_disk2h.size == self.dst_block_ids_disk2h.size
         assert self.swa_src_block_ids_h2d.size == self.swa_dst_block_ids_h2d.size
-        assert self.swa_src_block_ids_disk2h.size == self.swa_dst_block_ids_disk2h.size
 
         assert self.src_block_ids_h2d.dtype == _INT64
         assert self.dst_block_ids_h2d.dtype == _INT64
-        assert self.src_block_ids_disk2h.dtype == _INT64
-        assert self.dst_block_ids_disk2h.dtype == _INT64
         assert self.swa_src_block_ids_h2d.dtype == _INT64
         assert self.swa_dst_block_ids_h2d.dtype == _INT64
-        assert self.swa_src_block_ids_disk2h.dtype == _INT64
-        assert self.swa_dst_block_ids_disk2h.dtype == _INT64
 
 
 class TransferOpGraph:
@@ -988,29 +970,52 @@ def merge_to_batch_graph(batch_id: int,
             assert merged_h2d_op is not None or merged_swa_h2d_op is not None, \
                 "layerwise GET requires an H2D (main or SWA)"
 
+            # The SSD read is an ordinary DISK2H op the LAYERWISE op depends on,
+            # never a fused Step 0 inside the layerwise worker.  It has to be:
+            # this commit replaces the SSD-capable LayerwiseTransferWorker with
+            # the plain CPU<->GPU worker under a PER_LAYER contract, and that
+            # worker has no SSD binding at all -- ids fused onto the op would be
+            # read by nobody.  Hoisting also lets the SSD read overlap with
+            # anything else the engine has queued.
+            #
+            # Byte-for-byte it is the same read either way:
+            # CPUSSDDiskTransferWorker derives its strides from the same CPU/SSD
+            # layouts and calls transfer_kv_blocks_ssd over all layers with full
+            # (non-TP-divided) CPU strides.
+            layerwise_disk2h_ops = [op for op in (merged_disk2h_op,
+                                                  merged_swa_disk2h_op)
+                                    if op is not None]
+            for op in layerwise_disk2h_ops:
+                merged_graph.add_transfer_op(op)
+            # The callbacks ride the hoisted ops, which fires them at CPU-ready
+            # rather than GPU-ready -- correctly so: they publish CPU blocks into
+            # the radix tree, which is exactly what a finished DISK2H
+            # established.
+            # Re-attach with per-source spans, exactly as _merge_ops would have:
+            # a hoisted DISK2H is a merged op, so a partial-capable completion
+            # must still slice back to the task that contributed each block.
+            if merged_disk2h_op is not None:
+                _attach_merged_callbacks(
+                    merged_disk2h_op, ops_by_type[TransferType.DISK2H],
+                    callbacks_by_type[TransferType.DISK2H],
+                    new_op_callback_dict)
+            if merged_swa_disk2h_op is not None:
+                _attach_merged_callbacks(
+                    merged_swa_disk2h_op, swa_ops_by_type[TransferType.DISK2H],
+                    swa_callbacks_by_type[TransferType.DISK2H],
+                    new_op_callback_dict)
+
             layerwise_transfer_op = LayerwiseTransferOp(
                 graph_id=merged_graph.graph_id,
                 src_block_ids_h2d=merged_h2d_op.src_block_ids if merged_h2d_op is not None
                     else np.array([], dtype=np.int64),
                 dst_block_ids_h2d=merged_h2d_op.dst_block_ids if merged_h2d_op is not None
                     else np.array([], dtype=np.int64),
-                src_block_ids_disk2h=merged_disk2h_op.src_block_ids
-                    if merged_disk2h_op is not None
-                    else np.array([], dtype=np.int64),
-                dst_block_ids_disk2h=merged_disk2h_op.dst_block_ids
-                    if merged_disk2h_op is not None
-                    else np.array([], dtype=np.int64),
                 swa_src_block_ids_h2d=merged_swa_h2d_op.src_block_ids
                     if merged_swa_h2d_op is not None
                     else np.array([], dtype=np.int64),
                 swa_dst_block_ids_h2d=merged_swa_h2d_op.dst_block_ids
                     if merged_swa_h2d_op is not None
-                    else np.array([], dtype=np.int64),
-                swa_src_block_ids_disk2h=merged_swa_disk2h_op.src_block_ids
-                    if merged_swa_disk2h_op is not None
-                    else np.array([], dtype=np.int64),
-                swa_dst_block_ids_disk2h=merged_swa_disk2h_op.dst_block_ids
-                    if merged_swa_disk2h_op is not None
                     else np.array([], dtype=np.int64),
                 dp_client_id=dp_client_id,
                 counter_id=counter_id,
@@ -1024,16 +1029,19 @@ def merge_to_batch_graph(batch_id: int,
                 merged_graph.add_dependency(
                     layerwise_transfer_op.op_id, merged_swa_remote2h_op.op_id)
 
-            # DISK2H rides the LAYERWISE op as its fused Step 0a, so its
-            # callbacks fold in here with the H2D ones and fire when the whole
-            # fused transfer is done.
+            # The per-layer H2D reads CPU blocks the hoisted DISK2H fills, so it
+            # must not start before that op is BACKEND_DONE. This edge is the
+            # whole safety argument for the hoisted SSD read.
+            for op in layerwise_disk2h_ops:
+                merged_graph.add_dependency(
+                    layerwise_transfer_op.op_id, op.op_id)
+
+            # DISK2H callbacks are NOT here: the SSD read is hoisted into its own
+            # op above and fires its own callbacks at CPU-ready. Only the H2D
+            # lanes fold into LAYERWISE.
             layerwise_callbacks: List[Callable] = []
             layerwise_callbacks.extend(
-                callback for _, callback in callbacks_by_type[TransferType.DISK2H])
-            layerwise_callbacks.extend(
                 callback for _, callback in callbacks_by_type[TransferType.H2D])
-            layerwise_callbacks.extend(
-                callback for _, callback in swa_callbacks_by_type[TransferType.DISK2H])
             layerwise_callbacks.extend(
                 callback for _, callback in swa_callbacks_by_type[TransferType.H2D])
             _attach_combined_callback(

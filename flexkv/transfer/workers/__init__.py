@@ -34,7 +34,6 @@ from flexkv.transfer.workers.gds import GDSTransferWorker, tpGDSTransferWorker  
 from flexkv.transfer.workers.gpu_cpu import (  # noqa: E402
     GPUCPUTransferWorker,
     _validate_multi_group_chunk_layout,
-    tpGPUCPUTransferWorker,
 )
 from flexkv.transfer.workers.handle import WorkerHandle  # noqa: E402
 from flexkv.transfer.workers.nixl import NixlTransferWorker  # noqa: E402
@@ -69,5 +68,4 @@ __all__ = [
     "ensure_cuda_device",
     "import_tensor_handles",
     "tpGDSTransferWorker",
-    "tpGPUCPUTransferWorker",
 ]

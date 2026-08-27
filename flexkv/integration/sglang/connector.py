@@ -58,7 +58,7 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.integration.config import FlexKVConfig
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
-from flexkv.transfer.layerwise import build_layerwise_eventfd_socket_path
+from flexkv.transfer.layer_eventfd import build_layerwise_eventfd_socket_path
 from flexkv.transfer_manager import TransferManagerOnRemote
 
 logger = logging.getLogger(__name__)

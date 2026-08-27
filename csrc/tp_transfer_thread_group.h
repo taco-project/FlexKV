@@ -16,19 +16,15 @@
  */
 #pragma once
 
+#include "device_thread_pool.h"
 #include "gtensor_handler.cuh"
 #include "transfer.cuh"
 #include "ce_transfer.h"
-#include <atomic>
-#include <condition_variable>
 #include <cuda_runtime.h>
 #include <functional>
 #include <future>
 #include <memory>
-#include <mutex>
-#include <queue>
 #include <string>
-#include <thread>
 #include <torch/extension.h>
 #include <vector>
 
@@ -59,6 +55,13 @@ public:
   void update_gpu_block_ptrs(
       const std::vector<int64_t> &gpu_block_ptrs_flat);
 
+  // sync=true (the default) keeps the historical contract: the call returns
+  // only once every rank's copy has landed. sync=false launches onto each
+  // rank's stream and returns as soon as the launches are issued -- the caller
+  // must then call wait_all_streams() before touching the data. Multi-group
+  // callers want the latter: with sync=true group N+1 cannot even be launched
+  // while group N drains, which serializes what the per-rank streams could
+  // otherwise overlap.
   void tp_group_transfer(const torch::Tensor &gpu_block_id_tensor,
                          const torch::Tensor &cpu_block_id_tensor,
                          const int64_t cpu_kv_stride_in_bytes,
@@ -71,7 +74,12 @@ public:
                          const int layer_granularity, const int kv_dim,
                          const int num_kv_heads,
                          const std::string &kv_shared_across_ranks_mode = "sharded",
-                         const int designated_rank = 0);
+                         const int designated_rank = 0,
+                         const bool sync = true);
+
+  // Block until every rank's stream has drained. Only needed after a
+  // tp_group_transfer(sync=false); a no-op otherwise.
+  void wait_all_streams();
 
 #ifdef FLEXKV_ENABLE_NVCOMP
 
@@ -100,6 +108,15 @@ private:
   using Task = std::function<void()>;
   std::future<void> enqueue_for_gpu(int gpu_idx, Task task);
 
+  // One thread + one stream per rank, cudaSetDevice applied once at start-up.
+  // Was five hand-rolled members here (threads_, queues_, mtxs_, cvs_,
+  // stop_pool_) plus a destructor that had to join before destroying streams;
+  // the same five lived in TPGDSTransferThreadGroup and the since-deleted
+  // LayerwiseTransferGroup,
+  // and the copies drifted -- this one leaked every stream it created until
+  // that was fixed in only this copy.
+  std::unique_ptr<DeviceThreadPool> pool_;
+
   int num_gpus_;
   std::vector<int> gpu_device_ids_;
   void **gpu_blocks_;
@@ -116,13 +133,9 @@ private:
 
   CETransferConfig ce_config_;
 
-  std::vector<std::thread> threads_;
+  // Mirrors pool_->stream(i); kept because nvcomp_ans_tp.cpp indexes
+  // streams_[i] directly from inside a pool task.
   std::vector<cudaStream_t> streams_;
-
-  std::vector<std::queue<Task>> queues_;
-  std::vector<std::mutex> mtxs_;
-  std::vector<std::condition_variable> cvs_;
-  std::atomic<bool> stop_pool_;
 
   // rank_rotate mode: request-level round-robin counter, incremented each D2H call.
   int rotate_counter_ = 0;
