@@ -313,10 +313,13 @@ cpp_sources = [
     "csrc/ce_transfer.cu",
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
+    "csrc/device_thread_pool.cpp",
+    "csrc/transfer_backend.cpp",
+    "csrc/region_batch.cpp",
+    "csrc/layer_notify.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
     "csrc/eviction_strategy.cpp",
-    "csrc/layerwise.cpp",
     "csrc/monitoring/metrics_manager.cpp",  # Monitoring support
 ]
 
@@ -324,10 +327,13 @@ hpp_sources = [
     "csrc/logging.h",
     "csrc/cache_utils.h",
     "csrc/tp_transfer_thread_group.h",
+    "csrc/device_thread_pool.h",
+    "csrc/transfer_backend.h",
+    "csrc/region_batch.h",
+    "csrc/layer_notify.h",
     "csrc/transfer_ssd.h",
     "csrc/radix_tree.h",
     "csrc/eviction_strategy.h",
-    "csrc/layerwise.h",
     "csrc/ce_transfer.h",
     "csrc/monitoring/metrics_manager.h",  # Monitoring support
 ]

@@ -39,9 +39,15 @@ from flexkv.transfer.workers import (
     import_tensor_handles,
 )
 
-# Not a worker: a pure-arithmetic geometry check that lives beside the only
-# worker that runs it. Re-exported because the GLM DSA regression test
-# imports it from this path.
+# Not workers either. These are the geometry check and the Mooncake external-MR
+# helpers, which live beside the code that runs them (``workers/gpu_cpu.py``
+# and ``backends.py``) but are re-exported here because the regression suites
+# import them from this path.
+from flexkv.transfer.backends import (
+    _register_mooncake_regions,
+    _split_mooncake_registration_regions,
+    _unregister_mooncake_regions,
+)
 from flexkv.transfer.workers import _validate_multi_group_chunk_layout
 
 __all__ = [
@@ -57,4 +63,7 @@ __all__ = [
     "shared_transfer_kv_blocks_remote_read",
     "transfer_kv_blocks_remote",
     "_validate_multi_group_chunk_layout",
+    "_register_mooncake_regions",
+    "_split_mooncake_registration_regions",
+    "_unregister_mooncake_regions",
 ]

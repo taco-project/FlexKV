@@ -8,145 +8,64 @@ import torch
 
 from flexkv.common.storage import KVCacheLayoutType
 from flexkv.common.transfer import TransferType
-from flexkv.c_ext import (
-    transfer_kv_blocks_ans_comp,
-    transfer_kv_blocks_ans_decomp,
-    transfer_kv_blocks_ssd_packed,
-)
+from flexkv.c_ext import transfer_kv_blocks_ssd_packed
 from flexkv.transfer.compression.ans import ans_utils
 from flexkv.transfer.compression.common.size_table import bind_size_table
 from flexkv.transfer.compression.common.strategy import CompressionStrategy
 
 
 class NvcompGpuCpuStrategy(CompressionStrategy):
+    """ANS-compressed CPU<->GPU transfer for a TP group of any size.
+
+    There used to be a second strategy (``NvcompGpuCpuTpStrategy``) because
+    there used to be a second worker.  The two bound to different attribute
+    shapes -- scalar ``gpu_kv_stride_in_bytes`` and module-level
+    ``transfer_kv_blocks_ans_{comp,decomp}`` here, list-shaped
+    ``gpu_chunk_sizes_in_bytes`` and ``tp_group_transfer_ans`` there -- so
+    every field added to one had to be mirrored into the other.  Now that
+    ``GPUCPUTransferWorker`` covers tp==1 as ``num_gpus == 1``, one strategy
+    on ``tp_group_transfer_ans`` covers both: the cpp side already dispatches
+    per rank, and with a single rank the ``num_kv_heads > 1`` branch reduces
+    to exactly the old non-TP call (offset 0, table slice 0).
+
+    The size table follows the same rule: canonical 3-D ``[blocks, layers,
+    kv]`` when tp==1 or KV is replicated across ranks, per-rank 4-D otherwise
+    (see ``ans_utils.size_table_shape``).  Only the 4-D form has a rank
+    stride, and only then does the kernel need one.
+    """
+
     def __init__(self, cpu_size_table: torch.Tensor):
         self._cpu_size_table = cpu_size_table
-        self._ans_ctx: Optional[Any] = None
-        self._table_ptr = 0
-        self._table_block_stride = 0
-        self._table_layer_stride = 0
-
-    def attach(self, worker) -> None:
-        (self._table_ptr, _,
-         self._table_block_stride,
-         self._table_layer_stride) = bind_size_table(
-            self._cpu_size_table,
-            "[GPUCPUTransferWorker] cpu_size_table",
-            register=True,
-            expected_dims=(3,),
-        )
-        if self._table_ptr == 0:
-            raise RuntimeError(
-                "GPUCPUTransferWorker: nvcomp is enabled but "
-                "cpu_size_table was not supplied.")
-        self._ans_ctx = ans_utils.create_ans_context(
-            chunk_size_bytes=worker.chunk_size_in_bytes,
-            dtype=worker.dtype,
-            kv_dim=worker.kv_dim,
-            log_prefix="[nvcomp]",
-        )
-
-    def run(self, worker, op, src_block_ids, dst_block_ids) -> None:
-        start_time = time.time()
-        compressed_bytes = self._dispatch(
-            worker, src_block_ids, dst_block_ids, op.transfer_type)
-        end_time = time.time()
-        uncomp_size = (
-            worker.chunk_size_in_bytes
-            * worker.num_layers
-            * op.valid_block_num
-            * worker.kv_dim
-        )
-        worker._log_transfer_performance(
-            op, int(compressed_bytes), start_time, end_time,
-            uncompressed_size=uncomp_size)
-
-    def _dispatch(self, worker, src_block_ids, dst_block_ids, transfer_type) -> int:
-        if transfer_type == TransferType.H2D:
-            gpu_block_id_list, cpu_block_id_list = dst_block_ids, src_block_ids
-        elif transfer_type == TransferType.D2H:
-            gpu_block_id_list, cpu_block_id_list = src_block_ids, dst_block_ids
-        else:
-            raise ValueError(
-                f"Invalid transfer type: {transfer_type} for GPUCPUTransferWorker")
-        if len(gpu_block_id_list) == 0:
-            return 0
-
-        nvtx_range = nvtx.start_range(
-            message=f"NvcompGpuCpuStrategy.run[{transfer_type.name}]",
-            color="purple")
-        try:
-            gpu_tensor_ptrs = worker.gpu_blocks_ptrs
-            if transfer_type == TransferType.D2H:
-                ans_range = nvtx.start_range(
-                    message="D2H_nvcomp:transfer_kv_blocks_ans_comp",
-                    color="orange")
-                try:
-                    compressed_bytes = transfer_kv_blocks_ans_comp(
-                        self._ans_ctx, gpu_block_id_list, gpu_tensor_ptrs,
-                        worker.gpu_kv_stride_in_bytes,
-                        worker.gpu_block_stride_in_bytes,
-                        worker.gpu_layer_stride_in_bytes, cpu_block_id_list,
-                        worker.cpu_tensor, worker.cpu_kv_stride_in_bytes,
-                        worker.cpu_layer_stride_in_bytes,
-                        worker.cpu_block_stride_in_bytes,
-                        worker.chunk_size_in_bytes, 0, worker.num_layers,
-                        worker.kv_dim, worker.gpu_block_type_,
-                        self._table_ptr, self._table_block_stride,
-                        self._table_layer_stride)
-                finally:
-                    nvtx.end_range(ans_range)
-            else:
-                ans_range = nvtx.start_range(
-                    message="H2D_nvcomp:transfer_kv_blocks_ans_decomp",
-                    color="orange")
-                try:
-                    compressed_bytes = transfer_kv_blocks_ans_decomp(
-                        self._ans_ctx, gpu_block_id_list, gpu_tensor_ptrs,
-                        worker.gpu_kv_stride_in_bytes,
-                        worker.gpu_block_stride_in_bytes,
-                        worker.gpu_layer_stride_in_bytes, cpu_block_id_list,
-                        worker.cpu_tensor, worker.cpu_kv_stride_in_bytes,
-                        worker.cpu_layer_stride_in_bytes,
-                        worker.cpu_block_stride_in_bytes,
-                        worker.chunk_size_in_bytes, 0, worker.num_layers,
-                        worker.kv_dim, worker.gpu_block_type_,
-                        self._table_ptr, self._table_block_stride,
-                        self._table_layer_stride)
-                finally:
-                    nvtx.end_range(ans_range)
-            return int(compressed_bytes)
-        finally:
-            nvtx.end_range(nvtx_range)
-
-    def shutdown(self) -> None:
-        if self._ans_ctx is not None:
-            self._ans_ctx.destroy()
-            self._ans_ctx = None
-
-
-class NvcompGpuCpuTpStrategy(CompressionStrategy):
-    def __init__(self, cpu_size_table_tp: torch.Tensor):
-        self._cpu_size_table_tp = cpu_size_table_tp
         self._table_ptr = 0
         self._table_rank_stride = 0
         self._table_block_stride = 0
         self._table_layer_stride = 0
 
     def attach(self, worker) -> None:
+        if getattr(worker, "tp_group_transfer_groups", None) is not None:
+            raise RuntimeError(
+                "nvcomp is not supported for multi-group (heterogeneous KV) "
+                "layouts: the per-group transfers bypass the compressor.")
         batch_size, data_type = ans_utils.tp_worker_config(
             gpu_chunk_sizes_in_bytes=worker.gpu_chunk_sizes_in_bytes,
             dtype=worker.dtype,
             tp_size=worker.num_gpus,
         )
+        # A 4-D per-rank table is required exactly when the ranks hold
+        # different bytes: head-sharded KV spread over more than one GPU.
+        needs_rank_stride = worker.num_kv_heads > 1 and worker.num_gpus > 1
         (self._table_ptr, self._table_rank_stride,
          self._table_block_stride,
          self._table_layer_stride) = bind_size_table(
-            self._cpu_size_table_tp,
-            "[tpGPUCPUTransferWorker] cpu_size_table_tp",
+            self._cpu_size_table,
+            "[GPUCPUTransferWorker] cpu_size_table",
             register=True,
-            expected_dims=(3,) if worker.num_kv_heads == 1 else (4,),
+            expected_dims=(4,) if needs_rank_stride else (3,),
         )
+        if self._table_ptr == 0:
+            raise RuntimeError(
+                "GPUCPUTransferWorker: nvcomp is enabled but "
+                "cpu_size_table was not supplied.")
         worker.tp_transfer_thread_group.init_nvcomp(batch_size, data_type)
 
     def run(self, worker, op, src_block_ids, dst_block_ids) -> None:
@@ -181,31 +100,38 @@ class NvcompGpuCpuTpStrategy(CompressionStrategy):
             transfer_num_cta = worker.transfer_num_cta_d2h
         else:
             raise ValueError(
-                f"Invalid transfer type: {transfer_type} for tpGPUCPUTransferWorker")
+                f"Invalid transfer type: {transfer_type} for GPUCPUTransferWorker")
 
         if len(gpu_block_id_list) == 0:
             return 0
 
         nvtx_range = nvtx.start_range(
-            message=f"NvcompGpuCpuTpStrategy.run[{transfer_type.name}]",
+            message=f"NvcompGpuCpuStrategy.run[{transfer_type.name}]",
             color="purple")
         try:
+            # Keyword args, not positional: the cpp signature takes
+            # num_kv_heads between kv_dim and the size-table pointer, and the
+            # old positional call omitted it -- the four table values shifted
+            # up by one and the call was one argument short of the binding.
+            # It never fired because nvcomp+TP had no test that reached here.
             return int(worker.tp_transfer_thread_group.tp_group_transfer_ans(
-                gpu_block_id_list, cpu_block_id_list,
-                worker.cpu_kv_stride_in_bytes,
-                worker.cpu_layer_stride_in_bytes,
-                worker.cpu_block_stride_in_bytes,
-                worker.cpu_tp_stride_in_bytes,
-                transfer_num_cta,
-                transfer_type == TransferType.H2D,
-                use_ce_transfer,
-                0,
-                worker.num_layers,
-                worker.kv_dim,
-                self._table_ptr,
-                self._table_rank_stride,
-                self._table_block_stride,
-                self._table_layer_stride,
+                gpu_block_id_tensor=gpu_block_id_list,
+                cpu_block_id_tensor=cpu_block_id_list,
+                cpu_kv_stride_in_bytes=worker.cpu_kv_stride_in_bytes,
+                cpu_layer_stride_in_bytes=worker.cpu_layer_stride_in_bytes,
+                cpu_block_stride_in_bytes=worker.cpu_block_stride_in_bytes,
+                cpu_tp_stride_in_bytes=worker.cpu_tp_stride_in_bytes,
+                transfer_num_cta=transfer_num_cta,
+                is_host_to_device=(transfer_type == TransferType.H2D),
+                use_ce_transfer=use_ce_transfer,
+                layer_id=0,
+                layer_granularity=worker.num_layers,
+                kv_dim=worker.kv_dim,
+                num_kv_heads=worker.num_kv_heads,
+                cpu_size_table_tp_ptr=self._table_ptr,
+                cpu_size_table_tp_rank_stride=self._table_rank_stride,
+                cpu_size_table_block_stride=self._table_block_stride,
+                cpu_size_table_layer_stride=self._table_layer_stride,
             ))
         finally:
             nvtx.end_range(nvtx_range)

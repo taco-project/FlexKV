@@ -1,5 +1,6 @@
 #include "tp_gds_transfer_thread_group.h"
 #include "gds_manager.h"
+#include "../transfer_backend.h"
 #include <stdexcept>
 
 namespace flexkv {
@@ -75,66 +76,40 @@ TPGDSTransferThreadGroup::TPGDSTransferThreadGroup(
     }
   }
 
-  queues_.resize(num_gpus_);
-  mtxs_   = std::vector<std::mutex>(num_gpus_);
-  cvs_    = std::vector<std::condition_variable>(num_gpus_);
-
   // Use device IDs passed from Python (already extracted there)
   gpu_device_ids_.resize(num_gpus_);
   for (int i = 0; i < num_gpus_; ++i) {
     gpu_device_ids_[i] = static_cast<int>(gpu_device_ids[i]);
   }
 
-  // Create CUDA streams for each GPU
-  streams_.resize(num_gpus_);
-  for (int i = 0; i < num_gpus_; ++i) {
-    cudaError_t err = cudaSetDevice(gpu_device_ids_[i]);
-    if (err != cudaSuccess)
-      throw std::runtime_error(std::string("cudaSetDevice failed: ") + cudaGetErrorString(err));
-    err = cudaStreamCreate(&streams_[i]);
-    if (err != cudaSuccess)
-      throw std::runtime_error(std::string("cudaStreamCreate failed: ") + cudaGetErrorString(err));
-  }
-
-  // Create the thread pool
-  stop_pool_ = false;
-  for (int i = 0; i < num_gpus_; ++i) {
-    threads_.emplace_back([this, i]() {
-      int device_id = gpu_device_ids_[i];
-      cudaSetDevice(device_id);  // only once
-
-      while (true) {
-        Task task;
-        {
-          std::unique_lock<std::mutex> lk(mtxs_[i]);
-          cvs_[i].wait(lk, [&]{ return stop_pool_ || !queues_[i].empty(); });
-          if (stop_pool_ && queues_[i].empty()) return;
-
-          task = std::move(queues_[i].front());
-          queues_[i].pop();
-        }
-        task();  // 
-      }
-    });
-  }
+  // Threads and streams: one per rank, device bound once. The pool owns both
+  // and destroys the streams after joining its threads, which is what the
+  // hand-rolled version here had to remember to do in the right order.
+  pool_ = std::make_unique<DeviceThreadPool>(gpu_device_ids_);
 }
 
 TPGDSTransferThreadGroup::~TPGDSTransferThreadGroup() {
-  stop_pool_ = true;
-  for (auto& cv : cvs_) cv.notify_all();
-  for (auto& t : threads_) if (t.joinable()) t.join();
+  // Save/restore the current device around the teardown below: a leaked
+  // current-device makes device-keyed caches elsewhere in the process (CE
+  // staging buffers, event pools) bind to the wrong GPU. layerwise.cpp guards
+  // its destructor the same way.
+  int prev_device = 0;
+  cudaGetDevice(&prev_device);
+
+  // Destroying the pool joins its threads, then syncs and destroys every
+  // stream. It must happen before the GDS managers go away: an in-flight
+  // cuFile op still holds one.
+  pool_.reset();
 
   // Clean up GDS managers
   for (auto* manager : gds_managers_) {
     delete manager;
   }
-  
-  // Clean up CUDA streams
-  for (int i = 0; i < streams_.size(); ++i) {
-    cudaSetDevice(gpu_device_ids_[i]);
-    cudaStreamDestroy(streams_[i]);
-  }
-  
+
+  cudaSetDevice(prev_device);
+  // Do not let a teardown error surface as the next transfer's failure.
+  cudaGetLastError();
+
   // Clean up GPU blocks pointers
   if (gpu_blocks_) {
     cudaFreeHost(gpu_blocks_);
@@ -150,14 +125,7 @@ TPGDSTransferThreadGroup::~TPGDSTransferThreadGroup() {
 }
 
 std::future<void> TPGDSTransferThreadGroup::enqueue_for_gpu(int gpu_idx, Task task) {
-  auto pkg = std::make_shared<std::packaged_task<void()>>(std::move(task));
-  auto fut = pkg->get_future();
-  {
-      std::lock_guard<std::mutex> lk(mtxs_[gpu_idx]);
-      queues_[gpu_idx].emplace([pkg]{ (*pkg)(); });
-  }
-  cvs_[gpu_idx].notify_one();
-  return fut;
+  return pool_->enqueue(gpu_idx, std::move(task));
 }
 
 void TPGDSTransferThreadGroup::tp_group_transfer(
@@ -175,7 +143,17 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
     const int num_kv_heads) {
 
   std::atomic<bool> failed{false};
+  // See tp_transfer_thread_group.cpp: error_msg is written by up to num_gpus_
+  // worker threads, so it needs a lock, not just the atomic flag next to it.
+  std::mutex error_mtx;
   std::string error_msg;
+  auto record_error = [&](const std::string &msg) {
+    std::lock_guard<std::mutex> lk(error_mtx);
+    failed = true;
+    if (error_msg.empty()) {
+      error_msg = msg;
+    }
+  };
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
@@ -196,55 +174,55 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
         }
 
         int64_t chunk_size = gpu_chunk_size_in_bytes;
-        switch (backend_type_) {
-          case BackendType::VLLM:
-            flexkv::transfer_kv_blocks_gds<BackendType::VLLM>(
-                *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
-                ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
-                ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
-                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
-                is_read, false, kv_dim
-            );
-            break;
-          case BackendType::TRTLLM:
-            flexkv::transfer_kv_blocks_gds<BackendType::TRTLLM>(
-                *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
-                ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
-                ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
-                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
-                is_read, false, kv_dim
-            );
-            break;
-          case BackendType::SGLANG:
-            flexkv::transfer_kv_blocks_gds<BackendType::SGLANG>(
-                *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
-                ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
-                ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
-                ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes, gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
-                is_read, false, kv_dim
-            );
-            break;
-        }
-        
+        // Same tag dispatch as the host-device path (transfer_backend.h): the
+        // layout is a template parameter, so it is one arm here rather than
+        // three spelled out at every call site.
+        flexkv::with_tensor_kind(backend_type_, [&](auto tag) {
+          flexkv::transfer_kv_blocks_gds<decltype(tag)::value>(
+              *gds_managers_[i], layer_id_list, gpu_tensor_handlers_[i],
+              ssd_block_id_tensor, gpu_block_id_tensor, ssd_layer_stride_in_bytes,
+              ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes, chunk_size,
+              ssd_copy_off_inside_chunks, ssd_tp_stride_in_bytes,
+              gpu_device_ids_[i], num_blocks_per_file, layer_granularity,
+              is_read, false, kv_dim);
+        });
+
+
         // Check for CUDA errors
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-          failed = true;
-          error_msg = cudaGetErrorString(err);
+          record_error(std::string("rank ") + std::to_string(i) + ": " +
+                       cudaGetErrorString(err));
         }
       } catch (const std::exception &e) {
-        failed = true;
-        error_msg = e.what();
+        record_error(std::string("rank ") + std::to_string(i) + ": " + e.what());
+      } catch (...) {
+        record_error(std::string("rank ") + std::to_string(i) +
+                     ": unknown exception");
       }
     }));
   }
 
+  // Wait on every future even after a failure: the lambdas capture local
+  // state by reference, so an early return would leave live threads reading
+  // destroyed objects.
   for (auto &f : futures) {
-    f.get();
+    try {
+      f.get();
+    } catch (const std::exception &e) {
+      record_error(std::string("future: ") + e.what());
+    } catch (...) {
+      record_error("future: unknown exception");
+    }
   }
 
   if (failed) {
-    throw std::runtime_error("tp_gds_group_transfer failed: " + error_msg);
+    std::string msg;
+    {
+      std::lock_guard<std::mutex> lk(error_mtx);
+      msg = error_msg;
+    }
+    throw std::runtime_error("tp_gds_group_transfer failed: " + msg);
   }
 }
 

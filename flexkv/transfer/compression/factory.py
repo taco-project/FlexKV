@@ -9,9 +9,10 @@ from flexkv.transfer.compression.common.strategy import (
 )
 
 
+# "gpu_cpu_tp" is gone: GPUCPUTransferWorker now covers tp==1 as num_gpus==1,
+# so there is one CPU<->GPU compressor, not one per fan-out width.
 WORKER_KINDS = (
     "gpu_cpu",
-    "gpu_cpu_tp",
     "cpu_ssd",
 )
 
@@ -48,16 +49,17 @@ def build_compressors(
     from flexkv.transfer.compression.ans.ans_strategy import (
         NvcompCpuSsdStrategy,
         NvcompGpuCpuStrategy,
-        NvcompGpuCpuTpStrategy,
     )
 
-    kv_shared = (cpu_handle.kv_layout.num_kv_heads == 1)
     tp_size = model_config.effective_tp_size_per_node
 
+    # allocate_engine_size_tables() returns exactly one of the two: the
+    # canonical 3-D table (tp==1 or KV replicated across ranks) or the
+    # per-rank 4-D one. The strategy checks the dim it got against the
+    # worker's own shape, so handing it whichever exists is safe.
     compressors = _null_compressors()
-    compressors["gpu_cpu"] = NvcompGpuCpuStrategy(cpu_size_table=cpu_table)
-    compressors["gpu_cpu_tp"] = NvcompGpuCpuTpStrategy(
-        cpu_size_table_tp=(cpu_table if kv_shared else cpu_table_tp))
+    compressors["gpu_cpu"] = NvcompGpuCpuStrategy(
+        cpu_size_table=(cpu_table if cpu_table is not None else cpu_table_tp))
     compressors["cpu_ssd"] = NvcompCpuSsdStrategy(
         cpu_size_table=cpu_table,
         ssd_size_table=ssd_table,
