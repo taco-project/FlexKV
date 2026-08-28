@@ -492,7 +492,7 @@ PYBIND11_MODULE(c_ext, m) {
                        int ce_force_path,
                        bool ce_enable_memcpy2d,
                        bool is_blockfirst,
-                       int num_kv_heads = 1,
+                       int num_kv_heads,
                        int ce_gather_threads,
                        bool ce_gather_nt, bool ssd_io_opt) {
             flexkv::CETransferConfig cfg;
@@ -574,7 +574,7 @@ PYBIND11_MODULE(c_ext, m) {
           torch::Tensor swa_gpu_layer_strides_tensor,
           torch::Tensor swa_gpu_chunk_sizes_tensor,
           int64_t ce_segment_threshold, bool ce_path_opt, int ce_force_path,
-          bool ce_enable_memcpy2d, bool is_blockfirst, int num_kv_heads = 1,
+          bool ce_enable_memcpy2d, bool is_blockfirst, int num_kv_heads,
           int ce_gather_threads, bool ce_gather_nt, bool ssd_io_opt) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
@@ -776,7 +776,7 @@ PYBIND11_MODULE(c_ext, m) {
                        int ce_force_path,
                        bool ce_enable_memcpy2d,
                        bool is_blockfirst,
-                       int num_kv_heads = 1,
+                       int num_kv_heads,
                        int ce_gather_threads,
                        bool ce_gather_nt) {
             flexkv::CETransferConfig cfg;
