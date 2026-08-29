@@ -60,6 +60,7 @@ __global__ void transfer_kv_blocks_kernel_8b(
   for (int chunk_idx = blockIdx.x * warps_per_block + warp_id;
        chunk_idx < num_chunks; chunk_idx += total_warps) {
     int layer_idx = start_layer_id + chunk_idx / (num_blocks * kv_dim);
+    int gpu_layer_idx = chunk_idx / (num_blocks * kv_dim);
     int kv_idx = (chunk_idx % (num_blocks * kv_dim)) / num_blocks;
     int gpu_block_idx = gpu_block_ids[chunk_idx % num_blocks];
     int cpu_block_idx = cpu_block_ids[chunk_idx % num_blocks];
@@ -117,6 +118,7 @@ __global__ void transfer_kv_blocks_kernel(
   for (int chunk_idx = blockIdx.x * warps_per_block + warp_id;
        chunk_idx < num_chunks; chunk_idx += total_warps) {
     int layer_idx = start_layer_id + chunk_idx / num_blocks;
+    int gpu_layer_idx = chunk_idx / num_blocks;
     int block_pos = chunk_idx % num_blocks;
     int gpu_block_idx = gpu_block_ids[block_pos];
     int cpu_block_idx = cpu_block_ids[block_pos];

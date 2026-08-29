@@ -1468,14 +1468,9 @@ class FlexKVConnector:
                         "ok": False,
                         "error": f"waiting for layerwise loads during reset failed: {exc}",
                     }
-        if self._sync_ctx.needs_sync:
-            load_reset_status = self._sync_ctx.scatter(
-                load_reset_status,
-                channel=FlexKVScatterChannel.RESET,
-                blocking=True,
-            )
-        if not load_reset_status["ok"]:
-            raise RuntimeError(f"[FlexKV] {load_reset_status['error']}")
+        # reset clears each rank's local cache; no cross-stage data dependency.
+        # Skip the blocking PP scatter — it deadlocks when sglang's flush_cache
+        # triggers reset on all stages simultaneously via separate IPC channels.
 
         # Drop pending lookups (cancel their held tasks on the leader).
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:

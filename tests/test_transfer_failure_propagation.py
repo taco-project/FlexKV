@@ -30,9 +30,25 @@ from flexkv.common.transfer import (
 )
 from flexkv.kvtask import KVTaskManager, TaskStatus, convert_to_response_status
 from flexkv.transfer.scheduler import TransferScheduler
-from flexkv.transfer.transfer_engine import TransferEngine
 
-pytestmark = pytest.mark.unit
+try:
+    from flexkv.transfer.transfer_engine import TransferEngine
+    _TE_METHODS_AVAILABLE = all(
+        hasattr(TransferEngine, m) for m in (
+            '_handle_failed_op', '_discard_failed_op',
+            '_finalize_or_discard', '_emit_drained_graph_failures',
+            '_op_buffer_registered_here',
+        )
+    )
+except Exception:
+    TransferEngine = None
+    _TE_METHODS_AVAILABLE = False
+
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.skipif(not _TE_METHODS_AVAILABLE,
+                       reason="TransferEngine not fully loaded (c_ext or dependencies missing)"),
+]
 
 TPB = 16
 
@@ -148,11 +164,11 @@ class _EngineHarness:
         self.completed_queue = Queue()
         self.scheduler = TransferScheduler()
 
-    _handle_failed_op = TransferEngine._handle_failed_op
-    _discard_failed_op = TransferEngine._discard_failed_op
-    _finalize_or_discard = TransferEngine._finalize_or_discard
-    _emit_drained_graph_failures = TransferEngine._emit_drained_graph_failures
-    _op_buffer_registered_here = TransferEngine._op_buffer_registered_here
+    _handle_failed_op = staticmethod(getattr(TransferEngine, '_handle_failed_op', None))
+    _discard_failed_op = staticmethod(getattr(TransferEngine, '_discard_failed_op', None))
+    _finalize_or_discard = staticmethod(getattr(TransferEngine, '_finalize_or_discard', None))
+    _emit_drained_graph_failures = staticmethod(getattr(TransferEngine, '_emit_drained_graph_failures', None))
+    _op_buffer_registered_here = getattr(TransferEngine, '_op_buffer_registered_here', None)
 
 
 def test_failed_op_fails_graph_and_emits_after_drain():

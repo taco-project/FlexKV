@@ -209,7 +209,7 @@ class KVTaskManager:
             ))
             self.transfer_handles[-1]._handle.send_config_to_remotes()
 
-        self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
+        self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(ttl=1800)  # 30 minutes
 
         # hash(token_ids) -> task_id
         self.prefetch_tasks: ExpiringDict[int, int] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
@@ -1458,7 +1458,8 @@ class KVTaskEngine(KVTaskManager):
         on transfer completion. This mirrors vLLM's own reset_encoder_cache /
         reset_mm_cache, which likewise only warn on has_unfinished_requests().
         """
-        ongoing = sum(1 for t in list(self.tasks.values()) if not t.is_completed())
+        ongoing = sum(1 for t in list(self.tasks.values())
+                      if hasattr(t, 'is_completed') and not t.is_completed())
         if ongoing:
             flexkv_logger.warning(
                 f"reset_cache called while {ongoing} task(s) are still in flight; "
@@ -1476,6 +1477,8 @@ class KVTaskEngine(KVTaskManager):
         # (_update_tasks), so no lock is needed. We keep the graph_to_task
         # mapping so a late-completing op still resolves to its task and warns.
         for task_id, task in list(self.tasks.items()):
+            if not hasattr(task, 'is_completed'):
+                continue  # non-task entry (e.g. batch_id int)
             if task.is_completed():
                 continue  # already-fired callbacks are harmless
             task.callback = None

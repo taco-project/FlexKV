@@ -85,7 +85,7 @@ def _probe_engine(use_ce):
             cpu_block_stride_in_bytes=layout.get_block_stride() * 2,
             cpu_tp_stride_in_bytes=layout.get_block_stride() * 2,
             transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-            layer_id=0, layer_granularity=1, kv_dim=1, num_kv_heads=1,
+            pp_offset_bytes=0, start_layer_id=0, layer_granularity=1, kv_dim=1, num_kv_heads=1,
             kv_shared_across_ranks_mode="sharded")
         torch.cuda.synchronize()
         del tp
@@ -156,6 +156,11 @@ ENGINES = [
 MLA_MODES = ["sharded", "all_write", "rank0_only", "layer_parallel", "rank_rotate"]
 
 CE_MEMCPY2D_CONFIGS = [False, True]
+
+PP_OFFSET_SIZES = [
+    pytest.param((4, 4, 16, 1, 512), id="mla-mini"),
+    pytest.param((8, 4, 16, 1, 512), id="mla-small"),
+]
 
 
 # Helpers (matching production code in worker.py / layerwise.py)
@@ -559,7 +564,7 @@ def test_non_mla_roundtrip(data_config, kv_dim, cpu_layout_name, engine_name, us
         cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
         cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode="sharded",  # ignored for multi-head
     )
     sync_all(num_gpus)
@@ -578,7 +583,7 @@ def test_non_mla_roundtrip(data_config, kv_dim, cpu_layout_name, engine_name, us
         cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
         cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode="sharded",  # ignored for multi-head
     )
     sync_all(num_gpus)
@@ -672,7 +677,7 @@ def test_mla_roundtrip_modes(data_config, kv_dim, cpu_layout_name, engine_name, 
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -691,7 +696,7 @@ def test_mla_roundtrip_modes(data_config, kv_dim, cpu_layout_name, engine_name, 
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -771,7 +776,7 @@ def test_tp1_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -789,7 +794,7 @@ def test_tp1_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -854,7 +859,7 @@ def test_layerwise_h2d_notify_modes(data_config, kv_dim, engine_name, use_ce, no
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode="sharded",
     )
     sync_all(num_gpus)
@@ -952,7 +957,7 @@ def test_non_mla_roundtrip_layerwise(data_config, kv_dim, cpu_layout_name, engin
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1037,7 +1042,7 @@ def test_mla_roundtrip_modes_layerwise(data_config, kv_dim, cpu_layout_name, mod
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1094,7 +1099,7 @@ def test_invalid_mode_fallback():
         cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
         cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=False,
-        layer_id=0, layer_granularity=num_layers, kv_dim=1, num_kv_heads=1,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=1, num_kv_heads=1,
         kv_shared_across_ranks_mode="invalid_xyz",
     )
     sync_all(num_gpus)
@@ -1393,7 +1398,7 @@ def test_ce_paths_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name, 
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1412,7 +1417,7 @@ def test_ce_paths_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name, 
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1521,7 +1526,7 @@ def test_ce_paths_layerwise_h2d(data_config, kv_dim, num_kv_heads, cpu_layout_na
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1649,7 +1654,7 @@ def test_mla_designated_rank_d2h(data_config, designated_rank):
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode="rank0_only", designated_rank=designated_rank)
     sync_all(num_gpus)
     del tp
@@ -1813,7 +1818,7 @@ def test_gather_nt_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1832,7 +1837,7 @@ def test_gather_nt_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1912,7 +1917,7 @@ def test_gather_nt_layerwise_h2d(data_config, kv_dim, num_kv_heads, cpu_layout_n
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -2741,6 +2746,749 @@ def test_ssd_transfer_layerwise_h2disk(data_config, kv_dim, cpu_layout_name, ssd
 
     del ioctx
     shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])
+
+
+# ---------------------------------------------------------------------------
+# Same-node PP>1 offset tests — all worker types.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("data_config", PP_OFFSET_SIZES)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("engine_name,use_ce", ENGINES)
+def test_same_node_pp_offset_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
+    """Two PP stages share one CPU pool. PP offset baked into CPU pointer;
+    start_layer_id=0 (GPU is PP-stage-local). Uses sharded mode (each GPU writes
+    1/num_gpus, H2D reads back full)."""
+    skip_if_engine_unsupported(use_ce)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    num_gpus = NUM_GPUS
+    kv_dim = 1
+    num_kv_heads = 1
+    half = num_layers // 2
+    assert half >= 1
+
+    gpu_layout, cpu_layout, cpu_layout_tp, _, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, kv_dim, num_kv_heads, num_gpus)
+
+    pool_layout = KVCacheLayout(
+        type=cpu_layout.type, num_layer=num_layers, num_block=num_blocks,
+        tokens_per_block=tpb, num_head=num_heads, head_size=head_dim,
+        kv_dim=kv_dim, num_kv_heads=num_kv_heads)
+    cpu_pool = make_cpu_tensor(pool_layout, num_layers, num_blocks)
+
+    stages = [(0, half, 0), (half, num_layers - half, half)]
+
+    for _, stage_layers, start_layer_id in stages:
+        all_gpu = [make_gpu_tensors(stage_layers, num_blocks, tpb, heads_per_rank,
+                                     head_dim, kv_dim, g) for g in range(num_gpus)]
+        for g in range(num_gpus):
+            fill_gpu(all_gpu[g], start_layer_id * 100, stage_layers, num_blocks,
+                     tpb, heads_per_rank, head_dim, kv_dim)
+        sync_all(num_gpus)
+
+        stage_gpu_layout = KVCacheLayout(
+            type=KVCacheLayoutType.LAYERFIRST, num_layer=stage_layers,
+            num_block=num_blocks, tokens_per_block=tpb,
+            num_head=heads_per_rank, head_size=head_dim,
+            kv_dim=kv_dim, num_kv_heads=num_kv_heads)
+
+        pp_cpu_offset = start_layer_id * cpu_layout_tp.get_layer_stride() * ES
+        tp = make_tp_group(cpu_pool.data_ptr() + pp_cpu_offset, all_gpu, num_gpus,
+                           stage_gpu_layout, stage_layers,
+                           is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+        ids = block_ids(num_blocks)
+
+        tp.tp_group_transfer(
+            gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+            cpu_kv_stride_in_bytes=cpu_layout_tp.get_kv_stride() * ES,
+            cpu_layer_stride_in_bytes=cpu_layout_tp.get_layer_stride() * ES,
+            cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
+            cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
+            transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
+            pp_offset_bytes=0, start_layer_id=0, layer_granularity=stage_layers,
+            kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+            kv_shared_across_ranks_mode="sharded")
+        sync_all(num_gpus)
+
+        for g in range(num_gpus):
+            for l in range(stage_layers):
+                all_gpu[g][l].zero_()
+        sync_all(num_gpus)
+
+        tp.tp_group_transfer(
+            gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+            cpu_kv_stride_in_bytes=cpu_layout_tp.get_kv_stride() * ES,
+            cpu_layer_stride_in_bytes=cpu_layout_tp.get_layer_stride() * ES,
+            cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
+            cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
+            transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
+            pp_offset_bytes=0, start_layer_id=0, layer_granularity=stage_layers,
+            kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+            kv_shared_across_ranks_mode="sharded")
+        sync_all(num_gpus)
+
+        for g in range(num_gpus):
+            for layer in [0, stage_layers - 1]:
+                for block in [0, num_blocks - 1]:
+                    for hd_idx in [0, head_dim - 1]:
+                        exp = expected_val(0 + start_layer_id * 100, layer, block, 0, hd_idx, 0)
+                        act = all_gpu[g][layer][0, block, 0, 0, hd_idx].item()
+                        assert abs(act - exp) < 1e-3, \
+                            f"PP round-trip mismatch: stage={start_layer_id} " \
+                            f"gpu={g} layer={layer} block={block}: " \
+                            f"expected={exp:.6f} got={act:.6f}"
+
+
+@pytest.mark.parametrize("data_config", PP_OFFSET_SIZES)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("engine_name,use_ce", ENGINES)
+def test_pp_offset_gpucpu_tp1(data_config, cpu_layout_name, engine_name, use_ce):
+    """TP=1 single-GPU transfer_kv_blocks with start_layer_id offset."""
+    skip_if_engine_unsupported(use_ce)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    kv_dim = 1
+    num_kv_heads = 1
+    half = num_layers // 2
+
+    gpu_layout, cpu_layout, _, _, _ = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, kv_dim, num_kv_heads, 1)
+
+    pool_layout = KVCacheLayout(
+        type=cpu_layout.type, num_layer=num_layers, num_block=num_blocks,
+        tokens_per_block=tpb, num_head=num_heads, head_size=head_dim,
+        kv_dim=kv_dim, num_kv_heads=num_kv_heads)
+    cpu_pool = make_cpu_tensor(pool_layout, num_layers, num_blocks)
+
+    from flexkv.c_ext import transfer_kv_blocks
+
+    for start_layer_id, stage_layers in [(0, half), (half, num_layers - half)]:
+        all_gpu = [make_gpu_tensors(stage_layers, num_blocks, tpb, num_heads,
+                                    head_dim, kv_dim, 0)]
+        fill_gpu(all_gpu[0], start_layer_id, stage_layers, num_blocks, tpb,
+                 num_heads, head_dim, kv_dim)
+        sync_all(1)
+
+        stage_gpu_layout = KVCacheLayout(
+            type=KVCacheLayoutType.LAYERFIRST, num_layer=stage_layers,
+            num_block=num_blocks, tokens_per_block=tpb,
+            num_head=num_heads, head_size=head_dim,
+            kv_dim=kv_dim, num_kv_heads=num_kv_heads)
+        ids = block_ids(num_blocks)
+
+        transfer_kv_blocks(
+            gpu_block_id_tensor=ids,
+            gpu_tensor_ptrs_tensor=torch.tensor([all_gpu[0][l].data_ptr() for l in range(stage_layers)], dtype=torch.int64).pin_memory(),
+            gpu_kv_stride_in_bytes=stage_gpu_layout.get_kv_stride() * ES,
+            gpu_block_stride_in_bytes=stage_gpu_layout.get_block_stride() * ES,
+            gpu_layer_stride_in_bytes=stage_gpu_layout.get_layer_stride() * ES,
+            cpu_block_id_tensor=ids, cpu_tensor=cpu_pool,
+            cpu_kv_stride_in_bytes=cpu_layout.get_kv_stride() * ES,
+            cpu_layer_stride_in_bytes=cpu_layout.get_layer_stride() * ES,
+            cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
+            chunk_size_in_bytes=stage_gpu_layout.get_chunk_size() * ES,
+            pp_offset_bytes=start_layer_id * cpu_layout.get_layer_stride() * ES,
+            start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
+            is_host_to_device=False, use_ce_transfer=use_ce,
+            kv_dim=kv_dim,
+            is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+        sync_all(1)
+
+        for l in range(stage_layers):
+            all_gpu[0][l].zero_()
+        sync_all(1)
+
+        transfer_kv_blocks(
+            gpu_block_id_tensor=ids,
+            gpu_tensor_ptrs_tensor=torch.tensor([all_gpu[0][l].data_ptr() for l in range(stage_layers)], dtype=torch.int64).pin_memory(),
+            gpu_kv_stride_in_bytes=stage_gpu_layout.get_kv_stride() * ES,
+            gpu_block_stride_in_bytes=stage_gpu_layout.get_block_stride() * ES,
+            gpu_layer_stride_in_bytes=stage_gpu_layout.get_layer_stride() * ES,
+            cpu_block_id_tensor=ids, cpu_tensor=cpu_pool,
+            cpu_kv_stride_in_bytes=cpu_layout.get_kv_stride() * ES,
+            cpu_layer_stride_in_bytes=cpu_layout.get_layer_stride() * ES,
+            cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
+            chunk_size_in_bytes=stage_gpu_layout.get_chunk_size() * ES,
+            pp_offset_bytes=start_layer_id * cpu_layout.get_layer_stride() * ES,
+            start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
+            is_host_to_device=True, use_ce_transfer=use_ce,
+            kv_dim=kv_dim,
+            is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+        sync_all(1)
+
+        for layer in [0, stage_layers - 1]:
+            for block in [0, num_blocks - 1]:
+                for hd_idx in [0, head_dim - 1]:
+                    exp = expected_val(start_layer_id, layer, block, 0, hd_idx, 0)
+                    act = all_gpu[0][layer][0, block, 0, 0, hd_idx].item()
+                    assert abs(act - exp) < 1e-3, \
+                        f"TP1 PP offset mismatch: stage={start_layer_id} " \
+                        f"layer={layer} block={block}: expected={exp:.6f} got={act:.6f}"
+
+
+@pytest.mark.parametrize("data_config", PP_OFFSET_SIZES)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("engine_name,use_ce", ENGINES)
+def test_pp_offset_swa(data_config, cpu_layout_name, engine_name, use_ce):
+    """SWA sidecar + PP offset: two PP stages share one SWA CPU pool."""
+    skip_if_engine_unsupported(use_ce)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    kv_dim = 1
+    num_kv_heads = 1
+    half = num_layers // 2
+
+    swa_head_dim = 128
+    swa_num_heads = 1
+    gpu_layout, cpu_layout, _, _, _ = make_layouts(
+        num_layers, num_blocks, tpb, swa_num_heads, swa_head_dim,
+        cpu_layout_name, kv_dim, num_kv_heads, 1)
+
+    pool_layout = KVCacheLayout(
+        type=cpu_layout.type, num_layer=num_layers, num_block=num_blocks,
+        tokens_per_block=tpb, num_head=swa_num_heads, head_size=swa_head_dim,
+        kv_dim=kv_dim, num_kv_heads=num_kv_heads)
+    cpu_pool = make_cpu_tensor(pool_layout, num_layers, num_blocks)
+
+    from flexkv.c_ext import transfer_kv_blocks
+
+    for start_layer_id, stage_layers in [(0, half), (half, num_layers - half)]:
+        all_gpu = [make_gpu_tensors(stage_layers, num_blocks, tpb, swa_num_heads,
+                                    swa_head_dim, kv_dim, 0)]
+        fill_gpu(all_gpu[0], start_layer_id, stage_layers, num_blocks, tpb,
+                 swa_num_heads, swa_head_dim, kv_dim)
+        sync_all(1)
+
+        stage_gpu_layout = KVCacheLayout(
+            type=KVCacheLayoutType.LAYERFIRST, num_layer=stage_layers,
+            num_block=num_blocks, tokens_per_block=tpb,
+            num_head=swa_num_heads, head_size=swa_head_dim,
+            kv_dim=kv_dim, num_kv_heads=num_kv_heads)
+        ids = block_ids(num_blocks)
+
+        transfer_kv_blocks(
+            gpu_block_id_tensor=ids,
+            gpu_tensor_ptrs_tensor=torch.tensor([all_gpu[0][l].data_ptr() for l in range(stage_layers)], dtype=torch.int64).pin_memory(),
+            gpu_kv_stride_in_bytes=stage_gpu_layout.get_kv_stride() * ES,
+            gpu_block_stride_in_bytes=stage_gpu_layout.get_block_stride() * ES,
+            gpu_layer_stride_in_bytes=stage_gpu_layout.get_layer_stride() * ES,
+            cpu_block_id_tensor=ids, cpu_tensor=cpu_pool,
+            cpu_kv_stride_in_bytes=cpu_layout.get_kv_stride() * ES,
+            cpu_layer_stride_in_bytes=cpu_layout.get_layer_stride() * ES,
+            cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
+            chunk_size_in_bytes=stage_gpu_layout.get_chunk_size() * ES,
+            pp_offset_bytes=start_layer_id * cpu_layout.get_layer_stride() * ES,
+            start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
+            is_host_to_device=False, use_ce_transfer=use_ce,
+            kv_dim=kv_dim,
+            is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+        sync_all(1)
+
+        for l in range(stage_layers):
+            all_gpu[0][l].zero_()
+        sync_all(1)
+
+        transfer_kv_blocks(
+            gpu_block_id_tensor=ids,
+            gpu_tensor_ptrs_tensor=torch.tensor([all_gpu[0][l].data_ptr() for l in range(stage_layers)], dtype=torch.int64).pin_memory(),
+            gpu_kv_stride_in_bytes=stage_gpu_layout.get_kv_stride() * ES,
+            gpu_block_stride_in_bytes=stage_gpu_layout.get_block_stride() * ES,
+            gpu_layer_stride_in_bytes=stage_gpu_layout.get_layer_stride() * ES,
+            cpu_block_id_tensor=ids, cpu_tensor=cpu_pool,
+            cpu_kv_stride_in_bytes=cpu_layout.get_kv_stride() * ES,
+            cpu_layer_stride_in_bytes=cpu_layout.get_layer_stride() * ES,
+            cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
+            chunk_size_in_bytes=stage_gpu_layout.get_chunk_size() * ES,
+            pp_offset_bytes=start_layer_id * cpu_layout.get_layer_stride() * ES,
+            start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
+            is_host_to_device=True, use_ce_transfer=use_ce,
+            kv_dim=kv_dim,
+            is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+        sync_all(1)
+
+        for layer in [0, stage_layers - 1]:
+            for block in [0, num_blocks - 1]:
+                for hd_idx in [0, swa_head_dim - 1]:
+                    exp = expected_val(start_layer_id, layer, block, 0, hd_idx, 0)
+                    act = all_gpu[0][layer][0, block, 0, 0, hd_idx].item()
+                    assert abs(act - exp) < 1e-3, \
+                        f"SWA PP offset mismatch: stage={start_layer_id} " \
+                        f"layer={layer} block={block}: expected={exp:.6f} got={act:.6f}"
+
+
+@pytest.mark.parametrize("data_config", PP_OFFSET_SIZES)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("engine_name,use_ce", ENGINES)
+def test_pp_offset_multigroup(data_config, cpu_layout_name, engine_name, use_ce):
+    """Multi-group + PP offset: two groups (main KV + SWA sidecar) share
+    one CPU pool.  Two PP stages each transfer their per-stage layers
+    per-group, with start_layer_id as PP offset into the shared pool.
+
+    Simulates DSv4-style layer_groups (main KV head_dim=512 + SWA sidecar
+    head_dim=128) with same-node PP=2.  The CPU pool is a uint8 byte buffer
+    matching production multi-group layout; start_layer_id is passed directly
+    to transfer_kv_blocks (not baked into the CPU pointer) so the C++ kernel
+    handles per-layer offset within each block correctly for both layouts.
+    """
+    skip_if_engine_unsupported(use_ce)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    kv_dim = 1
+    num_kv_heads = 1
+    half = num_layers // 2
+    assert half >= 1
+
+    # Two groups: main KV (head_dim from data_config) + SWA sidecar (head_dim=128)
+    groups_spec = [
+        ('main', head_dim, num_layers),
+        ('swa', 128, num_layers),
+    ]
+
+    is_bfirst = (cpu_layout_name == "BLOCKFIRST")
+
+    # Compute per-group byte sizes and strides for the shared pool
+    group_params = []
+    cpu_offset_bytes = 0
+    for gname, g_hd, g_nl in groups_spec:
+        chunk_elements = tpb * num_heads * g_hd
+        chunk_bytes = chunk_elements * ES
+
+        if is_bfirst:
+            cpu_layer_stride = kv_dim * chunk_bytes
+            cpu_kv_stride = chunk_bytes
+            cpu_block_stride = None  # set after all groups
+        else:
+            cpu_block_stride = chunk_bytes
+            cpu_layer_stride = kv_dim * num_blocks * chunk_bytes
+            cpu_kv_stride = num_blocks * chunk_bytes
+
+        group_params.append({
+            'name': gname, 'head_dim': g_hd, 'num_layers': g_nl,
+            'chunk_bytes': chunk_bytes, 'cpu_offset': cpu_offset_bytes,
+            'cpu_layer_stride': cpu_layer_stride,
+            'cpu_kv_stride': cpu_kv_stride,
+            'cpu_block_stride': cpu_block_stride,
+        })
+
+        if is_bfirst:
+            cpu_offset_bytes += g_nl * kv_dim * chunk_elements * ES
+        else:
+            cpu_offset_bytes += g_nl * kv_dim * num_blocks * chunk_elements * ES
+
+    # For BLOCKFIRST, cpu_block_stride = total_block_bytes (all groups per block)
+    if is_bfirst:
+        for gp in group_params:
+            gp['cpu_block_stride'] = cpu_offset_bytes
+        pool_bytes = cpu_offset_bytes * num_blocks
+    else:
+        pool_bytes = cpu_offset_bytes
+
+    cpu_pool = torch.zeros(pool_bytes, dtype=torch.uint8, pin_memory=True)
+
+    from flexkv.c_ext import transfer_kv_blocks
+
+    for start_layer_id, stage_layers in [(0, half), (half, num_layers - half)]:
+        for gp in group_params:
+            gname = gp['name']
+            g_hd = gp['head_dim']
+            g_chunk = gp['chunk_bytes']
+            g_offset = gp['cpu_offset']
+            g_cls = gp['cpu_layer_stride']
+            g_cks = gp['cpu_kv_stride']
+            g_cbs = gp['cpu_block_stride']
+
+            all_gpu = [make_gpu_tensors(stage_layers, num_blocks, tpb, num_heads,
+                                        g_hd, kv_dim, 0)]
+            fill_gpu(all_gpu[0], start_layer_id, stage_layers, num_blocks, tpb,
+                     num_heads, g_hd, kv_dim)
+            sync_all(1)
+
+            stage_gpu_layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST, num_layer=stage_layers,
+                num_block=num_blocks, tokens_per_block=tpb,
+                num_head=num_heads, head_size=g_hd,
+                kv_dim=kv_dim, num_kv_heads=num_kv_heads)
+            ids = block_ids(num_blocks)
+
+            cpu_tensor_for_group = cpu_pool.view(-1)[g_offset:]
+
+            # D2H
+            transfer_kv_blocks(
+                gpu_block_id_tensor=ids,
+                gpu_tensor_ptrs_tensor=torch.tensor(
+                    [all_gpu[0][l].data_ptr() for l in range(stage_layers)],
+                    dtype=torch.int64).pin_memory(),
+                gpu_kv_stride_in_bytes=stage_gpu_layout.get_kv_stride() * ES,
+                gpu_block_stride_in_bytes=stage_gpu_layout.get_block_stride() * ES,
+                gpu_layer_stride_in_bytes=stage_gpu_layout.get_layer_stride() * ES,
+                cpu_block_id_tensor=ids, cpu_tensor=cpu_tensor_for_group,
+                cpu_kv_stride_in_bytes=g_cks,
+                cpu_layer_stride_in_bytes=g_cls,
+                cpu_block_stride_in_bytes=g_cbs,
+                chunk_size_in_bytes=g_chunk,
+                pp_offset_bytes=start_layer_id * g_cls,
+                start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
+                is_host_to_device=False, use_ce_transfer=use_ce,
+                kv_dim=kv_dim, is_blockfirst=is_bfirst)
+            sync_all(1)
+
+            for l in range(stage_layers):
+                all_gpu[0][l].zero_()
+            sync_all(1)
+
+            # H2D
+            transfer_kv_blocks(
+                gpu_block_id_tensor=ids,
+                gpu_tensor_ptrs_tensor=torch.tensor(
+                    [all_gpu[0][l].data_ptr() for l in range(stage_layers)],
+                    dtype=torch.int64).pin_memory(),
+                gpu_kv_stride_in_bytes=stage_gpu_layout.get_kv_stride() * ES,
+                gpu_block_stride_in_bytes=stage_gpu_layout.get_block_stride() * ES,
+                gpu_layer_stride_in_bytes=stage_gpu_layout.get_layer_stride() * ES,
+                cpu_block_id_tensor=ids, cpu_tensor=cpu_tensor_for_group,
+                cpu_kv_stride_in_bytes=g_cks,
+                cpu_layer_stride_in_bytes=g_cls,
+                cpu_block_stride_in_bytes=g_cbs,
+                chunk_size_in_bytes=g_chunk,
+                pp_offset_bytes=start_layer_id * g_cls,
+                start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
+                is_host_to_device=True, use_ce_transfer=use_ce,
+                kv_dim=kv_dim, is_blockfirst=is_bfirst)
+            sync_all(1)
+
+            for layer in [0, stage_layers - 1]:
+                for block in [0, num_blocks - 1]:
+                    for hd_idx in [0, g_hd - 1]:
+                        exp = expected_val(start_layer_id, layer, block, 0, hd_idx, 0)
+                        act = all_gpu[0][layer][0, block, 0, 0, hd_idx].item()
+                        assert abs(act - exp) < 1e-3, \
+                            f"MultiGroup PP offset mismatch: group={gname} " \
+                            f"layout={cpu_layout_name} stage={start_layer_id} " \
+                            f"layer={layer} block={block}: " \
+                            f"expected={exp:.6f} got={act:.6f}"
+
+
+# ---------------------------------------------------------------------------
+# Multi-group layerwise SSD DISK2H + H2D roundtrip (mirrors the e2e path of
+# test_kvmanager_with_indexer_layerwise with SSD enabled).
+#
+#   seed GPU (2 groups) -> D2H -> H2DISK (opaque block blob, worker-style PUT)
+#   -> zero CPU staging + GPU -> layerwise_transfer_multi_group (DISK2H + H2D)
+#
+# Three verification levels bisect any corruption in one run:
+#   (a) SSD file bytes vs golden CPU bytes   [bisects PUT / H2DISK]
+#   (b) staging CPU after GET vs golden      [bisects DISK2H]
+#   (c) GPU after GET vs seed                [bisects H2D]
+#
+# iouring_entries=0 forces the threaded synchronous pread/pwrite fallback,
+# so the fallback path is covered on any machine.
+# ---------------------------------------------------------------------------
+MG_SSD_NUM_BLOCKS = 8
+MG_SSD_NUM_LAYERS = 4
+MG_SSD_BLOCKS_PER_FILE = 4
+MG_SSD_NUM_DEVICES = 2
+
+# Two geometries:
+#   u8_single_head : tiny uint8 groups (baseline; dsv4-style coverage)
+#   mla_fp16_32head: mirrors test_kvmanager_with_indexer_layerwise e2e params
+#                    (main KV: fp16, num_kv_heads=32, head_size=128, kv_dim=1
+#                     MLA-packed; indexer: uint8, 1 head, head_size=64; tpb=16)
+MG_SSD_GEOMS = {
+    "u8_single_head": dict(tpb=128, main=dict(heads=1, head=64, dtype=torch.uint8, cr=1),
+                           indexer=dict(heads=1, head=8, dtype=torch.uint8, cr=1)),
+    "u8_cr4": dict(tpb=128, main=dict(heads=1, head=64, dtype=torch.uint8, cr=4),
+                   indexer=dict(heads=1, head=8, dtype=torch.uint8, cr=1)),
+    "mla_fp16_32head": dict(tpb=16, main=dict(heads=32, head=128, dtype=torch.float16, cr=1),
+                            indexer=dict(heads=1, head=64, dtype=torch.uint8, cr=1)),
+}
+
+
+def _mg_ssd_layer_groups(geom):
+    from flexkv.common.config import LayerGroupSpec
+
+    cfg = MG_SSD_GEOMS[geom]
+    return [
+        LayerGroupSpec(
+            num_layers=MG_SSD_NUM_LAYERS,
+            num_kv_heads=cfg["main"]["heads"],
+            head_size=cfg["main"]["head"],
+            layer_indices=list(range(MG_SSD_NUM_LAYERS)),
+            dtype=cfg["main"]["dtype"],
+            compress_ratio=cfg["main"].get("cr", 1),
+        ),
+        LayerGroupSpec(
+            num_layers=MG_SSD_NUM_LAYERS,
+            num_kv_heads=cfg["indexer"]["heads"],
+            head_size=cfg["indexer"]["head"],
+            layer_indices=list(range(MG_SSD_NUM_LAYERS)),
+            dtype=cfg["indexer"]["dtype"],
+            compress_ratio=cfg["indexer"].get("cr", 1),
+        ),
+    ]
+
+
+def _mg_ssd_gpu_layout(g, num_blocks, tpb):
+    """GPU layout with kv_dim=1 (MLA-packed semantics, like the e2e test)."""
+    return KVCacheLayout(
+        type=KVCacheLayoutType.LAYERFIRST,
+        num_layer=g.num_layers,
+        num_block=num_blocks,
+        tokens_per_block=tpb // g.compress_ratio,
+        num_head=g.num_kv_heads,
+        head_size=g.head_size,
+        kv_dim=1,
+        num_kv_heads=g.num_kv_heads,
+    )
+
+
+def _mg_ssd_gpu_ptrs(tensors):
+    return torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64).pin_memory()
+
+
+def _mg_ssd_seed_layer(tensor, block_id, orig_layer, group_idx, local_layer_id):
+    plane = tensor[block_id]
+    tpb, num_heads, head_size = tensor.shape[1], tensor.shape[2], tensor.shape[3]
+    for tok in range(tpb):
+        for h in range(num_heads):
+            for b in range(head_size):
+                plane[tok, h, b] = (
+                    (orig_layer * 97 + group_idx * 13 + local_layer_id * 7 + tok) ^ b
+                ) & 0xFF
+
+
+def _mg_ssd_files(tmpdir, block_stride):
+    ssd_files = {}
+    for d in range(MG_SSD_NUM_DEVICES):
+        path = os.path.join(tmpdir, f"mg_ssd_cache_{d}.bin")
+        with open(path, "wb") as f:
+            f.truncate(MG_SSD_BLOCKS_PER_FILE * block_stride)
+        ssd_files[d] = [path]
+    return ssd_files
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("mg_blocks,use_ce", [(1, True), (8, True), (1, False), (8, False)],
+                         ids=["b1-ce", "b8-ce", "b1-kernel", "b8-kernel"])
+@pytest.mark.parametrize("geom", list(MG_SSD_GEOMS), ids=list(MG_SSD_GEOMS))
+@pytest.mark.parametrize("iouring_entries", [0, 512], ids=["thread", "iouring"])
+def test_multi_group_layerwise_ssd_disk2h_roundtrip(iouring_entries, geom, mg_blocks, use_ce, tmp_path):
+    from flexkv.c_ext import SSDIOCTX, transfer_kv_blocks, transfer_kv_blocks_ssd
+    from test_layerwise_multi_group_swa import (
+        _compute_multi_group_strides,
+        _device,
+        _make_group_gpu_tensors,
+        _make_multi_group_cpu_layout,
+    )
+
+    device = _device()
+    torch.cuda.set_device(device)
+    tpb = MG_SSD_GEOMS[geom]["tpb"]
+    layer_groups = _mg_ssd_layer_groups(geom)
+
+    cpu_layout = _make_multi_group_cpu_layout(
+        layer_groups, MG_SSD_NUM_LAYERS, mg_blocks, tpb,
+    )
+    gpu_layouts = [
+        _mg_ssd_gpu_layout(g, mg_blocks, tpb) for g in layer_groups
+    ]
+    strides = _compute_multi_group_strides(layer_groups, cpu_layout, gpu_layouts)
+    block_stride = cpu_layout.get_block_stride()
+    assert block_stride % 4096 == 0, f"block stride {block_stride} not 4KiB aligned"
+
+    gpu_tensors_per_group = [
+        _make_group_gpu_tensors(g, mg_blocks, tpb, device)
+        for g in layer_groups
+    ]
+    gpu_blocks_per_group = [[tensors] for tensors in gpu_tensors_per_group]
+
+    cpu_pool = torch.zeros(
+        mg_blocks, block_stride, dtype=torch.uint8, pin_memory=True,
+    )
+    ssd_files = _mg_ssd_files(str(tmp_path), block_stride)
+
+    group = LayerwiseTransferGroup(
+        num_gpus=1,
+        gpu_blocks_per_group=gpu_blocks_per_group,
+        cpu_blocks=cpu_pool,
+        ssd_files=ssd_files,
+        num_original_layers=MG_SSD_NUM_LAYERS,
+        layer_members=strides["layer_members"],
+        group_num_layers=strides["group_num_layers"],
+        group_cpu_offset_bytes=strides["group_cpu_offset_bytes"],
+        group_ssd_offset_bytes=strides["group_ssd_offset_bytes"],
+        group_cpu_layer_strides=strides["group_cpu_layer_strides"],
+        group_cpu_kv_strides=strides["group_cpu_kv_strides"],
+        group_ssd_layer_strides=strides["group_ssd_layer_strides"],
+        group_ssd_kv_strides=strides["group_ssd_kv_strides"],
+        group_chunk_sizes=strides["group_chunk_sizes"],
+        group_h2d_cpu_kv_strides=strides["group_h2d_cpu_kv_strides"],
+        group_h2d_cpu_layer_strides=strides["group_h2d_cpu_layer_strides"],
+        group_cpu_block_strides=strides["group_cpu_block_strides"],
+        group_cpu_tp_strides=strides["group_cpu_tp_strides"],
+        group_gpu_kv_strides=strides["group_gpu_kv_strides"],
+        group_gpu_block_strides=strides["group_gpu_block_strides"],
+        group_gpu_layer_strides=strides["group_gpu_layer_strides"],
+        group_gpu_chunk_sizes=strides["group_gpu_chunk_sizes"],
+        iouring_entries=iouring_entries,
+        iouring_flags=0,
+        layer_eventfds_tensor=torch.empty(0, dtype=torch.int32),
+        tp_size=1,
+        has_swa=False,
+        swa_gpu_blocks=[],
+        swa_cpu_blocks=torch.empty(0),
+        swa_ssd_files={},
+        is_blockfirst=True,
+    )
+
+    # Phase 0: seed GPU.
+    for gi, tensors in enumerate(gpu_tensors_per_group):
+        for li, tensor in enumerate(tensors):
+            for blk in range(mg_blocks):
+                _mg_ssd_seed_layer(tensor, blk, li, gi, li)
+    torch.cuda.synchronize()
+
+    # Phase 1: D2H per group (worker-style) into the CPU pool.
+    block_ids = torch.arange(mg_blocks, dtype=torch.int64).pin_memory()
+    for gi, g in enumerate(layer_groups):
+        gpu_layout = gpu_layouts[gi]
+        tensors = gpu_tensors_per_group[gi]
+        cpu_flat = cpu_pool.contiguous().view(-1)
+        cpu_off = strides["group_cpu_offset_bytes"][gi]
+        transfer_kv_blocks(
+            block_ids,
+            _mg_ssd_gpu_ptrs(tensors),
+            gpu_layout.get_kv_stride() * g.dtype.itemsize,
+            gpu_layout.get_block_stride() * g.dtype.itemsize,
+            gpu_layout.get_layer_stride() * g.dtype.itemsize,
+            block_ids,
+            cpu_flat[cpu_off:],
+            strides["group_cpu_kv_strides"][gi],
+            strides["group_cpu_layer_strides"][gi],
+            strides["group_cpu_block_strides"][gi],
+            strides["group_chunk_sizes"][gi],
+            0,  # pp_offset_bytes
+            0,  # start_layer_id
+            g.num_layers,
+            4,
+            False,  # D2H
+            True,
+            gpu_layout.kv_dim,
+            0,
+        )
+    golden_cpu = cpu_pool.clone()
+
+    # Phase 2: H2DISK opaque-blob PUT (worker.py multi-group style).
+    ioctx = SSDIOCTX(ssd_files, MG_SSD_NUM_DEVICES, iouring_entries, 0)
+    block_ids = torch.arange(mg_blocks, dtype=torch.int64).pin_memory()
+    transfer_kv_blocks_ssd(
+        ioctx,
+        torch.tensor([0], dtype=torch.int32),
+        cpu_pool.data_ptr(),
+        block_ids,      # ssd ids
+        block_ids,      # cpu ids
+        block_stride,   # cpu_layer_stride
+        0,              # cpu_kv_stride
+        block_stride,   # ssd_layer_stride
+        0,              # ssd_kv_stride
+        block_stride,   # chunk_size
+        block_stride,   # block_stride
+        False,          # is_read: CPU -> SSD
+        MG_SSD_BLOCKS_PER_FILE,
+        1,     # round_robin
+        32,    # threads
+        True,  # kv_dim=1 (opaque blob)
+        True,  # ssd_io_opt
+    )
+
+    # Verify (a0): D2H wrote the seed pattern into the CPU pool.
+    # (a)/(b) only prove SSD<->CPU self-consistency; if D2H itself is wrong,
+    # the whole chain is consistently wrong and only (c) vs the GPU seed
+    # exposes it.  This check bisects D2H directly.
+    # LUT: little-endian bytes of each seed value in the group dtype.
+    # fp16 stores the FLOAT encoding (e.g. 1.0 -> 0x3C00), not the raw integer.
+    def _val_bytes(val, dtype):
+        return torch.tensor([val], dtype=dtype).view(torch.uint8).tolist()
+
+    expected_cpu = torch.zeros_like(cpu_pool)
+    val_lut = {}
+    for gi, g in enumerate(layer_groups):
+        g_off = strides["group_cpu_offset_bytes"][gi]
+        l_stride = strides["group_cpu_layer_strides"][gi]
+        tpb_g = tpb // g.compress_ratio
+        if g.dtype not in val_lut:
+            val_lut[g.dtype] = [_val_bytes(v, g.dtype) for v in range(256)]
+        for li in range(g.num_layers):
+            for tok in range(tpb_g):
+                for h in range(g.num_kv_heads):
+                    for bdim in range(g.head_size):
+                        val = ((li * 104 + gi * 13 + tok) ^ bdim) & 0xFF
+                        base = g_off + li * l_stride + (
+                            (tok * g.num_kv_heads + h) * g.head_size + bdim
+                        ) * g.dtype.itemsize
+                        for k, byte in enumerate(val_lut[g.dtype][val]):
+                            expected_cpu[:, base + k] = byte
+    assert torch.equal(golden_cpu, expected_cpu), (
+        f"D2H wrote wrong CPU bytes: {(golden_cpu != expected_cpu).sum().item()} mismatched"
+    )
+
+    # Verify (a): SSD file bytes == golden CPU bytes  [bisects PUT].
+    # Block b lives in file b//MG_SSD_BLOCKS_PER_FILE at offset
+    # (b%MG_SSD_BLOCKS_PER_FILE)*block_stride (verified by the b8 case).
+    for blk in range(mg_blocks):
+        f = ssd_files[blk // MG_SSD_BLOCKS_PER_FILE][0]
+        with open(f, "rb") as fh:
+            fh.seek((blk % MG_SSD_BLOCKS_PER_FILE) * block_stride)
+            got = fh.read(block_stride)
+        exp = golden_cpu[blk].numpy().tobytes()
+        assert got == exp, f"H2DISK wrote wrong bytes to SSD for block {blk}"
+
+    # Phase 3: zero staging + GPU, then layerwise GET (DISK2H + H2D).
+    cpu_pool.zero_()
+    for tensors in gpu_tensors_per_group:
+        for t in tensors:
+            t.zero_()
+    torch.cuda.synchronize()
+
+    group.layerwise_transfer_multi_group(
+        block_ids,  # ssd_block_ids (DISK2H src)
+        block_ids,  # cpu_block_ids_d2h (DISK2H dst = staging slots)
+        num_blocks_per_file=MG_SSD_BLOCKS_PER_FILE,
+        round_robin=1,
+        num_threads_per_device=32,
+        gpu_block_id_tensor=block_ids,  # H2D dst
+        cpu_block_id_tensor=block_ids,  # H2D src (staging slots)
+        transfer_cta_num=4,
+        use_ce_transfer=True,
+        kv_dim=1,
+        num_kv_heads=1,
+        counter_id=0,
+    )
+    torch.cuda.synchronize()
+
+    # Verify (b): staging CPU == golden CPU  [bisects DISK2H].
+    assert torch.equal(cpu_pool, golden_cpu), (
+        f"DISK2H staged wrong bytes: {(cpu_pool != golden_cpu).sum().item()} mismatched"
+    )
+
+    # Verify (c): GPU == seed golden  [bisects H2D].
+    for gi, tensors in enumerate(gpu_tensors_per_group):
+        for li, tensor in enumerate(tensors):
+            expected = torch.zeros(
+                tensor.shape[1], tensor.shape[2], tensor.shape[3],
+                dtype=tensor.dtype,
+            )
+            for tok in range(tensor.shape[1]):
+                for h in range(tensor.shape[2]):
+                    for b in range(tensor.shape[3]):
+                        expected[tok, h, b] = ((li * 97 + gi * 13 + li * 7 + tok) ^ b) & 0xFF
+            for blk in range(mg_blocks):
+                got = tensor[blk].cpu()
+                assert torch.equal(got, expected), (
+                    f"H2D restored wrong GPU bytes: group={gi} layer={li} block={blk}"
+                )
 
 
 if __name__ == "__main__":

@@ -57,7 +57,8 @@ void transfer_kv_blocks_binding(
     int64_t gpu_layer_stride_in_bytes, torch::Tensor &cpu_block_id_tensor,
     torch::Tensor &cpu_tensor, int64_t cpu_kv_stride_in_bytes,
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_block_stride_in_bytes,
-    int64_t chunk_size_in_bytes, int start_layer_id, int num_layers,
+    int64_t chunk_size_in_bytes, int64_t pp_offset_bytes,
+    int start_layer_id, int num_layers,
     int transfer_num_cta = 4, bool is_host_to_device = true,
     bool use_ce_transfer = false, int kv_dim = 2,
     int num_kv_heads = 1,
@@ -104,6 +105,12 @@ void transfer_kv_blocks_binding(
   ce_config.gather_threads = ce_gather_threads;
   ce_config.gather_nt = ce_gather_nt;
 
+  // pp_offset_bytes anchors the CPU tensor inside the per-node pool (the
+  // PP stage's first layer); start_layer_id is the batch-local start layer
+  // and indexes both the anchored CPU view and the 0-based per-stage GPU
+  // pointer array.
+  void *cpu_base = static_cast<char *>(cpu_ptr) + pp_offset_bytes;
+
   // Create GTensorHandler
   flexkv::GTensorHandler handler(
       backend_type, reinterpret_cast<int64_t **>(gpu_tensor_ptrs), num_layers,
@@ -115,7 +122,7 @@ void transfer_kv_blocks_binding(
   case flexkv::BackendType::VLLM:
     flexkv::transfer_kv_blocks<flexkv::BackendType::VLLM>(
         num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
-        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
+        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_base,
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
@@ -125,7 +132,7 @@ void transfer_kv_blocks_binding(
   case flexkv::BackendType::TRTLLM:
     flexkv::transfer_kv_blocks<flexkv::BackendType::TRTLLM>(
         num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
-        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
+        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_base,
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
@@ -135,7 +142,7 @@ void transfer_kv_blocks_binding(
   case flexkv::BackendType::SGLANG:
     flexkv::transfer_kv_blocks<flexkv::BackendType::SGLANG>(
         num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
-        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
+        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_base,
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
@@ -444,7 +451,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("cpu_tensor"), py::arg("cpu_kv_stride_in_bytes"),
         py::arg("cpu_layer_stride_in_bytes"),
         py::arg("cpu_block_stride_in_bytes"), py::arg("chunk_size_in_bytes"),
-        py::arg("start_layer_id"), py::arg("num_layers"),
+        py::arg("pp_offset_bytes"), py::arg("start_layer_id"),
+        py::arg("num_layers"),
         py::arg("transfer_num_cta") = 4, py::arg("is_host_to_device") = true,
         py::arg("use_ce_transfer") = false,
         py::arg("kv_dim") = 2,
@@ -472,6 +480,7 @@ PYBIND11_MODULE(c_ext, m) {
       .def(py::init([](int num_gpus,
                        const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
                        torch::Tensor &cpu_blocks,
+                       int64_t pp_offset_bytes,
                        std::map<int, std::vector<std::string>> &ssd_files,
                        int num_layers, torch::Tensor &gpu_kv_strides_tensor,
                        torch::Tensor &gpu_block_strides_tensor,
@@ -505,7 +514,8 @@ PYBIND11_MODULE(c_ext, m) {
             cfg.gather_threads = ce_gather_threads;
             cfg.gather_nt = ce_gather_nt;
              return new flexkv::LayerwiseTransferGroup(
-                 num_gpus, gpu_blocks, cpu_blocks, ssd_files, num_layers,
+                 num_gpus, gpu_blocks, cpu_blocks, pp_offset_bytes,
+                 ssd_files, num_layers,
                  gpu_kv_strides_tensor, gpu_block_strides_tensor,
                  gpu_layer_strides_tensor, gpu_chunk_sizes_tensor,
                  iouring_entries, iouring_flags, layer_eventfds_tensor,
@@ -515,6 +525,7 @@ PYBIND11_MODULE(c_ext, m) {
                  swa_gpu_chunk_sizes_tensor, ssd_io_opt, cfg);
            }),
            py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("cpu_blocks"),
+           py::arg("pp_offset_bytes") = (int64_t)0,
            py::arg("ssd_files"), py::arg("num_layers"),
            py::arg("gpu_kv_strides_tensor"),
            py::arg("gpu_block_strides_tensor"),
@@ -824,7 +835,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_block_stride_in_bytes"),
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
-           py::arg("layer_id"), py::arg("layer_granularity"),
+           py::arg("pp_offset_bytes"), py::arg("start_layer_id"),
+           py::arg("layer_granularity"),
            py::arg("kv_dim"), py::arg("num_kv_heads"),
            py::arg("kv_shared_across_ranks_mode") = "sharded",
            py::arg("designated_rank") = 0);
@@ -842,7 +854,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_block_stride_in_bytes"),
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
-           py::arg("layer_id"), py::arg("layer_granularity"), py::arg("kv_dim"),
+           py::arg("pp_offset_bytes"), py::arg("start_layer_id"),
+           py::arg("layer_granularity"), py::arg("kv_dim"),
            py::arg("num_kv_heads"),
            py::arg("cpu_size_table_tp_ptr"),
            py::arg("cpu_size_table_tp_rank_stride"),
@@ -871,9 +884,10 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ssd_kv_stride_in_bytes"),
            py::arg("ssd_block_stride_in_bytes"),
            py::arg("ssd_tp_stride_in_bytes"), py::arg("num_blocks_per_file"),
-           py::arg("is_read"), py::arg("layer_id"),
+           py::arg("is_read"), py::arg("start_layer_id"),
            py::arg("layer_granularity"), py::arg("kv_dim"),
-           py::arg("num_kv_heads") = 1);
+           py::arg("num_kv_heads") = 1,
+           py::arg("ssd_pp_seek_offset_bytes") = (int64_t)0);
 #endif
 
   // Add Hasher class binding
