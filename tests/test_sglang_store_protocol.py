@@ -6,6 +6,7 @@ import torch
 
 from flexkv.integration.sglang.comm import FlexKVScatterChannel
 from flexkv.integration.sglang.connector import FlexKVConnector
+from flexkv.common.request import KVResponseStatus
 
 
 def _follower_connector(payload):
@@ -113,6 +114,8 @@ def test_prefetch_start_extracts_task_id_from_current_manager_result():
     )
     connector._ongoing_prefetches = {}
     connector._prefetch_contexts = {}
+    connector._prefetch_planned_tokens = {}
+    connector._prefetch_loaded_tokens = {}
     context = SimpleNamespace(task_id=-1)
     connector._new_op_context = MagicMock(return_value=context)
     connector._log_cache_op = MagicMock()
@@ -123,6 +126,35 @@ def test_prefetch_start_extracts_task_id_from_current_manager_result():
     assert context.task_id == 23
     assert connector._ongoing_prefetches == {"request": 23}
     assert connector._prefetch_contexts == {"request": context}
+    assert connector._prefetch_planned_tokens == {"request": 256}
+
+
+def test_prefetch_completion_reports_loaded_tokens_once():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._prefetch_enabled = True
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.try_wait.return_value = {
+        23: SimpleNamespace(status=KVResponseStatus.SUCCESS)
+    }
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=True,
+        needs_sync=False,
+    )
+    connector._ongoing_prefetches = {"request": 23}
+    connector._prefetch_contexts = {
+        "request": SimpleNamespace(task_id=23)
+    }
+    connector._prefetch_planned_tokens = {"request": 256}
+    connector._prefetch_loaded_tokens = {}
+    connector._new_op_context = MagicMock()
+    connector._pop_context = MagicMock(
+        return_value=SimpleNamespace(task_id=23)
+    )
+    connector._log_cache_op = MagicMock()
+
+    assert connector.check_prefetch_progress("request") is True
+    assert connector.pop_prefetch_loaded_tokens("request") == 256
+    assert connector.pop_prefetch_loaded_tokens("request") == 0
 
 
 def test_duplicate_lookup_cancels_replaced_held_task():

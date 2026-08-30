@@ -303,6 +303,8 @@ class FlexKVConnector:
         # Prefetches
         self._ongoing_prefetches: Dict[str, int] = {}  # rid -> fkv_task_id
         self._prefetch_contexts: Dict[str, _CacheOpContext] = {}
+        self._prefetch_planned_tokens: Dict[str, int] = {}
+        self._prefetch_loaded_tokens: Dict[str, int] = {}
         self._prefetch_enabled = bool(
             self.cache_config.enable_ssd
             or self.cache_config.enable_remote
@@ -1355,6 +1357,7 @@ class FlexKVConnector:
             return -1
         context = self._new_op_context("prefetch", rid, sglang_req_id)
         task_id = -1
+        planned_tokens = 0
         prefetch_error: Optional[Exception] = None
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
@@ -1372,19 +1375,23 @@ class FlexKVConnector:
                     if isinstance(prefetch_result, tuple)
                     else prefetch_result
                 )
+                if isinstance(prefetch_result, tuple) and len(prefetch_result) > 1:
+                    planned_tokens = int(prefetch_result[1])
             except Exception as exc:  # noqa: BLE001
                 prefetch_error = exc
                 task_id = -1
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
-                {"task_id": task_id},
+                {"task_id": task_id, "planned_tokens": planned_tokens},
                 channel=FlexKVScatterChannel.PREFETCH_START,
             )
             task_id = payload["task_id"]
+            planned_tokens = int(payload["planned_tokens"])
         if task_id >= 0:
             context.task_id = task_id
             self._ongoing_prefetches[rid] = task_id
             self._prefetch_contexts[rid] = context
+            self._prefetch_planned_tokens[rid] = planned_tokens
             self._log_cache_op(
                 context,
                 "launch",
@@ -1409,6 +1416,7 @@ class FlexKVConnector:
             return True
         done = False
         status = "running"
+        loaded_tokens = 0
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 completed = self.kv_manager.try_wait(task_ids=[task_id]) or {}
@@ -1427,15 +1435,24 @@ class FlexKVConnector:
             if task_id in completed:
                 status = _status_value(completed[task_id])
                 done = _is_terminal_status(status)
+                if done and status == KVResponseStatus.SUCCESS.value:
+                    loaded_tokens = self._prefetch_planned_tokens.get(rid, 0)
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
-                {"done": done, "status": status},
+                {
+                    "done": done,
+                    "status": status,
+                    "loaded_tokens": loaded_tokens,
+                },
                 channel=FlexKVScatterChannel.PREFETCH_PROGRESS,
             )
             done = payload["done"]
             status = payload["status"]
+            loaded_tokens = int(payload["loaded_tokens"])
         if done:
             self._ongoing_prefetches.pop(rid, None)
+            self._prefetch_planned_tokens.pop(rid, None)
+            self._prefetch_loaded_tokens[rid] = loaded_tokens
             context = self._pop_context("_prefetch_contexts", rid, "prefetch", task_id)
             self._log_cache_op(
                 context,
@@ -1443,6 +1460,10 @@ class FlexKVConnector:
                 status,
             )
         return done
+
+    def pop_prefetch_loaded_tokens(self, rid: str) -> int:
+        """Return the successfully materialized REMOTE2H prefix once."""
+        return int(self._prefetch_loaded_tokens.pop(rid, 0))
 
     def cancel_prefetch(self, rid: str) -> None:
         self._pending_lookups.pop(rid, None)
@@ -1458,6 +1479,8 @@ class FlexKVConnector:
         # FlexKV doesn't currently support prefetch cancellation, but
         # we still drop our tracking entry.
         task_id = self._ongoing_prefetches.pop(rid, -1)
+        self._prefetch_planned_tokens.pop(rid, None)
+        self._prefetch_loaded_tokens.pop(rid, None)
         context = getattr(self, "_prefetch_contexts", {}).pop(rid, None)
         if context is not None:
             self._log_cache_op(
@@ -1565,6 +1588,8 @@ class FlexKVConnector:
             )
         self._prefetch_contexts.clear()
         self._ongoing_prefetches.clear()
+        getattr(self, "_prefetch_planned_tokens", {}).clear()
+        getattr(self, "_prefetch_loaded_tokens", {}).clear()
         self._inflight_loads.clear()
         self._completed_layerwise.clear()
         self._launched_load_tids.clear()
