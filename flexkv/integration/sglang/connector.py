@@ -1433,10 +1433,26 @@ class FlexKVConnector:
                 )
                 completed = {}
             if task_id in completed:
-                status = _status_value(completed[task_id])
+                response = completed[task_id]
+                status = _status_value(response)
                 done = _is_terminal_status(status)
                 if done and status == KVResponseStatus.SUCCESS.value:
-                    loaded_tokens = self._prefetch_planned_tokens.get(rid, 0)
+                    # Current FlexKV finalizes the authoritative reusable L3
+                    # prefix in KVResponse.return_mask after REMOTE2H commits
+                    # into the CPU tree.  Launch-time prefetch_async returns
+                    # only a task id, so using that result for accounting
+                    # silently reports real storage hits as host hits.
+                    return_mask = getattr(response, "return_mask", None)
+                    if return_mask is None:
+                        # Compatibility with older managers that returned the
+                        # planned token count at launch and no completion mask.
+                        loaded_tokens = self._prefetch_planned_tokens.get(rid, 0)
+                    elif isinstance(return_mask, list):
+                        loaded_tokens = sum(
+                            int(np.count_nonzero(mask)) for mask in return_mask
+                        )
+                    else:
+                        loaded_tokens = int(np.count_nonzero(return_mask))
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
                 {

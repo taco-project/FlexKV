@@ -103,7 +103,7 @@ def test_lookup_accepts_sglang_array_token_ids():
     ) == (-1, 0)
     connector._log_cache_op.assert_called_once()
 
-def test_prefetch_start_extracts_task_id_from_current_manager_result():
+def test_prefetch_start_accepts_legacy_manager_result_with_planned_tokens():
     connector = FlexKVConnector.__new__(FlexKVConnector)
     connector._prefetch_enabled = True
     connector.kv_manager = MagicMock()
@@ -134,7 +134,10 @@ def test_prefetch_completion_reports_loaded_tokens_once():
     connector._prefetch_enabled = True
     connector.kv_manager = MagicMock()
     connector.kv_manager.try_wait.return_value = {
-        23: SimpleNamespace(status=KVResponseStatus.SUCCESS)
+        23: SimpleNamespace(
+            status=KVResponseStatus.SUCCESS,
+            return_mask=np.ones(256, dtype=np.bool_),
+        )
     }
     connector._sync_ctx = SimpleNamespace(
         is_sync_leader=True,
@@ -144,7 +147,7 @@ def test_prefetch_completion_reports_loaded_tokens_once():
     connector._prefetch_contexts = {
         "request": SimpleNamespace(task_id=23)
     }
-    connector._prefetch_planned_tokens = {"request": 256}
+    connector._prefetch_planned_tokens = {"request": 0}
     connector._prefetch_loaded_tokens = {}
     connector._new_op_context = MagicMock()
     connector._pop_context = MagicMock(
@@ -155,6 +158,36 @@ def test_prefetch_completion_reports_loaded_tokens_once():
     assert connector.check_prefetch_progress("request") is True
     assert connector.pop_prefetch_loaded_tokens("request") == 256
     assert connector.pop_prefetch_loaded_tokens("request") == 0
+
+
+def test_prefetch_completion_reports_partial_remote_prefix():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._prefetch_enabled = True
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.try_wait.return_value = {
+        23: SimpleNamespace(
+            status=KVResponseStatus.SUCCESS,
+            return_mask=np.asarray([True] * 192 + [False] * 64),
+        )
+    }
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=True,
+        needs_sync=False,
+    )
+    connector._ongoing_prefetches = {"request": 23}
+    connector._prefetch_contexts = {
+        "request": SimpleNamespace(task_id=23)
+    }
+    connector._prefetch_planned_tokens = {"request": 0}
+    connector._prefetch_loaded_tokens = {}
+    connector._new_op_context = MagicMock()
+    connector._pop_context = MagicMock(
+        return_value=SimpleNamespace(task_id=23)
+    )
+    connector._log_cache_op = MagicMock()
+
+    assert connector.check_prefetch_progress("request") is True
+    assert connector.pop_prefetch_loaded_tokens("request") == 192
 
 
 def test_duplicate_lookup_cancels_replaced_held_task():
