@@ -33,6 +33,7 @@ import signal
 import socket
 import struct
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -263,6 +264,9 @@ class FlexKVConnector:
         self.enable_layerwise = bool(
             int(os.environ.get("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "0"))
         )
+        self._profile_store_stages = os.getenv(
+            "FLEXKV_PROFILE_STORE_STAGES", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._layerwise_socket = build_layerwise_eventfd_socket_path(
             dp_client_id=self.rank_info.dp_client_id,
             pp_rank=self.rank_info.pp_rank,
@@ -1008,6 +1012,33 @@ class FlexKVConnector:
     # Public API — store
     # ------------------------------------------------------------------
 
+    @property
+    def is_store_sync_leader(self) -> bool:
+        """Whether this rank owns the authoritative FlexKV store decision."""
+        return bool(self._sync_ctx.is_sync_leader)
+
+    @property
+    def supports_async_store_slot_mapping(self) -> bool:
+        """Whether a leader-only pinned slot copy is valid for this topology.
+
+        Cross-node PP receivers need their own stage-local mapping, and SWA
+        needs a GPU-side full-to-SWA translation. Keep those paths on the
+        synchronous implementation until they have an explicit sideband.
+        """
+        return not bool(getattr(self._sync_ctx, "is_cross_node_pp", False)) and (
+            self._swa_kv_pool is None
+        )
+
+    def sync_ready_store_rids(self, ready_rids: List[str]) -> List[str]:
+        """Fan out the leader's ready pinned-copy set to every cache rank."""
+        payload = list(ready_rids) if self._sync_ctx.is_sync_leader else []
+        if self._sync_ctx.needs_sync:
+            payload = self._sync_ctx.scatter(
+                payload,
+                channel=FlexKVScatterChannel.STORE_READY,
+            )
+        return list(payload)
+
     def store_kv(
         self,
         rid: str,
@@ -1026,7 +1057,8 @@ class FlexKVConnector:
         nothing needed to be written.
         """
         context = self._new_op_context("store", rid, sglang_req_id)
-        token_ids_np = np.asarray(token_ids, dtype=np.int64)
+        with self._store_profile_scope("flexkv.connector.store.tokens_to_numpy"):
+            token_ids_np = np.asarray(token_ids, dtype=np.int64)
         n = len(token_ids_np)
         if n != len(kv_indices):
             raise ValueError(
@@ -1051,18 +1083,24 @@ class FlexKVConnector:
             if aligned_len < n:
                 token_ids_np = token_ids_np[:aligned_len]
                 kv_indices = kv_indices[:aligned_len]
+                n = aligned_len
 
         store_start = {
             "rid": rid,
             "task_id": -1,
             "active": False,
+            "slot_count": n,
+            "unmatched_count": 0,
             "unmatched_mask": [],
             "error": "",
         }
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             match_error: Optional[Exception] = None
             try:
-                res = self.kv_manager.put_match(token_ids=token_ids_np, token_mask=None)
+                with self._store_profile_scope("flexkv.connector.store.put_match"):
+                    res = self.kv_manager.put_match(
+                        token_ids=token_ids_np, token_mask=None
+                    )
             except Exception as exc:  # noqa: BLE001
                 match_error = exc
                 res = None
@@ -1078,33 +1116,55 @@ class FlexKVConnector:
                 )
             else:
                 fkv_task_id, unmatched_mask = res
+                # TP/CP followers only need the task id to retain their local
+                # radix-node ownership.  Broadcasting one Python bool per
+                # prompt token made the common TP-only write-through path
+                # serialize/deserialise tens of thousands of objects per
+                # request.  Only cross-node PP receivers need the mask to
+                # construct their stage-local slot mapping.
+                needs_remote_mask = bool(
+                    getattr(self._sync_ctx, "is_cross_node_pp", False)
+                )
+                unmatched_count = int(np.count_nonzero(unmatched_mask))
                 mask_list = (
                     unmatched_mask.tolist()
-                    if hasattr(unmatched_mask, "tolist")
+                    if needs_remote_mask and hasattr(unmatched_mask, "tolist")
                     else list(unmatched_mask)
+                    if needs_remote_mask
+                    else []
                 )
                 store_start.update(
-                    task_id=int(fkv_task_id), unmatched_mask=mask_list
+                    task_id=int(fkv_task_id),
+                    unmatched_count=unmatched_count,
+                    unmatched_mask=mask_list,
                 )
                 context.task_id = int(fkv_task_id)
-                unmatched_count = int(sum(bool(item) for item in mask_list))
                 if unmatched_count > 0:
-                    filtered = kv_indices[unmatched_mask]
-                    slot_mapping_cpu = self._to_cpu_int64(filtered)
-                    swa_slot_mapping = self._build_swa_slot_mapping(filtered)
+                    with self._store_profile_scope(
+                        "flexkv.connector.store.filter_slot_mapping"
+                    ):
+                        filtered = kv_indices[unmatched_mask]
+                    with self._store_profile_scope(
+                        "flexkv.connector.store.slot_mapping_to_cpu"
+                    ):
+                        slot_mapping_cpu = self._to_cpu_int64(filtered)
+                        swa_slot_mapping = self._build_swa_slot_mapping(filtered)
                     swa_slots = (
                         0
                         if swa_slot_mapping is None
                         else int(swa_slot_mapping.numel())
                     )
                     try:
-                        self.kv_manager.launch(
-                            task_ids=[fkv_task_id],
-                            slot_mappings=[slot_mapping_cpu],
-                            swa_slot_mappings=[swa_slot_mapping],
-                            as_batch=False,
-                            layerwise_transfer=False,
-                        )
+                        with self._store_profile_scope(
+                            "flexkv.connector.store.kvmanager_launch"
+                        ):
+                            self.kv_manager.launch(
+                                task_ids=[fkv_task_id],
+                                slot_mappings=[slot_mapping_cpu],
+                                swa_slot_mappings=[swa_slot_mapping],
+                                as_batch=False,
+                                layerwise_transfer=False,
+                            )
                     except Exception as exc:  # noqa: BLE001
                         store_start["error"] = str(exc)
                         self._log_cache_op(
@@ -1139,10 +1199,11 @@ class FlexKVConnector:
                     )
 
         if self._sync_ctx.needs_sync:
-            store_start = self._sync_ctx.scatter(
-                store_start,
-                channel=FlexKVScatterChannel.STORE_START,
-            )
+            with self._store_profile_scope("flexkv.connector.store.scatter_start"):
+                store_start = self._sync_ctx.scatter(
+                    store_start,
+                    channel=FlexKVScatterChannel.STORE_START,
+                )
         if store_start.get("rid") != rid:
             raise RuntimeError(
                 "[FlexKV] store-start rid mismatch: "
@@ -1156,16 +1217,22 @@ class FlexKVConnector:
             return -1
 
         fkv_task_id = int(store_start["task_id"])
+        slot_count = int(store_start.get("slot_count", -1))
         mask_list = store_start.get("unmatched_mask", [])
-        if fkv_task_id < 0 or len(mask_list) != len(kv_indices):
+        if fkv_task_id < 0 or slot_count != len(kv_indices):
             raise RuntimeError(
                 "[FlexKV] invalid store-start payload: "
-                f"task_id={fkv_task_id}, mask_len={len(mask_list)}, "
+                f"task_id={fkv_task_id}, slot_count={slot_count}, "
                 f"slot_len={len(kv_indices)}"
             )
 
         # Cross-node PP needs the local PP stage's physical slot mapping.
         if self._sync_ctx.should_send_slot_mapping_to_remote:
+            if len(mask_list) != len(kv_indices):
+                raise RuntimeError(
+                    "[FlexKV] invalid cross-node store mask: "
+                    f"mask_len={len(mask_list)}, slot_len={len(kv_indices)}"
+                )
             unmatched_mask = torch.as_tensor(
                 mask_list, dtype=torch.bool, device=kv_indices.device
             )
@@ -1596,11 +1663,65 @@ class FlexKVConnector:
     # Private helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _alias_empty_indexer_buffers(
+        indexer_buffers: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Replace skip-topk zero-row placeholders with their source layer.
+
+        SGLang intentionally allocates a ``(0, page_stride)`` tensor for a
+        skip-topk layer because that layer reuses the preceding layer's
+        indexer cache.  FlexKV keeps one physical indexer slot per model layer
+        (matching HiCache sizing), so its pointer table must alias the same
+        preceding buffer instead of exporting a null ``data_ptr()``.
+        """
+        resolved: List[torch.Tensor] = []
+        previous: Optional[torch.Tensor] = None
+        alias_count = 0
+        for layer_idx, buffer in enumerate(indexer_buffers):
+            if buffer.ndim != 2:
+                raise RuntimeError(
+                    f"FlexKV indexer layer {layer_idx} expects a 2D buffer, "
+                    f"got shape={tuple(buffer.shape)}"
+                )
+            if buffer.shape[0] == 0:
+                if previous is None:
+                    raise RuntimeError(
+                        "FlexKV cannot alias a leading skip-topk indexer layer: "
+                        f"layer={layer_idx} has shape={tuple(buffer.shape)}"
+                    )
+                if buffer.shape[1] != previous.shape[1]:
+                    raise RuntimeError(
+                        "FlexKV skip-topk indexer placeholder width mismatch: "
+                        f"layer={layer_idx} width={buffer.shape[1]} "
+                        f"source_width={previous.shape[1]}"
+                    )
+                resolved.append(previous)
+                alias_count += 1
+                continue
+            if previous is not None and buffer.shape != previous.shape:
+                raise RuntimeError(
+                    "FlexKV active indexer buffers must share one shape: "
+                    f"layer={layer_idx} shape={tuple(buffer.shape)} "
+                    f"previous={tuple(previous.shape)}"
+                )
+            previous = buffer
+            resolved.append(buffer)
+        if alias_count:
+            logger.info(
+                "[FlexKV] aliased %d skip-topk indexer placeholders to the "
+                "preceding active layer",
+                alias_count,
+            )
+        return resolved
+
     def _resolve_kv_buffers(
         self, kvcache: Any
     ) -> Tuple[List[torch.Tensor], Optional[List[torch.Tensor]]]:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
+        if indexer_buffers:
+            indexer_buffers = self._alias_empty_indexer_buffers(indexer_buffers)
         if not self._is_dsv4:
             if hasattr(kvcache, "kv_buffer"):
                 return list(kvcache.kv_buffer), indexer_buffers
@@ -1914,6 +2035,11 @@ class FlexKVConnector:
         if tensor.is_cuda:
             tensor = tensor.cpu()
         return tensor.to(torch.int64)
+
+    def _store_profile_scope(self, name: str):
+        if not getattr(self, "_profile_store_stages", False):
+            return nullcontext()
+        return torch.profiler.record_function(name)
 
     def _wait_kv_manager_ready(self, poll_interval: float = 10.0) -> None:
         assert self.kv_manager is not None
