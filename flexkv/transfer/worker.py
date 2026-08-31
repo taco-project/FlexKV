@@ -1842,6 +1842,10 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             # the kernel issue exactly one pread/pwrite of block_stride bytes
             # per block, sidestepping the sub-4KiB chunk hazard for highly
             # compressed groups (e.g. DSv4 indexer at compress_ratio=128).
+            #
+            # kv_dim=1 for the same reason: block_stride already covers K and V,
+            # and kv_stride is 0, so looping the kv axis would repeat the very
+            # same I/O.
             one_layer_id = torch.tensor([0], dtype=torch.int32)
             transfer_kv_blocks_ssd(
                 self.ioctx,
@@ -1859,7 +1863,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 self.num_blocks_per_file,
                 self.round_robin,
                 32,
-                True,
+                1,  # kv_dim
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
         else:

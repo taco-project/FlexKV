@@ -1370,6 +1370,20 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
   }
 
   // Step 0a: main-KV SSD -> CPU (opaque multi-group block).
+  //
+  // kv_dim is deliberately 1 here, NOT the model's kv_dim. A multi-group
+  // block_stride already accounts for both K and V (see
+  // KVCacheLayout._compute_kv_shape: bytes_per_block multiplies by kv_dim),
+  // and the strides below declare the whole block as one opaque region
+  // (layer_stride == chunk_size == block_stride, kv_stride == 0). Passing
+  // kv_dim=2 makes transfer_blocks_impl loop the kv axis with a zero stride,
+  // so every path (layer-major batch / vectored / baseline) issues the exact
+  // same read twice -- identical fd, offset, cpu_ptr and size. The data stays
+  // correct because a re-read is idempotent, but SSD read traffic doubles.
+  //
+  // The write side already passes 1 (CPUSSDDiskTransferWorker multi-group), so
+  // the on-disk image is a single opaque block with no K/V split to iterate,
+  // and Step 0b below does the same for multi-group SWA.
   if (enable_ssd_ && ssd_block_ids.numel() > 0) {
     const int64_t block_stride = groups_[0].cpu_block_stride;
     char ssd_range_name[128];
@@ -1391,7 +1405,7 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
         /*chunk_size_in_bytes=*/block_stride,
         /*block_stride_in_bytes=*/block_stride,
         /*is_read=*/true, num_blocks_per_file, round_robin,
-        num_threads_per_device, kv_dim,
+        num_threads_per_device, /*kv_dim=*/1,
         /*ssd_io_opt=*/ssd_io_opt_);
     nvtxRangePop();
   }
