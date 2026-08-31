@@ -89,30 +89,8 @@ def test_2g_limit_rejects_unconfigured_large_block_alignment():
         )
 
 
-def test_2g_aligned_mrs_may_span_blocks_when_explicitly_enabled():
-    block_size = 25_638_912
-    mapped_size = 700 << 30
-    logical_size = (mapped_size // block_size) * block_size
-
-    regions = _split_mooncake_registration_regions(
-        base_ptr=BASE_PTR,
-        logical_size=logical_size,
-        mapped_size=mapped_size,
-        block_size=block_size,
-        max_mr_size=2 << 30,
-        size_alignment=MAPPING_ALIGNMENT,
-        pointer_alignment=HUGEPAGE_SIZE,
-        allow_block_spanning_mrs=True,
-    )
-
-    assert len(regions) == 350
-    assert all(size == 2 << 30 for _, size in regions)
-    assert all(ptr % HUGEPAGE_SIZE == 0 for ptr, _ in regions)
-    assert regions[0][1] % block_size != 0
-
-
 @pytest.mark.parametrize("mapped_gib,expected_regions", [(8, 5), (700, 354)])
-def test_2g_unaligned_mrs_keep_every_large_block_inside_one_mr(mapped_gib, expected_regions):
+def test_2g_block_boundary_policy_keeps_every_large_block_inside_one_mr(mapped_gib, expected_regions):
     block_size = 25_638_912
     mapped_size = mapped_gib << 30
     logical_size = (mapped_size // block_size) * block_size
@@ -125,7 +103,7 @@ def test_2g_unaligned_mrs_keep_every_large_block_inside_one_mr(mapped_gib, expec
         max_mr_size=2 << 30,
         size_alignment=MAPPING_ALIGNMENT,
         pointer_alignment=HUGEPAGE_SIZE,
-        allow_unaligned_block_mrs=True,
+        mr_split_policy="block_boundary",
     )
 
     assert len(regions) == expected_regions
@@ -137,8 +115,8 @@ def test_2g_unaligned_mrs_keep_every_large_block_inside_one_mr(mapped_gib, expec
     assert any(ptr % HUGEPAGE_SIZE != 0 for ptr, _ in regions[1:])
 
 
-def test_mooncake_split_modes_are_mutually_exclusive():
-    with pytest.raises(ValueError, match="mutually exclusive"):
+def test_mooncake_split_policy_rejects_unknown_value():
+    with pytest.raises(ValueError, match="mr_split_policy"):
         _split_mooncake_registration_regions(
             base_ptr=BASE_PTR,
             logical_size=BLOCK_SIZE * 2,
@@ -147,8 +125,7 @@ def test_mooncake_split_modes_are_mutually_exclusive():
             max_mr_size=2 << 30,
             size_alignment=MAPPING_ALIGNMENT,
             pointer_alignment=HUGEPAGE_SIZE,
-            allow_block_spanning_mrs=True,
-            allow_unaligned_block_mrs=True,
+            mr_split_policy="registration_aligned",
         )
 
 
