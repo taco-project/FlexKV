@@ -107,7 +107,14 @@ def _split_mooncake_registration_regions(
     size_alignment: int,
     pointer_alignment: int,
 ) -> List[Tuple[int, int]]:
-    """Split a mapped KV pool into aligned MRs without splitting KV blocks."""
+    """Split a mapped KV pool without splitting KV blocks.
+
+    Prefer regions aligned to the KV block, mapping alignment and HugePage
+    size.  If that common alignment period is larger than the configured MR
+    limit, keep block boundaries and relax only the derived sub-MR pointer and
+    size alignment.  This is required by transports with a 2 GiB MR limit:
+    older Mooncake releases cannot transfer one KV block across two MRs.
+    """
     values = {
         "base_ptr": base_ptr,
         "logical_size": logical_size,
@@ -143,32 +150,58 @@ def _split_mooncake_registration_regions(
     if mapped_size <= max_mr_size:
         return [(base_ptr, mapped_size)]
 
-    region_unit = math.lcm(block_size, size_alignment, pointer_alignment)
-    region_size = (max_mr_size // region_unit) * region_unit
-    if region_size <= 0:
-        raise ValueError(
-            "Mooncake max MR size cannot hold one aligned KV region: "
-            f"max_mr_size={max_mr_size}, region_unit={region_unit}"
-        )
-
     regions: List[Tuple[int, int]] = []
-    offset = 0
-    while offset < mapped_size:
-        remaining = mapped_size - offset
-        size = remaining if remaining <= max_mr_size else region_size
-        ptr = base_ptr + offset
-        is_last = offset + size == mapped_size
+    region_unit = math.lcm(block_size, size_alignment, pointer_alignment)
+    aligned_region_size = (max_mr_size // region_unit) * region_unit
+    use_block_boundary_fallback = aligned_region_size <= 0
+
+    if use_block_boundary_fallback:
+        mapped_padding = mapped_size - logical_size
+        regular_region_size = (max_mr_size // block_size) * block_size
+        final_logical_capacity = (
+            (max_mr_size - mapped_padding) // block_size
+        ) * block_size
+        if regular_region_size <= 0 or final_logical_capacity <= 0:
+            raise ValueError(
+                "Mooncake max MR size cannot hold one KV block plus mapping tail: "
+                f"max_mr_size={max_mr_size}, block_size={block_size}, "
+                f"mapped_padding={mapped_padding}"
+            )
+        offset = 0
+        while logical_size - offset > final_logical_capacity:
+            required = logical_size - offset - final_logical_capacity
+            size = min(
+                regular_region_size,
+                ((required + block_size - 1) // block_size) * block_size,
+            )
+            regions.append((base_ptr + offset, size))
+            offset += size
+        regions.append((base_ptr + offset, mapped_size - offset))
+    else:
+        offset = 0
+        while offset < mapped_size:
+            remaining = mapped_size - offset
+            size = (
+                remaining
+                if remaining <= max_mr_size
+                else aligned_region_size
+            )
+            regions.append((base_ptr + offset, size))
+            offset += size
+
+    for index, (ptr, size) in enumerate(regions):
+        is_last = index == len(regions) - 1
         if not is_last and size % block_size != 0:
             raise ValueError(
                 "Non-final Mooncake MR is not KV-block aligned: "
-                f"offset={offset}, size={size}, block_size={block_size}"
+                f"index={index}, size={size}, block_size={block_size}"
             )
-        if ptr % pointer_alignment != 0:
+        if not use_block_boundary_fallback and ptr % pointer_alignment != 0:
             raise ValueError(
                 "Mooncake MR pointer is not HugePage aligned: "
                 f"ptr=0x{ptr:x}, alignment={pointer_alignment}"
             )
-        if size % size_alignment != 0:
+        if not use_block_boundary_fallback and size % size_alignment != 0:
             raise ValueError(
                 "Mooncake MR size is not externally aligned: "
                 f"size={size}, alignment={size_alignment}"
@@ -178,8 +211,6 @@ def _split_mooncake_registration_regions(
                 "Mooncake MR exceeds configured maximum: "
                 f"size={size}, max_mr_size={max_mr_size}"
             )
-        regions.append((ptr, size))
-        offset += size
 
     if regions[-1][0] + regions[-1][1] != base_ptr + mapped_size:
         raise ValueError("Mooncake MR split does not cover mapped extent")
@@ -4106,18 +4137,14 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
         if mapped_size is None:
             regions = [(base_ptr, logical_size)]
         else:
-            hugepage_size = int(
-                os.getenv("FLEXKV_HUGEPAGE_SIZE_BYTES", str(2 << 20))
-            )
+            hugepage_size = int(self.cache_config.hugepage_size_bytes)
             size_alignment = int(
                 os.getenv(
                     "FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES",
                     str(hugepage_size),
                 )
             )
-            max_mr_size = int(
-                os.getenv("FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES", str(512 << 30))
-            )
+            max_mr_size = int(self.cache_config.mooncake_max_mr_size_bytes)
             regions = _split_mooncake_registration_regions(
                 base_ptr=base_ptr,
                 logical_size=logical_size,

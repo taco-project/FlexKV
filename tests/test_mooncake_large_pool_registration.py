@@ -72,6 +72,31 @@ def test_large_glm_pool_splits_into_two_aligned_regions():
     assert regions[-1][0] + regions[-1][1] >= BASE_PTR + LOGICAL_SIZE
 
 
+@pytest.mark.parametrize("mapped_gib,expected_regions", [(8, 5), (700, 354)])
+def test_ionic_2g_limit_keeps_every_hy4_block_inside_one_mr(mapped_gib, expected_regions):
+    block_size = 25_638_912
+    mapped_size = mapped_gib << 30
+    logical_size = (mapped_size // block_size) * block_size
+
+    regions = _split_mooncake_registration_regions(
+        base_ptr=BASE_PTR,
+        logical_size=logical_size,
+        mapped_size=mapped_size,
+        block_size=block_size,
+        max_mr_size=2 << 30,
+        size_alignment=MAPPING_ALIGNMENT,
+        pointer_alignment=HUGEPAGE_SIZE,
+    )
+
+    assert len(regions) == expected_regions
+    assert sum(size for _, size in regions) == mapped_size
+    assert all(size <= 2 << 30 for _, size in regions)
+    assert all(size % block_size == 0 for _, size in regions[:-1])
+    assert all((ptr - BASE_PTR) % block_size == 0 for ptr, _ in regions)
+    assert regions[-1][0] + regions[-1][1] == BASE_PTR + mapped_size
+    assert any(ptr % HUGEPAGE_SIZE != 0 for ptr, _ in regions[1:])
+
+
 def test_partial_registration_failure_rolls_back_completed_regions():
     regions = [(BASE_PTR, MAPPING_ALIGNMENT), (BASE_PTR + MAPPING_ALIGNMENT, MAPPING_ALIGNMENT)]
     client = _RecordingClient(fail_on_register=2)
