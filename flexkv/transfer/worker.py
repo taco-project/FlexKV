@@ -74,6 +74,28 @@ def import_tensor_handles(
     if handles:
         ensure_cuda_device(handles[0].device)
     return [h.get_tensor() for h in handles]
+
+
+def _validate_multi_group_chunk_layout(
+    group_chunk_size: int,
+    layout_chunk_size: int,
+    group_index: int,
+    group_tpb: int,
+    layout_tpb: int,
+    head_size: int,
+    compress_ratio: int,
+) -> None:
+    """Reject a transfer descriptor that disagrees with GPU storage."""
+    if group_chunk_size != layout_chunk_size:
+        raise ValueError(
+            "Multi-group chunk/layout mismatch for group "
+            f"{group_index}: group_chunk={group_chunk_size} B, "
+            f"layout_chunk={layout_chunk_size} B, "
+            f"group_tpb={group_tpb}, layout_tpb={layout_tpb}, "
+            f"head_size={head_size}, compress_ratio={compress_ratio}"
+        )
+
+
 from flexkv.transfer.compression.common.strategy import (
     CompressionStrategy,
     NullCompressionStrategy,
@@ -879,6 +901,20 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             # GPU strides: compute from actual tensor to handle different
             # attention backend layouts (flash_attn vs triton/flashinfer).
             gpu_chunk_size = chunk_elements * dtype_size_g
+            # Fail closed before submitting a native transfer if the
+            # declarative LayerGroupSpec disagrees with the actual tensor
+            # layout. This catches page-packed GLM DSA indexer buffers
+            # (tpb=1, one 8448-byte row) being described as tpb=64.
+            layout_chunk_size = gpu_layout.get_chunk_size() * dtype_size_g
+            _validate_multi_group_chunk_layout(
+                gpu_chunk_size,
+                layout_chunk_size,
+                gi,
+                tpb_g,
+                gpu_layout.tokens_per_block,
+                g.head_size,
+                g.compress_ratio,
+            )
             t0 = group_gpu_blocks[0]
             gpu_strides = self._get_gpu_strides_from_tensor(t0, tpb_g, dtype_size_g, self.kv_dim)
             if gpu_strides is not None:
