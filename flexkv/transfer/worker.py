@@ -106,14 +106,15 @@ def _split_mooncake_registration_regions(
     max_mr_size: int,
     size_alignment: int,
     pointer_alignment: int,
+    allow_block_spanning_mrs: bool = False,
+    allow_unaligned_block_mrs: bool = False,
 ) -> List[Tuple[int, int]]:
-    """Split a mapped KV pool without splitting KV blocks.
+    """Split a mapped KV pool according to an explicit MR policy.
 
-    Prefer regions aligned to the KV block, mapping alignment and HugePage
-    size.  If that common alignment period is larger than the configured MR
-    limit, keep block boundaries and relax only the derived sub-MR pointer and
-    size alignment.  This is required by transports with a 2 GiB MR limit:
-    older Mooncake releases cannot transfer one KV block across two MRs.
+    The default keeps every region aligned to the KV block, external mapping,
+    and HugePage. A deployment may explicitly allow either aligned MRs that
+    span KV blocks, or block-boundary MRs whose derived pointer/size is not
+    externally aligned. The two compatibility modes are mutually exclusive.
     """
     values = {
         "base_ptr": base_ptr,
@@ -131,6 +132,11 @@ def _split_mooncake_registration_regions(
         raise ValueError(
             "HugePage mapped length is smaller than the logical CPU pool: "
             f"mapped={mapped_size}, logical={logical_size}"
+        )
+    if allow_block_spanning_mrs and allow_unaligned_block_mrs:
+        raise ValueError(
+            "Mooncake MR split modes are mutually exclusive: choose block-spanning "
+            "MRs or unaligned block-boundary MRs"
         )
     if logical_size % block_size != 0:
         raise ValueError(
@@ -151,11 +157,7 @@ def _split_mooncake_registration_regions(
         return [(base_ptr, mapped_size)]
 
     regions: List[Tuple[int, int]] = []
-    region_unit = math.lcm(block_size, size_alignment, pointer_alignment)
-    aligned_region_size = (max_mr_size // region_unit) * region_unit
-    use_block_boundary_fallback = aligned_region_size <= 0
-
-    if use_block_boundary_fallback:
+    if allow_unaligned_block_mrs:
         mapped_padding = mapped_size - logical_size
         regular_region_size = (max_mr_size // block_size) * block_size
         final_logical_capacity = (
@@ -178,6 +180,15 @@ def _split_mooncake_registration_regions(
             offset += size
         regions.append((base_ptr + offset, mapped_size - offset))
     else:
+        region_unit = math.lcm(size_alignment, pointer_alignment)
+        if not allow_block_spanning_mrs:
+            region_unit = math.lcm(block_size, region_unit)
+        aligned_region_size = (max_mr_size // region_unit) * region_unit
+        if aligned_region_size <= 0:
+            raise ValueError(
+                "Mooncake max MR size cannot hold one aligned KV region: "
+                f"max_mr_size={max_mr_size}, region_unit={region_unit}"
+            )
         offset = 0
         while offset < mapped_size:
             remaining = mapped_size - offset
@@ -191,17 +202,21 @@ def _split_mooncake_registration_regions(
 
     for index, (ptr, size) in enumerate(regions):
         is_last = index == len(regions) - 1
-        if not is_last and size % block_size != 0:
+        if (
+            not allow_block_spanning_mrs
+            and not is_last
+            and size % block_size != 0
+        ):
             raise ValueError(
                 "Non-final Mooncake MR is not KV-block aligned: "
                 f"index={index}, size={size}, block_size={block_size}"
             )
-        if not use_block_boundary_fallback and ptr % pointer_alignment != 0:
+        if not allow_unaligned_block_mrs and ptr % pointer_alignment != 0:
             raise ValueError(
                 "Mooncake MR pointer is not HugePage aligned: "
                 f"ptr=0x{ptr:x}, alignment={pointer_alignment}"
             )
-        if not use_block_boundary_fallback and size % size_alignment != 0:
+        if not allow_unaligned_block_mrs and size % size_alignment != 0:
             raise ValueError(
                 "Mooncake MR size is not externally aligned: "
                 f"size={size}, alignment={size_alignment}"
@@ -4153,10 +4168,20 @@ class MooncakeStoreTransferWorker(TransferWorkerBase):
                 max_mr_size=max_mr_size,
                 size_alignment=size_alignment,
                 pointer_alignment=hugepage_size,
+                allow_block_spanning_mrs=(
+                    self.cache_config.mooncake_allow_block_spanning_mrs
+                ),
+                allow_unaligned_block_mrs=(
+                    self.cache_config.mooncake_allow_unaligned_block_mrs
+                ),
             )
         flexkv_logger.info(
             "[MooncakeStoreTransferWorker] registering external MRs: "
             f"logical_size={logical_size} mapped_size={mapped_size or logical_size} "
+            f"allow_block_spanning_mrs="
+            f"{self.cache_config.mooncake_allow_block_spanning_mrs} "
+            f"allow_unaligned_block_mrs="
+            f"{self.cache_config.mooncake_allow_unaligned_block_mrs} "
             f"regions={regions}"
         )
         self._mooncake_registered_regions = _register_mooncake_regions(

@@ -653,8 +653,13 @@ class CacheConfig:
     hugepage_size_bytes: int = 2 * 1024 * 1024  # 2 MiB by default; set to 1<<30 for 1GiB
     # Maximum size accepted by one Mooncake external memory registration.
     # Keep the historical 512 GiB default; deployments with a smaller NIC or
-    # transport limit (for example ionic's 2 GiB limit) can override it.
+    # transport limit (for example a 2 GiB limit) can override it.
     mooncake_max_mr_size_bytes: int = 512 * 1024 * 1024 * 1024
+    # MR split policy. Both modes are disabled by default and are mutually
+    # exclusive. Production deployments with a small MR limit can choose the
+    # compatibility mode supported by their Mooncake transport.
+    mooncake_allow_block_spanning_mrs: bool = False
+    mooncake_allow_unaligned_block_mrs: bool = False
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
@@ -855,6 +860,8 @@ class UserConfig:
     use_hugepage_tmp_buffer: bool = False
     hugepage_size_bytes: int = 2 * 1024 * 1024
     mooncake_max_mr_size_bytes: int = 512 * 1024 * 1024 * 1024
+    mooncake_allow_block_spanning_mrs: bool = False
+    mooncake_allow_unaligned_block_mrs: bool = False
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
@@ -894,6 +901,14 @@ class UserConfig:
             raise ValueError(
                 "mooncake_max_mr_size_bytes must be positive, "
                 f"got {self.mooncake_max_mr_size_bytes}"
+            )
+        if (
+            self.mooncake_allow_block_spanning_mrs
+            and self.mooncake_allow_unaligned_block_mrs
+        ):
+            raise ValueError(
+                "Mooncake MR split modes are mutually exclusive: choose "
+                "block-spanning MRs or unaligned block-boundary MRs"
             )
         if self.swa_multi_group is not None and not isinstance(
             self.swa_multi_group, bool
@@ -946,6 +961,12 @@ def load_user_config_from_env() -> UserConfig:
         mooncake_max_mr_size_bytes=int(os.getenv(
             'FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES', 512 * 1024 * 1024 * 1024
         )),
+        mooncake_allow_block_spanning_mrs=bool(int(os.getenv(
+            'FLEXKV_MOONCAKE_ALLOW_BLOCK_SPANNING_MRS', 0
+        ))),
+        mooncake_allow_unaligned_block_mrs=bool(int(os.getenv(
+            'FLEXKV_MOONCAKE_ALLOW_UNALIGNED_BLOCK_MRS', 0
+        ))),
         use_mooncake_store_backend=bool(int(os.getenv('FLEXKV_USE_MOONCAKE_STORE_BACKEND', 0))),
         mooncake_store_config_path=os.getenv('FLEXKV_MOONCAKE_STORE_CONFIG_PATH', None),
         kv_cache_dtype=os.getenv('FLEXKV_KV_CACHE_DTYPE', None),
@@ -1116,6 +1137,12 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     cache_config.use_hugepage_tmp_buffer = user_config.use_hugepage_tmp_buffer
     cache_config.hugepage_size_bytes = user_config.hugepage_size_bytes
     cache_config.mooncake_max_mr_size_bytes = user_config.mooncake_max_mr_size_bytes
+    cache_config.mooncake_allow_block_spanning_mrs = (
+        user_config.mooncake_allow_block_spanning_mrs
+    )
+    cache_config.mooncake_allow_unaligned_block_mrs = (
+        user_config.mooncake_allow_unaligned_block_mrs
+    )
     cache_config.enable_p2p_cpu = user_config.enable_p2p_cpu
     cache_config.enable_p2p_ssd = user_config.enable_p2p_ssd
     cache_config.enable_3rd_remote = user_config.enable_3rd_remote

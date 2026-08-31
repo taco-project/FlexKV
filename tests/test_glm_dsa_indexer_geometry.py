@@ -57,9 +57,7 @@ def test_connector_aliases_skip_topk_zero_row_indexer_buffers():
     skipped = torch.empty((0, INDEX_HEAD_SIZE), dtype=torch.uint8)
     active2 = torch.empty((11, INDEX_HEAD_SIZE), dtype=torch.uint8)
 
-    resolved = FlexKVConnector._alias_empty_indexer_buffers(
-        [active0, skipped, active2]
-    )
+    resolved = FlexKVConnector._alias_empty_indexer_buffers([active0, skipped, active2])
 
     assert resolved == [active0, active0, active2]
     assert resolved[1].data_ptr() != 0

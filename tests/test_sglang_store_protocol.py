@@ -1,3 +1,4 @@
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -21,9 +22,7 @@ def _follower_connector(payload):
     )
     connector._inflight_stores = {}
     connector._inflight_store_contexts = {}
-    connector._new_op_context = MagicMock(
-        return_value=SimpleNamespace(task_id=-1)
-    )
+    connector._new_op_context = MagicMock(return_value=SimpleNamespace(task_id=-1))
     connector._log_cache_op = MagicMock()
     return connector
 
@@ -40,9 +39,7 @@ def test_store_start_tracks_task_on_nonleader_rank():
     }
     connector = _follower_connector(payload)
 
-    task_id = connector.store_kv(
-        "request", [1, 2, 3, 4], torch.arange(4, dtype=torch.int64)
-    )
+    task_id = connector.store_kv("request", [1, 2, 3, 4], torch.arange(4, dtype=torch.int64))
 
     assert task_id == 17
     assert connector._inflight_stores == {"request": 17}
@@ -78,9 +75,7 @@ def test_store_leader_accepts_pinned_sideband_cpu_mapping():
     )
     connector._inflight_stores = {}
     connector._inflight_store_contexts = {}
-    connector._new_op_context = MagicMock(
-        return_value=SimpleNamespace(task_id=-1)
-    )
+    connector._new_op_context = MagicMock(return_value=SimpleNamespace(task_id=-1))
     connector._log_cache_op = MagicMock()
     cpu_mapping = torch.tensor([4, 5, 8, 9], dtype=torch.int64)
 
@@ -102,6 +97,7 @@ def test_lookup_accepts_sglang_array_token_ids():
         rid="request",
     ) == (-1, 0)
     connector._log_cache_op.assert_called_once()
+
 
 def test_prefetch_start_accepts_legacy_manager_result_with_planned_tokens():
     connector = FlexKVConnector.__new__(FlexKVConnector)
@@ -144,15 +140,11 @@ def test_prefetch_completion_reports_loaded_tokens_once():
         needs_sync=False,
     )
     connector._ongoing_prefetches = {"request": 23}
-    connector._prefetch_contexts = {
-        "request": SimpleNamespace(task_id=23)
-    }
+    connector._prefetch_contexts = {"request": SimpleNamespace(task_id=23)}
     connector._prefetch_planned_tokens = {"request": 0}
     connector._prefetch_loaded_tokens = {}
     connector._new_op_context = MagicMock()
-    connector._pop_context = MagicMock(
-        return_value=SimpleNamespace(task_id=23)
-    )
+    connector._pop_context = MagicMock(return_value=SimpleNamespace(task_id=23))
     connector._log_cache_op = MagicMock()
 
     assert connector.check_prefetch_progress("request") is True
@@ -175,15 +167,11 @@ def test_prefetch_completion_reports_partial_remote_prefix():
         needs_sync=False,
     )
     connector._ongoing_prefetches = {"request": 23}
-    connector._prefetch_contexts = {
-        "request": SimpleNamespace(task_id=23)
-    }
+    connector._prefetch_contexts = {"request": SimpleNamespace(task_id=23)}
     connector._prefetch_planned_tokens = {"request": 0}
     connector._prefetch_loaded_tokens = {}
     connector._new_op_context = MagicMock()
-    connector._pop_context = MagicMock(
-        return_value=SimpleNamespace(task_id=23)
-    )
+    connector._pop_context = MagicMock(return_value=SimpleNamespace(task_id=23))
     connector._log_cache_op = MagicMock()
 
     assert connector.check_prefetch_progress("request") is True
@@ -222,8 +210,7 @@ def test_duplicate_lookup_cancels_replaced_held_task():
     assert connector._pending_lookup_contexts == {"same": contexts[1]}
     assert contexts[0].operation == "load"
     assert any(
-        call.args[1:3] == ("complete", "cancelled")
-        and call.kwargs.get("reason") == "lookup_replaced"
+        call.args[1:3] == ("complete", "cancelled") and call.kwargs.get("reason") == "lookup_replaced"
         for call in connector._log_cache_op.call_args_list
     )
 
@@ -245,18 +232,14 @@ def test_store_completion_clears_nonleader_tracking():
     assert connector.check_completed_stores() == ["request"]
     assert connector._inflight_stores == {}
     assert connector._inflight_store_contexts == {}
-    connector._sync_ctx.scatter.assert_called_once_with(
-        [], channel=FlexKVScatterChannel.STORE_COMPLETION
-    )
+    connector._sync_ctx.scatter.assert_called_once_with([], channel=FlexKVScatterChannel.STORE_COMPLETION)
 
 
 def test_store_ready_uses_leader_payload_and_dedicated_channel():
     connector = _follower_connector(["request"])
 
     assert connector.sync_ready_store_rids(["ignored-on-follower"]) == ["request"]
-    connector._sync_ctx.scatter.assert_called_once_with(
-        [], channel=FlexKVScatterChannel.STORE_READY
-    )
+    connector._sync_ctx.scatter.assert_called_once_with([], channel=FlexKVScatterChannel.STORE_READY)
 
 
 def test_store_reset_waits_for_leader_drain_on_follower():

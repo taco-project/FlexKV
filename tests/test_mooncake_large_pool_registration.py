@@ -72,8 +72,47 @@ def test_large_glm_pool_splits_into_two_aligned_regions():
     assert regions[-1][0] + regions[-1][1] >= BASE_PTR + LOGICAL_SIZE
 
 
+def test_2g_limit_rejects_unconfigured_large_block_alignment():
+    block_size = 25_638_912
+    mapped_size = 8 << 30
+    logical_size = (mapped_size // block_size) * block_size
+
+    with pytest.raises(ValueError, match="cannot hold one aligned KV region"):
+        _split_mooncake_registration_regions(
+            base_ptr=BASE_PTR,
+            logical_size=logical_size,
+            mapped_size=mapped_size,
+            block_size=block_size,
+            max_mr_size=2 << 30,
+            size_alignment=MAPPING_ALIGNMENT,
+            pointer_alignment=HUGEPAGE_SIZE,
+        )
+
+
+def test_2g_aligned_mrs_may_span_blocks_when_explicitly_enabled():
+    block_size = 25_638_912
+    mapped_size = 700 << 30
+    logical_size = (mapped_size // block_size) * block_size
+
+    regions = _split_mooncake_registration_regions(
+        base_ptr=BASE_PTR,
+        logical_size=logical_size,
+        mapped_size=mapped_size,
+        block_size=block_size,
+        max_mr_size=2 << 30,
+        size_alignment=MAPPING_ALIGNMENT,
+        pointer_alignment=HUGEPAGE_SIZE,
+        allow_block_spanning_mrs=True,
+    )
+
+    assert len(regions) == 350
+    assert all(size == 2 << 30 for _, size in regions)
+    assert all(ptr % HUGEPAGE_SIZE == 0 for ptr, _ in regions)
+    assert regions[0][1] % block_size != 0
+
+
 @pytest.mark.parametrize("mapped_gib,expected_regions", [(8, 5), (700, 354)])
-def test_ionic_2g_limit_keeps_every_hy4_block_inside_one_mr(mapped_gib, expected_regions):
+def test_2g_unaligned_mrs_keep_every_large_block_inside_one_mr(mapped_gib, expected_regions):
     block_size = 25_638_912
     mapped_size = mapped_gib << 30
     logical_size = (mapped_size // block_size) * block_size
@@ -86,6 +125,7 @@ def test_ionic_2g_limit_keeps_every_hy4_block_inside_one_mr(mapped_gib, expected
         max_mr_size=2 << 30,
         size_alignment=MAPPING_ALIGNMENT,
         pointer_alignment=HUGEPAGE_SIZE,
+        allow_unaligned_block_mrs=True,
     )
 
     assert len(regions) == expected_regions
@@ -95,6 +135,21 @@ def test_ionic_2g_limit_keeps_every_hy4_block_inside_one_mr(mapped_gib, expected
     assert all((ptr - BASE_PTR) % block_size == 0 for ptr, _ in regions)
     assert regions[-1][0] + regions[-1][1] == BASE_PTR + mapped_size
     assert any(ptr % HUGEPAGE_SIZE != 0 for ptr, _ in regions[1:])
+
+
+def test_mooncake_split_modes_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _split_mooncake_registration_regions(
+            base_ptr=BASE_PTR,
+            logical_size=BLOCK_SIZE * 2,
+            mapped_size=MAPPING_ALIGNMENT,
+            block_size=BLOCK_SIZE,
+            max_mr_size=2 << 30,
+            size_alignment=MAPPING_ALIGNMENT,
+            pointer_alignment=HUGEPAGE_SIZE,
+            allow_block_spanning_mrs=True,
+            allow_unaligned_block_mrs=True,
+        )
 
 
 def test_partial_registration_failure_rolls_back_completed_regions():

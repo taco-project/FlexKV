@@ -59,7 +59,9 @@ swa_multi_group: false
 | `FLEXKV_USE_HUGEPAGE_TMP_BUFFER` | bool | 0 | 是否为 `enable_p2p_ssd` 场景下的 tmp CPU staging buffer 启用 HugePage。默认关闭，开启请设为 1 |
 | `FLEXKV_HUGEPAGE_SIZE_BYTES` | int | 2097152 | HugePage 大小，默认 2 MiB。如果宿主机准备的是 1 GiB HugePage，可设为 `1073741824` |
 | `FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES` | int | HugePage 大小 | 将可共享 HugePage backing mapping 补齐到该边界，同时保持 tensor 的 logical length 不变。使用会把 external buffer 等分的 Mooncake 版本时，可设为 `33554432`（32 MiB）以保证子段仍按 HugePage 对齐 |
-| `FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES` | int | 549755813888 | 单个 Mooncake external MR 的最大字节数，也可在 YAML/JSON 中使用 `mooncake_max_mr_size_bytes`；传输层限制为 2 GiB 时设为 `2147483648`。更大的 pool 会在不跨 KV block 的前提下拆分；共同对齐周期大于 MR 上限时仅放宽派生子 MR 的对齐，并在失败或退出时逆序注销 |
+| `FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES` | int | 549755813888 | 单个 Mooncake external MR 的最大字节数，也可在 YAML/JSON 中使用 `mooncake_max_mr_size_bytes`；传输层限制为 2 GiB 时设为 `2147483648` |
+| `FLEXKV_MOONCAKE_ALLOW_BLOCK_SPANNING_MRS` | bool | 0 | 允许对齐后的 MR 边界切断一个 KV block。仅当传输层能跨相邻 MR 访问同一个请求 buffer 时开启；与 `FLEXKV_MOONCAKE_ALLOW_UNALIGNED_BLOCK_MRS` 互斥 |
+| `FLEXKV_MOONCAKE_ALLOW_UNALIGNED_BLOCK_MRS` | bool | 0 | 当 block 与外部对齐的共同周期超过 MR 上限时，保证每个 KV block 完整位于单个 MR，并允许派生子 MR 的指针和大小不对齐。生产配置可在 YAML/JSON 中设置 `mooncake_allow_unaligned_block_mrs: true`；与跨 block 模式互斥 |
 | `FLEXKV_CUDAHOST_CHUNK_SIZE_GB` | float | 0 | HugePage host buffer 执行 `cudaHostRegister` 时的分段大小，单位为 GB。默认 `0` 表示整块一次性注册；设为大于 0 时按该大小分段注册（并对应分段反注册），可避免超大 buffer 一次注册失败。分段大小会自动向下对齐到 4 KiB 页边界，并预留少量对齐余量 |
 | `FLEXKV_SWA_MULTI_GROUP` | bool | 未设置（自动开启） | DeepSeek-V4 下未设置或设为 `1` 时，SWA KV 与 attention/indexer compress state 一起存取；设为 `0` 时只保留 SWA KV 存取 |
 | `FLEXKV_SWA_MULTI_LAYER` | bool | 1 | `1` 表示把 SWA/state H2D 融合进 layerwise restore；`0` 表示使用独立的 SWA/state H2D 前置 worker |
