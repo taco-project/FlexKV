@@ -70,6 +70,23 @@ def make_cpu_layout(shape, num_blocks: int, layout_type: str = "LAYERFIRST"):
     )
 
 
+def _hugepage_aligned(shape, dtype: torch.dtype, alignment: int):
+    """A tensor of ``shape`` whose data pointer is ``alignment``-aligned.
+
+    Returns ``(backing, view)``; the caller must keep ``backing`` alive, since
+    the view does not own the storage.
+    """
+    nbytes = 1
+    for dim in shape:
+        nbytes *= int(dim)
+    nbytes *= torch.empty(0, dtype=dtype).element_size()
+    backing = torch.zeros(nbytes + alignment, dtype=torch.uint8)
+    pad = (-backing.data_ptr()) % alignment
+    view = backing[pad:pad + nbytes].view(dtype).view(shape)
+    assert view.data_ptr() % alignment == 0
+    return backing, view
+
+
 # ---------------------------------------------------------------------------
 # The edge a backend is allowed to read.
 # ---------------------------------------------------------------------------
@@ -182,11 +199,14 @@ class _StubMooncakeClient:
         # case is a *partial* failure, which is what a single flag cannot say.
         self.fail_indices: set = set()
 
-    def register_buffer(self, buf):
-        self.registered.append(buf.data_ptr())
+    # (ptr, size) rather than a tensor: the backend registers *memory
+    # regions* now, because a HugePage pool larger than the transport's MR
+    # limit has to be split into several, and a tensor cannot say "this half".
+    def register_buffer(self, ptr, size):
+        self.registered.append((ptr, size))
 
-    def unregister_buffer(self, buf):
-        self.unregistered.append(buf.data_ptr())
+    def unregister_buffer(self, ptr):
+        self.unregistered.append(ptr)
 
     def _results(self, keys):
         return [not (self.fail_next or i in self.fail_indices)
@@ -235,7 +255,14 @@ def test_mooncake_block_size_is_whole_block_bytes(shape, monkeypatch):
     want = num_layers * kv_dim * tpb * num_kv_heads * head_size * dtype.itemsize
     assert be.block_size_bytes == want
     assert worker._bytes_per_block == want
-    assert worker.registered == ["mooncake_store_cpu_pool"]
+    # Not registered with CUDA: Mooncake owns the RDMA MR, and a second host
+    # registration of the same shared pool exhausts the host mapping budget on
+    # a large cache for no gain.
+    assert worker.registered == []
+    # A plain tensor pool maps exactly what it holds, so it is one whole MR.
+    stub = be.mooncake_client
+    assert stub.registered == [
+        (cpu_blocks.data_ptr(), cpu_blocks.numel() * cpu_blocks.element_size())]
 
 
 @pytest.mark.parametrize(
@@ -249,16 +276,21 @@ def test_mooncake_block_size_is_whole_block_bytes(shape, monkeypatch):
     ],
     ids=["get", "put"],
 )
-def test_mooncake_partial_failure_fails_the_op(transfer_type, why, monkeypatch):
-    """One False in the batch must fail the whole op, not be logged and ignored.
+def test_mooncake_partial_failure_is_reported_per_block(transfer_type, why,
+                                                        monkeypatch):
+    """One False in the batch must reach the engine as *that block's* outcome.
 
-    This backend used to return ``sum(sizes)`` -- the *full* byte count --
-    after logging the failures, so the engine completed the op successfully.
-    The engine has no notion of a partly-transferred op: there is no way to
-    tell it "blocks 0 and 2 arrived, block 1 did not", so the only outcome it
-    can act on is failure.  A ``batch_get`` False is never a normal miss
-    either: the op is built from blocks the cache index already matched, so
-    False here means the store and the index disagree.
+    This test used to assert the opposite -- that a single False raised and
+    failed the whole op -- because the engine had no way to be told "blocks 0
+    and 2 arrived, block 1 did not".  It does now: an op carries
+    ``block_results``, and the engine AND-merges them.  So the contract
+    inverted, and the reason the old one existed is preserved: what must never
+    happen is a partial batch reported as a *success*, because then the cache
+    hands out block 1 as a hit.
+
+    Failure is still not an exception. An op that never completes hangs its
+    graph and leaks every cache block the plan holds, which is strictly worse
+    than completing with the truth about each block.
     """
     from flexkv.external.mooncake_store_keys import PoolKind
 
@@ -279,16 +311,139 @@ def test_mooncake_partial_failure_fails_the_op(transfer_type, why, monkeypatch):
     op = FakeOp(transfer_type, 3, block_hashes=hashes)
     op.transfer_op_id, op.transfer_graph_id = 41, 5
 
-    with pytest.raises(RuntimeError) as exc:
-        be.transfer(worker, op, src, dst)
+    block_results, moved = be.transfer_blocks(worker, op, src, dst)
 
-    msg = str(exc.value)
-    assert "1/3" in msg, f"must say how much of the batch failed: {msg}"
-    assert "41" in msg and "5" in msg, f"must name the op and graph: {msg}"
-    # The failing key, not just a count -- otherwise the log cannot be joined
-    # against the store's own.
-    failing_key = (stub.gets if transfer_type == TransferType.REMOTE2H
-                   else stub.puts)[0][0][1]
-    assert failing_key in msg, why
+    # Non-contiguous: the surviving blocks keep their own positions, which is
+    # the whole point -- position 1 is the one the cache must not hand out.
+    assert block_results == (True, False, True), why
+    # Bytes *actually* moved. Counting the miss would inflate the bandwidth
+    # every trace reports and hide the failure from the perf record.
+    assert moved == 2 * be.block_size_bytes
 
 
+
+
+def test_mooncake_splits_a_hugepage_pool_that_exceeds_the_mr_limit(monkeypatch):
+    """A HugePage pool bigger than the MR limit registers as several regions.
+
+    ``_split_mooncake_registration_regions`` is unit-tested directly in
+    ``test_mooncake_large_pool_registration.py``.  What is *not* covered there
+    is the wiring: whether ``attach`` reaches the splitter at all, and whether
+    it feeds it the mapping's aligned length rather than the logical pool
+    size.  Those are two different numbers, and registering the logical one
+    leaves the tail of the mapping outside every MR.
+    """
+    from flexkv.external.mooncake_store_keys import PoolKind
+
+    hugepage = 2 << 20
+    cpu_layout = make_cpu_layout(QWEN3_8B, num_blocks=64, layout_type="BLOCKFIRST")
+    # A real pool is a HugePage mapping, so its base pointer is HugePage
+    # aligned and the splitter rejects anything else. torch.zeros is not, so
+    # over-allocate and take an aligned view rather than relaxing the check --
+    # that alignment is a precondition of the arithmetic under test.
+    backing, cpu_blocks = _hugepage_aligned(cpu_layout.kv_shape,
+                                            torch.bfloat16, hugepage)
+    worker = FakeWorker(cpu_layout, torch.bfloat16, cpu_blocks)
+
+    logical = cpu_blocks.numel() * cpu_blocks.element_size()
+    # A HugePage handle knows its mapping is longer than the pool; a plain
+    # tensor does not, which is why the worker publishes this separately.
+    mapped = logical + (2 << 20)
+    worker.cpu_blocks_mapped_size = mapped
+
+    cfg = _mooncake_cache_config()
+    cfg.hugepage_size_bytes = hugepage
+    cfg.mooncake_max_mr_size_bytes = logical // 3  # force at least 3 regions
+
+    be = MooncakeStoreBackend(cache_config=cfg, pool_kind=PoolKind.KV)
+    stub = _attach_mooncake(be, worker, monkeypatch)
+
+    assert len(stub.registered) > 1
+    assert all(size <= cfg.mooncake_max_mr_size_bytes
+               for _, size in stub.registered)
+    # Every byte of the *mapping* is covered, contiguously and exactly once.
+    assert stub.registered[0][0] == cpu_blocks.data_ptr()
+    assert sum(size for _, size in stub.registered) == mapped
+    for (ptr, size), (next_ptr, _) in zip(stub.registered, stub.registered[1:]):
+        assert ptr + size == next_ptr
+    # No block straddles two MRs: that is the failure this splitting exists to
+    # prevent, since older Mooncake releases cannot transfer such a block.
+    assert all(size % be.block_size_bytes == 0
+               for _, size in stub.registered[:-1])
+
+    be.shutdown()
+    # Reverse order, so a region is never left registered behind a freed one.
+    assert stub.unregistered == [ptr for ptr, _ in reversed(stub.registered)]
+
+
+def test_mooncake_plain_pool_registers_exactly_once(monkeypatch):
+    """No mapped size means no splitting: one MR over what the pool holds."""
+    from flexkv.external.mooncake_store_keys import PoolKind
+
+    cpu_layout = make_cpu_layout(QWEN3_8B, num_blocks=8, layout_type="BLOCKFIRST")
+    cpu_blocks = torch.zeros(cpu_layout.kv_shape, dtype=torch.bfloat16)
+    worker = FakeWorker(cpu_layout, torch.bfloat16, cpu_blocks)
+    assert not hasattr(worker, "cpu_blocks_mapped_size")
+
+    be = MooncakeStoreBackend(cache_config=_mooncake_cache_config(),
+                              pool_kind=PoolKind.KV)
+    stub = _attach_mooncake(be, worker, monkeypatch)
+
+    assert stub.registered == [
+        (cpu_blocks.data_ptr(), cpu_blocks.numel() * cpu_blocks.element_size())]
+
+
+def test_mooncake_store_failure_completes_the_op_all_false(monkeypatch):
+    """A raising store client completes the op rather than propagating.
+
+    The old code let this out of ``transfer``, and the worker turned it into a
+    failed completion -- which worked only because a mooncake op was
+    all-or-nothing.  Now that the op carries per-block outcomes, an exception
+    escaping here would skip the reporting path entirely, and an op that never
+    reports hangs its graph and leaks every cache block the plan holds.
+    """
+    from flexkv.external.mooncake_store_keys import PoolKind
+
+    cpu_layout = make_cpu_layout(QWEN3_8B, num_blocks=8, layout_type="BLOCKFIRST")
+    cpu_blocks = torch.zeros(cpu_layout.kv_shape, dtype=torch.bfloat16)
+    worker = FakeWorker(cpu_layout, torch.bfloat16, cpu_blocks)
+    be = MooncakeStoreBackend(cache_config=_mooncake_cache_config(),
+                              pool_kind=PoolKind.KV)
+    stub = _attach_mooncake(be, worker, monkeypatch)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("store is down")
+
+    stub.batch_get = boom
+
+    op = FakeOp(TransferType.REMOTE2H, 3,
+                block_hashes=np.array([7, 8, 9], dtype=np.int64))
+    block_results, moved = be.transfer_blocks(
+        worker, op,
+        torch.tensor([0, 1, 2], dtype=torch.int64),
+        torch.tensor([2, 6, 4], dtype=torch.int64))
+
+    assert block_results == (False, False, False)
+    assert moved == 0
+
+
+def test_mooncake_rejects_a_direction_it_cannot_serve(monkeypatch):
+    """A key/value store has no D2H: report it, do not raise past the worker."""
+    from flexkv.external.mooncake_store_keys import PoolKind
+
+    cpu_layout = make_cpu_layout(QWEN3_8B, num_blocks=8, layout_type="BLOCKFIRST")
+    cpu_blocks = torch.zeros(cpu_layout.kv_shape, dtype=torch.bfloat16)
+    worker = FakeWorker(cpu_layout, torch.bfloat16, cpu_blocks)
+    be = MooncakeStoreBackend(cache_config=_mooncake_cache_config(),
+                              pool_kind=PoolKind.KV)
+    _attach_mooncake(be, worker, monkeypatch)
+
+    op = FakeOp(TransferType.D2H, 3,
+                block_hashes=np.array([7, 8, 9], dtype=np.int64))
+    block_results, moved = be.transfer_blocks(
+        worker, op,
+        torch.tensor([0, 1, 2], dtype=torch.int64),
+        torch.tensor([2, 6, 4], dtype=torch.int64))
+
+    assert block_results == (False, False, False)
+    assert moved == 0
