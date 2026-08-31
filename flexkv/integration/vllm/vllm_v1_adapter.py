@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 from typing import TYPE_CHECKING, Optional, Literal, Iterable, Any, List
 from dataclasses import dataclass, field
@@ -9,14 +10,20 @@ import torch
 
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
-from flexkv.common.config import LayerGroupSpec, RankInfo
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, LayerGroupSpec, RankInfo
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
 from flexkv.integration.config import FlexKVConfig
 from flexkv.integration.dynamo.collector import KVEventCollector
+from flexkv.integration.vllm.layerwise_sync import (
+    LayerwiseCounterPool,
+    LayerwiseLoadMetadata,
+    LayerwiseStepCoordinator,
+)
 from flexkv.transfer_manager import TransferManagerOnRemote
+from flexkv.transfer.layerwise import build_layerwise_eventfd_socket_path
 
 # vllm
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -154,6 +161,14 @@ class FlexKVResponse:
 
 
 @dataclass
+class FlexKVConnectorMetadata(KVConnectorMetadata):
+    """Scheduler-to-worker state for one vLLM model step."""
+
+    layerwise: LayerwiseLoadMetadata = field(
+        default_factory=LayerwiseLoadMetadata)
+
+
+@dataclass
 class FlexKVTask(ABC):
     task_id: int = 0
     request: "Request" = 0
@@ -230,6 +245,7 @@ class FlexKVSchedulerConnector:
         self,
         flexkv_config: FlexKVConfig,
         rank_info: "RankInfo",
+        enable_layerwise_transfer: Optional[bool] = None,
     ):
         logger.info(f"Start init FlexKVSchedulerConnector with {flexkv_config}, {rank_info}")
         self.server_recv_port = flexkv_config.server_recv_port
@@ -257,11 +273,25 @@ class FlexKVSchedulerConnector:
         # unlaunched tasks
         self.tasks_to_launch: dict[int, FlexKVTask] = {}
         self.tasks_to_cancel: dict[int, FlexKVTask] = {}
+        # A very short request may finish after its final layer eventfd but
+        # before the GET graph's completion callback is observed. vLLM calls
+        # request_finished only once, so retain enough state to create the PUT
+        # after the GET tail completes instead of losing the generated suffix.
+        self.deferred_layerwise_puts: dict[
+            str, tuple[Any, list[int]]
+        ] = {}
 
         self.flexkv_stats = FlexKVStats(int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', '200')))
         self.failed_block_ids: set[int] = set()
 
         self.maybe_skip_put = os.getenv('FLEXKV_MAYBE_SKIP_PUT', '0') == '1'
+        self.enable_layerwise_transfer = (
+            bool(int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', '0')))
+            if enable_layerwise_transfer is None
+            else enable_layerwise_transfer
+        )
+        self.layerwise_steps = LayerwiseStepCoordinator(
+            self.enable_layerwise_transfer)
 
         # only support local batching for now
         self.enable_batch = (not self.cache_config.enable_kv_sharing
@@ -517,8 +547,14 @@ class FlexKVSchedulerConnector:
             True if a FlexKV transfer still needs the request's blocks and
             vLLM must defer freeing them; False if the blocks can be freed.
         """
-        # An existing FlexKV task still owns these blocks, so keep them alive.
+        # A GET task still owns the blocks until its graph completion callback
+        # runs. In layer-wise mode this is normally only a short tail after the
+        # final eventfd; query_finished_task() will return this finished request
+        # id so vLLM can release the deferred blocks.
         if request.request_id in self.req_id_to_task_dict:
+            if self.enable_layerwise_transfer:
+                self.deferred_layerwise_puts[request.request_id] = (
+                    request, list(block_ids))
             return True
 
         finish_reason = request.get_finished_reason()
@@ -659,12 +695,13 @@ class FlexKVSchedulerConnector:
         self.flexkv_manager.cancel(task_ids=list(self.tasks_to_cancel.keys()))
         self.tasks_to_cancel.clear()
 
-    def launch_tasks(self) -> None:
+    def launch_tasks(self) -> LayerwiseLoadMetadata:
         """
         Launch tasks in self.tasks_to_launch
         """
         if len(self.tasks_to_launch) == 0:
-            return
+            return LayerwiseLoadMetadata(
+                enabled=self.enable_layerwise_transfer)
         task_launch_time = time.perf_counter()
         get_task_ids: list[int] = []
         get_slot_mappings: list[np.ndarray] = []
@@ -684,13 +721,26 @@ class FlexKVSchedulerConnector:
                 put_slot_mappings.append(task.slot_mapping)
                 put_tasks_to_launch.append(task)
         if get_task_ids:
+            layerwise_metadata = self.layerwise_steps.build_metadata(True)
+            layerwise_launch = self.layerwise_steps.launch_kwargs(
+                layerwise_metadata)
             launched_get_task_ids = self.flexkv_manager.launch(task_ids=get_task_ids,
                                        slot_mappings=get_slot_mappings,
-                                       as_batch=self.enable_batch and len(get_task_ids) > 1)
+                                       as_batch=(
+                                           bool(layerwise_launch["as_batch"])
+                                           or (self.enable_batch
+                                               and len(get_task_ids) > 1)),
+                                       layerwise_transfer=bool(
+                                           layerwise_launch[
+                                               "layerwise_transfer"]),
+                                       counter_id=int(
+                                           layerwise_launch["counter_id"]))
             if len(launched_get_task_ids) == 1 and len(get_tasks_to_launch) > 1:
                 self.get_tasks[launched_get_task_ids[0]] = get_tasks_to_launch
             elif len(launched_get_task_ids) == len(get_tasks_to_launch):
-                for launched_task_id, task in zip(launched_get_task_ids, get_tasks_to_launch):
+                for launched_task_id, task in zip(
+                    launched_get_task_ids, get_tasks_to_launch, strict=True
+                ):
                     self.get_tasks[launched_task_id] = [task]
             else:
                 raise ValueError("KVTaskManager returned unexpected number of launched get task ids.")
@@ -701,11 +751,17 @@ class FlexKVSchedulerConnector:
             if len(launched_put_task_ids) == 1 and len(put_tasks_to_launch) > 1:
                 self.put_tasks[launched_put_task_ids[0]] = put_tasks_to_launch
             elif len(launched_put_task_ids) == len(put_tasks_to_launch):
-                for launched_task_id, task in zip(launched_put_task_ids, put_tasks_to_launch):
+                for launched_task_id, task in zip(
+                    launched_put_task_ids, put_tasks_to_launch, strict=True
+                ):
                     self.put_tasks[launched_task_id] = [task]
             else:
                 raise ValueError("KVTaskManager returned unexpected number of launched put task ids.")
         self.tasks_to_launch.clear()
+        return (
+            layerwise_metadata if get_task_ids
+            else self.layerwise_steps.build_metadata(False)
+        )
 
     def query_finished_task(self) -> tuple[set[str], set[str]]:
         """
@@ -728,7 +784,9 @@ class FlexKVSchedulerConnector:
             success = (response.status == KVResponseStatus.SUCCESS)
             if task_id in self.get_tasks:
                 tasks = self.get_tasks.pop(task_id)
-                finished_recving.update(task.request.request_id for task in tasks)
+                if not self.enable_layerwise_transfer:
+                    finished_recving.update(
+                        task.request.request_id for task in tasks)
             else:
                 tasks = self.put_tasks.pop(task_id)
                 finished_sending.update(task.request.request_id for task in tasks)
@@ -742,6 +800,15 @@ class FlexKVSchedulerConnector:
                         self.failed_block_ids.update(task.block_ids)
                 # responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
                 #                                             request=task.request, success=success))
+                deferred = self.deferred_layerwise_puts.pop(
+                    task.request.request_id, None)
+                if deferred is not None:
+                    request, block_ids = deferred
+                    if (not success
+                            or not self.request_finished(request, block_ids)):
+                        # No PUT was needed (or the request ended abnormally);
+                        # release the blocks that vLLM deferred for the GET.
+                        finished_sending.add(request.request_id)
         self.flexkv_stats.record_faild(num_failed_requests=num_failed_tasks)
         return finished_sending, finished_recving
 
@@ -803,6 +870,7 @@ class FlexKVWorkerConnector:
         self,
         flexkv_config: FlexKVConfig,
         rank_info: "RankInfo",
+        enable_layerwise_transfer: Optional[bool] = None,
     ):
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 
@@ -834,6 +902,14 @@ class FlexKVWorkerConnector:
             intra_client_id=rank_info.intra_client_id,
             device_id=rank_info.local_rank,
         )
+        self.enable_layerwise_transfer = (
+            bool(int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', '0')))
+            if enable_layerwise_transfer is None
+            else enable_layerwise_transfer
+        )
+        self.layerwise_counter_pool: Optional[LayerwiseCounterPool] = None
+        self._layerwise_sender_thread: Optional[threading.Thread] = None
+        self._layerwise_sender_error: Optional[BaseException] = None
         logger.info("Finish init FlexKVWorkerConnector")
 
     def register_to_server(
@@ -849,6 +925,9 @@ class FlexKVWorkerConnector:
                 indexer_kv_caches[layer_name] = tensor
             else:
                 main_kv_caches[layer_name] = tensor
+
+        if self.enable_layerwise_transfer:
+            self._start_layerwise_eventfd_sender(tuple(main_kv_caches))
 
         # Build main KV cache layout.
         #
@@ -976,6 +1055,7 @@ class FlexKVWorkerConnector:
                 resume=resume,
             )
 
+        self._finish_layerwise_eventfd_sender()
         logger.info("Finish register kv_caches")
         self._registered_kv_caches = dict(kv_caches)
 
@@ -987,7 +1067,90 @@ class FlexKVWorkerConnector:
             raise RuntimeError("KV caches were not registered before wake")
         self.register_to_server(self._registered_kv_caches, resume=True)
 
+    def _start_layerwise_eventfd_sender(
+        self, layer_names: tuple[str, ...]
+    ) -> None:
+        """Start the eventfd handshake before GPU registration can block.
+
+        Registering GPU caches may cause the FlexKV server to construct a
+        LayerwiseTransferWorker, whose initialization waits for eventfds.  The
+        sender therefore has to run concurrently with register_to_server().
+        """
+        if self.layerwise_counter_pool is not None:
+            if self.layerwise_counter_pool.layer_names != layer_names:
+                raise ValueError(
+                    "KV cache layer order changed after layerwise setup: "
+                    f"{self.layerwise_counter_pool.layer_names!r} -> "
+                    f"{layer_names!r}"
+                )
+            return
+
+        pool = LayerwiseCounterPool(layer_names)
+        self.layerwise_counter_pool = pool
+        socket_path = build_layerwise_eventfd_socket_path(
+            dp_client_id=self.rank_info.dp_client_id,
+            pp_rank=self.rank_info.pp_rank,
+            model_config=self.rank_info.model_config,
+        )
+        effective_tp_size = (
+            self.rank_info.model_config.effective_tp_size_per_node)
+        effective_tp_rank = (
+            self.rank_info.effective_tp_rank % effective_tp_size)
+
+        def _send() -> None:
+            try:
+                pool.send_to_worker(
+                    socket_path=socket_path,
+                    tp_rank_per_node=effective_tp_rank,
+                    tp_size_per_node=effective_tp_size,
+                )
+            except BaseException as exc:
+                self._layerwise_sender_error = exc
+
+        self._layerwise_sender_thread = threading.Thread(
+            target=_send,
+            name="flexkv-vllm-layerwise-eventfd",
+            daemon=True,
+        )
+        self._layerwise_sender_thread.start()
+
+    def _finish_layerwise_eventfd_sender(self) -> None:
+        if self._layerwise_sender_thread is None:
+            return
+        self._layerwise_sender_thread.join()
+        self._layerwise_sender_thread = None
+        if self._layerwise_sender_error is not None:
+            raise RuntimeError(
+                "layerwise eventfd handshake failed"
+            ) from self._layerwise_sender_error
+
+    def bind_layerwise_metadata(
+        self, metadata: LayerwiseLoadMetadata
+    ) -> None:
+        if self.layerwise_counter_pool is None:
+            if metadata.has_load:
+                raise RuntimeError(
+                    "received layerwise load metadata before KV caches/eventfds "
+                    "were registered"
+                )
+            return
+        if self._layerwise_sender_error is not None:
+            raise RuntimeError(
+                "layerwise eventfd handshake failed"
+            ) from self._layerwise_sender_error
+        self.layerwise_counter_pool.bind(metadata)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if self.layerwise_counter_pool is not None:
+            self.layerwise_counter_pool.wait(layer_name)
+
+    def shutdown(self) -> None:
+        if self.layerwise_counter_pool is not None:
+            self.layerwise_counter_pool.close()
+            self.layerwise_counter_pool = None
+
     def __del__(self):
+        self.shutdown()
         if hasattr(self, "remote_transfer_manager_process") and \
             self.remote_transfer_manager_process is not None:
             self.remote_transfer_manager_process.join()
@@ -999,9 +1162,45 @@ class FlexKVConnectorV1Impl:
         self.role = role
         flexkv_config = FlexKVConfig.from_env()
         rank_info = flexkv_config.post_init_from_vllm_config(vllm_config)
+        transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        layerwise_from_vllm = (
+            transfer_config.get_from_extra_config("use_layerwise", False)
+            if transfer_config is not None
+            else False
+        )
+        env_layerwise = bool(
+            int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', '0')))
+        if env_layerwise and not layerwise_from_vllm:
+            logger.warning(
+                "Ignoring FLEXKV_ENABLE_LAYERWISE_TRANSFER=1 for vLLM because "
+                "kv_connector_extra_config.use_layerwise is false. The vLLM "
+                "wrapper must select PIECEWISE CUDA graph mode before per-layer "
+                "eventfd waits are safe."
+            )
+        self.enable_layerwise_transfer = bool(layerwise_from_vllm)
+        if (self.enable_layerwise_transfer
+                and rank_info.model_config.cp_size != 1):
+            raise NotImplementedError(
+                "vLLM FlexKV layer-wise transfer currently requires "
+                "context_parallel_size=1; runtime DCP/PCP rank mapping is not "
+                "yet wired into the eventfd index space"
+            )
+        if self.enable_layerwise_transfer and flexkv_config.cache_config.enable_gds:
+            raise NotImplementedError(
+                "vLLM FlexKV layer-wise transfer is incompatible with GDS; "
+                "the fused LAYERWISE graph expects CPU/SSD/remote staging, not "
+                "DISK2D operations"
+            )
+        # TransferEngine reads the process-global config, while the vLLM
+        # connector reads kv_connector_extra_config. Keep both sides on one
+        # authoritative value before KVManager/TransferEngine construction.
+        GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer = (
+            self.enable_layerwise_transfer)
+        self._bound_metadata: Optional[FlexKVConnectorMetadata] = None
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector = FlexKVSchedulerConnector(flexkv_config, rank_info)
+            self.connector = FlexKVSchedulerConnector(
+                flexkv_config, rank_info, self.enable_layerwise_transfer)
             # Track scheduled requests to detect preemptions in build_connector_meta
             self.previous_scheduled_req_ids: set[str] = set()
         elif role == KVConnectorRole.WORKER:
@@ -1032,13 +1231,13 @@ class FlexKVConnectorV1Impl:
                     f"FlexKV: could not derive ranks from vllm process groups: "
                     f"{_e}. device_id will collide across workers and GPU "
                     f"registration will hang at 1/N.")
-            self.connector = FlexKVWorkerConnector(flexkv_config, rank_info)
+            self.connector = FlexKVWorkerConnector(
+                flexkv_config, rank_info, self.enable_layerwise_transfer)
         else:
             raise ValueError(f"Unrecognized KVConnectorRole: {role}.")
 
     def shutdown(self):
-        if self.role == KVConnectorRole.SCHEDULER:
-            self.connector.shutdown()
+        self.connector.shutdown()
 
     def reset_cache(self) -> Optional[bool]:
         """Reset the FlexKV cache. Only meaningful on the scheduler side
@@ -1047,6 +1246,14 @@ class FlexKVConnectorV1Impl:
         if self.role == KVConnectorRole.SCHEDULER:
             return self.connector.reset_cache()
         return None
+
+    def bind_connector_metadata(
+        self, metadata: FlexKVConnectorMetadata
+    ) -> None:
+        self._bound_metadata = metadata
+
+    def clear_connector_metadata(self) -> None:
+        self._bound_metadata = None
 
     # ==============================
     # Worker-side methods
@@ -1067,7 +1274,23 @@ class FlexKVConnectorV1Impl:
             the same.
 
         """
-        pass
+        if self.role != KVConnectorRole.WORKER:
+            return
+        metadata = kwargs.get("connector_metadata")
+        if metadata is None:
+            metadata = self._bound_metadata
+        if metadata is None:
+            # vLLM binds metadata on the outer FlexKVConnectorV1 wrapper before
+            # delegating this hook to the installed FlexKV implementation.
+            from vllm.distributed.kv_transfer import get_kv_transfer_group
+            outer_connector = get_kv_transfer_group()
+            metadata = outer_connector._get_connector_metadata()
+        if not isinstance(metadata, FlexKVConnectorMetadata):
+            raise TypeError(
+                "expected FlexKVConnectorMetadata, got "
+                f"{type(metadata).__name__}"
+            )
+        self.connector.bind_layerwise_metadata(metadata.layerwise)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
@@ -1080,7 +1303,8 @@ class FlexKVConnectorV1Impl:
         Args:
             layer_name: the name of that layer
         """
-        pass
+        if self.role == KVConnectorRole.WORKER:
+            self.connector.wait_for_layer_load(layer_name)
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", **kwargs) -> None:
@@ -1163,8 +1387,15 @@ class FlexKVConnectorV1Impl:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
-        return self.connector.get_num_new_matched_tokens(
+        matched_tokens, needs_load = self.connector.get_num_new_matched_tokens(
             request, num_computed_tokens)
+        # Layer-wise loads enter the same model step. Per-layer eventfds,
+        # consumed by wait_for_layer_load(), provide the data dependency
+        # instead of WAITING_FOR_REMOTE_KVS.
+        return (
+            matched_tokens,
+            self.connector.layerwise_steps.external_match_is_async(needs_load),
+        )
 
     def update_state_after_alloc(self, request: "Request",
                                  blocks: "KVCacheBlocks",
@@ -1209,7 +1440,7 @@ class FlexKVConnectorV1Impl:
             self.connector.handle_preemptions(preempted_req_ids)
 
         self.connector.cancel_tasks()
-        self.connector.launch_tasks()
+        layerwise_metadata = self.connector.launch_tasks()
 
         # Optional: Synchronous wait for get tasks to ensure data consistency.
         # This is a safety fallback because currently FlexKV worker does not support
@@ -1217,7 +1448,7 @@ class FlexKVConnectorV1Impl:
         if os.getenv('FLEXKV_SYNC_GET', '0') == '1':
             self.connector.wait_for_all_get_tasks()
 
-        return KVConnectorMetadata()
+        return FlexKVConnectorMetadata(layerwise=layerwise_metadata)
 
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
         """
