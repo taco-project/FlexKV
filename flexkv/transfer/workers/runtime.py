@@ -419,19 +419,29 @@ class TransferWorkerBase(ABC):
             transfer_size = backend.transfer(
                 self, transfer_op, src_block_ids, dst_block_ids)
         end_time = time.time()
-        # Diagnostics must not decide the outcome: a throw here would lose the
-        # per-block results the caller needs to fall back selectively.
+        if block_results is None:
+            # Bool path: a throw here propagates, exactly as it did when every
+            # launch_transfer logged for itself. The run loop turns it into a
+            # failed completion.
+            self._log_transfer_performance(
+                transfer_op, transfer_size, start_time, end_time)
+            return True
+        # Block-results path: the op has already completed one way or another,
+        # so a logging fault must not be raised past here -- an op that never
+        # reports hangs its graph and leaks every cache block the plan holds.
+        # It does still fail the op closed, because a worker that cannot even
+        # record what it did is not one whose success we should believe.
         try:
             self._log_transfer_performance(
                 transfer_op, transfer_size, start_time, end_time)
-        except Exception as e:  # noqa: BLE001
+        except Exception:
             flexkv_logger.error(
                 f"[worker {self.worker_id}] transfer performance logging "
-                f"failed for op {transfer_op.transfer_op_id}: {e}",
+                "failed; reporting the operation unsuccessful for "
+                f"op_id={transfer_op.transfer_op_id}",
                 exc_info=True,
             )
-        if block_results is None:
-            return True
+            block_results = (False,) * len(block_results)
         return WorkerTransferResult(
             transfer_op_id=transfer_op.transfer_op_id,
             block_results=block_results,
