@@ -22,7 +22,14 @@ import pytest
 import torch
 import gc
 
-from flexkv.c_ext import TPTransferThreadGroup, TPGDSTransferThreadGroup
+from flexkv.c_ext import TPTransferThreadGroup
+# GDS is a build option (ENABLE_GDS), not a runtime one: a c_ext built without
+# cuFile has no such symbol, and importing it at module scope takes the whole
+# file's collection down with it -- including the ~40 tests that need no GDS.
+try:
+    from flexkv.c_ext import TPGDSTransferThreadGroup
+except ImportError:  # pragma: no cover - depends on how c_ext was built
+    TPGDSTransferThreadGroup = None
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.storage.allocator import SSDAllocator
@@ -2524,6 +2531,8 @@ def make_tp_gds_group(gpu_blocks,
 
     return tp_gds
 
+@pytest.mark.skipif(TPGDSTransferThreadGroup is None,
+                    reason="c_ext built with ENABLE_GDS=false")
 @pytest.mark.parametrize("data_config", MHA_SIZES)
 def test_mha_gds(data_config, ssd_cache_dirs):
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
