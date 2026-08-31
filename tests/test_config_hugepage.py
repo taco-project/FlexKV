@@ -5,6 +5,7 @@ from flexkv.common.config import (
     ModelConfig,
     RankInfo,
     UserConfig,
+    load_user_config_from_file,
     load_user_config_from_env,
     update_default_config_from_user_config,
 )
@@ -14,12 +15,14 @@ def test_load_user_config_from_env_reads_hugepage_flags(monkeypatch) -> None:
     monkeypatch.setenv("FLEXKV_USE_HUGEPAGE_CPU_BUFFER", "1")
     monkeypatch.setenv("FLEXKV_USE_HUGEPAGE_TMP_BUFFER", "1")
     monkeypatch.setenv("FLEXKV_HUGEPAGE_SIZE_BYTES", str(1 << 30))
+    monkeypatch.setenv("FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES", str(2 << 30))
 
     user_config = load_user_config_from_env()
 
     assert user_config.use_hugepage_cpu_buffer is True
     assert user_config.use_hugepage_tmp_buffer is True
     assert user_config.hugepage_size_bytes == 1 << 30
+    assert user_config.mooncake_max_mr_size_bytes == 2 << 30
 
 
 def test_update_default_config_from_user_config_applies_hugepage_flags() -> None:
@@ -36,6 +39,7 @@ def test_update_default_config_from_user_config_applies_hugepage_flags() -> None
         use_hugepage_cpu_buffer=True,
         use_hugepage_tmp_buffer=True,
         hugepage_size_bytes=1 << 30,
+        mooncake_max_mr_size_bytes=2 << 30,
     )
 
     update_default_config_from_user_config(RankInfo(model_config=model_config), cache_config, user_config)
@@ -43,3 +47,23 @@ def test_update_default_config_from_user_config_applies_hugepage_flags() -> None
     assert cache_config.use_hugepage_cpu_buffer is True
     assert cache_config.use_hugepage_tmp_buffer is True
     assert cache_config.hugepage_size_bytes == 1 << 30
+    assert cache_config.mooncake_max_mr_size_bytes == 2 << 30
+
+
+def test_mooncake_max_mr_size_rejects_non_positive_values() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="must be positive"):
+        UserConfig(mooncake_max_mr_size_bytes=0)
+
+
+def test_load_user_config_from_yaml_reads_mooncake_max_mr_size(tmp_path) -> None:
+    config_path = tmp_path / "flexkv.yaml"
+    config_path.write_text(
+        "cpu_cache_gb: 16\nmooncake_max_mr_size_bytes: 2147483648\n",
+        encoding="utf-8",
+    )
+
+    user_config = load_user_config_from_file(str(config_path))
+
+    assert user_config.mooncake_max_mr_size_bytes == 2 << 30
