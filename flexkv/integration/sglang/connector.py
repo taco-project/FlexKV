@@ -1191,7 +1191,12 @@ class FlexKVConnector:
                 fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
                 try:
                     completed_dict = (
-                        self.kv_manager.try_wait(task_ids=list(fk_to_rid.keys())) or {}
+                        self.kv_manager.wait(
+                            list(fk_to_rid.keys()),
+                            timeout=0.0,
+                            completely=True,
+                        )
+                        or {}
                     )
                 except Exception as exc:  # noqa: BLE001
                     rid = next(iter(self._inflight_stores))
@@ -1243,20 +1248,25 @@ class FlexKVConnector:
 
     def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
         """Block until a single store task identified by ``rid`` finishes."""
-        fkv_task_id = self._inflight_stores.pop(rid, -1)
+        fkv_task_id = self._inflight_stores.get(rid, -1)
         if fkv_task_id < 0:
             return True
-        context = self._pop_context(
-            "_inflight_store_contexts", rid, "store", fkv_task_id
+        context = getattr(self, "_inflight_store_contexts", {}).get(rid)
+        context = context or self._new_op_context(
+            "store", rid, task_id=fkv_task_id
         )
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
+            self._inflight_stores.pop(rid, None)
+            getattr(self, "_inflight_store_contexts", {}).pop(rid, None)
             return True
         try:
-            resp = self.kv_manager.wait([fkv_task_id], timeout=timeout) or {}
+            resp = self.kv_manager.wait(
+                [fkv_task_id], timeout=timeout, completely=True
+            ) or {}
         except Exception as exc:  # noqa: BLE001
             self._log_cache_op(
                 context,
-                "complete",
+                "poll",
                 "failed",
                 direction="D2H",
                 transfer_mode="no-layerwise",
@@ -1264,6 +1274,19 @@ class FlexKVConnector:
             )
             return False
         status = _status_value(resp.get(fkv_task_id))
+        if not _is_terminal_status(status):
+            self._log_cache_op(
+                context,
+                "poll",
+                status,
+                direction="D2H",
+                transfer_mode="no-layerwise",
+            )
+            return False
+        self._inflight_stores.pop(rid, None)
+        self._pop_context(
+            "_inflight_store_contexts", rid, "store", fkv_task_id
+        )
         success = status == KVResponseStatus.SUCCESS.value
         self._log_cache_op(
             context,

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import torch
 
+from flexkv.common.request import KVResponse, KVResponseStatus
 from flexkv.integration.sglang.comm import FlexKVScatterChannel
 from flexkv.integration.sglang.connector import FlexKVConnector
 
@@ -136,6 +137,65 @@ def test_store_completion_clears_nonleader_tracking():
     connector._sync_ctx.scatter.assert_called_once_with(
         [], channel=FlexKVScatterChannel.STORE_COMPLETION
     )
+
+
+def test_store_completion_waits_for_fully_drained_graph():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector.kv_manager = MagicMock()
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=True,
+        needs_sync=False,
+    )
+    connector._inflight_stores = {"request": 17}
+    connector._inflight_store_contexts = {
+        "request": SimpleNamespace(task_id=17)
+    }
+    connector._new_op_context = MagicMock(
+        return_value=SimpleNamespace(task_id=17)
+    )
+    connector._log_cache_op = MagicMock()
+    connector.kv_manager.wait.side_effect = [
+        {17: KVResponse(KVResponseStatus.TIMEOUT, 17, None)},
+        {17: KVResponse(KVResponseStatus.SUCCESS, 17, None)},
+    ]
+
+    assert connector.check_completed_stores() == []
+    assert connector._inflight_stores == {"request": 17}
+
+    assert connector.check_completed_stores() == ["request"]
+    assert connector._inflight_stores == {}
+    assert connector.kv_manager.wait.call_args_list == [
+        (([17],), {"timeout": 0.0, "completely": True}),
+        (([17],), {"timeout": 0.0, "completely": True}),
+    ]
+
+
+def test_wait_store_keeps_tracking_until_fully_drained():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector.kv_manager = MagicMock()
+    connector._sync_ctx = SimpleNamespace(is_sync_leader=True)
+    connector._inflight_stores = {"request": 17}
+    connector._inflight_store_contexts = {
+        "request": SimpleNamespace(task_id=17)
+    }
+    connector._new_op_context = MagicMock(
+        return_value=SimpleNamespace(task_id=17)
+    )
+    connector._log_cache_op = MagicMock()
+    connector.kv_manager.wait.side_effect = [
+        {17: KVResponse(KVResponseStatus.TIMEOUT, 17, None)},
+        {17: KVResponse(KVResponseStatus.SUCCESS, 17, None)},
+    ]
+
+    assert not connector.wait_store("request", timeout=5.0)
+    assert connector._inflight_stores == {"request": 17}
+
+    assert connector.wait_store("request", timeout=5.0)
+    assert connector._inflight_stores == {}
+    assert connector.kv_manager.wait.call_args_list == [
+        (([17],), {"timeout": 5.0, "completely": True}),
+        (([17],), {"timeout": 5.0, "completely": True}),
+    ]
 
 
 def test_store_reset_waits_for_leader_drain_on_follower():

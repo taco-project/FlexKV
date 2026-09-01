@@ -349,15 +349,26 @@ class KVTPClient:
             )
 
     def suspend_gpu_mappings(self) -> int:
-        self.gpu_control_socket.send_pyobj({
+        request = {
             "type": "suspend_gpu",
             "registration_key": (self.dp_client_id, self.intra_client_id),
-        })
-        response = self.gpu_control_socket.recv_pyobj()
-        if not response.get("ok"):
-            raise RuntimeError(
-                f"FlexKV GPU unmap failed: {response.get('error')}"
-            )
+        }
+        deadline = time.monotonic() + 120.0
+        while True:
+            self.gpu_control_socket.send_pyobj(request)
+            response = self.gpu_control_socket.recv_pyobj()
+            if not response.get("ok"):
+                raise RuntimeError(
+                    f"FlexKV GPU unmap failed: {response.get('error')}"
+                )
+            if response.get("ready"):
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for all FlexKV GPU registrations "
+                    "to reach the suspend barrier"
+                )
+            time.sleep(0.01)
         for handle in self._exported_handles:
             handle.release_exported_vmm_handle()
         self._exported_handles = []

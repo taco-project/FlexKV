@@ -48,6 +48,7 @@ def test_sleep_wake_remaps_after_all_gpu_registrations():
     manager = _empty_transfer_manager()
     manager.expected_gpus = 2
     manager._gpu_suspended = False
+    manager._pending_suspend_registrations = set()
     manager._pending_resume_registrations = {}
     manager.all_gpu_blocks = {(0, 0): ["old0"], (0, 1): ["old1"]}
     manager.all_gpu_layouts = {(0, 0): "layout0", (0, 1): "layout1"}
@@ -66,8 +67,22 @@ def test_sleep_wake_remaps_after_all_gpu_registrations():
         resume_gpu_mappings=lambda groups: calls.append(("resume", groups)) or 4,
     )
 
-    suspended = manager.handle_gpu_control({"type": "suspend_gpu"})
-    assert suspended == {"ok": True, "released_mappings": 4}
+    first_suspend = manager.handle_gpu_control(
+        {"type": "suspend_gpu", "registration_key": (0, 0)}
+    )
+    assert first_suspend["ready"] is False
+    assert first_suspend["registered"] == 1
+    assert calls == []
+
+    suspended = manager.handle_gpu_control(
+        {"type": "suspend_gpu", "registration_key": (0, 1)}
+    )
+    assert suspended == {
+        "ok": True,
+        "ready": True,
+        "registered": 2,
+        "released_mappings": 4,
+    }
 
     first = _request(0, 0, 0)
     first.handles = ["new0"]
