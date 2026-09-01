@@ -68,7 +68,6 @@ def test_connector_rejects_leading_skip_topk_placeholder():
     with pytest.raises(RuntimeError, match="leading skip-topk"):
         FlexKVConnector._alias_empty_indexer_buffers([skipped])
 
-
 def test_corrected_glm_dsa_block_arithmetic():
     groups = _groups(PAGE_SIZE)
     layout = KVCacheLayout(

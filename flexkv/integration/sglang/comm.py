@@ -54,7 +54,6 @@ class FlexKVScatterChannel(str, Enum):
     RESET = "reset"
     STORE_START = "store_start"
     STORE_RESET = "store_reset"
-    STORE_READY = "store_ready"
 
 
 _SCATTER_CHANNEL_OFFSETS = {
@@ -66,7 +65,6 @@ _SCATTER_CHANNEL_OFFSETS = {
     FlexKVScatterChannel.RESET: 6,
     FlexKVScatterChannel.STORE_START: 7,
     FlexKVScatterChannel.STORE_RESET: 8,
-    FlexKVScatterChannel.STORE_READY: 9,
 }
 _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.LOOKUP: dict,
@@ -77,7 +75,6 @@ _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.RESET: dict,
     FlexKVScatterChannel.STORE_START: dict,
     FlexKVScatterChannel.STORE_RESET: dict,
-    FlexKVScatterChannel.STORE_READY: list,
 }
 
 
