@@ -32,7 +32,9 @@ def test_store_start_tracks_task_on_nonleader_rank():
         "rid": "request",
         "task_id": 17,
         "active": True,
-        "unmatched_mask": [True, False, True, False],
+        "slot_count": 4,
+        "unmatched_count": 2,
+        "unmatched_mask": [],
         "error": "",
     }
     connector = _follower_connector(payload)
@@ -46,11 +48,41 @@ def test_store_start_tracks_task_on_nonleader_rank():
             "rid": "request",
             "task_id": -1,
             "active": False,
+            "slot_count": 4,
+            "unmatched_count": 0,
             "unmatched_mask": [],
             "error": "",
         },
         channel=FlexKVScatterChannel.STORE_START,
     )
+
+
+def test_store_leader_accepts_pinned_sideband_cpu_mapping():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector.page_size = 1
+    connector._swa_kv_pool = None
+    connector._profile_store_stages = False
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.put_match.return_value = (
+        17,
+        np.asarray([True, False, True, False], dtype=np.bool_),
+    )
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=True,
+        needs_sync=False,
+        should_send_slot_mapping_to_remote=False,
+        is_cross_node_pp=False,
+    )
+    connector._inflight_stores = {}
+    connector._inflight_store_contexts = {}
+    connector._new_op_context = MagicMock(return_value=SimpleNamespace(task_id=-1))
+    connector._log_cache_op = MagicMock()
+    cpu_mapping = torch.tensor([4, 5, 8, 9], dtype=torch.int64)
+
+    assert connector.store_kv("request", [1, 2, 3, 4], cpu_mapping) == 17
+    launch = connector.kv_manager.launch.call_args.kwargs
+    assert launch["slot_mappings"][0].tolist() == [4, 8]
+    assert launch["swa_slot_mappings"] == [None]
 
 
 def test_lookup_accepts_sglang_array_token_ids():
@@ -201,6 +233,13 @@ def test_store_completion_clears_nonleader_tracking():
     assert connector._inflight_stores == {}
     assert connector._inflight_store_contexts == {}
     connector._sync_ctx.scatter.assert_called_once_with([], channel=FlexKVScatterChannel.STORE_COMPLETION)
+
+
+def test_store_ready_uses_leader_payload_and_dedicated_channel():
+    connector = _follower_connector(["request"])
+
+    assert connector.sync_ready_store_rids(["ignored-on-follower"]) == ["request"]
+    connector._sync_ctx.scatter.assert_called_once_with([], channel=FlexKVScatterChannel.STORE_READY)
 
 
 def test_store_reset_waits_for_leader_drain_on_follower():
