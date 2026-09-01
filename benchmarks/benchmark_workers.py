@@ -36,7 +36,6 @@ class BenchmarkConfig:
     shuffle_ids: bool = False
     warmup_round: int = 1
     benchmark_round: int = 10
-    bidirectional: bool = False
     gpu_layout_type: int = 0
     use_ce_transfer: bool = False
     transfer_num_cta: int = 4
@@ -58,7 +57,6 @@ def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]
             shuffle_ids=args.shuffle_ids,
             warmup_round=args.warmup_round,
             benchmark_round=args.benchmark_round,
-            bidirectional=args.bi,
             gpu_layout_type=args.gpu_layout_type,
             use_ce_transfer=args.use_ce,
             transfer_num_cta=args.cta,
@@ -421,15 +419,6 @@ def sync_all(finished_ops_queue: mp.Queue, num_ops: int):
     for _ in range(num_ops):
         finished_ops_queue.get()
 
-REVERSE_TYPE_MAP = {
-    TransferType.D2H: TransferType.H2D,
-    TransferType.H2D: TransferType.D2H,
-    TransferType.DISK2H: TransferType.H2DISK,
-    TransferType.H2DISK: TransferType.DISK2H,
-    TransferType.DISK2D: TransferType.D2DISK,
-    TransferType.D2DISK: TransferType.DISK2D,
-    }
-
 def bench_worker(args):
     model_config, cache_config, bench_config = make_configs(args)
     if model_config.tp_size > torch.cuda.device_count():
@@ -597,9 +586,6 @@ def parse_args():
     parser.add_argument("--benchmark-round",
                         type=int,
                         default=10)
-    parser.add_argument("--bi",
-                        action="store_true",
-                        help="benchmark bidirectional bandwidth")
     parser.add_argument("--gpu-layout-type",
                         type=int,
                         default=0,
