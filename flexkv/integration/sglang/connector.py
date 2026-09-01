@@ -1023,11 +1023,13 @@ class FlexKVConnector:
     def supports_async_store_slot_mapping(self) -> bool:
         """Whether a leader-only pinned slot copy is valid for this topology.
 
-        Cross-node PP receivers need their own stage-local mapping, and SWA
-        needs a GPU-side full-to-SWA translation. Keep those paths on the
-        synchronous implementation until they have an explicit sideband.
+        PP stages need their own stage-local mapping, and SWA needs a GPU-side
+        full-to-SWA translation. Keep those paths on the synchronous
+        implementation until they have an explicit sideband.
         """
-        return not bool(getattr(self._sync_ctx, "is_cross_node_pp", False)) and (
+        # TODO: add stage-local mapping sidebands for PP and carry
+        # the GPU full-to-SWA translation in the asynchronous store protocol.
+        return not bool(getattr(self._sync_ctx, "is_pp_active", False)) and (
             self._swa_kv_pool is None
         )
 

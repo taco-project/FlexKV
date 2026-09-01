@@ -27,6 +27,21 @@ def _follower_connector(payload):
     return connector
 
 
+def test_async_store_slot_mapping_support_is_topology_driven():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._sync_ctx = SimpleNamespace(is_pp_active=False)
+    connector._swa_kv_pool = None
+
+    assert connector.supports_async_store_slot_mapping is True
+
+    connector._sync_ctx.is_pp_active = True
+    assert connector.supports_async_store_slot_mapping is False
+
+    connector._sync_ctx.is_pp_active = False
+    connector._swa_kv_pool = object()
+    assert connector.supports_async_store_slot_mapping is False
+
+
 def test_store_start_tracks_task_on_nonleader_rank():
     payload = {
         "rid": "request",
