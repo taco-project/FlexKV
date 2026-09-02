@@ -299,6 +299,8 @@ class FlexKVConnector:
         # Prefetches
         self._ongoing_prefetches: Dict[str, int] = {}  # rid -> fkv_task_id
         self._prefetch_contexts: Dict[str, _CacheOpContext] = {}
+        self._prefetch_planned_tokens: Dict[str, int] = {}
+        self._prefetch_loaded_tokens: Dict[str, int] = {}
         self._prefetch_enabled = bool(
             self.cache_config.enable_ssd
             or self.cache_config.enable_remote
@@ -1288,6 +1290,7 @@ class FlexKVConnector:
             return -1
         context = self._new_op_context("prefetch", rid, sglang_req_id)
         task_id = -1
+        planned_tokens = 0
         prefetch_error: Optional[Exception] = None
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
@@ -1305,19 +1308,23 @@ class FlexKVConnector:
                     if isinstance(prefetch_result, tuple)
                     else prefetch_result
                 )
+                if isinstance(prefetch_result, tuple) and len(prefetch_result) > 1:
+                    planned_tokens = int(prefetch_result[1])
             except Exception as exc:  # noqa: BLE001
                 prefetch_error = exc
                 task_id = -1
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
-                {"task_id": task_id},
+                {"task_id": task_id, "planned_tokens": planned_tokens},
                 channel=FlexKVScatterChannel.PREFETCH_START,
             )
             task_id = payload["task_id"]
+            planned_tokens = int(payload["planned_tokens"])
         if task_id >= 0:
             context.task_id = task_id
             self._ongoing_prefetches[rid] = task_id
             self._prefetch_contexts[rid] = context
+            self._prefetch_planned_tokens[rid] = planned_tokens
             self._log_cache_op(
                 context,
                 "launch",
@@ -1342,6 +1349,7 @@ class FlexKVConnector:
             return True
         done = False
         status = "running"
+        loaded_tokens = 0
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 completed = self.kv_manager.try_wait(task_ids=[task_id]) or {}
@@ -1358,17 +1366,42 @@ class FlexKVConnector:
                 )
                 completed = {}
             if task_id in completed:
-                status = _status_value(completed[task_id])
+                response = completed[task_id]
+                status = _status_value(response)
                 done = _is_terminal_status(status)
+                if done and status == KVResponseStatus.SUCCESS.value:
+                    # Current FlexKV finalizes the authoritative reusable L3
+                    # prefix in KVResponse.return_mask after REMOTE2H commits
+                    # into the CPU tree.  Launch-time prefetch_async returns
+                    # only a task id, so using that result for accounting
+                    # silently reports real storage hits as host hits.
+                    return_mask = getattr(response, "return_mask", None)
+                    if return_mask is None:
+                        # Compatibility with older managers that returned the
+                        # planned token count at launch and no completion mask.
+                        loaded_tokens = self._prefetch_planned_tokens.get(rid, 0)
+                    elif isinstance(return_mask, list):
+                        loaded_tokens = sum(
+                            int(np.count_nonzero(mask)) for mask in return_mask
+                        )
+                    else:
+                        loaded_tokens = int(np.count_nonzero(return_mask))
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
-                {"done": done, "status": status},
+                {
+                    "done": done,
+                    "status": status,
+                    "loaded_tokens": loaded_tokens,
+                },
                 channel=FlexKVScatterChannel.PREFETCH_PROGRESS,
             )
             done = payload["done"]
             status = payload["status"]
+            loaded_tokens = int(payload["loaded_tokens"])
         if done:
             self._ongoing_prefetches.pop(rid, None)
+            self._prefetch_planned_tokens.pop(rid, None)
+            self._prefetch_loaded_tokens[rid] = loaded_tokens
             context = self._pop_context("_prefetch_contexts", rid, "prefetch", task_id)
             self._log_cache_op(
                 context,
@@ -1376,6 +1409,10 @@ class FlexKVConnector:
                 status,
             )
         return done
+
+    def pop_prefetch_loaded_tokens(self, rid: str) -> int:
+        """Return the successfully materialized REMOTE2H prefix once."""
+        return int(self._prefetch_loaded_tokens.pop(rid, 0))
 
     def cancel_prefetch(self, rid: str) -> None:
         self._pending_lookups.pop(rid, None)
@@ -1391,6 +1428,8 @@ class FlexKVConnector:
         # FlexKV doesn't currently support prefetch cancellation, but
         # we still drop our tracking entry.
         task_id = self._ongoing_prefetches.pop(rid, -1)
+        self._prefetch_planned_tokens.pop(rid, None)
+        self._prefetch_loaded_tokens.pop(rid, None)
         context = getattr(self, "_prefetch_contexts", {}).pop(rid, None)
         if context is not None:
             self._log_cache_op(
@@ -1498,6 +1537,8 @@ class FlexKVConnector:
             )
         self._prefetch_contexts.clear()
         self._ongoing_prefetches.clear()
+        getattr(self, "_prefetch_planned_tokens", {}).clear()
+        getattr(self, "_prefetch_loaded_tokens", {}).clear()
         self._inflight_loads.clear()
         self._completed_layerwise.clear()
         self._launched_load_tids.clear()
@@ -1596,11 +1637,65 @@ class FlexKVConnector:
     # Private helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _alias_empty_indexer_buffers(
+        indexer_buffers: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Replace skip-topk zero-row placeholders with their source layer.
+
+        SGLang intentionally allocates a ``(0, page_stride)`` tensor for a
+        skip-topk layer because that layer reuses the preceding layer's
+        indexer cache. FlexKV keeps one physical indexer slot per model layer,
+        so its pointer table must alias the preceding buffer instead of
+        exporting a null ``data_ptr()``.
+        """
+        resolved: List[torch.Tensor] = []
+        previous: Optional[torch.Tensor] = None
+        alias_count = 0
+        for layer_idx, buffer in enumerate(indexer_buffers):
+            if buffer.ndim != 2:
+                raise RuntimeError(
+                    f"FlexKV indexer layer {layer_idx} expects a 2D buffer, "
+                    f"got shape={tuple(buffer.shape)}"
+                )
+            if buffer.shape[0] == 0:
+                if previous is None:
+                    raise RuntimeError(
+                        "FlexKV cannot alias a leading skip-topk indexer layer: "
+                        f"layer={layer_idx} has shape={tuple(buffer.shape)}"
+                    )
+                if buffer.shape[1] != previous.shape[1]:
+                    raise RuntimeError(
+                        "FlexKV skip-topk indexer placeholder width mismatch: "
+                        f"layer={layer_idx} width={buffer.shape[1]} "
+                        f"source_width={previous.shape[1]}"
+                    )
+                resolved.append(previous)
+                alias_count += 1
+                continue
+            if previous is not None and buffer.shape != previous.shape:
+                raise RuntimeError(
+                    "FlexKV active indexer buffers must share one shape: "
+                    f"layer={layer_idx} shape={tuple(buffer.shape)} "
+                    f"previous={tuple(previous.shape)}"
+                )
+            previous = buffer
+            resolved.append(buffer)
+        if alias_count:
+            logger.info(
+                "[FlexKV] aliased %d skip-topk indexer placeholders to the "
+                "preceding active layer",
+                alias_count,
+            )
+        return resolved
+
     def _resolve_kv_buffers(
         self, kvcache: Any
     ) -> Tuple[List[torch.Tensor], Optional[List[torch.Tensor]]]:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
+        if indexer_buffers:
+            indexer_buffers = self._alias_empty_indexer_buffers(indexer_buffers)
         if not self._is_dsv4:
             if hasattr(kvcache, "kv_buffer"):
                 return list(kvcache.kv_buffer), indexer_buffers

@@ -16,6 +16,7 @@ def test_load_user_config_from_env_reads_hugepage_flags(monkeypatch) -> None:
     monkeypatch.setenv("FLEXKV_USE_HUGEPAGE_TMP_BUFFER", "1")
     monkeypatch.setenv("FLEXKV_HUGEPAGE_SIZE_BYTES", str(1 << 30))
     monkeypatch.setenv("FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES", str(2 << 30))
+    monkeypatch.setenv("FLEXKV_MOONCAKE_MR_SPLIT_POLICY", "block_boundary")
 
     user_config = load_user_config_from_env()
 
@@ -23,6 +24,7 @@ def test_load_user_config_from_env_reads_hugepage_flags(monkeypatch) -> None:
     assert user_config.use_hugepage_tmp_buffer is True
     assert user_config.hugepage_size_bytes == 1 << 30
     assert user_config.mooncake_max_mr_size_bytes == 2 << 30
+    assert user_config.mooncake_mr_split_policy == "block_boundary"
 
 
 def test_update_default_config_from_user_config_applies_hugepage_flags() -> None:
@@ -40,6 +42,7 @@ def test_update_default_config_from_user_config_applies_hugepage_flags() -> None
         use_hugepage_tmp_buffer=True,
         hugepage_size_bytes=1 << 30,
         mooncake_max_mr_size_bytes=2 << 30,
+        mooncake_mr_split_policy="block_boundary",
     )
 
     update_default_config_from_user_config(RankInfo(model_config=model_config), cache_config, user_config)
@@ -48,6 +51,7 @@ def test_update_default_config_from_user_config_applies_hugepage_flags() -> None
     assert cache_config.use_hugepage_tmp_buffer is True
     assert cache_config.hugepage_size_bytes == 1 << 30
     assert cache_config.mooncake_max_mr_size_bytes == 2 << 30
+    assert cache_config.mooncake_mr_split_policy == "block_boundary"
 
 
 def test_mooncake_max_mr_size_rejects_non_positive_values() -> None:
@@ -57,13 +61,26 @@ def test_mooncake_max_mr_size_rejects_non_positive_values() -> None:
         UserConfig(mooncake_max_mr_size_bytes=0)
 
 
+def test_mooncake_mr_split_policy_defaults_to_strict() -> None:
+    assert UserConfig().mooncake_mr_split_policy == "strict"
+    assert CacheConfig().mooncake_mr_split_policy == "strict"
+
+
+def test_mooncake_mr_split_policy_rejects_unknown_value() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="mooncake_mr_split_policy"):
+        UserConfig(mooncake_mr_split_policy="registration_aligned")
+
+
 def test_load_user_config_from_yaml_reads_mooncake_max_mr_size(tmp_path) -> None:
     config_path = tmp_path / "flexkv.yaml"
     config_path.write_text(
-        "cpu_cache_gb: 16\nmooncake_max_mr_size_bytes: 2147483648\n",
+        "cpu_cache_gb: 16\nmooncake_max_mr_size_bytes: 2147483648\nmooncake_mr_split_policy: block_boundary\n",
         encoding="utf-8",
     )
 
     user_config = load_user_config_from_file(str(config_path))
 
     assert user_config.mooncake_max_mr_size_bytes == 2 << 30
+    assert user_config.mooncake_mr_split_policy == "block_boundary"
