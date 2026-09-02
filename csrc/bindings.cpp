@@ -191,13 +191,17 @@ void transfer_kv_blocks_remote(
   for (const auto &file_nodeid : file_nodeid_list) {
     file_nodeids.push_back(file_nodeid.cast<std::uint64_t>());
   }
-  flexkv::transfer_kv_blocks_cfs_mmap_multi_thread(
-      file_nodeids, cpu_layer_id_list, cpu_tensor_ptr, remote_block_ids,
-      cpu_block_ids, cpu_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
-      remote_layer_stride_in_bytes, remote_block_stride_in_bytes,
-      remote_kv_stride_in_bytes, block_size_in_bytes, total_layers, is_read,
-      partition_block_type, round_robin, num_remote_blocks_per_file, use_mmap,
-      num_threads_per_file, kv_dim);
+
+  {
+    py::gil_scoped_release release_gil;
+    flexkv::transfer_kv_blocks_cfs_mmap_multi_thread(
+        file_nodeids, cpu_layer_id_list, cpu_tensor_ptr, remote_block_ids,
+        cpu_block_ids, cpu_layer_stride_in_bytes, cpu_kv_stride_in_bytes,
+        remote_layer_stride_in_bytes, remote_block_stride_in_bytes,
+        remote_kv_stride_in_bytes, block_size_in_bytes, total_layers, is_read,
+        partition_block_type, round_robin, num_remote_blocks_per_file, use_mmap,
+        num_threads_per_file, kv_dim);
+  }
 }
 
 void shared_transfer_kv_blocks_remote_read_binding(
@@ -236,13 +240,15 @@ void shared_transfer_kv_blocks_remote_read_binding(
     cpu_blocks_partition.push_back(std::move(blocks));
   }
 
-  // call C++ implementation
-  flexkv::shared_transfer_kv_blocks_remote_read(
-      file_nodeids, cfs_blocks_partition, cpu_blocks_partition,
-      cpu_layer_id_list, cpu_tensor_ptr, cpu_layer_stride_in_bytes,
-      cpu_kv_stride_in_bytes, cfs_layer_stride_in_bytes,
-      cfs_block_stride_in_bytes,       cfs_kv_stride_in_bytes, block_size_in_bytes,
-      total_layers, kv_dim, num_threads_per_file);
+  {
+    py::gil_scoped_release release_gil;
+    flexkv::shared_transfer_kv_blocks_remote_read(
+        file_nodeids, cfs_blocks_partition, cpu_blocks_partition,
+        cpu_layer_id_list, cpu_tensor_ptr, cpu_layer_stride_in_bytes,
+        cpu_kv_stride_in_bytes, cfs_layer_stride_in_bytes,
+        cfs_block_stride_in_bytes,       cfs_kv_stride_in_bytes, block_size_in_bytes,
+        total_layers, kv_dim, num_threads_per_file);
+  }
 }
 #endif
 
@@ -456,7 +462,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("is_blockfirst") = false,
         py::arg("ce_gather_threads") = 4,
         py::arg("ce_gather_nt") = true,
-        py::arg("enable_transfer_trace") = false);
+        py::arg("enable_transfer_trace") = false,
+        py::call_guard<py::gil_scoped_release>());
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory", py::arg("ioctx"),
         py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),
@@ -467,7 +474,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("is_read"), py::arg("num_blocks_per_file"),
         py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
         py::arg("kv_dim") = 2,
-        py::arg("ssd_io_opt") = true);
+        py::arg("ssd_io_opt") = true,
+        py::call_guard<py::gil_scoped_release>());
   py::class_<flexkv::LayerwiseTransferGroup>(m, "LayerwiseTransferGroup")
       .def(py::init([](int num_gpus,
                        const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
@@ -492,7 +500,7 @@ PYBIND11_MODULE(c_ext, m) {
                        int ce_force_path,
                        bool ce_enable_memcpy2d,
                        bool is_blockfirst,
-                       int num_kv_heads = 1,
+                       int num_kv_heads,
                        int ce_gather_threads,
                        bool ce_gather_nt, bool ssd_io_opt) {
             flexkv::CETransferConfig cfg;
@@ -574,7 +582,7 @@ PYBIND11_MODULE(c_ext, m) {
           torch::Tensor swa_gpu_layer_strides_tensor,
           torch::Tensor swa_gpu_chunk_sizes_tensor,
           int64_t ce_segment_threshold, bool ce_path_opt, int ce_force_path,
-          bool ce_enable_memcpy2d, bool is_blockfirst, int num_kv_heads = 1,
+          bool ce_enable_memcpy2d, bool is_blockfirst, int num_kv_heads,
           int ce_gather_threads, bool ce_gather_nt, bool ssd_io_opt) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
@@ -688,7 +696,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("swa_num_blocks_per_file") = 0,
            py::arg("kv_shared_across_ranks_mode") = "sharded",
            py::arg("notify_mode") = "hostfunc",
-           py::arg("enable_trace") = false)
+           py::arg("enable_trace") = false,
+           py::call_guard<py::gil_scoped_release>())
       .def("layerwise_transfer_multi_group",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer_multi_group,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -714,7 +723,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("swa_num_blocks_per_file") = 0,
            py::arg("kv_shared_across_ranks_mode") = "sharded",
            py::arg("notify_mode") = "hostfunc",
-           py::arg("enable_trace") = false);
+           py::arg("enable_trace") = false,
+           py::call_guard<py::gil_scoped_release>());
 
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
@@ -746,13 +756,15 @@ PYBIND11_MODULE(c_ext, m) {
       py::arg("num_blocks_per_file"), py::arg("total_layers"),
       py::arg("is_read"), py::arg("verbose") = false,
       py::arg("kv_dim") = 2,
-      py::arg("gpu_block_type") = 0, py::arg("gpu_device_id") = 0);
+      py::arg("gpu_block_type") = 0, py::arg("gpu_device_id") = 0,
+      py::call_guard<py::gil_scoped_release>());
 #endif
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
         py::arg("hasher"), py::arg("token_ids"), py::arg("tokens_per_block"),
-        py::arg("block_hashes"));
+        py::arg("block_hashes"),
+        py::call_guard<py::gil_scoped_release>());
 
   py::class_<flexkv::SSDIOCTX>(m, "SSDIOCTX")
       .def(
@@ -776,7 +788,7 @@ PYBIND11_MODULE(c_ext, m) {
                        int ce_force_path,
                        bool ce_enable_memcpy2d,
                        bool is_blockfirst,
-                       int num_kv_heads = 1,
+                       int num_kv_heads,
                        int ce_gather_threads,
                        bool ce_gather_nt) {
             flexkv::CETransferConfig cfg;
@@ -827,7 +839,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("kv_dim"), py::arg("num_kv_heads"),
            py::arg("kv_shared_across_ranks_mode") = "sharded",
-           py::arg("designated_rank") = 0);
+           py::arg("designated_rank") = 0,
+           py::call_guard<py::gil_scoped_release>());
 #ifdef FLEXKV_ENABLE_NVCOMP
   // nvcomp ANS variant: tp_group_transfer_ans() lazily initializes from the
   // constructor config and returns total compressed bytes across ranks.
@@ -847,7 +860,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_size_table_tp_ptr"),
            py::arg("cpu_size_table_tp_rank_stride"),
            py::arg("cpu_size_table_block_stride"),
-           py::arg("cpu_size_table_layer_stride"));
+           py::arg("cpu_size_table_layer_stride"),
+           py::call_guard<py::gil_scoped_release>());
 #endif // FLEXKV_ENABLE_NVCOMP
 
 #ifdef FLEXKV_ENABLE_GDS
@@ -873,7 +887,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ssd_tp_stride_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"),
            py::arg("layer_granularity"), py::arg("kv_dim"),
-           py::arg("num_kv_heads") = 1);
+           py::arg("num_kv_heads") = 1,
+           py::call_guard<py::gil_scoped_release>());
 #endif
 
   // Add Hasher class binding
