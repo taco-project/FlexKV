@@ -652,11 +652,17 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             GLOBAL_CONFIG_FROM_ENV.iouring_entries,
             GLOBAL_CONFIG_FROM_ENV.iouring_flags,
             layer_eventfds_tensor, tp_group_size,
-            GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
-            GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
-            GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
-            (cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
-            self.num_kv_heads,
+            # These MUST be keyword args: positionally, slot 14 onwards is the
+            # SWA sidecar block (has_swa, swa_gpu_blocks, ...), so passing the
+            # CE knobs positionally makes pybind try ce_segment_threshold as
+            # ``has_swa`` and fail overload resolution with "incompatible
+            # constructor arguments" -- while _swa_init_kwargs() below also
+            # supplies has_swa, so the two collide.
+            ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+            ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+            ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+            is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
+            num_kv_heads=self.num_kv_heads,
             ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
             ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
