@@ -671,14 +671,13 @@ def _split_mooncake_registration_regions(
     max_mr_size: int,
     size_alignment: int,
     pointer_alignment: int,
+    mr_split_policy: str = "strict",
 ) -> List[Tuple[int, int]]:
-    """Split a mapped KV pool without splitting KV blocks.
+    """Split a mapped KV pool according to an explicit MR policy.
 
-    Prefer regions aligned to the KV block, mapping alignment and HugePage
-    size.  If that common alignment period is larger than the configured MR
-    limit, keep block boundaries and relax only the derived sub-MR pointer and
-    size alignment.  This is required by transports with a 2 GiB MR limit:
-    older Mooncake releases cannot transfer one KV block across two MRs.
+    ``strict`` keeps every region aligned to the KV block, external mapping,
+    and HugePage. ``block_boundary`` keeps every KV block inside one MR while
+    allowing derived MR pointers/sizes to be externally unaligned.
     """
     values = {
         "base_ptr": base_ptr,
@@ -696,6 +695,11 @@ def _split_mooncake_registration_regions(
         raise ValueError(
             "HugePage mapped length is smaller than the logical CPU pool: "
             f"mapped={mapped_size}, logical={logical_size}"
+        )
+    if mr_split_policy not in {"strict", "block_boundary"}:
+        raise ValueError(
+            "mr_split_policy must be one of {'strict', 'block_boundary'}, got "
+            f"{mr_split_policy!r}"
         )
     if logical_size % block_size != 0:
         raise ValueError(
@@ -716,11 +720,7 @@ def _split_mooncake_registration_regions(
         return [(base_ptr, mapped_size)]
 
     regions: List[Tuple[int, int]] = []
-    region_unit = math.lcm(block_size, size_alignment, pointer_alignment)
-    aligned_region_size = (max_mr_size // region_unit) * region_unit
-    use_block_boundary_fallback = aligned_region_size <= 0
-
-    if use_block_boundary_fallback:
+    if mr_split_policy == "block_boundary":
         mapped_padding = mapped_size - logical_size
         regular_region_size = (max_mr_size // block_size) * block_size
         final_logical_capacity = (
@@ -743,6 +743,13 @@ def _split_mooncake_registration_regions(
             offset += size
         regions.append((base_ptr + offset, mapped_size - offset))
     else:
+        region_unit = math.lcm(block_size, size_alignment, pointer_alignment)
+        aligned_region_size = (max_mr_size // region_unit) * region_unit
+        if aligned_region_size <= 0:
+            raise ValueError(
+                "Mooncake max MR size cannot hold one aligned KV region: "
+                f"max_mr_size={max_mr_size}, region_unit={region_unit}"
+            )
         offset = 0
         while offset < mapped_size:
             remaining = mapped_size - offset
@@ -756,17 +763,21 @@ def _split_mooncake_registration_regions(
 
     for index, (ptr, size) in enumerate(regions):
         is_last = index == len(regions) - 1
-        if not is_last and size % block_size != 0:
+        if (
+            mr_split_policy == "strict"
+            and not is_last
+            and size % block_size != 0
+        ):
             raise ValueError(
                 "Non-final Mooncake MR is not KV-block aligned: "
                 f"index={index}, size={size}, block_size={block_size}"
             )
-        if not use_block_boundary_fallback and ptr % pointer_alignment != 0:
+        if mr_split_policy == "strict" and ptr % pointer_alignment != 0:
             raise ValueError(
                 "Mooncake MR pointer is not HugePage aligned: "
                 f"ptr=0x{ptr:x}, alignment={pointer_alignment}"
             )
-        if not use_block_boundary_fallback and size % size_alignment != 0:
+        if mr_split_policy == "strict" and size % size_alignment != 0:
             raise ValueError(
                 "Mooncake MR size is not externally aligned: "
                 f"size={size}, alignment={size_alignment}"
@@ -904,9 +915,11 @@ class MooncakeStoreBackend(StorageBackend):
         """The MRs to register for this worker's CPU pool.
 
         One region unless the pool is HugePage-backed and larger than the
-        transport's MR limit, in which case it is split on KV-block
-        boundaries -- a block straddling two MRs cannot be transferred by
-        older Mooncake releases.
+        transport's MR limit, in which case it is split under
+        ``mooncake_mr_split_policy`` -- a block straddling two MRs cannot be
+        transferred by older Mooncake releases, so every policy keeps blocks
+        whole and they differ only in whether the derived MR pointers and
+        sizes stay externally aligned.
         """
         base_ptr = self._cpu_buffer.data_ptr()
         logical_size = (
@@ -929,10 +942,12 @@ class MooncakeStoreBackend(StorageBackend):
             max_mr_size=int(self.cache_config.mooncake_max_mr_size_bytes),
             size_alignment=size_alignment,
             pointer_alignment=hugepage_size,
+            mr_split_policy=self.cache_config.mooncake_mr_split_policy,
         )
         flexkv_logger.info(
             "[MooncakeStoreBackend] registering external MRs: "
             f"logical_size={logical_size} mapped_size={mapped_size} "
+            f"mr_split_policy={self.cache_config.mooncake_mr_split_policy} "
             f"regions={regions}")
         return regions
 
