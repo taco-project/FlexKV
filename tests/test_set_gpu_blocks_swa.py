@@ -80,7 +80,26 @@ def test_set_gpu_blocks_can_fill_swa_when_explicit_mapping_provided():
     )
 
     assert np.array_equal(main_h2d.dst_block_ids, np.array([100, 101], dtype=np.int64))
-    assert np.array_equal(swa_h2d.dst_block_ids, np.array([900, 901], dtype=np.int64))
+    # Surplus SWA pages sit at the head; ops bind to the tail of the mapping.
+    assert np.array_equal(swa_h2d.dst_block_ids, np.array([901, 902], dtype=np.int64))
+
+
+def test_set_gpu_blocks_swa_binds_trailing_page_of_a_multi_page_store():
+    """Regression: a multi-page SWA mapping must bind the LAST page, not the first."""
+    graph = TransferOpGraph()
+    swa_d2h = TransferOp(
+        graph_id=graph.graph_id,
+        transfer_type=TransferType.D2H,
+        src_block_ids=np.array([0], dtype=np.int64),
+        dst_block_ids=np.array([7], dtype=np.int64),
+        is_swa=True,
+    )
+    graph.add_transfer_op(swa_d2h)
+
+    swa_pages = np.arange(500, 517, dtype=np.int64)  # 17 pages, as for 4352 tokens
+    graph.set_gpu_blocks(np.array([], dtype=np.int64), swa_pages)
+
+    assert np.array_equal(swa_d2h.src_block_ids, np.array([516], dtype=np.int64))
 
 
 def test_set_gpu_blocks_explicit_swa_mapping_consumes_per_op():
