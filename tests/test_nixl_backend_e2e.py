@@ -15,17 +15,19 @@ Model shapes are the production ones (Qwen full attention, DeepSeek-V3.2 and
 GLM-5.2 MLA), and both CPU layout orders are exercised, because the CPU-side
 offset formula differs between them.
 
-``_EdgeWorker`` publishes exactly the attributes ``NixlFileBackend.attach``
-reads off a worker. Standing a real ``TransferWorkerBase`` up would need a
-spawned process, a pinned pool and the io_uring context this backend replaces
-anyway; what matters is that the *edge contract* -- these attribute names, with
-these meanings -- is what the backend consumes.
+``_build_edge`` reproduces exactly the ``EdgeGeometry`` that
+``CPUSSDDiskTransferWorker`` hands a backend, and ``_EdgeWorker`` carries the
+two non-geometry things ``attach`` may still touch (``worker_id`` for logs,
+``_register_host_tensor``). Standing a real ``TransferWorkerBase`` up would
+need a spawned process, a pinned pool and the io_uring context this backend
+replaces anyway; what matters is that the *edge contract* -- that geometry,
+with those meanings -- is what the backend consumes.
 """
 from __future__ import annotations
 
 import os
 import tempfile
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pytest
 import torch
@@ -33,6 +35,12 @@ import torch
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferType
 from flexkv.transfer.backends import NixlFileBackend
+from flexkv.transfer.geometry import (
+    ChunkStrides,
+    DiskSide,
+    EdgeGeometry,
+    HostSide,
+)
 
 pytest.importorskip("nixl", reason="NIXL SDK not installed")
 
@@ -93,17 +101,18 @@ def _require(plugin: str) -> None:
 
 
 class _EdgeWorker:
-    """The edge attributes ``NixlFileBackend.attach`` is allowed to read."""
+    """The non-geometry surface ``NixlFileBackend.attach`` may still touch.
+
+    Everything about the *edge* now arrives as an ``EdgeGeometry``; what is
+    left on the worker is the worker itself -- an id for the log line and the
+    host-registration hook, neither of which is geometry.
+    """
 
     def __init__(self, cpu_kv_layout: KVCacheLayout, dtype: torch.dtype):
         self.worker_id = 99
         self.cpu_kv_layout = cpu_kv_layout
         self.dtype = dtype
-        self.num_layers = cpu_kv_layout.num_layer
-        self.kv_dim = cpu_kv_layout.kv_dim
-        self.has_multi_group = False
         self.registered: List[str] = []
-        self._bytes_per_block = -1
 
     def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
         # The real worker calls cudaHostRegister here. NIXL's DRAM registration
@@ -126,30 +135,60 @@ def _make_layout(shape, layout_type: str, num_block: int = NUM_BLOCKS) -> KVCach
     )
 
 
-def _attach_edge(worker: _EdgeWorker, shape, layout_type: str) -> int:
-    """Reproduce ``CPUSSDDiskTransferWorker``'s single-group stride block.
+def _build_edge(
+    worker: _EdgeWorker, cpu_blocks: torch.Tensor, shape, layout_type: str
+) -> Tuple[EdgeGeometry, int]:
+    """Reproduce the ``EdgeGeometry`` ``CPUSSDDiskTransferWorker`` publishes.
 
-    Same expressions in the same order as ``worker.py``; if that derivation
-    changes, this expectation is what should have to change with it.  Returns
-    the byte size each backing file must have.
+    Same expressions in the same order as ``workers/cpu_ssd.py``; if that
+    derivation changes, this expectation is what should have to change with
+    it.  Returns the geometry and the byte size each backing file must have.
     """
     cpu = worker.cpu_kv_layout
     ssd = _make_layout(shape, layout_type)
     per_file = ssd.div_block(NUM_FILES, padding=True)
     itemsize = worker.dtype.itemsize
 
-    worker.chunk_size_in_bytes = cpu.get_chunk_size() * itemsize
-    worker.block_stride_in_bytes = cpu.get_block_stride() * itemsize
-    worker.cpu_kv_stride_in_bytes = cpu.get_kv_stride() * itemsize
-    worker.cpu_layer_stride_in_bytes = cpu.get_layer_stride() * itemsize
-    worker.ssd_kv_stride_in_bytes = per_file.get_kv_stride() * itemsize
-    worker.ssd_layer_stride_in_bytes = per_file.get_layer_stride() * itemsize
-    worker.ssd_block_stride_in_bytes = per_file.get_block_stride() * itemsize
+    chunk_bytes = cpu.get_chunk_size() * itemsize
+    cpu_block_stride = cpu.get_block_stride() * itemsize
+    ssd_block_stride = per_file.get_block_stride() * itemsize
+    # The real worker takes layer 0's pointer off the pool it owns.
+    layer_ptrs = torch.tensor([cpu_blocks.data_ptr()], dtype=torch.int64)
+
+    geometry = EdgeGeometry(
+        num_layers=cpu.num_layer,
+        kv_dim=cpu.kv_dim,
+        num_kv_heads=cpu.num_kv_heads,
+        dtype=worker.dtype,
+        has_multi_group=False,
+        bytes_per_block=chunk_bytes * cpu.num_layer * cpu.kv_dim,
+        cpu=HostSide(
+            layout=cpu,
+            blocks=cpu_blocks,
+            layer_ptrs=layer_ptrs,
+            block_stride=cpu_block_stride,
+            strides=ChunkStrides(
+                chunk_bytes=chunk_bytes,
+                kv_stride=cpu.get_kv_stride() * itemsize,
+                layer_stride=cpu.get_layer_stride() * itemsize,
+                block_stride=cpu_block_stride,
+            ),
+        ),
+        ssd=DiskSide(
+            block_stride=ssd_block_stride,
+            strides=ChunkStrides(
+                chunk_bytes=chunk_bytes,
+                kv_stride=per_file.get_kv_stride() * itemsize,
+                layer_stride=per_file.get_layer_stride() * itemsize,
+                block_stride=ssd_block_stride,
+            ),
+        ),
+    )
 
     # One whole per-file layout per file. Deriving it from the layout rather
     # than from a stride keeps it right for both orders: LAYERFIRST spans
     # num_layer*layer_stride, BLOCKFIRST spans num_block*block_stride.
-    return per_file.kv_shape.numel() * itemsize
+    return geometry, per_file.kv_shape.numel() * itemsize
 
 
 class _Op:
@@ -202,19 +241,20 @@ def test_nixl_posix_cpu_file_roundtrip_is_byte_exact(shape, layout_type):
     """
     _require("POSIX")
     worker = _EdgeWorker(_make_layout(shape, layout_type), DTYPE)
-    file_bytes = _attach_edge(worker, shape, layout_type)
-
     cpu_blocks = torch.empty(worker.cpu_kv_layout.kv_shape, dtype=DTYPE)
     _seed(cpu_blocks)
     golden = cpu_blocks.clone()
-    worker.cpu_blocks = cpu_blocks
+    geometry, file_bytes = _build_edge(worker, cpu_blocks, shape, layout_type)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         be = NixlFileBackend("POSIX", _make_files(tmpdir, file_bytes))
-        be.attach(worker)
+        be.attach(worker, geometry)
         assert worker.registered == ["nixl_cpu_pool"]
-        assert worker._bytes_per_block == (
+        # The engine reports its own whole-block size; on this edge it must
+        # agree with what the edge's native engine would have moved.
+        assert be.bytes_per_block == (
             be.chunk_size_in_bytes * be.num_layers * be.kv_dim)
+        assert be.bytes_per_block == geometry.bytes_per_block
 
         ids = torch.arange(NUM_BLOCKS, dtype=torch.int64)
         moved = be.transfer(worker, _Op(TransferType.H2DISK, NUM_BLOCKS), ids, ids)
@@ -237,16 +277,14 @@ def test_nixl_layer_range_transfers_only_that_range():
     _require("POSIX")
     shape = (4, 1, 576, 1)
     worker = _EdgeWorker(_make_layout(shape, "LAYERFIRST"), DTYPE)
-    file_bytes = _attach_edge(worker, shape, "LAYERFIRST")
-
     cpu_blocks = torch.empty(worker.cpu_kv_layout.kv_shape, dtype=DTYPE)
     _seed(cpu_blocks)
     golden = cpu_blocks.clone()
-    worker.cpu_blocks = cpu_blocks
+    geometry, file_bytes = _build_edge(worker, cpu_blocks, shape, "LAYERFIRST")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         be = NixlFileBackend("POSIX", _make_files(tmpdir, file_bytes))
-        be.attach(worker)
+        be.attach(worker, geometry)
         ids = torch.arange(NUM_BLOCKS, dtype=torch.int64)
         be.transfer(worker, _Op(TransferType.H2DISK, NUM_BLOCKS), ids, ids)
         cpu_blocks.zero_()

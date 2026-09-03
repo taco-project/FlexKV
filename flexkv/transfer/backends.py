@@ -58,6 +58,7 @@ import torch
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferType
+from flexkv.transfer.geometry import EdgeGeometry, HostSide
 from flexkv.external.mooncake_fault_inject import (
     inject_mooncake_fault,
     is_mooncake_fault_inject_enabled,
@@ -103,14 +104,36 @@ class StorageBackend(ABC):
     #: the ids are consumed by CUDA; a pure-host engine sets this False.
     needs_pinned_block_ids: bool = True
 
-    def attach(self, worker: "TransferWorkerBase") -> None:
+    #: Whole-block bytes *this engine* moves, when that differs from what the
+    #: edge's native engine would move.  Set in ``attach``; 0 means "same as
+    #: the edge", and the worker's ``EdgeGeometry.bytes_per_block`` stands.
+    #: Only feeds the bandwidth figure in the transfer trace.
+    #:
+    #: This used to be a write-back onto ``worker._bytes_per_block``, which
+    #: made that worker attribute mean different things depending on which
+    #: engine had attached -- the one direction a backend must not push in.
+    bytes_per_block: int = 0
+
+    def attach(
+        self, worker: "TransferWorkerBase", geometry: "EdgeGeometry"
+    ) -> None:
         """Open sessions / register memory.  Called once, at worker init.
 
         Runs after the worker has bound its CUDA device and imported its IPC
-        tensors, so it is safe to touch CUDA here.  A backend that needs
-        geometry the worker did not compute derives it here and stores it on
-        itself -- not on the worker, whose attributes describe the edge and
-        must mean the same thing for every backend of that edge.
+        tensors, so it is safe to touch CUDA here.
+
+        ``geometry`` is the edge, in the terms of ``geometry.py``: which sides
+        exist, their layouts and pointers, and their per-chunk strides where a
+        uniform chunk exists at all.  Read it rather than the worker's
+        attributes -- those are named differently on different workers for the
+        same quantity, and are simply absent under a heterogeneous layout.
+        ``worker`` remains available for the few things that are not geometry
+        (``worker_id`` for logs, ``_register_host_tensor``).
+
+        A backend that needs geometry the worker did not compute derives it
+        here and stores it on itself, never back onto the worker: the worker's
+        numbers describe the edge and must mean the same thing for every
+        engine that plugs into it.
         """
 
     #: Whether this backend reports *per-block* outcomes rather than an
@@ -221,34 +244,37 @@ class NixlFileBackend(StorageBackend):
         self._extra_config = nixl_extra_config or {}
         self._session: Any = None
 
-    def attach(self, worker: "TransferWorkerBase") -> None:
+    def attach(
+        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
+    ) -> None:
         from flexkv.transfer.nixlutil import NixlAgentSession
 
-        if getattr(worker, "has_multi_group", False):
-            raise ValueError(
-                f"NIXL {self.nixl_backend} does not support heterogeneous "
-                "(multi-group) KV layouts; the per-chunk addressing below "
-                "assumes one uniform (layer, kv) chunk size"
-            )
-        self.num_layers = worker.num_layers
-        self.kv_dim = worker.kv_dim
+        self.num_layers = geometry.num_layers
+        self.kv_dim = geometry.kv_dim
 
         # SSD side: identical geometry for every FILE plugin, and identical to
-        # what the native engine of this edge uses -- read it off the worker.
-        self.ssd_layer_stride_in_bytes = worker.ssd_layer_stride_in_bytes
-        self.ssd_kv_stride_in_bytes = worker.ssd_kv_stride_in_bytes
-        self.ssd_block_stride_in_bytes = worker.ssd_block_stride_in_bytes
+        # what the native engine of this edge uses -- read it off the edge.
+        # ``require_strides`` is where a heterogeneous layout is refused: there
+        # is no single (layer, kv) chunk for the addressing below to use.
+        ssd = geometry.require_ssd(f"NIXL {self.nixl_backend}")
+        ssd_strides = ssd.require_strides(f"NIXL {self.nixl_backend}")
+        self.ssd_layer_stride_in_bytes = ssd_strides.layer_stride
+        self.ssd_kv_stride_in_bytes = ssd_strides.kv_stride
+        self.ssd_block_stride_in_bytes = ssd.block_stride
 
         self._session = NixlAgentSession(self.nixl_backend, self._extra_config)
         if not self._session.prepare_all_ssd_files(self.ssd_files):
             raise RuntimeError("NIXL: prepare_all_ssd_files failed")
 
         if self.is_gpu_plugin:
-            self._attach_gpu(worker)
+            self._attach_gpu(geometry)
         else:
-            self._attach_cpu(worker)
+            self._attach_cpu(worker, geometry)
 
-        worker._bytes_per_block = (
+        # The engine moves one (layer, kv) chunk at a time on both sides, so
+        # a whole block is the product -- the same figure the native engine of
+        # this edge reports, but stated in this engine's own terms.
+        self.bytes_per_block = (
             self.chunk_size_in_bytes * self.num_layers * self.kv_dim
         )
         flexkv_logger.info(
@@ -257,19 +283,20 @@ class NixlFileBackend(StorageBackend):
             f"kv_dim={self.kv_dim}"
         )
 
-    def _attach_gpu(self, worker: "TransferWorkerBase") -> None:
+    def _attach_gpu(self, geometry: EdgeGeometry) -> None:
         """GDS_MT: bind to the single device's tensors and strides.
 
         ``enable_nixl`` is validated to ``effective_tp_size_per_node == 1``
-        (``KVTaskManager``), so the worker's per-device lists hold exactly one
+        (``KVTaskManager``), so the edge's per-device lists hold exactly one
         entry and index 0 is the whole TP group.
         """
-        if worker.num_gpus != 1:
+        gpu = geometry.require_gpu(f"NIXL {self.nixl_backend}")
+        if gpu.num_gpus != 1:
             raise RuntimeError(
                 f"NIXL {self.nixl_backend} requires a single-GPU worker, got "
-                f"num_gpus={worker.num_gpus}"
+                f"num_gpus={gpu.num_gpus}"
             )
-        self.gpu_blocks = worker.gpu_blocks[0]
+        self.gpu_blocks = gpu.blocks[0]
         n = len(self.gpu_blocks)
         # How the framework laid its KV tensors out: one fused tensor, one per
         # layer, or one per (layer, kv). The native engine derives the same
@@ -283,10 +310,11 @@ class NixlFileBackend(StorageBackend):
         else:
             raise ValueError(f"Invalid GPU block count for NIXL: {n}")
 
-        self.gpu_kv_stride_in_bytes = worker.gpu_kv_strides_in_bytes[0]
-        self.gpu_block_stride_in_bytes = worker.gpu_block_strides_in_bytes[0]
-        self.gpu_layer_stride_in_bytes = worker.gpu_layer_strides_in_bytes[0]
-        self.chunk_size_in_bytes = worker.gpu_chunk_sizes_in_bytes[0]
+        dev = gpu.require_strides(f"NIXL {self.nixl_backend}")[0]
+        self.gpu_kv_stride_in_bytes = dev.kv_stride
+        self.gpu_block_stride_in_bytes = dev.block_stride
+        self.gpu_layer_stride_in_bytes = dev.layer_stride
+        self.chunk_size_in_bytes = dev.chunk_bytes
 
         # NIXL VRAM xfers run on a stream of our own so they do not serialize
         # behind whatever the default stream is doing.
@@ -294,13 +322,17 @@ class NixlFileBackend(StorageBackend):
         if not self._session.prepare_vram_gpu(self.gpu_blocks):
             raise RuntimeError("NIXL: prepare_vram_gpu failed")
 
-    def _attach_cpu(self, worker: "TransferWorkerBase") -> None:
-        """POSIX / HF3FS: bind to the worker's CPU pool."""
-        self.cpu_blocks = worker.cpu_blocks
-        self.mem_layer_stride_in_bytes = worker.cpu_layer_stride_in_bytes
-        self.mem_kv_stride_in_bytes = worker.cpu_kv_stride_in_bytes
-        self.mem_block_stride_in_bytes = worker.block_stride_in_bytes
-        self.chunk_size_in_bytes = worker.chunk_size_in_bytes
+    def _attach_cpu(
+        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
+    ) -> None:
+        """POSIX / HF3FS: bind to the edge's CPU pool."""
+        cpu = geometry.require_cpu(f"NIXL {self.nixl_backend}")
+        cpu_strides = cpu.require_strides(f"NIXL {self.nixl_backend}")
+        self.cpu_blocks = cpu.blocks
+        self.mem_layer_stride_in_bytes = cpu_strides.layer_stride
+        self.mem_kv_stride_in_bytes = cpu_strides.kv_stride
+        self.mem_block_stride_in_bytes = cpu.block_stride
+        self.chunk_size_in_bytes = cpu_strides.chunk_bytes
         gib = self.cpu_blocks.numel() * self.cpu_blocks.element_size() / (1024 ** 3)
         flexkv_logger.info(
             f"[worker {worker.worker_id}] {self.name}: pinning CPU pool "
@@ -474,7 +506,9 @@ class PcfsRemoteBackend(StorageBackend):
         self.round_robin = 1
         self.pcfs: Any = None
 
-    def attach(self, worker: "TransferWorkerBase") -> None:
+    def attach(
+        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
+    ) -> None:
         from flexkv import c_ext
         # Deliberately the ``worker`` façade, not ``workers``: this is a c_ext
         # entry point re-exported there, resolved per call so a test can
@@ -487,15 +521,16 @@ class PcfsRemoteBackend(StorageBackend):
                 "transfer_kv_blocks_remote not available, please build with "
                 "FLEXKV_ENABLE_CFS=1")
 
-        cpu_layout = worker.cpu_kv_layout
+        cpu = geometry.require_cpu(self.name)
+        cpu_layout = cpu.layout
         remote_layout = self.remote_kv_layout
-        itemsize = worker.dtype.itemsize
+        itemsize = geometry.dtype.itemsize
 
         if cpu_layout.type != remote_layout.type:
             raise ValueError(
                 f"CPU layout {cpu_layout.type} and remote layout "
                 f"{remote_layout.type} must match")
-        if worker.has_multi_group and cpu_layout.type != KVCacheLayoutType.BLOCKFIRST:
+        if geometry.has_multi_group and cpu_layout.type != KVCacheLayoutType.BLOCKFIRST:
             raise ValueError(
                 "Multi-group CPU/remote transfer requires BLOCKFIRST layouts")
 
@@ -546,7 +581,14 @@ class PcfsRemoteBackend(StorageBackend):
             remote_kv_stride // self.num_remote_files)
         self.remote_block_stride_in_bytes = self.block_size * itemsize
         self.chunk_size_in_bytes = self.block_size * itemsize
-        worker._bytes_per_block = (
+        # Resolved once here rather than per transfer: the CPU pool is fixed
+        # for the worker's lifetime, and this is the base every chunk offset
+        # below is added to.
+        self.cpu_base_ptr = int(cpu.layer_ptrs[0].item())
+        # In this engine's own terms, which under BLOCKFIRST is one flattened
+        # block rather than num_layer*kv_dim chunks -- the same total either
+        # way, stated the way this engine addresses it.
+        self.bytes_per_block = (
             self.chunk_size_in_bytes * self.num_layers * self.kv_dim)
 
         cfg = self.remote_config_custom
@@ -605,7 +647,7 @@ class PcfsRemoteBackend(StorageBackend):
                 f"Invalid transfer type: {transfer_type} for PcfsRemoteBackend")
 
         layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
-        cpu_base_ptr = worker.cpu_layer_ptrs[0].item()
+        cpu_base_ptr = self.cpu_base_ptr
         src_block_node_ids = op.src_block_node_ids
 
         if self.enable_pcfs_sharing and transfer_type == TransferType.REMOTE2H:
@@ -893,24 +935,23 @@ class MooncakeStoreBackend(StorageBackend):
         self.total_layers = int(
             getattr(cache_config, 'mooncake_store_total_layers', 0) or 0)
 
-    def attach(self, worker: "TransferWorkerBase") -> None:
+    def attach(
+        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
+    ) -> None:
         from flexkv.external.mooncake_store_utils import (
             MooncakeStoreClient,
             MooncakeStoreConfig,
         )
 
-        cpu_layout = worker.cpu_kv_layout
+        cpu = geometry.require_cpu(self.name)
+        cpu_layout = cpu.layout
         assert cpu_layout.type == KVCacheLayoutType.BLOCKFIRST
-        # Opaque whole-block I/O. Multi-group BLOCKFIRST stores bytes_per_block
-        # directly in kv_shape[1] (via get_block_stride()), so it must not be
-        # multiplied by itemsize; single-group layouts count elements.
-        if cpu_layout.layer_groups is not None:
-            self.block_size_bytes = int(cpu_layout.get_block_stride())
-        else:
-            self.block_size_bytes = int(
-                cpu_layout.get_elements_per_block() * worker.dtype.itemsize)
+        # Opaque whole-block I/O, so this engine reads the edge's block stride
+        # and never its per-chunk strides -- which is why it works under a
+        # heterogeneous layout, where those strides do not exist.
+        self.block_size_bytes = cpu.block_stride
 
-        cpu_blocks = worker.cpu_blocks
+        cpu_blocks = cpu.blocks
         self._cpu_buffer = (
             cpu_blocks[0] if isinstance(cpu_blocks, (list, tuple)) else cpu_blocks)
         # No worker._register_host_tensor here: Mooncake owns the RDMA
@@ -927,13 +968,12 @@ class MooncakeStoreBackend(StorageBackend):
         )
         self.mooncake_client = MooncakeStoreClient(store_config)
         self._registered_regions = _register_mooncake_regions(
-            self.mooncake_client, self._registration_regions(worker))
-        worker._bytes_per_block = self.block_size_bytes
+            self.mooncake_client, self._registration_regions(cpu))
+        # One opaque value per block, so a block is exactly what is stored.
+        self.bytes_per_block = self.block_size_bytes
 
-    def _registration_regions(
-        self, worker: "TransferWorkerBase"
-    ) -> List[Tuple[int, int]]:
-        """The MRs to register for this worker's CPU pool.
+    def _registration_regions(self, cpu: HostSide) -> List[Tuple[int, int]]:
+        """The MRs to register for this edge's CPU pool.
 
         One region unless the pool is HugePage-backed and larger than the
         transport's MR limit, in which case it is split under
@@ -948,7 +988,7 @@ class MooncakeStoreBackend(StorageBackend):
         # ``mapped_size`` is the HugePage mapping's aligned length, which is
         # >= the logical pool. Only a HugePage handle knows it; a plain tensor
         # pool maps exactly what it holds.
-        mapped_size = getattr(worker, "cpu_blocks_mapped_size", None)
+        mapped_size = cpu.mapped_size
         if mapped_size is None:
             return [(base_ptr, logical_size)]
 

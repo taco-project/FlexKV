@@ -34,6 +34,7 @@ from flexkv.common.memory_handle import (
 from flexkv.common.transfer import TransferType, get_nvtx_range_color
 from flexkv.transfer import trace
 from flexkv.transfer.backends import StorageBackend
+from flexkv.transfer.geometry import EdgeGeometry
 from flexkv.transfer.host_buffer import (
     cudaHostRegister,
     safe_cuda_host_unregister,
@@ -111,6 +112,9 @@ class TransferWorkerBase(ABC):
         # Pluggable I/O engine for this worker's edge; None = the worker's own
         # native ``_transfer_impl``. See flexkv/transfer/backends.py.
         self._backend: Optional[StorageBackend] = None
+        # What this worker publishes about its edge, built by the subclass and
+        # handed to ``attach``. See flexkv/transfer/geometry.py.
+        self._geometry: Optional[EdgeGeometry] = None
 
     def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
         """cudaHostRegister and track for paired unregister in shutdown()."""
@@ -382,16 +386,49 @@ class TransferWorkerBase(ABC):
             f"bytes through a StorageBackend (see backends.py)"
         )
 
-    def _attach_backend(self, backend: Optional["StorageBackend"]) -> None:
+    def _attach_backend(
+        self,
+        backend: Optional["StorageBackend"],
+        geometry: EdgeGeometry,
+    ) -> None:
         """Bind a pluggable I/O engine, if this worker was given one.
 
-        Call at the *end* of ``__init__``: the backend reads the edge geometry
-        the worker just derived, and may open sessions that assume the CUDA
-        device is already bound.
+        Call at the *end* of ``__init__``: ``geometry`` describes the edge the
+        worker just derived, and ``attach`` may open sessions that assume the
+        CUDA device is already bound.
+
+        The geometry is recorded even when there is no backend, because it is
+        also this worker's own statement of what its edge is -- ``bytes_per_block``
+        for the transfer trace comes from it either way.
         """
+        self._geometry = geometry
         self._backend = backend
         if backend is not None:
-            backend.attach(self)
+            backend.attach(self, geometry)
+
+    def _trace_bytes_per_block(self) -> int:
+        """Whole-block bytes for the bandwidth figure in the transfer trace.
+
+        The engine that is actually moving the bytes gets the first say: PCFS
+        flattens a BLOCKFIRST block and mooncake-store writes one opaque value,
+        so what they move per block is not what this edge's native engine
+        would. A backend that has no separate answer leaves ``bytes_per_block``
+        at 0 and the edge's own number stands.
+
+        Backends used to write this back onto the worker, which meant a worker
+        attribute silently meant something different depending on which engine
+        had attached to it.
+        """
+        backend = getattr(self, "_backend", None)
+        if backend is not None and backend.bytes_per_block:
+            return backend.bytes_per_block
+        geometry = getattr(self, "_geometry", None)
+        if geometry is not None:
+            return geometry.bytes_per_block
+        # Workers that take no backend (GPU<->CPU, PEER2CPU) publish no
+        # geometry, because nothing would read it; they set the attribute
+        # directly and this is the only thing that reads it.
+        return int(getattr(self, "_bytes_per_block", 0))
 
     def _run_backend(
         self, transfer_op: WorkerTransferOp
@@ -676,7 +713,7 @@ class TransferWorkerBase(ABC):
                             transfer_start_ns,
                             launched_ns,
                             self.worker_id,
-                            getattr(self, "_bytes_per_block", 0),
+                            self._trace_bytes_per_block(),
                             getattr(self, "kv_dim", 2),
                             is_h2d,
                         )
