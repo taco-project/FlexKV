@@ -33,7 +33,7 @@ static size_t transfer_kv_blocks_ans_binding(
     int64_t chunk_size_in_bytes,
     int start_layer_id,
     int num_layers,
-    bool kv_dim,
+    int kv_dim,
     int gpu_block_type,
     int64_t cpu_size_table_ptr,
     int64_t cpu_size_table_block_stride,
@@ -44,6 +44,13 @@ static size_t transfer_kv_blocks_ans_binding(
               "cpu_block_id_tensor must be int64");
   TORCH_CHECK(gpu_tensor_ptrs_tensor.dtype() == torch::kInt64,
               "gpu_tensor_ptrs_tensor must be int64");
+  // This parameter was declared ``bool`` here (and only here -- every other
+  // kv_dim in the tree is int), so pybind11 folded MHA's 2 down to true and
+  // the implicit widening handed the kernel a 1. Half of every MHA batch
+  // then silently did not exist. Fail loudly on anything unexpected rather
+  // than degrade again.
+  TORCH_CHECK(kv_dim == 1 || kv_dim == 2,
+              "kv_dim must be 1 (MLA) or 2 (MHA/GQA), got ", kv_dim);
 
   int num_blocks = gpu_block_id_tensor.numel();
   int64_t *gpu_block_ids = static_cast<int64_t*>(gpu_block_id_tensor.data_ptr());
@@ -121,7 +128,7 @@ static size_t transfer_kv_blocks_ans_comp_binding(
     int64_t chunk_size_in_bytes,
     int start_layer_id,
     int num_layers,
-    bool kv_dim,
+    int kv_dim,
     int gpu_block_type,
     int64_t cpu_size_table_ptr,
     int64_t cpu_size_table_block_stride,
@@ -151,7 +158,7 @@ static size_t transfer_kv_blocks_ans_decomp_binding(
     int64_t chunk_size_in_bytes,
     int start_layer_id,
     int num_layers,
-    bool kv_dim,
+    int kv_dim,
     int gpu_block_type,
     int64_t cpu_size_table_ptr,
     int64_t cpu_size_table_block_stride,
