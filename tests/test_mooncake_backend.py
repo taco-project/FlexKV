@@ -181,6 +181,7 @@ def _mooncake_cache_config(**overrides):
         mooncake_store_pp_rank=0, mooncake_store_pp_size=1,
         mooncake_store_node_layer_start=0, mooncake_store_node_layer_end=0,
         mooncake_store_total_layers=0,
+        mooncake_mr_split_policy="strict",
     )
     base.update(overrides)
     return SimpleNamespace(**base)
