@@ -84,14 +84,23 @@ void CUDART_CB layer_done_host_callback(void *user_data) {
 } // namespace
 
 LayerNotifier::~LayerNotifier() {
-  stop_polling();
+  shutdown_polling();
   destroy_events();
+  release_event_pool();
 }
 
 void LayerNotifier::reset(LayerNotifyMode mode,
                           const std::vector<int> &device_ids, int counter_id) {
-  stop_polling();
-  destroy_events();
+  quiesce_polling();
+  // Not destroy_events(): the events are pooled and outlive the transfer.
+  // Only the per-transfer bookkeeping below is rewound. An event that was
+  // recorded last time is in the "completed" state, and cudaEventRecord
+  // overwrites it, so there is nothing to clear.
+  if (device_ids != pool_device_ids_) {
+    // Different rank set (or the first transfer): the pool's events were
+    // created on the old devices, so they cannot be recorded on the new ones.
+    release_event_pool();
+  }
   mode_ = mode;
   device_ids_ = device_ids;
   counter_id_ = counter_id;
@@ -99,7 +108,6 @@ void LayerNotifier::reset(LayerNotifyMode mode,
   batch_of_layer_.assign(table_.num_layers() > 0 ? table_.num_layers() : 0, -1);
   poll_stop_.store(false, std::memory_order_release);
   poll_next_.store(0, std::memory_order_release);
-  poll_done_.store(false, std::memory_order_release);
   poll_failed_.store(false, std::memory_order_release);
   {
     std::lock_guard<std::mutex> lk(poll_error_mtx_);
@@ -109,6 +117,54 @@ void LayerNotifier::reset(LayerNotifyMode mode,
 
 void LayerNotifier::post_empty(int layer) {
   table_.post(counter_id_, layer);
+}
+
+cudaEvent_t LayerNotifier::event_for(int layer, int rank) {
+  const int ranks = static_cast<int>(device_ids_.size());
+  if (pool_ranks_ != ranks || layer >= pool_layers_) {
+    // Grow to cover this layer, keeping what is already created. A rank-count
+    // change cannot be a grow -- reset() released the pool for that case.
+    const int new_layers = std::max(layer + 1, pool_layers_ * 2);
+    std::vector<cudaEvent_t> grown(static_cast<size_t>(new_layers) * ranks,
+                                   nullptr);
+    for (int l = 0; l < pool_layers_; ++l) {
+      for (int r = 0; r < pool_ranks_ && r < ranks; ++r) {
+        grown[static_cast<size_t>(l) * ranks + r] =
+            event_pool_[static_cast<size_t>(l) * pool_ranks_ + r];
+      }
+    }
+    event_pool_.swap(grown);
+    pool_layers_ = new_layers;
+    pool_ranks_ = ranks;
+    pool_device_ids_ = device_ids_;
+  }
+  cudaEvent_t &slot = event_pool_[static_cast<size_t>(layer) * ranks + rank];
+  if (slot == nullptr) {
+    cudaSetDevice(device_ids_[rank]);
+    cudaEventCreateWithFlags(&slot, cudaEventDisableTiming);
+  }
+  return slot;
+}
+
+void LayerNotifier::release_event_pool() {
+  if (!pool_device_ids_.empty()) {
+    int prev_device = 0;
+    cudaGetDevice(&prev_device);
+    for (int l = 0; l < pool_layers_; ++l) {
+      for (int r = 0; r < pool_ranks_; ++r) {
+        cudaEvent_t e = event_pool_[static_cast<size_t>(l) * pool_ranks_ + r];
+        if (e != nullptr) {
+          cudaSetDevice(pool_device_ids_[r]);
+          cudaEventDestroy(e);
+        }
+      }
+    }
+    cudaSetDevice(prev_device);
+  }
+  event_pool_.clear();
+  pool_layers_ = 0;
+  pool_ranks_ = 0;
+  pool_device_ids_.clear();
 }
 
 void LayerNotifier::begin_layer(int layer) {
@@ -126,8 +182,7 @@ void LayerNotifier::begin_layer(int layer) {
   if (mode_ == LayerNotifyMode::POLLING) {
     b.per_rank_events.resize(device_ids_.size(), nullptr);
     for (size_t r = 0; r < device_ids_.size(); ++r) {
-      cudaSetDevice(device_ids_[r]);
-      cudaEventCreateWithFlags(&b.per_rank_events[r], cudaEventDisableTiming);
+      b.per_rank_events[r] = event_for(layer, static_cast<int>(r));
     }
   } else if (table_.enabled()) {
     // One counter shared by this layer's ranks; the last callback frees it.
@@ -165,13 +220,38 @@ void LayerNotifier::arm() {
       batches_.empty()) {
     return;
   }
-  poll_thread_ = std::thread(&LayerNotifier::polling_loop, this);
+  {
+    std::lock_guard<std::mutex> lk(poll_mtx_);
+    if (!poll_thread_.joinable()) {
+      poll_thread_ = std::thread(&LayerNotifier::polling_loop, this);
+    }
+    poll_active_ = true;
+  }
+  poll_cv_.notify_one();
 }
 
 void LayerNotifier::polling_loop() {
-  int prev_device = 0;
-  cudaGetDevice(&prev_device);
+  // No device to save and restore: this thread is ours for the object's whole
+  // life, and run_polling_round() sets the device it needs on every query.
+  for (;;) {
+    {
+      // Park until arm() hands over a round, or the destructor asks us out.
+      std::unique_lock<std::mutex> lk(poll_mtx_);
+      poll_cv_.wait(lk, [&] { return poll_active_ || poll_exit_; });
+      if (poll_exit_) {
+        break;
+      }
+    }
+    run_polling_round();
+    {
+      std::lock_guard<std::mutex> lk(poll_mtx_);
+      poll_active_ = false;
+    }
+    poll_cv_.notify_all();
+  }
+}
 
+void LayerNotifier::run_polling_round() {
   while (!poll_stop_.load(std::memory_order_acquire)) {
     const int next = poll_next_.load(std::memory_order_acquire);
     if (next >= static_cast<int>(batches_.size())) {
@@ -221,31 +301,28 @@ void LayerNotifier::polling_loop() {
       std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
   }
-
-  cudaSetDevice(prev_device);
-  poll_done_.store(true, std::memory_order_release);
 }
 
 bool LayerNotifier::wait(double timeout_s, std::string *error_out) {
   if (mode_ != LayerNotifyMode::POLLING || !poll_thread_.joinable()) {
     return !poll_failed_.load(std::memory_order_acquire);
   }
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::duration<double>(timeout_s);
-  while (!poll_done_.load(std::memory_order_acquire)) {
-    if (std::chrono::steady_clock::now() >= deadline) {
+  {
+    std::unique_lock<std::mutex> lk(poll_mtx_);
+    const bool drained =
+        poll_cv_.wait_for(lk, std::chrono::duration<double>(timeout_s),
+                          [&] { return !poll_active_; });
+    if (!drained) {
       if (error_out != nullptr) {
         *error_out = "per-layer notification did not drain within " +
                      std::to_string(timeout_s) + "s";
       }
-      // Leave the thread running: it still references the batch events, and
-      // the next reset()/destructor joins it. Returning false lets the caller
-      // fail the op rather than hang.
+      // Leave the round running: it still references the batch events, and
+      // the next reset() quiesces it. Returning false lets the caller fail
+      // the op rather than hang.
       return false;
     }
-    std::this_thread::sleep_for(std::chrono::microseconds(200));
   }
-  poll_thread_.join();
   if (poll_failed_.load(std::memory_order_acquire)) {
     if (error_out != nullptr) {
       std::lock_guard<std::mutex> lk(poll_error_mtx_);
@@ -256,30 +333,36 @@ bool LayerNotifier::wait(double timeout_s, std::string *error_out) {
   return true;
 }
 
-void LayerNotifier::stop_polling() {
-  poll_stop_.store(true, std::memory_order_release);
-  if (poll_thread_.joinable()) {
-    poll_thread_.join();
+void LayerNotifier::quiesce_polling() {
+  if (!poll_thread_.joinable()) {
+    return;
   }
+  poll_stop_.store(true, std::memory_order_release);
+  std::unique_lock<std::mutex> lk(poll_mtx_);
+  poll_cv_.wait(lk, [&] { return !poll_active_; });
+}
+
+void LayerNotifier::shutdown_polling() {
+  if (!poll_thread_.joinable()) {
+    return;
+  }
+  poll_stop_.store(true, std::memory_order_release);
+  {
+    std::unique_lock<std::mutex> lk(poll_mtx_);
+    poll_cv_.wait(lk, [&] { return !poll_active_; });
+    poll_exit_ = true;
+  }
+  poll_cv_.notify_all();
+  poll_thread_.join();
 }
 
 void LayerNotifier::destroy_events() {
-  if (device_ids_.empty()) {
-    batches_.clear();
-    return;
-  }
-  int prev_device = 0;
-  cudaGetDevice(&prev_device);
+  // The events themselves belong to event_pool_ and are reused across
+  // transfers; a LayerBatch only borrows them. So this drops the borrowed
+  // handles and the batch list -- release_event_pool() is what frees.
   for (LayerBatch &b : batches_) {
-    for (size_t r = 0; r < b.per_rank_events.size(); ++r) {
-      if (b.per_rank_events[r] != nullptr) {
-        cudaSetDevice(device_ids_[r < device_ids_.size() ? r : 0]);
-        cudaEventDestroy(b.per_rank_events[r]);
-      }
-    }
     b.per_rank_events.clear();
   }
-  cudaSetDevice(prev_device);
   batches_.clear();
 }
 
