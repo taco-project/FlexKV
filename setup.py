@@ -514,4 +514,5 @@ setup(
     },
     #python_requires=">=3.8",
     python_requires=">=3.6",
+    entry_points={"console_scripts": ["flexkv=flexkv.cli.main:main"]},
 )
