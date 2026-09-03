@@ -6,6 +6,30 @@ DEFUALT_MHA_CONFIG = dict(num_head=8, head_dim=128)
 DEFUALT_MLA_SHAPE = dict(num_head=1, head_dim=576)
 
 
+def fp8_ans_supported() -> bool:
+    """Does the linked nvCOMP have native FP8 E4M3 ANS (>= 5.3)?
+
+    Asked by constructing the context the tests would use, because the version
+    gate lives in C++ (csrc/compression/ans/nvcomp_ans.cu:82) and is not
+    exported. An older nvCOMP is an environment limit, not a defect, so the
+    fp8 cells skip rather than fail -- the way the tp cells already skip when
+    the box has too few GPUs.
+    """
+    try:
+        from flexkv.c_ext import ANSTransferContext
+        from flexkv.transfer.compression.ans import ans_utils
+    except ImportError:
+        return False
+    chunk = 8 * 1024
+    dt = ans_utils.data_type(torch.float8_e4m3fn)
+    batch, _ = ans_utils.get_nvcomp_batch_size(chunk, data_type=dt)
+    try:
+        ANSTransferContext(batch, chunk, dt)
+    except Exception:
+        return False
+    return True
+
+
 def resolve_case(chunk_size_per_device, tp, kv_dim, num_kv_heads, dtype):
     elem = dtype.itemsize
     shape = DEFUALT_MLA_SHAPE if kv_dim == 1 else DEFUALT_MHA_CONFIG

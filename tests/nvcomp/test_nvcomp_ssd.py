@@ -10,6 +10,7 @@ from flexkv.transfer.compression.ans import ans_utils
 from nvcomp_common_utils import (
     make_gpu_cache,
     resolve_case,
+    fp8_ans_supported,
 )
 
 try:
@@ -141,6 +142,8 @@ def test_ssd_roundtrip_non_tp(
         pytest.skip("CUDA is not available")
     if (kv_dim == 1) != (chunk_size_per_device == 18 * 1024):
         pytest.skip("18KB is MLA-only; 8/16/32KB are MHA-only")
+    if dtype == torch.float8_e4m3fn and not fp8_ans_supported():
+        pytest.skip("native FP8 E4M3 ANS needs nvCOMP >= 5.3")
 
     case = resolve_case(chunk_size_per_device, tp_size, kv_dim, num_kv_heads, dtype)
     num_heads, head_size = case["num_head"], case["head_dim"]
@@ -362,6 +365,8 @@ def test_ssd_roundtrip_tp(
         pytest.skip(f"tp_size={tp_size} needs {tp_size} GPUs")
     if (kv_dim == 1) != (chunk_size_per_device == 18 * 1024):
         pytest.skip("18KB is MLA-only; 8/16/32KB are MHA-only")
+    if dtype == torch.float8_e4m3fn and not fp8_ans_supported():
+        pytest.skip("native FP8 E4M3 ANS needs nvCOMP >= 5.3")
 
     case = resolve_case(chunk_size_per_device, tp_size, kv_dim, num_kv_heads, dtype)
     num_heads, head_size = case["num_head"], case["head_dim"]
@@ -514,6 +519,7 @@ def test_ssd_roundtrip_tp(
             0,
             num_layers,
             kv_dim,
+            num_kv_heads,
             *st_args,
         )
         for rank in range(tp_size):
