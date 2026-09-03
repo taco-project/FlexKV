@@ -47,6 +47,11 @@ from flexkv.transfer.workers.runtime import (
     import_tensor_handles,
 )
 
+# Stand-in for the block ids of a cached layerwise request, which are rebound
+# on every submit. Never read: a plan is only handed to cpp after every
+# request's two tensors have been overwritten with the op's own.
+_EMPTY_BLOCK_IDS = torch.empty(0, dtype=torch.int64)
+
 
 def _validate_multi_group_chunk_layout(
     group_chunk_size: int,
@@ -532,6 +537,10 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             completion = CompletionContract.from_str(completion)
         self._completion = completion
         self._layer_milestones = self._build_layer_milestones()
+        # {has_swa: (requests, pool_of, empty_layers)}; see _layerwise_plan.
+        self._layerwise_plans: Dict[
+            bool, Tuple[List["c_ext.RegionRequest"], List[PoolId], List[int]]
+        ] = {}
         # Layers this model has no state for at all. Reported here only; the
         # list that gets posted is per transfer (see _layerwise_transfer_impl),
         # because an op that carries no SWA blocks leaves more layers uncovered
@@ -1001,6 +1010,74 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 self.tp_transfer_thread_group.wait_all_streams()
 
 
+    def _layerwise_plan(
+        self, has_swa: bool,
+    ) -> Tuple[List["c_ext.RegionRequest"], List[PoolId], List[int]]:
+        """The request list for a layerwise transfer, built once and reused.
+
+        Everything about these requests except the two block-id tensors is
+        fixed by the worker's geometry: the region index, the local layer, the
+        direction, the CTA count, the share mode. Only which blocks move
+        changes from op to op. So the objects are built the first time a shape
+        is seen and kept -- at DSv4 scale that is 128 ``RegionRequest``
+        constructions plus 11 pybind setter calls each, per transfer, for a
+        result that is byte-identical every time.
+
+        Reuse is safe because ``submit_layerwise`` copies: pybind11's
+        ``type_caster_base`` declares the non-movable ``cast_op_type``, so the
+        vector cast copies each element rather than moving from it, and the
+        objects come back intact. It is also *only* safe while transfers are
+        serialized on this worker's thread -- a second op overwriting the id
+        tensors while the previous one's DMA still reads them would corrupt it.
+        That is the case today: ``_layerwise_transfer_impl`` drains before it
+        returns.
+
+        Keyed on ``has_swa`` because an op with no SWA blocks skips the SWA
+        members entirely, which changes both the request list and the set of
+        layers left empty.
+        """
+        cached = self._layerwise_plans.get(has_swa)
+        if cached is not None:
+            return cached
+
+        requests: List["c_ext.RegionRequest"] = []
+        pool_of: List[PoolId] = []
+        # Layers this transfer will not launch anything for. The consumer waits
+        # on every layer's fd regardless, so these have to be posted up front or
+        # it hangs. It is per shape, not per worker: an op with no SWA blocks
+        # leaves every SWA-only layer uncovered too.
+        empty_layers: List[int] = []
+        for layer, members in enumerate(self._layer_milestones):
+            live = [m for m in members
+                    if has_swa or m[0] is PoolId.FULL_KV]
+            if not live:
+                empty_layers.append(layer)
+                continue
+            for pool_id, region_index, local_layer in live:
+                req = make_requests(
+                    self.region_batch.num_regions,
+                    # Placeholders; every submit rebinds both tensors.
+                    _EMPTY_BLOCK_IDS,
+                    _EMPTY_BLOCK_IDS,
+                    True,  # layerwise is CPU->GPU only
+                    transfer_num_cta=self.transfer_num_cta_h2d,
+                    use_ce_transfer=self.use_ce_transfer_h2d,
+                    share_mode=self._rank_share_mode,
+                    region_indices=[region_index],
+                    layer_id=local_layer,
+                    # PER_LAYER pins this to 1: a coarser batch would post
+                    # layer L's fd only after L+1 had also landed, so the
+                    # consumer would read a layer it was told was ready.
+                    layer_granularity=self._completion.layer_granularity(1),
+                )[0]
+                req.milestone_layer = layer
+                requests.append(req)
+                pool_of.append(pool_id)
+
+        plan = (requests, pool_of, empty_layers)
+        self._layerwise_plans[has_swa] = plan
+        return plan
+
     def _layerwise_transfer_impl(
         self,
         cpu_block_ids: torch.Tensor,
@@ -1033,12 +1110,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 f"[worker {self.worker_id}] layerwise op carries SWA block ids "
                 "but this worker has no SWA pool registered")
 
-        requests = []
-        # Layers this transfer will not launch anything for. The consumer waits
-        # on every layer's fd regardless, so these have to be posted up front or
-        # it hangs. It is a per-transfer list, not a per-worker one: an op with
-        # no SWA blocks leaves every SWA-only layer uncovered too.
-        empty_layers = []
+        requests, pool_of, empty_layers = self._layerwise_plan(has_swa)
         # The layerwise op carries one id pair per pool it touches. Only two
         # exist today, so this is a dict rather than a widening of the op: the
         # cpp entry point takes the two tensors positionally.
@@ -1046,31 +1118,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             PoolId.FULL_KV: (gpu_block_ids, cpu_block_ids),
             PoolId.SWA: (swa_gpu_block_ids, swa_cpu_block_ids),
         }
-        for layer, members in enumerate(self._layer_milestones):
-            live = [m for m in members
-                    if has_swa or m[0] is PoolId.FULL_KV]
-            if not live:
-                empty_layers.append(layer)
-                continue
-            for pool_id, region_index, local_layer in live:
-                pool_gpu_ids, pool_cpu_ids = ids_by_pool[pool_id]
-                req = make_requests(
-                    self.region_batch.num_regions,
-                    pool_gpu_ids,
-                    pool_cpu_ids,
-                    True,  # layerwise is CPU->GPU only
-                    transfer_num_cta=self.transfer_num_cta_h2d,
-                    use_ce_transfer=self.use_ce_transfer_h2d,
-                    share_mode=self._rank_share_mode,
-                    region_indices=[region_index],
-                    layer_id=local_layer,
-                    # PER_LAYER pins this to 1: a coarser batch would post
-                    # layer L's fd only after L+1 had also landed, so the
-                    # consumer would read a layer it was told was ready.
-                    layer_granularity=self._completion.layer_granularity(1),
-                )[0]
-                req.milestone_layer = layer
-                requests.append(req)
+        for req, pool_id in zip(requests, pool_of):
+            req.gpu_block_id_tensor, req.cpu_block_id_tensor = \
+                ids_by_pool[pool_id]
 
         self.region_batch.submit_layerwise(
             requests, empty_layers, counter_id)
