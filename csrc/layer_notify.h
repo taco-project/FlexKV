@@ -31,6 +31,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cuda_runtime.h>
 #include <mutex>
 #include <string>
@@ -135,8 +136,27 @@ private:
     std::atomic<int> *hostfunc_counter = nullptr;
   };
 
+  // A cudaEvent is a driver object, not a value: creating one per (layer,
+  // rank) per transfer costs ~64 create+destroy pairs on a 64-layer model and
+  // buys nothing, because the *shape* of what we wait on never changes across
+  // transfers -- only which layers happen to carry work. So the events live
+  // here, indexed [layer * num_ranks + rank], and reset() rewinds the
+  // bookkeeping instead of freeing them. Grown on demand; released only in
+  // the destructor and when the rank set itself changes.
+  cudaEvent_t event_for(int layer, int rank);
+  void release_event_pool();
+
+  // Outer park/wake loop, run by poll_thread_ for the object's whole life.
   void polling_loop();
-  void stop_polling();
+  // One transfer's worth of sweeping: walk batches_ in order, posting each
+  // layer as its per-rank events complete. Returns when the last layer has
+  // been posted, on a hard CUDA error, or when poll_stop_ is set.
+  void run_polling_round();
+  // Bring the current polling round to a stop and wait for the thread to
+  // leave it. The thread itself stays alive for the next transfer.
+  void quiesce_polling();
+  // Permanently stop and join the polling thread. Destructor only.
+  void shutdown_polling();
   void destroy_events();
 
   LayerEventfdTable table_;
@@ -149,13 +169,29 @@ private:
   // records in the same order it began.
   std::vector<int> batch_of_layer_;
 
+  // Persistent [layer * pool_ranks_ + rank] event pool; see event_for().
+  std::vector<cudaEvent_t> event_pool_;
+  int pool_layers_ = 0;
+  int pool_ranks_ = 0;
+  std::vector<int> pool_device_ids_; // the devices event_pool_ was built on
+
   std::atomic<bool> poll_stop_{false};
   std::atomic<int> poll_next_{0};
-  std::atomic<bool> poll_done_{false};
   std::atomic<bool> poll_failed_{false};
   std::mutex poll_error_mtx_;
   std::string poll_error_msg_;
+
+  // The polling thread is created once and parked between transfers: creating
+  // and joining a thread per transfer is ~40us of kernel work on the critical
+  // path, for a thread whose body is identical every time. ``poll_active_``
+  // is the handshake -- arm() sets it and notifies, the thread clears it when
+  // the last layer has been posted (or on error), and quiesce_polling() waits
+  // for that. ``poll_exit_`` is the one-way shutdown flag.
   std::thread poll_thread_;
+  std::mutex poll_mtx_;
+  std::condition_variable poll_cv_;
+  bool poll_active_ = false;
+  bool poll_exit_ = false;
 };
 
 } // namespace flexkv
