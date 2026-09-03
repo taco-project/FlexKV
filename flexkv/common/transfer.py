@@ -594,7 +594,15 @@ class TransferOpGraph:
                     else:
                         first = block_ids[:max_show].tolist()
                         last = block_ids[-max_show:].tolist()
-                        return f"{first[:-1]}...{last[-1]}] (n={block_ids.size})"
+                        # Explicit indices, not ``[:-1]``/``[-1]``: release
+                        # builds cythonize this module with wraparound=False,
+                        # under which negative indices on a real list are not
+                        # folded to len + i.  The numpy slices above are safe
+                        # (they go through PyObject_GetItem); ``first``/``last``
+                        # are lists and are not.
+                        head = first[:len(first) - 1]
+                        tail = last[len(last) - 1]
+                        return f"{head}...{tail}] (n={block_ids.size})"
 
                 src_str = format_blocks(op.src_block_ids)
                 dst_str = format_blocks(op.dst_block_ids)

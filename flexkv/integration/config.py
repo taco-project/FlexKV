@@ -740,7 +740,10 @@ class FlexKVConfig:
         if self.model_config.pp_size > 1:
             layers_range = mapping.pp_layers(self.model_config.num_layers)
             pp_start_layer = layers_range[0]
-            pp_end_layer = layers_range[-1] + 1
+            # Explicit last index: release builds cythonize this module with
+            # wraparound=False, so ``layers_range[-1]`` on a list reads off the
+            # front instead of folding to len - 1.
+            pp_end_layer = layers_range[len(layers_range) - 1] + 1
         else:
             pp_start_layer = 0
             pp_end_layer = self.model_config.num_layers

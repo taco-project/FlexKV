@@ -788,9 +788,15 @@ def _split_mooncake_registration_regions(
                 f"size={size}, max_mr_size={max_mr_size}"
             )
 
-    if regions[-1][0] + regions[-1][1] != base_ptr + mapped_size:
+    # Explicit last index, not ``regions[-1]``: release builds cythonize this
+    # module with ``wraparound=False``, under which a negative index is NOT
+    # folded to ``len + i`` -- it reads off the front of the list and segfaults.
+    # The pure-Python path is unaffected, so this only ever failed in a
+    # compiled build.
+    last_ptr, last_size = regions[len(regions) - 1]
+    if last_ptr + last_size != base_ptr + mapped_size:
         raise ValueError("Mooncake MR split does not cover mapped extent")
-    if base_ptr + logical_size > regions[-1][0] + regions[-1][1]:
+    if base_ptr + logical_size > last_ptr + last_size:
         raise ValueError("Mooncake MR split does not cover logical KV pool")
     return regions
 
