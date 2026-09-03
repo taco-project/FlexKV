@@ -491,13 +491,23 @@ class PcfsRemoteBackend(StorageBackend):
         remote_layout = self.remote_kv_layout
         itemsize = worker.dtype.itemsize
 
-        if worker.has_multi_group:
-            if (cpu_layout.type != KVCacheLayoutType.BLOCKFIRST
-                    or remote_layout.type != KVCacheLayoutType.BLOCKFIRST):
-                raise ValueError(
-                    "Multi-group CPU/remote transfer requires BLOCKFIRST layouts")
-            # A heterogeneous BLOCKFIRST block is already one byte-flat blob;
-            # present it to the remote kernel as a single MLA-shaped layer.
+        if cpu_layout.type != remote_layout.type:
+            raise ValueError(
+                f"CPU layout {cpu_layout.type} and remote layout "
+                f"{remote_layout.type} must match")
+        if worker.has_multi_group and cpu_layout.type != KVCacheLayoutType.BLOCKFIRST:
+            raise ValueError(
+                "Multi-group CPU/remote transfer requires BLOCKFIRST layouts")
+
+        # The PCFS kernel walks ``base + layer*layer_stride + block*chunk`` and
+        # transfers ``chunk`` bytes -- one value serves as both the block
+        # multiplier and the transfer length, so the addressing it can express
+        # is exactly LAYERFIRST.  Under BLOCKFIRST a block's layers are
+        # contiguous, so flatten the whole block into a single MLA-shaped
+        # "layer": ``block*whole_block`` is then the correct offset, and one
+        # large I/O replaces num_layer*kv_dim small ones.  Multi-group is only
+        # a special case of this -- its block was already a byte-flat blob.
+        if cpu_layout.type == KVCacheLayoutType.BLOCKFIRST:
             self.block_size = cpu_layout.get_block_stride()
             self.num_layers = 1
             self.kv_dim = 1
@@ -519,6 +529,11 @@ class PcfsRemoteBackend(StorageBackend):
                 f"num_remote_blocks_per_file {self.num_remote_blocks_per_file} "
                 f"is not divisible by round_robin {self.round_robin}")
 
+        # Strides are expressed in the flattened terms chosen above, so one
+        # formula covers both layouts: under LAYERFIRST these are the real
+        # per-layer/per-kv strides, and under BLOCKFIRST ``num_layers`` and
+        # ``kv_dim`` are 1, so they never enter the addressing and only size
+        # the file below.
         self.cpu_layer_stride_in_bytes = (
             num_cpu_blocks * self.block_size * itemsize * self.kv_dim)
         self.cpu_kv_stride_in_bytes = num_cpu_blocks * self.block_size * itemsize

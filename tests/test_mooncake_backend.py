@@ -152,18 +152,217 @@ class FakeOp:
 # ---------------------------------------------------------------------------
 # PcfsRemoteBackend.attach arithmetic
 #
-# The engine (libhifs_client_sdk) is not installed on most boxes, so the
-# stride derivation is verified against a hand-computed expectation rather than
-# by running a transfer. These formulas are the ones the old
-# CPURemoteTransferWorker.__init__ carried verbatim.
+# PCFS (libhifs_client_sdk) is not installed on any box we can test on, and
+# builds without ``FLEXKV_ENABLE_CFS=1`` leave ``transfer_kv_blocks_remote``
+# as ``None``, so no e2e run can reach this edge. That makes the geometry
+# worth pinning here, and pinning it *against the kernel's addressing* rather
+# than against the formula that produces it -- restating the formula would
+# have re-asserted the LAYERFIRST-only bug rather than catching it.
+#
+# What the kernel does (csrc/pcfs/pcfs.cpp:304-343), for each layer i and each
+# block b, is:
+#
+#     cpu = cpu_base + i*cpu_layer_stride + b*chunk        (+cpu_kv_stride for V)
+#     rem =            i*remote_layer_stride + b*chunk     (+remote_kv_stride for V)
+#     transfer ``chunk`` bytes
+#
+# ``chunk`` is both the block multiplier and the length, so the only layout it
+# can address natively is LAYERFIRST. Under BLOCKFIRST a block's layers are
+# contiguous and the backend must flatten the block to stay correct.
 # ---------------------------------------------------------------------------
 
 
+def _pcfs_expected_cpu_offsets(layout: KVCacheLayout, dtype: torch.dtype,
+                               block_id: int) -> List[int]:
+    """Byte offsets of every (layer, kv) chunk of ``block_id``, from the layout.
+
+    An oracle derived from ``kv_shape`` alone -- deliberately independent of
+    anything ``attach`` computes.
+    """
+    itemsize = dtype.itemsize
+    chunk = layout.get_chunk_size() * itemsize
+    offsets = []
+    for layer in range(layout.num_layer):
+        for kv in range(layout.kv_dim):
+            if layout.type == KVCacheLayoutType.LAYERFIRST:
+                # [layer, kv, block, ...]
+                idx = ((layer * layout.kv_dim + kv) * layout.num_block
+                       + block_id)
+            else:  # BLOCKFIRST: [block, layer, kv, ...]
+                idx = ((block_id * layout.num_layer + layer) * layout.kv_dim
+                       + kv)
+            offsets.append(idx * chunk)
+    return sorted(offsets)
+
+
+class _StubPcfs:
+    """Records the (offset, ptr, nbytes) triples the kernel would issue."""
+
+    def __init__(self):
+        self.reads: List[tuple] = []
+        self.writes: List[tuple] = []
+
+    def init(self):
+        return True
+
+    def lookup_or_create_file(self, path, size, need_create):
+        self.file_size = size
+        return 1234  # any non-zero nodeid
+
+
+def _run_pcfs_kernel(be: PcfsRemoteBackend, cpu_base: int,
+                     cpu_block_id: int, remote_block_id: int) -> List[tuple]:
+    """Re-implementation of the C++ loop, driven by what ``attach`` produced.
+
+    Mirrors ``_transfer_single_thread_impl`` exactly; the point is that it is
+    fed only the backend's own numbers, so a stride the backend got wrong
+    shows up as a wrong address here.
+    """
+    issued = []
+    for i in range(be.num_layers):
+        cpu_k_layer = cpu_base + i * be.cpu_layer_stride_in_bytes
+        remote_layer_off = i * be.remote_layer_stride_in_bytes_per_file
+        remote_k = remote_layer_off + remote_block_id * be.remote_block_stride_in_bytes
+        issued.append((cpu_k_layer + cpu_block_id * be.remote_block_stride_in_bytes,
+                       remote_k, be.chunk_size_in_bytes))
+        if be.kv_dim == 1:
+            continue
+        cpu_v_layer = cpu_k_layer + be.cpu_kv_stride_in_bytes
+        issued.append((cpu_v_layer + cpu_block_id * be.remote_block_stride_in_bytes,
+                       remote_k + be.remote_kv_stride_in_bytes_per_file,
+                       be.chunk_size_in_bytes))
+    return issued
+
+
+def _attach_pcfs(be: PcfsRemoteBackend, worker: FakeWorker, monkeypatch):
+    """attach() with the PCFS SDK stubbed, so the geometry half really runs."""
+    from flexkv import c_ext
+
+    stub = _StubPcfs()
+    monkeypatch.setattr(c_ext, "Pcfs", lambda *a, **k: stub, raising=False)
+    monkeypatch.setattr(c_ext, "set_pcfs_instance", lambda *a: None,
+                        raising=False)
+    # attach() refuses to run when the CFS kernel is absent, which it is on
+    # every box here; the geometry it computes is what we are testing.
+    import flexkv.transfer.worker as tw
+    monkeypatch.setattr(tw, "transfer_kv_blocks_remote", object(),
+                        raising=False)
+    be.attach(worker)
+    return stub
+
+
 @pytest.mark.parametrize("shape", MODEL_SHAPES)
-@pytest.mark.parametrize("transfer_type,is_read", [
-    (TransferType.H2REMOTE, False),
-    (TransferType.REMOTE2H, True),
-])
+@pytest.mark.parametrize("layout_type", ["LAYERFIRST", "BLOCKFIRST"])
+def test_pcfs_addresses_every_chunk_of_a_block_exactly_once(
+        shape, layout_type, monkeypatch):
+    """The kernel, fed attach()'s numbers, must cover a block exactly.
+
+    Under BLOCKFIRST the pre-fix backend derived CPU strides as
+    ``num_blocks * chunk`` -- the LAYERFIRST formula -- and addressed the pool
+    ``num_blocks`` times too far out. BLOCKFIRST is the default
+    (``FLEXKV_CPU_LAYOUT``), so this was the live path.
+    """
+    num_blocks, num_files = 64, 4
+    dtype = torch.bfloat16
+    layout = make_cpu_layout(shape, num_blocks, layout_type)
+    remote_layout = make_cpu_layout(shape, num_blocks, layout_type)
+    worker = FakeWorker(layout, dtype)
+
+    be = PcfsRemoteBackend(
+        remote_files=[f"/f{i}" for i in range(num_files)],
+        remote_kv_layout=remote_layout,
+        remote_config_custom={"pcfs_fsid": 1, "pcfs_port": 1,
+                              "pcfs_ip": "127.0.0.1",
+                              "pcfs_parent_nodeid": 1},
+        enable_pcfs_sharing=False,
+    )
+    _attach_pcfs(be, worker, monkeypatch)
+
+    block_id = 7
+    issued = _run_pcfs_kernel(be, cpu_base=0, cpu_block_id=block_id,
+                              remote_block_id=block_id)
+
+    # Every byte of the block, once: the CPU offsets the kernel touches must
+    # be exactly the chunks the layout says that block owns.
+    expected = _pcfs_expected_cpu_offsets(layout, dtype, block_id)
+    covered = []
+    for cpu_off, _remote_off, nbytes in issued:
+        covered.extend(range(cpu_off, cpu_off + nbytes,
+                             layout.get_chunk_size() * dtype.itemsize))
+    assert sorted(covered) == expected
+
+    # ...and it must stay inside the pool it was given.
+    pool_bytes = layout.kv_shape.numel() * dtype.itemsize
+    for cpu_off, _remote_off, nbytes in issued:
+        assert 0 <= cpu_off and cpu_off + nbytes <= pool_bytes, (
+            f"CPU access [{cpu_off}, {cpu_off + nbytes}) escapes the "
+            f"{pool_bytes}-byte pool")
+
+
+@pytest.mark.parametrize("shape", MODEL_SHAPES)
+@pytest.mark.parametrize("layout_type", ["LAYERFIRST", "BLOCKFIRST"])
+def test_pcfs_blocks_do_not_overlap_on_either_side(shape, layout_type,
+                                                   monkeypatch):
+    """Two distinct blocks must not touch a shared byte, CPU or remote.
+
+    The overlap check is what a too-large stride cannot survive: it aliases
+    block b onto some other block's bytes.
+    """
+    num_blocks, num_files = 64, 4
+    dtype = torch.bfloat16
+    layout = make_cpu_layout(shape, num_blocks, layout_type)
+    worker = FakeWorker(layout, dtype)
+
+    be = PcfsRemoteBackend(
+        remote_files=[f"/f{i}" for i in range(num_files)],
+        remote_kv_layout=make_cpu_layout(shape, num_blocks, layout_type),
+        remote_config_custom={"pcfs_fsid": 1, "pcfs_port": 1,
+                              "pcfs_ip": "127.0.0.1",
+                              "pcfs_parent_nodeid": 1},
+        enable_pcfs_sharing=False,
+    )
+    stub = _attach_pcfs(be, worker, monkeypatch)
+
+    def spans(block_id, side):
+        out = []
+        for cpu_off, remote_off, nbytes in _run_pcfs_kernel(
+                be, 0, block_id, block_id):
+            start = cpu_off if side == "cpu" else remote_off
+            out.append((start, start + nbytes))
+        return out
+
+    for side in ("cpu", "remote"):
+        a, b = spans(3, side), spans(4, side)
+        for (a0, a1) in a:
+            for (b0, b1) in b:
+                assert a1 <= b0 or b1 <= a0, (
+                    f"{side} blocks 3 and 4 overlap: "
+                    f"[{a0},{a1}) vs [{b0},{b1})")
+
+    # The file the backend asks PCFS to create must hold every block assigned
+    # to it -- a stride that under-counts would size the file short.
+    blocks_per_file = num_blocks // num_files
+    assert stub.file_size >= blocks_per_file * (
+        layout.get_block_stride() if layout_type == "BLOCKFIRST"
+        else layout.get_chunk_size() * layout.num_layer * layout.kv_dim
+    ) * dtype.itemsize
+
+
+def test_pcfs_rejects_mismatched_cpu_and_remote_layouts(monkeypatch):
+    """The kernel uses one set of block ids for both sides; layouts must agree."""
+    layout = make_cpu_layout(QWEN3_8B, 64, "BLOCKFIRST")
+    worker = FakeWorker(layout, torch.bfloat16)
+    be = PcfsRemoteBackend(
+        remote_files=["/f0"],
+        remote_kv_layout=make_cpu_layout(QWEN3_8B, 64, "LAYERFIRST"),
+        remote_config_custom={"pcfs_fsid": 1, "pcfs_port": 1,
+                              "pcfs_ip": "127.0.0.1",
+                              "pcfs_parent_nodeid": 1},
+        enable_pcfs_sharing=False,
+    )
+    with pytest.raises(ValueError, match="must match"):
+        _attach_pcfs(be, worker, monkeypatch)
+
 
 # ---------------------------------------------------------------------------
 # MooncakeStoreBackend.attach / key building
