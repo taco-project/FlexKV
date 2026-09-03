@@ -4,7 +4,7 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.transfer.compression.common.strategy import NullCompressionStrategy
 from nvcomp_common_utils import (
     make_kv_cache, make_gpu_cache, compute_strides,
-    DEFUALT_MHA_CONFIG, resolve_case,
+    DEFUALT_MHA_CONFIG, resolve_case, fp8_ans_supported,
 )
 
 try:
@@ -42,6 +42,8 @@ def test_roundtrip(cpu_layout_name, dtype, tp_size, kv_dim, num_kv_heads, chunk_
         pytest.skip("nvcomp not available")
     if (kv_dim == 1) != (chunk_size_per_device == 18 * 1024):
         pytest.skip("18KB is MLA-only; 8/16/32KB are MHA-only")
+    if dtype == torch.float8_e4m3fn and not fp8_ans_supported():
+        pytest.skip("native FP8 E4M3 ANS needs nvCOMP >= 5.3")
 
     case = resolve_case(chunk_size_per_device, tp_size, kv_dim, num_kv_heads, dtype)
 
@@ -145,6 +147,8 @@ def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, kv_dim, num_kv_heads, chu
         pytest.skip("nvcomp not available")
     if (kv_dim == 1) != (chunk_size_per_device == 18 * 1024):
         pytest.skip("18KB is MLA-only; 8/16/32KB are MHA-only")
+    if dtype == torch.float8_e4m3fn and not fp8_ans_supported():
+        pytest.skip("native FP8 E4M3 ANS needs nvCOMP >= 5.3")
     if torch.cuda.device_count() < tp_size:
         pytest.skip(f"tp_size={tp_size} needs {tp_size} GPUs, "
                     f"have {torch.cuda.device_count()}")
@@ -247,7 +251,7 @@ def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, kv_dim, num_kv_heads, chu
         tg.tp_group_transfer_ans(
             block_ids, block_ids,
             cpu_kv_stride, cpu_layer_stride, cpu_block_stride, cpu_tp_stride,
-            transfer_num_cta, False, False, layer_id, num_layers, kv_dim, *st_args)
+            transfer_num_cta, False, False, layer_id, num_layers, kv_dim, num_kv_heads, *st_args)
         for g in range(tp_size):
             torch.cuda.synchronize(g)
 
@@ -269,7 +273,7 @@ def test_roundtrip_tp(cpu_layout_name, dtype, tp_size, kv_dim, num_kv_heads, chu
         tg.tp_group_transfer_ans(
             block_ids, block_ids,
             cpu_kv_stride, cpu_layer_stride, cpu_block_stride, cpu_tp_stride,
-            transfer_num_cta, True, False, layer_id, num_layers, kv_dim, *st_args)
+            transfer_num_cta, True, False, layer_id, num_layers, kv_dim, num_kv_heads, *st_args)
         for g in range(tp_size):
             torch.cuda.synchronize(g)
 
