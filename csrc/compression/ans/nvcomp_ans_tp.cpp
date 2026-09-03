@@ -126,8 +126,17 @@ size_t TPTransferThreadGroup::tp_group_transfer_ans(
   (void)use_ce_transfer;
 
   ensure_nvcomp_initialized();
+  // A rank stride is required exactly when the table is actually indexed by
+  // rank below: the MHA branch does `ptr + i * rank_stride`, which only moves
+  // when there is more than one rank.  Head-sharded KV on a single GPU gets
+  // the canonical 3-D table (rank_stride == 0, i == 0), which is what
+  // ``NvcompGpuCpuStrategy.attach`` binds -- it asks for 4 dims only when
+  // ``num_kv_heads > 1 && num_gpus > 1``.  Demanding a non-zero stride for
+  // every MHA shape made this guard stricter than its own use, and rejected
+  // every tp==1 MHA transfer before a single byte moved.
   if (cpu_size_table_tp_ptr == 0 ||
-      (num_kv_heads > 1 && cpu_size_table_tp_rank_stride == 0) ||
+      (num_kv_heads > 1 && num_gpus_ > 1 &&
+       cpu_size_table_tp_rank_stride == 0) ||
       cpu_size_table_block_stride == 0 ||
       cpu_size_table_layer_stride == 0) {
     throw std::runtime_error(
