@@ -37,6 +37,18 @@ def _linux_eventfd(initval: int = 0, flags: int = _EFD_SEMAPHORE) -> int:
     return int(fd)
 
 
+def _settle_eventfd(fd: int, timeout_s: float) -> bool:
+    """Consume one pending eventfd unit, waiting at most timeout_s."""
+    try:
+        ready, _, _ = select.select([fd], [], [], timeout_s)
+        if not ready:
+            return False
+        os.read(fd, 8)
+        return True
+    except OSError:
+        return True
+
+
 def _read_eventfd(fd: int) -> int:
     timeout_s = float(os.getenv("FLEXKV_LAYERWISE_WAIT_TIMEOUT_S", "60"))
     ready, _, _ = select.select([fd], [], [], timeout_s)
@@ -97,11 +109,30 @@ class LayerwiseStepCoordinator:
         return bool(needs_load and not self.enabled)
 
     def launch_kwargs(self, metadata: LayerwiseLoadMetadata) -> dict[str, object]:
+        # A no-load step carries counter_id=-1. Clamping that to 0 would make
+        # the data plane signal counter 0 -- which a concurrent real load may
+        # own -- so its layers could see units that belong to no transfer.
+        # Only a metadata that actually has a load may drive a layer-wise
+        # launch; otherwise fall back to the non-layer-wise path.
+        if not metadata.enabled or not metadata.has_load:
+            return {
+                "as_batch": metadata.enabled,
+                "layerwise_transfer": False,
+                "counter_id": 0,
+            }
+        self._validate_launch_counter(metadata.counter_id)
         return {
             "as_batch": metadata.enabled,
             "layerwise_transfer": metadata.enabled,
-            "counter_id": max(metadata.counter_id, 0),
+            "counter_id": metadata.counter_id,
         }
+
+    def _validate_launch_counter(self, counter_id: int) -> None:
+        if counter_id < 0 or counter_id >= self.num_counters:
+            raise ValueError(
+                f"layer-wise launch counter_id={counter_id} outside "
+                f"[0, {self.num_counters})"
+            )
 
 
 class LayerwiseCounterPool:
@@ -120,6 +151,7 @@ class LayerwiseCounterPool:
         fd_factory: Callable[[], int] = _linux_eventfd,
         fd_reader: Callable[[int], int] = _read_eventfd,
         fd_closer: Callable[[int], None] = os.close,
+        fd_settler: Callable[[int, float], bool] = _settle_eventfd,
     ) -> None:
         if not layer_names:
             raise ValueError("layer_names must not be empty")
@@ -136,6 +168,10 @@ class LayerwiseCounterPool:
         self.num_counters = num_counters
         self._fd_reader = fd_reader
         self._fd_closer = fd_closer
+        # Retained for compatibility with external test fixtures that inject a
+        # settler. Reusing an incomplete asynchronous counter is unsafe, so
+        # this pool deliberately no longer invokes it.
+        self._fd_settler = fd_settler
         self._fds = [
             [fd_factory() for _ in range(self.num_layers)]
             for _ in range(num_counters)
@@ -164,6 +200,10 @@ class LayerwiseCounterPool:
                 "layer-wise counter pool is unusable after a prior wait failure"
             ) from self._failed_error
         if self._active_counter >= 0:
+            # Eventfd units carry no generation. The data plane writes them
+            # asynchronously, so an incomplete forward cannot be safely
+            # reclaimed without an explicit producer-quiescence acknowledgement
+            # or per-generation descriptors.
             raise RuntimeError(
                 "received new layer-wise metadata before the previous "
                 f"counter {self._active_counter} finished"
@@ -210,16 +250,23 @@ class LayerwiseCounterPool:
         tp_size_per_node: int,
         timeout_s: float = 360.0,
         retry_interval_s: float = 0.05,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Send all counter eventfds to the LayerwiseTransferWorker.
 
         This method is intended to run in a background thread before GPU-cache
         registration, because registration may start a worker that blocks while
         waiting for this handshake.
+
+        ``cancel_event`` lets a caller abandon the retry loop early. Shutdown
+        needs it: otherwise this thread keeps retrying for the full timeout_s
+        while holding eventfds that the caller wants to close.
         """
         deadline = time.monotonic() + timeout_s
         last_error: BaseException | None = None
         while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                     sock.connect(socket_path)
@@ -243,7 +290,13 @@ class LayerwiseCounterPool:
                     return
             except (OSError, RuntimeError, TimeoutError) as exc:
                 last_error = exc
-                time.sleep(retry_interval_s)
+                if cancel_event is not None:
+                    # Interruptible sleep: a plain time.sleep() would ignore a
+                    # cancel that arrives during the backoff.
+                    if cancel_event.wait(retry_interval_s):
+                        return
+                else:
+                    time.sleep(retry_interval_s)
         raise RuntimeError(
             f"timed out sending layer-wise eventfds to {socket_path}: {last_error}"
         )

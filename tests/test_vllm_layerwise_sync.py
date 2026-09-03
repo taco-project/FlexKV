@@ -4,6 +4,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 
 import pytest
 
@@ -25,6 +26,8 @@ def _short_socket_path(prefix):
 
 
 class _FakeFDs:
+    """Stand-in for the eventfd layer."""
+
     def __init__(self):
         self.next_fd = 10
         self.reads = []
@@ -110,7 +113,8 @@ def test_counter_pool_rejects_unknown_layer_and_counter():
         pool.wait("layer.99")
 
 
-def test_failed_wait_poisons_pool_to_prevent_stale_counter_reuse():
+def test_failed_wait_rejects_future_binds():
+    """A failed wait cannot safely reuse a generationless eventfd."""
     attempts = []
 
     def flaky_read(fd):
@@ -129,23 +133,104 @@ def test_failed_wait_poisons_pool_to_prevent_stale_counter_reuse():
     pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
     with pytest.raises(TimeoutError):
         pool.wait("layer.0")
-    with pytest.raises(RuntimeError, match="unusable"):
-        pool.bind(
-            LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
+    with pytest.raises(RuntimeError, match="prior wait failure"):
+        pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
+    with pytest.raises(RuntimeError, match="prior wait failure"):
+        pool.bind(LayerwiseLoadMetadata(enabled=True, has_load=False))
     assert attempts == [10]
 
 
-def test_bind_rejects_new_step_until_previous_counter_finishes():
+def test_bind_rejects_incomplete_forward():
+    """An incomplete forward cannot safely reuse asynchronous eventfds."""
     pool, fake = _pool(layer_names=("a", "b"))
     metadata = LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True)
     pool.bind(metadata)
     pool.wait("a")
-    with pytest.raises(RuntimeError, match="previous"):
+    with pytest.raises(RuntimeError, match="previous counter 0 finished"):
         pool.bind(metadata)
-    pool.wait("b")
-    pool.bind(metadata)
-    pool.wait("a")
-    assert fake.reads == [10, 11, 10]
+    assert fake.reads == [10]
+
+
+@pytest.mark.skipif(
+    os.uname().sysname != "Linux",
+    reason="requires Linux eventfd support",
+)
+def test_late_eventfd_signal_cannot_recover_an_incomplete_forward():
+    """A late producer signal must not make a later batch bindable."""
+    pool = LayerwiseCounterPool(("l0", "l1"), num_counters=2)
+    try:
+        pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
+        os.write(pool.fds[0][0], struct.pack("Q", 1))
+        pool.wait("l0")
+
+        # The missing completion from the abandoned batch lands after the
+        # forward stops. It remains quarantined with its old descriptor set.
+        os.write(pool.fds[0][1], struct.pack("Q", 1))
+        with pytest.raises(RuntimeError, match="previous counter 0 finished"):
+            pool.bind(LayerwiseLoadMetadata(
+                enabled=True, counter_id=1, has_load=True))
+    finally:
+        pool.close()
+
+
+def test_completed_forward_releases_counter_for_later_batches():
+    """A fully consumed batch may safely advance and reuse the ring."""
+    pool, fake = _pool(layer_names=("l0", "l1"))
+    md = lambda cid: LayerwiseLoadMetadata(  # noqa: E731
+        enabled=True, counter_id=cid, has_load=True)
+    for counter_id in (0, 1, 0):
+        pool.bind(md(counter_id))
+        pool.wait("l0")
+        pool.wait("l1")
+
+    assert fake.reads == [10, 11, 12, 13, 10, 11]
+
+
+def test_wait_timeout_rejects_future_binds():
+    """A timeout cannot safely reuse a generationless eventfd."""
+    def timed_out_reader(_fd):
+        raise TimeoutError("simulated")
+
+    fake = _FakeFDs()
+    pool = LayerwiseCounterPool(
+        ("l0", "l1"),
+        fd_factory=fake.create,
+        fd_reader=timed_out_reader,
+        fd_closer=fake.close,
+    )
+    pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
+    with pytest.raises(TimeoutError):
+        pool.wait("l0")
+    with pytest.raises(RuntimeError, match="prior wait failure"):
+        pool.bind(LayerwiseLoadMetadata(enabled=True, counter_id=0, has_load=True))
+
+
+def test_send_to_worker_returns_promptly_when_cancelled():
+    """Shutdown must be able to stop the handshake before its own deadline.
+
+    Nothing is listening on this path, so send_to_worker() would otherwise retry
+    for the full timeout_s while holding fds the caller wants to close.
+    """
+    pool, _ = _pool(layer_names=("a",))
+    cancel = threading.Event()
+    finished = threading.Event()
+
+    def run():
+        pool.send_to_worker(
+            _short_socket_path("flexkv-cancel-"),
+            tp_rank_per_node=0,
+            tp_size_per_node=1,
+            timeout_s=300.0,
+            retry_interval_s=0.05,
+            cancel_event=cancel,
+        )
+        finished.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    time.sleep(0.2)
+    assert not finished.is_set()
+    cancel.set()
+    assert finished.wait(5.0), "send_to_worker ignored the cancel event"
 
 
 def test_counter_pool_close_is_idempotent():
