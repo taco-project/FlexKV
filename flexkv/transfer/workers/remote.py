@@ -14,6 +14,7 @@ from torch.multiprocessing import Queue as MPQueue
 from flexkv.common.storage import KVCacheLayout
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 from flexkv.transfer.backends import StorageBackend
+from flexkv.transfer.geometry import ChunkStrides, EdgeGeometry, HostSide
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerTransferResult
 from flexkv.transfer.workers.runtime import TransferWorkerBase
 
@@ -72,7 +73,54 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             getattr(cpu_kv_layout, "layer_groups", None) is not None
         )
 
-        self._attach_backend(backend)
+        self._attach_backend(backend, self._build_geometry(cpu_kv_layout, dtype))
+
+    def _build_geometry(
+        self, cpu_kv_layout: KVCacheLayout, dtype: torch.dtype
+    ) -> EdgeGeometry:
+        """This edge, in the terms every remote engine reads it in.
+
+        There is no ``ssd`` or ``gpu`` side: a remote tier is reached from the
+        CPU pool and nothing else, so a backend asking for either gets a
+        sentence saying so rather than an ``AttributeError``.
+        """
+        itemsize = dtype.itemsize
+        if self.has_multi_group:
+            # Groups differ in chunk size, so there is no uniform (layer, kv)
+            # chunk. get_block_stride() is already bytes for this layout, and
+            # is the whole block.
+            block_stride = int(cpu_kv_layout.get_block_stride())
+            strides = None
+            bytes_per_block = block_stride
+        else:
+            block_stride = cpu_kv_layout.get_block_stride() * itemsize
+            chunk_bytes = cpu_kv_layout.get_chunk_size() * itemsize
+            strides = ChunkStrides(
+                chunk_bytes=chunk_bytes,
+                kv_stride=cpu_kv_layout.get_kv_stride() * itemsize,
+                layer_stride=cpu_kv_layout.get_layer_stride() * itemsize,
+                block_stride=block_stride,
+            )
+            # Not ``block_stride``: that is the *addressing* stride between
+            # consecutive blocks of one chunk, which under LAYERFIRST is one
+            # chunk rather than the whole block.
+            bytes_per_block = chunk_bytes * self.num_layers * self.kv_dim
+        return EdgeGeometry(
+            num_layers=self.num_layers,
+            kv_dim=self.kv_dim,
+            num_kv_heads=self.num_kv_heads,
+            dtype=dtype,
+            has_multi_group=self.has_multi_group,
+            bytes_per_block=bytes_per_block,
+            cpu=HostSide(
+                layout=cpu_kv_layout,
+                blocks=self.cpu_blocks,
+                layer_ptrs=self.cpu_layer_ptrs,
+                block_stride=block_stride,
+                mapped_size=self.cpu_blocks_mapped_size,
+                strides=strides,
+            ),
+        )
 
     def launch_transfer(
         self, transfer_op: WorkerTransferOp

@@ -13,9 +13,11 @@ Two failure modes are pinned:
     fail the whole op. Publishing the survivors is worse than failing: a
     reader hits blocks whose peers were never written.
 
-``FakeWorker`` stands in for the worker's *edge*: the attributes a backend is
-allowed to read. That contract is what the refactor introduced, so a worker
-that stops publishing one of these fails here rather than in production.
+``FakeWorker`` plus ``make_geometry`` stand in for the worker's *edge*: the
+``EdgeGeometry`` a backend is handed, built by the same expressions
+``CPURemoteTransferWorker`` uses. That contract is what the refactor
+introduced, so a worker that stops publishing one of these fails here rather
+than in production.
 
 ``NixlFileBackend`` is covered by ``test_nixl_backend_e2e.py``, which round-trips
 real bytes through a real agent.
@@ -29,6 +31,7 @@ import numpy as np
 import pytest
 import torch
 
+from flexkv.common.config import LayerGroupSpec
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferType
 from flexkv.transfer.backends import (
@@ -37,6 +40,7 @@ from flexkv.transfer.backends import (
     PcfsRemoteBackend,
     StorageBackend,
 )
+from flexkv.transfer.geometry import ChunkStrides, EdgeGeometry, HostSide
 
 P = pickle.HIGHEST_PROTOCOL
 
@@ -70,6 +74,35 @@ def make_cpu_layout(shape, num_blocks: int, layout_type: str = "LAYERFIRST"):
     )
 
 
+# DSv4-flash: main KV bf16 uncompressed alongside an fp8 indexer compressed
+# 128x, both attached to the same transformer layers. The two groups have
+# different dtypes *and* different token counts per block, which is exactly
+# why the block has no uniform (layer, kv) chunk and ``strides is None``.
+DSV4_GROUPS = [
+    LayerGroupSpec(num_layers=4, num_kv_heads=1, head_size=576,
+                   layer_indices=[0, 1, 2, 3], dtype=torch.bfloat16,
+                   compress_ratio=1),
+    LayerGroupSpec(num_layers=4, num_kv_heads=1, head_size=128,
+                   layer_indices=[0, 1, 2, 3], dtype=torch.uint8,
+                   compress_ratio=128),
+]
+
+
+def make_multi_group_layout(num_blocks: int = 8, tp_size: int = 1):
+    """A heterogeneous CPU layout: byte-flat blocks, no per-chunk strides.
+
+    ``tokens_per_block=128`` so the 128x-compressed indexer group still stores
+    a whole token per block; ``get_block_stride()`` returns BYTES here, which
+    is the asymmetry the geometry has to carry correctly.
+    """
+    return KVCacheLayout(
+        type=KVCacheLayoutType.BLOCKFIRST,
+        num_layer=4, num_block=num_blocks, tokens_per_block=128,
+        num_head=1, head_size=576, kv_dim=1, num_kv_heads=1,
+        layer_groups=DSV4_GROUPS, tp_size=tp_size,
+    )
+
+
 def _hugepage_aligned(shape, dtype: torch.dtype, alignment: int):
     """A tensor of ``shape`` whose data pointer is ``alignment``-aligned.
 
@@ -93,12 +126,15 @@ def _hugepage_aligned(shape, dtype: torch.dtype, alignment: int):
 
 
 class FakeWorker:
-    """Exactly the worker attributes ``StorageBackend.attach`` may read.
+    """Exactly the non-geometry worker surface ``attach`` may still read.
 
     Deliberately not a ``TransferWorkerBase``: the value of this stand-in is
     that touching anything else raises ``AttributeError``.  ``attach`` reaching
     for a private worker method would then fail here rather than silently
     couple the backend to one worker class.
+
+    Everything that describes the *edge* now arrives as an ``EdgeGeometry``
+    (see ``make_geometry``); what is left here is the worker itself.
     """
 
     def __init__(self, cpu_kv_layout: KVCacheLayout, dtype: torch.dtype,
@@ -106,19 +142,62 @@ class FakeWorker:
         self.worker_id = 0
         self.cpu_kv_layout = cpu_kv_layout
         self.dtype = dtype
-        self.num_layers = cpu_kv_layout.num_layer
-        self.kv_dim = cpu_kv_layout.kv_dim
-        self.has_multi_group = cpu_kv_layout.layer_groups is not None
         self.cpu_blocks = cpu_blocks
-        self.cpu_layer_ptrs = (
-            torch.tensor([cpu_blocks.data_ptr()], dtype=torch.int64)
-            if cpu_blocks is not None else torch.tensor([0], dtype=torch.int64)
-        )
-        self._bytes_per_block = -1
         self.registered: List[str] = []
+        # Only ``make_geometry`` reads this; a HugePage-backed pool maps more
+        # than it holds, and the geometry is where that gets published.
+        self.cpu_blocks_mapped_size: Optional[int] = None
 
     def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
         self.registered.append(label)
+
+
+def make_geometry(worker: FakeWorker) -> EdgeGeometry:
+    """The ``EdgeGeometry`` ``CPURemoteTransferWorker`` would publish.
+
+    Same expressions in the same order as ``workers/remote.py``; a remote edge
+    has no ``ssd`` or ``gpu`` side, and under a heterogeneous layout no
+    per-chunk strides at all.
+    """
+    layout = worker.cpu_kv_layout
+    dtype = worker.dtype
+    itemsize = dtype.itemsize
+    has_multi_group = layout.layer_groups is not None
+    if has_multi_group:
+        block_stride = int(layout.get_block_stride())
+        strides = None
+        bytes_per_block = block_stride
+    else:
+        block_stride = layout.get_block_stride() * itemsize
+        chunk_bytes = layout.get_chunk_size() * itemsize
+        strides = ChunkStrides(
+            chunk_bytes=chunk_bytes,
+            kv_stride=layout.get_kv_stride() * itemsize,
+            layer_stride=layout.get_layer_stride() * itemsize,
+            block_stride=block_stride,
+        )
+        bytes_per_block = chunk_bytes * layout.num_layer * layout.kv_dim
+    blocks = worker.cpu_blocks
+    layer_ptrs = (
+        torch.tensor([blocks.data_ptr()], dtype=torch.int64)
+        if blocks is not None else torch.tensor([0], dtype=torch.int64)
+    )
+    return EdgeGeometry(
+        num_layers=layout.num_layer,
+        kv_dim=layout.kv_dim,
+        num_kv_heads=layout.num_kv_heads,
+        dtype=dtype,
+        has_multi_group=has_multi_group,
+        bytes_per_block=bytes_per_block,
+        cpu=HostSide(
+            layout=layout,
+            blocks=blocks,
+            layer_ptrs=layer_ptrs,
+            block_stride=block_stride,
+            mapped_size=worker.cpu_blocks_mapped_size,
+            strides=strides,
+        ),
+    )
 
 
 class FakeOp:
@@ -247,7 +326,7 @@ def _attach_pcfs(be: PcfsRemoteBackend, worker: FakeWorker, monkeypatch):
     import flexkv.transfer.worker as tw
     monkeypatch.setattr(tw, "transfer_kv_blocks_remote", object(),
                         raising=False)
-    be.attach(worker)
+    be.attach(worker, make_geometry(worker))
     return stub
 
 
@@ -431,7 +510,7 @@ def _attach_mooncake(be: MooncakeStoreBackend, worker: FakeWorker,
                         classmethod(lambda cls, cfg, override_global_segment_size=None:
                                     object()))
     monkeypatch.setattr(msu, "MooncakeStoreClient", lambda cfg: stub)
-    be.attach(worker)
+    be.attach(worker, make_geometry(worker))
     return stub
 
 
@@ -454,7 +533,9 @@ def test_mooncake_block_size_is_whole_block_bytes(shape, monkeypatch):
 
     want = num_layers * kv_dim * tpb * num_kv_heads * head_size * dtype.itemsize
     assert be.block_size_bytes == want
-    assert worker._bytes_per_block == want
+    # The engine publishes its own whole-block size; the worker reads it back
+    # for the transfer trace rather than the backend writing onto the worker.
+    assert be.bytes_per_block == want
     # Not registered with CUDA: Mooncake owns the RDMA MR, and a second host
     # registration of the same shared pool exhausts the host mapping budget on
     # a large cache for no gain.
@@ -463,6 +544,80 @@ def test_mooncake_block_size_is_whole_block_bytes(shape, monkeypatch):
     stub = be.mooncake_client
     assert stub.registered == [
         (cpu_blocks.data_ptr(), cpu_blocks.numel() * cpu_blocks.element_size())]
+
+
+def test_mooncake_serves_a_heterogeneous_block_whose_chunks_do_not_exist(monkeypatch):
+    """The multi-group edge: whole-block I/O works where chunk I/O cannot.
+
+    Under a heterogeneous layout the block has no uniform (layer, kv) chunk --
+    ``get_chunk_size()`` raises -- so ``strides is None`` on the CPU side and
+    the *only* number a backend may read is ``block_stride``, already in bytes.
+    Mooncake is opaque and whole-block, so it must attach here; a regression
+    that reintroduces chunk arithmetic fails with the layout's own
+    "not valid for multi-group layout" rather than silently sizing keys wrong.
+
+    Byte size is asserted against the groups it was built from rather than
+    against ``get_block_stride()``, so the test does not simply restate the
+    implementation.
+    """
+    from flexkv.external.mooncake_store_keys import PoolKind
+
+    cpu_layout = make_multi_group_layout(num_blocks=8)
+    # Multi-group pools are byte-flat: the buffer dtype is uint8 and the
+    # layout's second dim is already the block's byte count.
+    cpu_blocks = torch.zeros(cpu_layout.kv_shape, dtype=torch.uint8)
+    worker = FakeWorker(cpu_layout, torch.uint8, cpu_blocks)
+
+    geometry = make_geometry(worker)
+    assert geometry.has_multi_group
+    assert geometry.cpu.strides is None
+    with pytest.raises(ValueError, match="NIXL GDS_MT needs.*CPU"):
+        geometry.cpu.require_strides("NIXL GDS_MT")
+
+    be = MooncakeStoreBackend(cache_config=_mooncake_cache_config(),
+                              pool_kind=PoolKind.KV)
+    _attach_mooncake(be, worker, monkeypatch)
+
+    # 4 layers * kv_dim 1 * (128 tokens * 1 head * 576) * 2 bytes  [main KV]
+    # + 4 layers * kv_dim 1 * (128/128 tokens * 1 head * 128) * 1 byte [indexer]
+    want = 4 * 1 * 128 * 1 * 576 * 2 + 4 * 1 * 1 * 1 * 128 * 1
+    assert be.block_size_bytes == want
+    assert be.bytes_per_block == want
+    assert geometry.bytes_per_block == want
+    # And the whole pool is one MR, sized in those same bytes.
+    assert be.mooncake_client.registered == [(cpu_blocks.data_ptr(), want * 8)]
+
+
+def test_pcfs_flattens_a_heterogeneous_block_into_one_io(monkeypatch):
+    """PCFS under multi-group: one I/O per block, addressed in bytes.
+
+    PCFS *is* chunk-addressing, but under BLOCKFIRST it flattens the whole
+    block into a single pseudo-layer of a single pseudo-KV before it reads any
+    stride -- which is what lets it serve a heterogeneous edge at all. The
+    numbers below are the flattened ones (``num_layers == kv_dim == 1``), not
+    the edge's four layers, and that distinction is the reason the backend may
+    not write them back onto the worker.
+    """
+    cpu_layout = make_multi_group_layout(num_blocks=64)
+    cpu_blocks = torch.zeros(cpu_layout.kv_shape, dtype=torch.uint8)
+    worker = FakeWorker(cpu_layout, torch.uint8, cpu_blocks)
+
+    be = PcfsRemoteBackend(
+        remote_files=["/f0", "/f1"],
+        remote_kv_layout=make_multi_group_layout(num_blocks=64),
+        remote_config_custom={"pcfs_fsid": 1, "pcfs_port": 1,
+                              "pcfs_ip": "127.0.0.1",
+                              "pcfs_parent_nodeid": 1},
+        enable_pcfs_sharing=False,
+    )
+    _attach_pcfs(be, worker, monkeypatch)
+
+    want = 4 * 1 * 128 * 1 * 576 * 2 + 4 * 1 * 1 * 1 * 128 * 1
+    assert (be.num_layers, be.kv_dim) == (1, 1)
+    assert be.chunk_size_in_bytes == want
+    assert be.bytes_per_block == want
+    # The CPU base pointer is resolved at attach, not per transfer.
+    assert be.cpu_base_ptr == cpu_blocks.data_ptr()
 
 
 @pytest.mark.parametrize(

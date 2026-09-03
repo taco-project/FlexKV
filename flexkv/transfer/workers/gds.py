@@ -23,6 +23,12 @@ from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
 from flexkv.common.transfer import TransferType
 from flexkv.transfer.backends import StorageBackend
+from flexkv.transfer.geometry import (
+    ChunkStrides,
+    DeviceSide,
+    DiskSide,
+    EdgeGeometry,
+)
 from flexkv.transfer.template import compile_gpu_regions, compile_host_regions
 from flexkv.transfer.worker_op import WorkerTransferOp
 from flexkv.transfer.workers.runtime import (
@@ -140,8 +146,6 @@ class GDSTransferWorker(TransferWorkerBase):
             self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
             self.chunk_size_in_bytes = self.ssd_chunk_size_in_bytes
             self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
-            # Bytes per KV block (all layers); used by transfer tracing for bw.
-            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
             if self.num_kv_heads > 1:
                 ssd_kv_layout_per_file = ssd_kv_layout_per_file.div_head(self.tp_group_size)
 
@@ -200,7 +204,58 @@ class GDSTransferWorker(TransferWorkerBase):
                     gpu_device_ids,
                 )
 
-        self._attach_backend(backend)
+        self._attach_backend(backend, self._build_geometry())
+
+    def _build_geometry(self) -> EdgeGeometry:
+        """This edge, in the terms every GPU<->SSD engine reads it in.
+
+        There is no ``cpu`` side: GDS moves bytes between device memory and a
+        file without a host bounce, so an engine that asks for a CPU pool gets
+        a sentence saying this edge has none.
+
+        Note which chunk size the SSD side carries. This worker's own
+        ``chunk_size_in_bytes`` is the *SSD* chunk, while
+        ``CPUSSDDiskTransferWorker``'s is the *CPU* chunk -- one attribute name
+        for two different sides of two different transfers. Here each side
+        states its own, so a backend cannot read one meaning it as the other.
+        """
+        if self.has_multi_group:
+            ssd_strides = None
+            gpu_strides = None
+            ssd_block_stride = self.ssd_block_stride_in_bytes
+            bytes_per_block = ssd_block_stride
+        else:
+            ssd_block_stride = self.ssd_block_stride_in_bytes
+            ssd_strides = ChunkStrides(
+                chunk_bytes=self.ssd_chunk_size_in_bytes,
+                kv_stride=self.ssd_kv_stride_in_bytes,
+                layer_stride=self.ssd_layer_stride_in_bytes,
+                block_stride=ssd_block_stride,
+            )
+            gpu_strides = tuple(
+                ChunkStrides(
+                    chunk_bytes=self.gpu_chunk_sizes_in_bytes[i],
+                    kv_stride=self.gpu_kv_strides_in_bytes[i],
+                    layer_stride=self.gpu_layer_strides_in_bytes[i],
+                    block_stride=self.gpu_block_strides_in_bytes[i],
+                )
+                for i in range(self.num_gpus)
+            )
+            bytes_per_block = (
+                self.chunk_size_in_bytes * self.num_layers * self.kv_dim)
+        return EdgeGeometry(
+            num_layers=self.num_layers,
+            kv_dim=self.kv_dim,
+            num_kv_heads=self.num_kv_heads,
+            dtype=self.dtype,
+            has_multi_group=self.has_multi_group,
+            bytes_per_block=bytes_per_block,
+            ssd=DiskSide(
+                block_stride=ssd_block_stride,
+                strides=ssd_strides,
+            ),
+            gpu=DeviceSide(blocks=self.gpu_blocks, strides=gpu_strides),
+        )
 
     def _init_multi_group_gds(
         self,

@@ -27,6 +27,12 @@ from flexkv.transfer.compression.common.strategy import (
     CompressionStrategy,
     NullCompressionStrategy,
 )
+from flexkv.transfer.geometry import (
+    ChunkStrides,
+    DiskSide,
+    EdgeGeometry,
+    HostSide,
+)
 from flexkv.transfer.worker_op import WorkerTransferOp
 from flexkv.transfer.workers.runtime import TransferWorkerBase
 
@@ -71,6 +77,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
 
+        self.cpu_kv_layout = cpu_kv_layout
         if self.has_multi_group:
             self._init_multi_group_ssd(cpu_kv_layout, ssd_kv_layout, layer_groups)
         else:
@@ -88,8 +95,6 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             # of the same file from drifting.
             self.ssd_block_stride_in_bytes = (
                 ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize)
-            # Bytes per KV block (all layers); used by transfer tracing for bw.
-            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
 
         if backend is None:
             # io_uring is this edge's native engine; a backend replaces it
@@ -103,7 +108,61 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
 
         self._compressor = compressor or NullCompressionStrategy()
         self._compressor.attach(self)
-        self._attach_backend(backend)
+        self._attach_backend(backend, self._build_geometry())
+
+    def _build_geometry(self) -> EdgeGeometry:
+        """This edge, in the terms every CPU<->SSD engine reads it in.
+
+        Under a heterogeneous layout there is no uniform (layer, kv) chunk on
+        either side -- both blocks are opaque blobs of identical byte layout,
+        which is exactly what makes the native io_uring path able to move them
+        as one I/O -- so both ``strides`` are None and a chunk-addressing
+        engine is refused by name.
+        """
+        cpu_block_stride = self.block_stride_in_bytes
+        if self.has_multi_group:
+            cpu_strides = ssd_strides = None
+            # CPU and SSD share an identical per-block byte layout here.
+            ssd_block_stride = cpu_block_stride
+            bytes_per_block = cpu_block_stride
+        else:
+            cpu_strides = ChunkStrides(
+                chunk_bytes=self.chunk_size_in_bytes,
+                kv_stride=self.cpu_kv_stride_in_bytes,
+                layer_stride=self.cpu_layer_stride_in_bytes,
+                block_stride=cpu_block_stride,
+            )
+            ssd_block_stride = self.ssd_block_stride_in_bytes
+            ssd_strides = ChunkStrides(
+                # The two sides move the same bytes, so one chunk size covers
+                # both; the SSD layout differs only in how blocks are spread
+                # across files.
+                chunk_bytes=self.chunk_size_in_bytes,
+                kv_stride=self.ssd_kv_stride_in_bytes,
+                layer_stride=self.ssd_layer_stride_in_bytes,
+                block_stride=ssd_block_stride,
+            )
+            bytes_per_block = (
+                self.chunk_size_in_bytes * self.num_layers * self.kv_dim)
+        return EdgeGeometry(
+            num_layers=self.num_layers,
+            kv_dim=self.kv_dim,
+            num_kv_heads=self.num_kv_heads,
+            dtype=self.dtype,
+            has_multi_group=self.has_multi_group,
+            bytes_per_block=bytes_per_block,
+            cpu=HostSide(
+                layout=self.cpu_kv_layout,
+                blocks=self.cpu_blocks,
+                layer_ptrs=self.cpu_layer_ptrs,
+                block_stride=cpu_block_stride,
+                strides=cpu_strides,
+            ),
+            ssd=DiskSide(
+                block_stride=ssd_block_stride,
+                strides=ssd_strides,
+            ),
+        )
 
     def _init_multi_group_ssd(
         self,
