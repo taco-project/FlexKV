@@ -9,7 +9,7 @@ delivery is a completion contract on this worker, not a separate class.
 import time
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from torch.multiprocessing import Queue as MPQueue
@@ -51,6 +51,30 @@ from flexkv.transfer.workers.runtime import (
 # on every submit. Never read: a plan is only handed to cpp after every
 # request's two tensors have been overwritten with the op's own.
 _EMPTY_BLOCK_IDS = torch.empty(0, dtype=torch.int64)
+
+
+class LayerwisePlan(NamedTuple):
+    """The static half of a layerwise transfer: everything but the block ids.
+
+    A layerwise submit is two separable things. This is the part fixed by the
+    worker's geometry -- which region carries which layer, in what order, at
+    what CTA count and share mode -- and it is the same for every op of a given
+    shape. The other part is the two block-id tensors per pool, which are all
+    that actually changes from op to op; ``_layerwise_transfer_impl`` binds
+    those onto ``requests`` just before submitting.
+
+    Splitting them is what makes the plan cacheable: see ``_layerwise_plan``
+    for why it is built once, and for the serialization this reuse relies on.
+
+    ``pool_of[i]`` names the pool whose ids belong on ``requests[i]``; the two
+    lists are parallel and are always consumed zipped.
+    """
+
+    requests: List["c_ext.RegionRequest"]
+    pool_of: List[PoolId]
+    # Original model layers this shape launches nothing for. The consumer waits
+    # on every layer's fd regardless, so these are posted up front or it hangs.
+    empty_layers: List[int]
 
 
 def _validate_multi_group_chunk_layout(
@@ -600,10 +624,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             completion = CompletionContract.from_str(completion)
         self._completion = completion
         self._layer_milestones = self._build_layer_milestones()
-        # {has_swa: (requests, pool_of, empty_layers)}; see _layerwise_plan.
-        self._layerwise_plans: Dict[
-            bool, Tuple[List["c_ext.RegionRequest"], List[PoolId], List[int]]
-        ] = {}
+        # One plan per shape, keyed on whether the op carries SWA blocks.
+        # See LayerwisePlan and _layerwise_plan.
+        self._layerwise_plans: Dict[bool, LayerwisePlan] = {}
         # Layers this model has no state for at all. Reported here only; the
         # list that gets posted is per transfer (see _layerwise_transfer_impl),
         # because an op that carries no SWA blocks leaves more layers uncovered
@@ -980,8 +1003,10 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             )
         if not self.gpu_blocks:
             return 0
-        zero_ptrs = [0] * sum(self._gpu_block_counts)
-        self._update_gpu_block_ptrs(zero_ptrs)
+        expected = sum(self._gpu_block_counts)
+        # Zeroed before the mappings go away, so a transfer that somehow raced
+        # this faults on a null pointer instead of reading freed memory.
+        self._update_gpu_block_ptrs([0] * expected)
         old_blocks = self.gpu_blocks
         self.gpu_blocks = []
         released = sum(
@@ -989,7 +1014,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             for blocks_in_one_gpu in old_blocks
             for tensor in blocks_in_one_gpu
         )
-        expected = sum(self._gpu_block_counts)
         if released != expected:
             raise RuntimeError(
                 f"Expected {expected} VMM mappings, released {released}"
@@ -1030,6 +1054,20 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         case no longer has to fall back to the per-group loop.
         """
         return getattr(self, "region_batch", None) is not None
+
+    def _is_per_group(self, pool: "_Pool") -> bool:
+        """Whether this pool's transfers are described per layer group.
+
+        True for a multi-group worker, and for any pool other than the main one
+        -- an SWA pool has its own geometry even when it holds a single group,
+        because that geometry lives on the pool rather than on ``self``.
+
+        Two callers, for two reasons that happen to coincide: it selects the
+        per-group loop in ``_transfer_impl``, and in ``launch_transfer`` it
+        rules out compression, which is sized for the main uniform pool only.
+        """
+        return (pool.pool_id is not PoolId.FULL_KV
+                or self.tp_group_transfer_groups is not None)
 
     def _pool_for(self, op: Optional[WorkerTransferOp]) -> "_Pool":
         """Which pool an op addresses.
@@ -1107,19 +1145,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             )
             if self._use_async_launch:
                 self.region_batch.wait_all_streams()
-        elif (pool.pool_id is not PoolId.FULL_KV
-              or self.tp_group_transfer_groups is not None):
-            # Multi-group transfer: one call per group. With launch_sync=False
-            # every group is in flight at once instead of one at a time.
-            # A non-default pool always comes through here even when it has a
-            # single group -- its geometry lives on the pool, not on self.
+        elif self._is_per_group(pool):
+            # One call per group. With launch_sync=False every group is in
+            # flight at once instead of one at a time.
             for gp in pool.thread_groups:
-                g_gpu = gpu_block_id_list
-                g_cpu = cpu_block_id_list
-
                 gp['tp_thread_group'].tp_group_transfer(
-                    g_gpu,
-                    g_cpu,
+                    gpu_block_id_list,
+                    cpu_block_id_list,
                     gp['cpu_kv_stride'],
                     gp['cpu_layer_stride'],
                     gp['cpu_block_stride'],
@@ -1161,31 +1193,28 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 self.tp_transfer_thread_group.wait_all_streams()
 
 
-    def _layerwise_plan(
-        self, has_swa: bool,
-    ) -> Tuple[List["c_ext.RegionRequest"], List[PoolId], List[int]]:
-        """The request list for a layerwise transfer, built once and reused.
+    def _layerwise_plan(self, has_swa: bool) -> LayerwisePlan:
+        """The plan for one layerwise shape, built on first use and reused.
 
-        Everything about these requests except the two block-id tensors is
-        fixed by the worker's geometry: the region index, the local layer, the
-        direction, the CTA count, the share mode. Only which blocks move
-        changes from op to op. So the objects are built the first time a shape
-        is seen and kept -- at DSv4 scale that is 128 ``RegionRequest``
+        Building it is not free -- at DSv4 scale it is 128 ``RegionRequest``
         constructions plus 11 pybind setter calls each, per transfer, for a
-        result that is byte-identical every time.
-
-        Reuse is safe because ``submit_layerwise`` copies: pybind11's
-        ``type_caster_base`` declares the non-movable ``cast_op_type``, so the
-        vector cast copies each element rather than moving from it, and the
-        objects come back intact. It is also *only* safe while transfers are
-        serialized on this worker's thread -- a second op overwriting the id
-        tensors while the previous one's DMA still reads them would corrupt it.
-        That is the case today: ``_layerwise_transfer_impl`` drains before it
-        returns.
+        result that is byte-identical every time. Since none of those 11 fields
+        depend on the op (see ``LayerwisePlan``), the whole thing is cached.
 
         Keyed on ``has_swa`` because an op with no SWA blocks skips the SWA
         members entirely, which changes both the request list and the set of
         layers left empty.
+
+        Reuse is safe on two counts. ``submit_layerwise`` copies: pybind11's
+        ``type_caster_base`` declares the non-movable ``cast_op_type``, so the
+        vector cast copies each element rather than moving from it, and the
+        objects come back intact. And rebinding the ids in place is safe only
+        while ops are serialized on this worker's thread -- a second op
+        overwriting the tensors while the previous one's DMA still reads them
+        would corrupt both. That holds today because
+        ``_layerwise_transfer_impl`` drains before it returns; a worker that
+        ever pipelines two layerwise ops would need a plan per in-flight op
+        rather than a plan per shape.
         """
         cached = self._layerwise_plans.get(has_swa)
         if cached is not None:
@@ -1193,10 +1222,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
         requests: List["c_ext.RegionRequest"] = []
         pool_of: List[PoolId] = []
-        # Layers this transfer will not launch anything for. The consumer waits
-        # on every layer's fd regardless, so these have to be posted up front or
-        # it hangs. It is per shape, not per worker: an op with no SWA blocks
-        # leaves every SWA-only layer uncovered too.
+        # Per shape, not per worker: an op with no SWA blocks leaves every
+        # SWA-only layer uncovered too.
         empty_layers: List[int] = []
         for layer, members in enumerate(self._layer_milestones):
             live = [m for m in members
@@ -1225,7 +1252,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 requests.append(req)
                 pool_of.append(pool_id)
 
-        plan = (requests, pool_of, empty_layers)
+        plan = LayerwisePlan(requests, pool_of, empty_layers)
         self._layerwise_plans[has_swa] = plan
         return plan
 
@@ -1261,20 +1288,23 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 f"[worker {self.worker_id}] layerwise op carries SWA block ids "
                 "but this worker has no SWA pool registered")
 
-        requests, pool_of, empty_layers = self._layerwise_plan(has_swa)
-        # The layerwise op carries one id pair per pool it touches. Only two
-        # exist today, so this is a dict rather than a widening of the op: the
-        # cpp entry point takes the two tensors positionally.
+        plan = self._layerwise_plan(has_swa)
+        # Bind this op's ids onto the plan: the only per-op input there is. The
+        # layerwise op carries one pair per pool it touches, and only two pools
+        # exist today, so this is a dict rather than a widening of the op --
+        # the cpp entry point takes the two tensors positionally.
         ids_by_pool = {
             PoolId.FULL_KV: (gpu_block_ids, cpu_block_ids),
             PoolId.SWA: (swa_gpu_block_ids, swa_cpu_block_ids),
         }
-        for req, pool_id in zip(requests, pool_of):
+        # strict: the two lists are built in lockstep, and a silent truncation
+        # here would drop requests and hang the consumer on an unposted fd.
+        for req, pool_id in zip(plan.requests, plan.pool_of, strict=True):
             req.gpu_block_id_tensor, req.cpu_block_id_tensor = \
                 ids_by_pool[pool_id]
 
         self.region_batch.submit_layerwise(
-            requests, empty_layers, counter_id)
+            plan.requests, plan.empty_layers, counter_id)
         # Launched, not landed. Returning here would let the engine recycle the
         # source blocks while DMA is still reading them -- and we cannot drain
         # inline before the posts, because the consumer is blocked on the very
@@ -1319,10 +1349,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             return self._launch_layerwise(transfer_op)
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
         pool = self._pool_for(transfer_op)
-        if (pool.pool_id is not PoolId.FULL_KV
-                or self.tp_group_transfer_groups is not None):
-            # Multi-group or a non-default pool — compression is sized for the
-            # main uniform pool only, so it does not apply here.
+        if self._is_per_group(pool):
+            # No compression here: it is sized for the main uniform pool only.
             start_time = time.time()
             self._transfer_impl(
                 src_block_ids,
