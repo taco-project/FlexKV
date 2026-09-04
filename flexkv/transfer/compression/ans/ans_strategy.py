@@ -15,6 +15,30 @@ from flexkv.transfer.compression.common.strategy import CompressionStrategy
 
 
 class NvcompGpuCpuStrategy(CompressionStrategy):
+    """ANS-compressed CPU<->GPU transfer for a TP group of any size.
+
+    There used to be a second strategy (``NvcompGpuCpuTpStrategy``) because
+    there used to be a second worker.  The two bound to different attribute
+    shapes -- scalar ``gpu_kv_stride_in_bytes`` and module-level
+    ``transfer_kv_blocks_ans_{comp,decomp}`` here, list-shaped
+    ``gpu_chunk_sizes_in_bytes`` and ``tp_group_transfer_ans`` there -- so
+    every field added to one had to be mirrored into the other.  Now that
+    ``GPUCPUTransferWorker`` covers tp==1 as ``num_gpus == 1``, one strategy
+    on ``tp_group_transfer_ans`` covers both: the cpp side already dispatches
+    per rank, and with a single rank the ``num_kv_heads > 1`` branch reduces
+    to exactly the old non-TP call (offset 0, table slice 0).
+
+    The size table follows the same rule: canonical 3-D ``[blocks, layers,
+    kv]`` when tp==1 or KV is replicated across ranks, per-rank 4-D otherwise
+    (see ``ans_utils.size_table_shape``).  Only the 4-D form has a rank
+    stride, and only then does the kernel need one.
+    """
+
+    # ANS goes through ``tp_group_transfer_ans`` on the thread group; the
+    # region batch has no compressed entry point. So this strategy is the one
+    # thing that keeps the thread group on the live path for a uniform pool.
+    needs_gpu_cpu_thread_group = True
+
     def __init__(self, cpu_size_table: torch.Tensor):
         self._cpu_size_table = cpu_size_table
         self._table_ptr = 0
