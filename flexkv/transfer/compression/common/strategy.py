@@ -11,6 +11,12 @@ if TYPE_CHECKING:
 
 
 class CompressionStrategy(ABC):
+    # Whether this strategy issues transfers through the worker's
+    # ``TPTransferThreadGroup`` rather than its region batch. The GPU<->CPU
+    # worker builds that object only when something will actually call it, so
+    # a strategy that needs it has to say so before ``attach`` runs.
+    needs_gpu_cpu_thread_group: bool = False
+
     @abstractmethod
     def attach(self, worker: "TransferWorkerBase") -> None:
         ...

@@ -34,6 +34,11 @@ class NvcompGpuCpuStrategy(CompressionStrategy):
     stride, and only then does the kernel need one.
     """
 
+    # ANS goes through ``tp_group_transfer_ans`` on the thread group; the
+    # region batch has no compressed entry point. So this strategy is the one
+    # thing that keeps the thread group on the live path for a uniform pool.
+    needs_gpu_cpu_thread_group = True
+
     def __init__(self, cpu_size_table: torch.Tensor):
         self._cpu_size_table = cpu_size_table
         self._table_ptr = 0
