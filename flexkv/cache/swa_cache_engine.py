@@ -16,7 +16,7 @@
 """SWAOpConstructor — SWA peer-op graph builder.
 
 The node-mounted SWA state lives on the Full-KV radix nodes; per-tier match,
-slot allocation, pinning, and ready-node ownership are resolved inside
+slot allocation, pinning, and node ownership are resolved inside
 ``GlobalCacheEngine._get_impl_*`` / ``_put_impl_*`` alongside the Full-KV plan.
 This module is intentionally narrower: given resolved SWA slot ids, it appends
 the peer SWA ops into the same ``TransferOpGraph`` as the Full-KV ops.

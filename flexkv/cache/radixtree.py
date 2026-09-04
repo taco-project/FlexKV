@@ -49,17 +49,15 @@ from flexkv.common.transfer import DeviceType
 
 @dataclass
 class MatchResult:
-    num_ready_matched_blocks: int = 0
     num_matched_blocks: int = 0
     matched_pos: str = "local"
-    last_ready_node: Optional['RadixNode'] = None
     last_node: Optional['RadixNode'] = None
     last_node_matched_length: int = 0
     physical_blocks: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     # ===== SWA (node-mounted) =====
-    # Deepest fully-matched, ready node that carries a live SWA slot, and the
-    # ready-prefix block count ending at that node. This is the SWA hit: the
-    # longest reusable trailing-SWA prefix (one forward pass, no backtracking).
+    # Deepest fully-matched node that carries a live SWA slot, and the matched
+    # prefix block count ending at that node. This is the SWA hit: the longest
+    # reusable trailing-SWA prefix (one forward pass, no backtracking).
     last_swa_node: Optional['RadixNode'] = None
     swa_hit_blocks: int = 0
 
@@ -75,7 +73,6 @@ class RadixNode:
     block_hashes: np.ndarray
     physical_blocks: np.ndarray
 
-    is_ready: bool
     lock_cnt: int          # Full-KV lock ref (== sglang full_lock_ref)
     grace_time: float
     hit_count: int = 0
@@ -122,9 +119,11 @@ class RadixNode:
         return not self.is_root() and self.is_leaf() and not self.in_use()
 
     def in_use(self) -> bool:
-        # A node is in use (not full-evictable) if its Full KV is locked, its SWA
-        # is locked (I3: swa_lock_ref>0 implies it must stay), or it is not ready.
-        return self.lock_cnt > 0 or self.swa_lock_ref > 0 or not self.is_ready
+        # A node is in use (not full-evictable) if its Full KV is locked or its
+        # SWA is locked (I3: swa_lock_ref>0 implies it must stay). Nodes are only
+        # mounted once their data is written, so every node in the tree is
+        # readable.
+        return self.lock_cnt > 0 or self.swa_lock_ref > 0
 
     def has_swa(self) -> bool:
         """True iff this node carries a live (non-tombstone) SWA slot."""
@@ -163,7 +162,6 @@ class RadixNode:
         new_node = RadixNode(
             block_hashes=self.block_hashes[:prefix_length],
             physical_blocks=self.physical_blocks[:prefix_length],
-            is_ready=self.is_ready,
             lock_cnt=0,  # Note: only lock near-leaf node
             grace_time=self.grace_time,
             hit_count=self.hit_count,
@@ -215,7 +213,6 @@ class RadixTreeIndex:
                  protected_threshold: int = 2):
         self.root_node: RadixNode = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                               physical_blocks=np.array([], dtype=np.int64),
-                                              is_ready=True,
                                               lock_cnt=0,
                                               grace_time=time.time())
 
@@ -236,10 +233,10 @@ class RadixTreeIndex:
         # Full KV (multi-turn dialogue: evict interior-prefix SWA first).
         self._swa_lru_head = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                        physical_blocks=np.array([], dtype=np.int64),
-                                       is_ready=True, lock_cnt=0, grace_time=0.0)
+                                       lock_cnt=0, grace_time=0.0)
         self._swa_lru_tail = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                        physical_blocks=np.array([], dtype=np.int64),
-                                       is_ready=True, lock_cnt=0, grace_time=0.0)
+                                       lock_cnt=0, grace_time=0.0)
         self._swa_lru_head.swa_lru_next = self._swa_lru_tail
         self._swa_lru_tail.swa_lru_prev = self._swa_lru_head
         # SWA slots freed by structural changes (split / merge / evict / evict_swa),
@@ -255,7 +252,6 @@ class RadixTreeIndex:
     def reset(self) -> None:
         self.root_node = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                    physical_blocks=np.array([], dtype=np.int64),
-                                   is_ready=True,
                                    lock_cnt=0,
                                    grace_time=time.time())
         self.leaf_nodes.clear()
@@ -377,18 +373,10 @@ class RadixTreeIndex:
                     update_cache_info: bool = True) -> MatchResult:
         sequence.gen_hashes()
         current_node = self.root_node
-        last_ready_node = self.root_node
         prefix_blocks_num = 0
-        ready_prefix_blocks_num = 0
-        # ``num_ready_matched_blocks`` is a prefix length, not a count of ready
-        # blocks anywhere on the matched path.  A later child may become ready
-        # before an in-flight parent (for example after a concurrent branch
-        # split); once that happens, no descendant can extend the readable
-        # prefix until the parent is ready too.
-        ready_prefix_open = True
         last_node_matched_length = 0
         physical_blocks = np.array([], dtype=np.int64)
-        # SWA: deepest fully-matched ready node carrying a live SWA slot.
+        # SWA: deepest fully-matched node carrying a live SWA slot.
         last_swa_node: Optional[RadixNode] = None
         swa_hit_blocks = 0
         while prefix_blocks_num < sequence.num_blocks:
@@ -405,18 +393,13 @@ class RadixTreeIndex:
                 current_node.hit_count += 1
             child_hash = sequence.get_hash(prefix_blocks_num + current_node.size())
             if child_hash in current_node.children:
-                if ready_prefix_open and current_node.is_ready:
-                    last_ready_node = current_node
-                    ready_prefix_blocks_num += current_node.size()
-                    # current_node is FULLY matched (whole size consumed): if it
-                    # carries a live SWA at its trailing page, it is the new
-                    # deepest SWA hit (single forward pass, no backtracking).
-                    if current_node.has_swa():
-                        last_swa_node = current_node
-                        swa_hit_blocks = ready_prefix_blocks_num
-                elif current_node.size() > 0:
-                    ready_prefix_open = False
                 prefix_blocks_num += current_node.size()
+                # current_node is FULLY matched (whole size consumed): if it
+                # carries a live SWA at its trailing page, it is the new
+                # deepest SWA hit (single forward pass, no backtracking).
+                if current_node.has_swa():
+                    last_swa_node = current_node
+                    swa_hit_blocks = prefix_blocks_num
                 physical_blocks = np.concatenate([physical_blocks, current_node.physical_blocks])
                 current_node = current_node.children[child_hash]
             else:
@@ -434,30 +417,23 @@ class RadixTreeIndex:
                     physical_blocks = np.concatenate([physical_blocks, current_node.physical_blocks[:matched_length]])
                 else:
                     matched_length = 0
-                if ready_prefix_open and current_node.is_ready:
-                    last_ready_node = current_node
-                    ready_prefix_blocks_num += matched_length
-                    # Only a FULL node match (matched_length == size) exposes the
-                    # trailing page, so only then can this node's SWA be reused.
-                    if matched_length == current_node.size() and current_node.has_swa():
-                        last_swa_node = current_node
-                        swa_hit_blocks = ready_prefix_blocks_num
-                elif matched_length > 0:
-                    ready_prefix_open = False
                 last_node_matched_length = matched_length
                 prefix_blocks_num += matched_length
+                # Only a FULL node match (matched_length == size) exposes the
+                # trailing page, so only then can this node's SWA be reused.
+                if matched_length == current_node.size() and current_node.has_swa():
+                    last_swa_node = current_node
+                    swa_hit_blocks = prefix_blocks_num
                 break
         # Read-hit heat update: on a real match (update_cache_info=True), promote
         # the matched SWA node to its SWA-LRU MRU — the SWA peer of the per-node
         # Full-KV heat bump above, so a reused SWA copy survives eviction over a
-        # never-reused one. last_swa_node is the deepest fully-matched ready node
+        # never-reused one. last_swa_node is the deepest fully-matched node
         # with a live SWA slot (or None); promote_swa no-ops on root / no-SWA.
         # A probe (update_cache_info=False) must NOT touch the SWA-LRU.
         if update_cache_info and last_swa_node is not None:
             self.promote_swa(last_swa_node)
         return MatchResult(num_matched_blocks=prefix_blocks_num,
-                           num_ready_matched_blocks=ready_prefix_blocks_num,
-                           last_ready_node=last_ready_node,
                            last_node=current_node,
                            last_node_matched_length=last_node_matched_length,
                            physical_blocks=physical_blocks,
@@ -473,7 +449,6 @@ class RadixTreeIndex:
                sequence_meta: SequenceMeta,
                physical_block_ids: np.ndarray,
                num_insert_blocks: int = -1,
-               is_ready: bool = True,
                match_result: Optional[MatchResult] = None) -> Optional[RadixNode]:
         if num_insert_blocks == -1:
             num_insert_blocks = sequence_meta.num_blocks
@@ -510,7 +485,6 @@ class RadixTreeIndex:
         new_node = RadixNode(
             block_hashes=sequence_meta.block_hashes[num_matched_blocks:num_insert_blocks],
             physical_blocks=physical_block_ids,
-            is_ready=is_ready,
             lock_cnt=0,
             grace_time=now,
             creation_time=now,
@@ -688,53 +662,17 @@ class RadixTreeIndex:
                     evicted_full_blocks = np.concatenate([evicted_full_blocks, freed_full])
         return evicted_full_blocks, num_swa_freed
 
-    def remove_unready_leaf(self, node: Optional[RadixNode]) -> np.ndarray:
-        """Roll back a not-yet-ready inserted leaf, returning its blocks.
-
-        Used when a planned transfer is aborted before launch: the node was
-        inserted with ``is_ready=False`` and its completion callback (which
-        would have marked it ready) will never run. Left alone it can never be
-        evicted (``in_use`` is true for unready nodes) and it shadows future
-        puts of the same prefix, so the blocks and the prefix are both lost.
-
-        Only removes the node when doing so is unambiguously safe: it must
-        still be an unready, unlocked, SWA-unlocked leaf. If another request
-        split it or inserted below it in the create-to-cancel window, the node
-        is left in place (pre-existing behavior) rather than risk detaching
-        blocks another plan references. Returns the physical blocks to recycle
-        (empty when nothing was removed).
-        """
-        if (node is None or node.is_root() or node.is_ready
-                or node.lock_cnt > 0 or node.swa_lock_ref > 0
-                or not node.is_leaf()):
-            return np.array([], dtype=np.int64)
-        parent = node.parent
-        assert parent is not None
-        parent.children.pop(node.head_hash(), None)
-        self.leaf_nodes.pop(node.head_hash(), None)
-        self.record_freed_swa_slot(node)
-        freed = node.physical_blocks
-        node.parent = None
-        if parent.is_leaf() and not parent.is_root():
-            self.leaf_nodes[parent.head_hash()] = parent
-        if self._swa_enabled:
-            cascade_blocks, _hashes, _survivor = \
-                self._iteratively_delete_tombstone_leaf(parent)
-            if cascade_blocks.size:
-                freed = np.concatenate([freed, cascade_blocks])
-        return freed
-
     def _iteratively_delete_tombstone_leaf(
             self, node: RadixNode) -> Tuple[np.ndarray, np.ndarray, Optional[RadixNode]]:
         """Delete ``node`` and its ancestors while they are tombstone leaves with
         no Full lock (a leaf without SWA is meaningless, I2). Returns the Full
         physical blocks freed, their block hashes, and the last surviving
-        ancestor (a non-tombstone leaf, a locked/unready node, an internal node,
-        or root) so the caller can reconsider it for eviction."""
+        ancestor (a non-tombstone leaf, a locked node, an internal node, or
+        root) so the caller can reconsider it for eviction."""
         freed = np.array([], dtype=np.int64)
         freed_hashes = np.array([], dtype=np.int64)
         while (node is not None and not node.is_root() and node.is_leaf()
-               and node.swa_tombstone and node.lock_cnt == 0 and node.is_ready):
+               and node.swa_tombstone and node.lock_cnt == 0):
             parent = node.parent
             assert parent is not None
             parent.children.pop(node.head_hash(), None)
@@ -844,19 +782,6 @@ class RadixTreeIndex:
         assert node.lock_cnt > 0
         node.lock_cnt -= 1
 
-    def set_ready(self, node: RadixNode, is_ready: bool = True, ready_length: int = -1) -> None:
-        node.is_ready = is_ready
-        if ready_length > 0:
-            ready_length -= node.size()
-            num_node = 1
-            while ready_length > 0:
-                assert node.parent is not None
-                node = node.parent
-                ready_length -= node.size()
-                node.is_ready = True
-                num_node += 1
-            assert ready_length == 0
-
     def total_cached_blocks(self) -> int:
         total_cached_blocks = 0
         queue = [self.root_node]
@@ -886,19 +811,6 @@ class RadixTreeIndex:
             queue.extend(node.children.values())
         return total
 
-    def total_ready_blocks(self) -> int:
-        total_ready_blocks = 0
-        queue = [self.root_node]
-        while queue:
-            node = queue.pop(0)
-            if node.is_ready:
-                total_ready_blocks += node.size()
-            queue.extend(node.children.values())
-        return total_ready_blocks
-
-    def total_unready_blocks(self) -> int:
-        return self.total_cached_blocks() - self.total_ready_blocks()
-
 if __name__ == "__main__":
     tokens_per_block = 2
     index = RadixTreeIndex(tokens_per_block=tokens_per_block)
@@ -910,12 +822,12 @@ if __name__ == "__main__":
     seq1 = SequenceMeta(token_ids=token_ids1, tokens_per_block=tokens_per_block)
     seq2 = SequenceMeta(token_ids=token_ids2, tokens_per_block=tokens_per_block)
 
-    index.insert(seq1, np.array([0, 1, 2, 3], dtype=np.int64), is_ready=True)
+    index.insert(seq1, np.array([0, 1, 2, 3], dtype=np.int64))
     print(f"insert seq1 = {seq1.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks()}")
     seq2_matched_blocks = index.num_matched_blocks(seq2)
     assert seq2_matched_blocks == 2
-    index.insert(seq2, np.array([8, 9], dtype=np.int64), is_ready=True)
+    index.insert(seq2, np.array([8, 9], dtype=np.int64))
     print(f"insert seq2 = {seq2.token_ids}, "
           f"total cached blocks = {index.total_cached_blocks()}")
 
