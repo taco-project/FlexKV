@@ -205,8 +205,8 @@ class TestLayerwisePlanReuse:
         fx = build_fixture([main], NUM_LAYERS, has_swa=True)
         w = _worker(fx, with_swa_pool=True)
 
-        assert w._layerwise_plan(True)[2] == []
-        assert w._layerwise_plan(False)[2] == [0]
+        assert w._layerwise_plan(True).empty_layers == []
+        assert w._layerwise_plan(False).empty_layers == [0]
 
     def test_swa_op_at_a_worker_without_an_swa_pool_raises(self) -> None:
         """The dangerous fall-through: SWA slot ids against full-KV regions.
