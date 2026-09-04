@@ -31,3 +31,24 @@ def test_lookup_accepts_sglang_array_token_ids():
         rid="request",
     ) == (-1, 0)
     connector._log_cache_op.assert_called_once()
+
+
+def test_registration_distinguishes_physical_and_global_kv_heads():
+    for physical_heads, global_heads in ((8, 32), (1, 4), (1, 1)):
+        connector = FlexKVConnector.__new__(FlexKVConnector)
+        connector.model_config = SimpleNamespace(
+            kv_dim=2, num_kv_heads=global_heads
+        )
+        connector.rank_info = SimpleNamespace(num_layers_per_pp_stage=2)
+        connector.page_size = 16
+        connector.tp_client = MagicMock()
+        connector._label = "test"
+        kv_caches = [torch.empty(160, physical_heads, 128)] * 4
+
+        connector._register_standard_to_server(kv_caches)
+
+        layout = connector.tp_client.register_to_server.call_args.kwargs[
+            "kv_layout"
+        ]
+        assert layout.num_head == physical_heads
+        assert layout.num_kv_heads == global_heads
