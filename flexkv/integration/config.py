@@ -196,6 +196,7 @@ class FlexKVConfig:
     def post_init_from_vllm_config(
         self,
         vllm_config: "VllmConfig",
+        kv_cache_config: Optional["KVCacheConfig"] = None,
         ) -> RankInfo:
         parallel_config = vllm_config.parallel_config
         tp_rank = int(getattr(parallel_config, 'tensor_parallel_rank', 0))
@@ -234,7 +235,7 @@ class FlexKVConfig:
                 "for MLA instead."
             )
         self._configure_kv_layout_from_vllm_backend(
-            vllm_config, vllm_kv_cache_dtype)
+            vllm_config, vllm_kv_cache_dtype, kv_cache_config)
 
         if self.model_config.pp_size > 1:
             from vllm.distributed.utils import get_pp_indices as vllm_get_pp_indices
@@ -284,6 +285,7 @@ class FlexKVConfig:
         self,
         vllm_config: "VllmConfig",
         vllm_kv_cache_dtype: str,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
     ) -> None:
         """Populate FlexKV's storage layout from vLLM's physical cache shape.
 
@@ -301,6 +303,10 @@ class FlexKVConfig:
         Raises:
             ValueError: if the backend returns an unsupported cache shape.
         """
+        if kv_cache_config is not None:
+            self._configure_kv_layout_from_vllm_cache_config(kv_cache_config)
+            return
+
         from vllm.distributed.kv_transfer.kv_connector.utils import (
             get_current_attn_backend,
         )
@@ -380,6 +386,85 @@ class FlexKVConfig:
             f"num_kv_heads_per_rank={physical_num_heads_per_rank}, "
             f"total_storage_heads={self.model_config.num_kv_heads}, "
             f"head_size={physical_head_size}, kv_dim={kv_dim}"
+        )
+
+    def _configure_kv_layout_from_vllm_cache_config(
+        self,
+        kv_cache_config: "KVCacheConfig",
+    ) -> None:
+        """Populate the packed storage layout from vLLM resolved KV specs."""
+        from vllm.v1.kv_cache_interface import AttentionSpec, iter_layer_specs
+
+        layouts = set()
+        for group in kv_cache_config.kv_cache_groups:
+            for spec in iter_layer_specs(group.kv_cache_spec):
+                if not isinstance(spec, AttentionSpec):
+                    raise ValueError(
+                        "FlexKV only supports attention KV cache specs; got "
+                        f"{type(spec).__name__}"
+                    )
+                if spec.tokens_per_state != 1:
+                    raise ValueError(
+                        "FlexKV does not support compressed vLLM KV states; "
+                        f"tokens_per_state={spec.tokens_per_state}"
+                    )
+                if (
+                    spec.page_size_padded is not None
+                    and spec.page_size_padded != spec.unpadded_page_size_bytes
+                ):
+                    raise ValueError(
+                        "FlexKV does not support padded vLLM KV pages; "
+                        f"page_size_padded={spec.page_size_padded}, "
+                        f"unpadded={spec.unpadded_page_size_bytes}"
+                    )
+
+                element_size = torch.empty((), dtype=spec.dtype).element_size()
+                if spec.state_content_size_bytes % element_size != 0:
+                    raise ValueError(
+                        "vLLM KV state byte width is not divisible by its "
+                        f"dtype size: bytes={spec.state_content_size_bytes}, "
+                        f"dtype={spec.dtype}"
+                    )
+                layouts.add(
+                    (
+                        spec.num_heads,
+                        spec.state_content_size_bytes // element_size,
+                        spec.dtype,
+                        spec.block_size,
+                    )
+                )
+
+        if len(layouts) != 1:
+            raise ValueError(
+                "FlexKV requires one uniform vLLM attention storage layout; "
+                f"got {sorted(map(str, layouts))}"
+            )
+
+        physical_num_heads_per_rank, physical_head_size, dtype, block_size = (
+            layouts.pop()
+        )
+        if block_size != self.cache_config.tokens_per_block:
+            raise ValueError(
+                "vLLM KV spec block size disagrees with cache config: "
+                f"spec={block_size}, config={self.cache_config.tokens_per_block}"
+            )
+        if dtype != self.model_config.dtype:
+            raise ValueError(
+                "vLLM resolved KV dtype disagrees with FlexKV dtype: "
+                f"spec={dtype}, flexkv={self.model_config.dtype}"
+            )
+
+        self.model_config.num_kv_heads = physical_num_heads_per_rank
+        if physical_num_heads_per_rank != 1:
+            self.model_config.num_kv_heads *= self.model_config.tp_size
+        self.model_config.head_size = physical_head_size
+        # vLLM standardized [B, H, N, C] layout packs K/V in C.
+        self.model_config.kv_dim = 1
+        logger.info(
+            f"[FlexKV vllm] physical KV layout from KVCacheConfig: "
+            f"num_kv_heads_per_rank={physical_num_heads_per_rank}, "
+            f"total_storage_heads={self.model_config.num_kv_heads}, "
+            f"head_size={physical_head_size}, kv_dim=1, dtype={dtype}"
         )
 
     def post_init_from_sglang_config(

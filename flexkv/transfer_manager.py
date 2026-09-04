@@ -82,6 +82,7 @@ class TransferManager:
             self.context, zmq.SocketType.REP, self.gpu_control_port, True
         )
         self._gpu_suspended = False
+        self._pending_suspend_registrations: set[RegistrationKey] = set()
         self._pending_resume_registrations: Dict[
             RegistrationKey, RegisterTPClientRequest
         ] = {}
@@ -171,16 +172,35 @@ class TransferManager:
 
         request_type = request.get("type")
         if request_type == "suspend_gpu":
-            if not self._gpu_suspended:
+            registration_key = request.get("registration_key")
+            if registration_key not in self.all_gpu_blocks:
+                raise KeyError(f"Unknown registration key {registration_key}")
+            if self._gpu_suspended:
+                return {
+                    "ok": True,
+                    "ready": True,
+                    "registered": self.expected_gpus,
+                    "released_mappings": 0,
+                }
+
+            self._pending_suspend_registrations.add(registration_key)
+            registered = len(self._pending_suspend_registrations)
+            ready = registered == self.expected_gpus
+            released = 0
+            if ready:
                 released = self.transfer_engine.suspend_gpu_mappings()
                 self._gpu_suspended = True
+                self._pending_suspend_registrations.clear()
                 self._pending_resume_registrations.clear()
                 flexkv_logger.info(
                     f"Suspended FlexKV GPU mappings: released={released}"
                 )
-            else:
-                released = 0
-            return {"ok": True, "released_mappings": released}
+            return {
+                "ok": True,
+                "ready": ready,
+                "registered": registered,
+                "released_mappings": released,
+            }
 
         if request_type != "resume_gpu":
             raise ValueError(f"Unknown GPU control request: {request_type}")

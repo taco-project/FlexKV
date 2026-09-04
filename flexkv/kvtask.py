@@ -209,10 +209,10 @@ class KVTaskManager:
             ))
             self.transfer_handles[-1]._handle.send_config_to_remotes()
 
-        self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
+        self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(ttl=1800) # 30 minutes
 
         # hash(token_ids) -> task_id
-        self.prefetch_tasks: ExpiringDict[int, int] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
+        self.prefetch_tasks: ExpiringDict[int, int] = ExpiringDict(ttl=1800) # 30 minutes
         self._gen_prefetch_key = lambda token_ids, namespace: hash_token(token_ids, namespace)
 
         self.graph_to_task: Dict[int, int] = {}

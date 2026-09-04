@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
     if _HAS_KV_CONNECTOR_OUTPUT:
         from vllm.v1.outputs import KVConnectorOutput
@@ -534,12 +535,27 @@ class FlexKVSchedulerConnector:
         if self.maybe_skip_put and os.path.exists('/tmp/flexkv_skip_put'):
             return False
 
-        task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(request=request)
+        # vLLM passes only blocks backed by completed model execution. During
+        # abort, request.num_tokens can also include tokens still in flight or
+        # waiting on a remote-KV load, so it is not a valid upper bound for a
+        # GPU-to-host transfer.
+        max_backed_tokens = len(block_ids) * self.block_size
+        num_tokens_to_put = min(
+            ((request.num_tokens - 1) // self.block_size) * self.block_size,
+            max_backed_tokens,
+        )
+        if num_tokens_to_put == 0:
+            return False
 
-        self.flexkv_stats.record_put(num_all_tokens=request.num_tokens,
+        task_id, num_matched_tokens, num_unmatched_tokens = self._put_match(
+            request=request,
+            num_tokens_to_put=num_tokens_to_put,
+        )
+
+        self.flexkv_stats.record_put(num_all_tokens=num_tokens_to_put,
                                      num_unmatched_tokens=num_unmatched_tokens)
 
-        if not self._need_to_put(num_all_tokens=request.num_tokens,
+        if not self._need_to_put(num_all_tokens=num_tokens_to_put,
                                 num_matched_tokens=num_matched_tokens,
                                 num_unmatched_tokens=num_unmatched_tokens):
             return False
@@ -577,7 +593,8 @@ class FlexKVSchedulerConnector:
 
     def _put_match(
         self,
-        request: "Request"
+        request: "Request",
+        num_tokens_to_put: int,
     ) -> tuple[int, int, int]:
         """
         Args:
@@ -588,7 +605,6 @@ class FlexKVSchedulerConnector:
                             the task_id, number of matched tokens and number of unmatched tokens.
         """
         match_start_time = time.perf_counter()
-        num_tokens_to_put = ((request.num_tokens - 1) // self.block_size) * self.block_size
         token_ids = request.all_token_ids[:num_tokens_to_put]
 
         if num_tokens_to_put == 0:
@@ -995,10 +1011,12 @@ class FlexKVWorkerConnector:
             self.remote_transfer_manager_process = None
 
 class FlexKVConnectorV1Impl:
-    def __init__(self, vllm_config: "VllmConfig", role: "KVConnectorRole"):
+    def __init__(self, vllm_config: "VllmConfig", role: "KVConnectorRole",
+                 kv_cache_config: Optional["KVCacheConfig"] = None):
         self.role = role
         flexkv_config = FlexKVConfig.from_env()
-        rank_info = flexkv_config.post_init_from_vllm_config(vllm_config)
+        rank_info = flexkv_config.post_init_from_vllm_config(
+            vllm_config, kv_cache_config)
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector = FlexKVSchedulerConnector(flexkv_config, rank_info)

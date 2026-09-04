@@ -137,6 +137,8 @@ MLA_SIZES = [
 MHA_SIZES = [
     # Llama-3 scale: 32 layers, kv_heads=8, head_dim=128
     pytest.param((4, 8, 16, 8, 128), id="llama3-mini"),
+    # Qwen3-30B-A3B boundary: one physical KV head on each TP4 rank.
+    pytest.param((4, 8, 16, 4, 128), id="qwen3-gqa-tp4"),
     pytest.param((32, 64, 16, 8, 128), id="llama3-8b"),
     pytest.param((80, 256, 16, 8, 128), id="llama3-70b"),
     pytest.param((2, 4, 1, 8, 128), id="edge"),            # tpb=1 edge case

@@ -1262,7 +1262,12 @@ class FlexKVConnector:
                 fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
                 try:
                     completed_dict = (
-                        self.kv_manager.try_wait(task_ids=list(fk_to_rid.keys())) or {}
+                        self.kv_manager.wait(
+                            list(fk_to_rid.keys()),
+                            timeout=0.0,
+                            completely=True,
+                        )
+                        or {}
                     )
                 except Exception as exc:  # noqa: BLE001
                     rid = next(iter(self._inflight_stores))
@@ -1314,20 +1319,25 @@ class FlexKVConnector:
 
     def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
         """Block until a single store task identified by ``rid`` finishes."""
-        fkv_task_id = self._inflight_stores.pop(rid, -1)
+        fkv_task_id = self._inflight_stores.get(rid, -1)
         if fkv_task_id < 0:
             return True
-        context = self._pop_context(
-            "_inflight_store_contexts", rid, "store", fkv_task_id
+        context = getattr(self, "_inflight_store_contexts", {}).get(rid)
+        context = context or self._new_op_context(
+            "store", rid, task_id=fkv_task_id
         )
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
+            self._inflight_stores.pop(rid, None)
+            getattr(self, "_inflight_store_contexts", {}).pop(rid, None)
             return True
         try:
-            resp = self.kv_manager.wait([fkv_task_id], timeout=timeout) or {}
+            resp = self.kv_manager.wait(
+                [fkv_task_id], timeout=timeout, completely=True
+            ) or {}
         except Exception as exc:  # noqa: BLE001
             self._log_cache_op(
                 context,
-                "complete",
+                "poll",
                 "failed",
                 direction="D2H",
                 transfer_mode="no-layerwise",
@@ -1335,6 +1345,19 @@ class FlexKVConnector:
             )
             return False
         status = _status_value(resp.get(fkv_task_id))
+        if not _is_terminal_status(status):
+            self._log_cache_op(
+                context,
+                "poll",
+                status,
+                direction="D2H",
+                transfer_mode="no-layerwise",
+            )
+            return False
+        self._inflight_stores.pop(rid, None)
+        self._pop_context(
+            "_inflight_store_contexts", rid, "store", fkv_task_id
+        )
         success = status == KVResponseStatus.SUCCESS.value
         self._log_cache_op(
             context,
@@ -2143,21 +2166,21 @@ class FlexKVConnector:
             kv_caches[0].ndim == 3
         ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
 
-        # kv_dim from ModelConfig (MLA→1, non-MLA plain MHA→2). num_kv_heads is
-        # the per-rank physical head count read from the GPU tensor (same value
-        # used for num_head); for MLA the tensor's head axis is 1.
         kv_dim = self.model_config.kv_dim
-        num_blocks, num_kv_heads, head_size = kv_caches[0].shape
+        num_blocks, physical_num_kv_heads, head_size = kv_caches[0].shape
+        global_num_kv_heads = self.model_config.num_kv_heads
+        # FlexKV uses num_kv_heads == 1 for KV shared across all TP ranks.
+        # TODO: represent partial KV-head replication when 1 < global heads < TP.
 
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=self.rank_info.num_layers_per_pp_stage,
             num_block=num_blocks // self.page_size,
             tokens_per_block=self.page_size,
-            num_head=num_kv_heads,
+            num_head=physical_num_kv_heads,
             head_size=head_size,
             kv_dim=kv_dim,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=global_num_kv_heads,
         )
 
         indexer_layout = None
