@@ -373,7 +373,7 @@ def test_pcfs_addresses_every_chunk_of_a_block_exactly_once(
     # ...and it must stay inside the pool it was given.
     pool_bytes = layout.kv_shape.numel() * dtype.itemsize
     for cpu_off, _remote_off, nbytes in issued:
-        assert 0 <= cpu_off and cpu_off + nbytes <= pool_bytes, (
+        assert cpu_off >= 0 and cpu_off + nbytes <= pool_bytes, (
             f"CPU access [{cpu_off}, {cpu_off + nbytes}) escapes the "
             f"{pool_bytes}-byte pool")
 
