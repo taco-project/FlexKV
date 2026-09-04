@@ -287,7 +287,9 @@ class GDSTransferWorker(TransferWorkerBase):
 
         gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
 
-        for gi, (g, ssd) in enumerate(zip(layer_groups, ssd_regions)):
+        # strict=: compile_host_regions() emits exactly one region per group, so
+        # a length mismatch is a broken invariant, not an input to truncate past.
+        for gi, (g, ssd) in enumerate(zip(layer_groups, ssd_regions, strict=True)):
             # TP stride for SSD: partition the block across TP ranks. With one
             # KV head the ranks share the same heads, so there is nothing to
             # partition and every rank addresses the whole block.
