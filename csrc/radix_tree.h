@@ -28,6 +28,13 @@ private:
   uint64_t creation_time;
   int hit_count;
   int leaf_vector_index = -1;
+  // Cached sum of ancestor sizes (blocks preceding this node). Maintained
+  // incrementally in split() and CRadixTreeIndex::insert so StreamingLLM sink
+  // checks are O(1) instead of an O(depth) walk to root. split()/merge_child
+  // preserve the block count along every root->descendant path, so only the
+  // split node itself and freshly-inserted nodes ever need updating (no
+  // subtree refresh). Mirror of Python RadixNode.block_offset.
+  int block_offset_ = 0;
 
   // ===== SWA (Sliding Window Attention) fields =====
   // SWA snapshot state attached to this node. Mirrors the Python RadixNode
@@ -109,6 +116,10 @@ public:
   void set_leaf_vector_index(int index) { leaf_vector_index = index; }
 
   int get_leaf_vector_index() { return leaf_vector_index; }
+
+  void set_block_offset(int offset) { block_offset_ = offset; }
+
+  int get_block_offset() const { return block_offset_; }
 
   // ===== SWA accessors =====
   int get_swa_host_slot() { return swa_host_slot; }
@@ -301,6 +312,9 @@ protected:
   int node_count;
   int hit_reward_seconds;
   std::unique_ptr<IEvictionStrategy> strategy_;
+  // StreamingLLM: number of leading blocks (attention sinks) protected from
+  // eviction. 0 disables the protection.
+  int sink_block_count_ = 0;
 
   // SWA slots that were freed because their node was deleted/invalidated by a
   // structural change (split / merge / evict). The Python side drains this and
@@ -353,12 +367,13 @@ public:
   CRadixTreeIndex(int tokens_per_block, int max_num_blocks = 1000000,
                   int hit_reward_seconds = 0,
                   EvictionPolicy eviction_policy = EvictionPolicy::LRU,
-                  int protected_threshold = 2) {
+                  int protected_threshold = 2, int sink_block_count = 0) {
     this->tokens_per_block = tokens_per_block;
     this->max_num_blocks = max_num_blocks;
     this->node_count = 0;
     this->hit_reward_seconds = hit_reward_seconds;
     this->strategy_ = create_eviction_strategy(eviction_policy, protected_threshold);
+    this->sink_block_count_ = sink_block_count;
 
     root = new CRadixNode(this, true, 0);
     node_list.push_back(root);
@@ -371,6 +386,34 @@ public:
     swa_lru_tail = new CRadixNode(this, true, 0);
     swa_lru_head->set_swa_lru_next(swa_lru_tail);
     swa_lru_tail->set_swa_lru_prev(swa_lru_head);
+  }
+
+  // Number of blocks preceding *node* (sum of sizes of all ancestors).  Used
+  // by StreamingLLM sink-token protection.  O(1): maintained incrementally in
+  // CRadixNode::split and CRadixTreeIndex::insert (was an O(depth) walk called
+  // per candidate on every eviction).  See walk_block_offset_from_root for the
+  // reference computation used by debug asserts / tests.
+  int get_block_offset_from_root(CRadixNode *node) const {
+    return node->get_block_offset();
+  }
+
+  // Reference O(depth) computation; not on the hot path.
+  int walk_block_offset_from_root(CRadixNode *node) const {
+    int offset = 0;
+    CRadixNode *cur = node->get_parent();
+    while (cur != nullptr && !is_root(cur)) {
+      offset += cur->size();
+      cur = cur->get_parent();
+    }
+    return offset;
+  }
+
+  // True if *node* falls within the first sink_block_count_ blocks and should
+  // be protected from eviction (StreamingLLM attention sinks).
+  bool is_sink_block(CRadixNode *node) const {
+    if (sink_block_count_ <= 0)
+      return false;
+    return get_block_offset_from_root(node) < sink_block_count_;
   }
 
   const IEvictionStrategy *get_strategy() const { return strategy_.get(); }
@@ -417,7 +460,29 @@ public:
     freed_swa_slots.clear();
   }
 
-  bool is_root(CRadixNode *node) { return node == root; }
+  // Recompute cached offsets after bulk tree construction/re-parenting.
+  // Normal insert/split maintain offsets incrementally in O(1); distributed
+  // rebuilds attach and merge whole subtrees through several custom paths, so
+  // one O(nodes) pass at the end is simpler and keeps the node invariant exact.
+  void rebuild_block_offsets() {
+    root->set_block_offset(0);
+    std::vector<CRadixNode *> stack{root};
+    while (!stack.empty()) {
+      CRadixNode *parent = stack.back();
+      stack.pop_back();
+      const int child_offset =
+          is_root(parent) ? 0 : parent->get_block_offset() + parent->size();
+      parent->for_each_child([&](HashType, CRadixNode *child) {
+        if (child == nullptr) {
+          return;
+        }
+        child->set_block_offset(child_offset);
+        stack.push_back(child);
+      });
+    }
+  }
+
+  bool is_root(CRadixNode *node) const { return node == root; }
 
   CRadixNode *get_root() { return root; }
 

@@ -177,6 +177,13 @@ CRadixNode *LocalRadixTree::insert(torch::Tensor &physical_block_ids,
   current_block_count += new_node->size();
   new_node->set_parent(last_node);
   last_node->set_child(new_node->get_head_hash(), new_node);
+  // Keep the shared CRadixNode offset invariant in sync with the base insert.
+  // LocalRadixTree currently constructs the base with sink_block_count=0, but
+  // nodes should remain structurally valid if sink-aware eviction is enabled
+  // here later.
+  new_node->set_block_offset(
+      is_root(last_node) ? 0
+                         : last_node->get_block_offset() + last_node->size());
 
   add_node(new_node);
   add_leaf(new_node);

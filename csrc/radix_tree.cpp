@@ -135,6 +135,12 @@ CRadixNode *CRadixNode::split(int prefix_length) {
 
   set_parent(new_node);
 
+  // Offset maintenance (O(1)): new_node is the PREFIX half and keeps this
+  // node's original offset; `this` is the SUFFIX half and now starts
+  // new_node->size() blocks later.  Read the old offset before overwriting.
+  new_node->set_block_offset(get_block_offset());
+  set_block_offset(new_node->get_block_offset() + new_node->size());
+
   // SWA (node-mount, I0/I4): the SWA snapshot lives on the node's LAST page.
   // After the split, `this` is the SUFFIX half and still owns that original
   // last page, so its SWA (slot / tombstone / lock / SWA-LRU membership) stays
@@ -374,6 +380,11 @@ CRadixNode *CRadixTreeIndex::insert(torch::Tensor &physical_block_ids,
 
   new_node->set_parent(last_node);
   last_node->set_child(new_node->get_head_hash(), new_node);
+  // O(1) offset: blocks preceding new_node == offset+size of its parent.
+  // (last_node may be the root, whose offset and size are both 0.)
+  new_node->set_block_offset(
+      is_root(last_node) ? 0
+                         : last_node->get_block_offset() + last_node->size());
 
   add_node(new_node);
   add_leaf(new_node);
@@ -455,20 +466,41 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks,
   // Optimization: Batch build the priority queue to reduce overhead from O(N
   // log N) to O(N)
   std::vector<CRadixNode *> candidates;
+  std::vector<CRadixNode *> sink_candidates;
   candidates.reserve(leaf_list.size());
   for (auto node : leaf_list) {
-    if (node->evictable()) {
+    if (!node->evictable())
+      continue;
+    // StreamingLLM: protect attention-sink blocks (first sink_block_count_
+    // blocks from the root). They are always attended to and should be evicted
+    // only as a last resort when no non-sink block is available.
+    if (is_sink_block(node)) {
+      sink_candidates.push_back(node);
+    } else {
       candidates.push_back(node);
     }
   }
-
   std::priority_queue<CRadixNode *, std::vector<CRadixNode *>,
                       CRadixNode::Compare>
       candidate(CRadixNode::Compare(), std::move(candidates));
+  std::priority_queue<CRadixNode *, std::vector<CRadixNode *>,
+                      CRadixNode::Compare>
+      sink_candidate(CRadixNode::Compare(), std::move(sink_candidates));
 
-  while ((has_evicted < num_evicted) && candidate.size()) {
-    auto node = candidate.top();
-    candidate.pop();
+  while (has_evicted < num_evicted &&
+         (!candidate.empty() || !sink_candidate.empty())) {
+    // Prefer every available non-sink block. Only fall back to sinks when the
+    // normal heap is empty; this decision is re-evaluated after each cascade
+    // because deleting a child can expose a new sink parent.
+    const bool use_sink_fallback = candidate.empty();
+    CRadixNode *node;
+    if (use_sink_fallback) {
+      node = sink_candidate.top();
+      sink_candidate.pop();
+    } else {
+      node = candidate.top();
+      candidate.pop();
+    }
 
     if (node->size() > num_evicted - has_evicted) {
       auto [blocks, block_hashes] = node->shrink(num_evicted - has_evicted);
@@ -499,7 +531,11 @@ int CRadixTreeIndex::evict(torch::Tensor &evicted_blocks,
         add_leaf(parent);
       }
       if (parent != nullptr && parent->evictable()) {
-        candidate.push(parent);
+        if (is_sink_block(parent)) {
+          sink_candidate.push(parent);
+        } else {
+          candidate.push(parent);
+        }
       }
     }
   }
