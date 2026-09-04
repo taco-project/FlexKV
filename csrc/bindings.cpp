@@ -22,8 +22,10 @@
 #include "gds/tp_gds_transfer_thread_group.h"
 #include "pcfs/pcfs.h"
 #include "radix_tree.h"
+#include "region_batch.h"
 #include "tp_transfer_thread_group.h"
 #include "transfer.cuh"
+#include "transfer_backend.h"
 #include "transfer_ssd.h"
 
 #ifndef FLEXKV_GIT_COMMIT
@@ -38,7 +40,6 @@
 #include "dist/lock_free_q.h"
 #include "dist/redis_meta_channel.h"
 #endif
-#include "layerwise.h"
 #include "monitoring/metrics_manager.h"
 #include <deque>
 
@@ -110,10 +111,12 @@ void transfer_kv_blocks_binding(
       gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes,
       gpu_layer_stride_in_bytes);
 
-  // Dispatch to appropriate template instantiation
-  switch (backend_type) {
-  case flexkv::BackendType::VLLM:
-    flexkv::transfer_kv_blocks<flexkv::BackendType::VLLM>(
+  // Dispatch to appropriate template instantiation. This binding keeps its own
+  // sync/trace arguments rather than going through launch_region: it is the
+  // standalone one-shot entry point (tests and tools call it directly), so it
+  // has no caller to hand the draining to.
+  flexkv::with_tensor_kind(backend_type, [&](auto tag) {
+    flexkv::transfer_kv_blocks<decltype(tag)::value>(
         num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
         /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
@@ -121,28 +124,7 @@ void transfer_kv_blocks_binding(
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
         use_ce_transfer, kv_dim,
         gpu_block_stride_in_bytes, sync, ce_config, enable_transfer_trace);
-    break;
-  case flexkv::BackendType::TRTLLM:
-    flexkv::transfer_kv_blocks<flexkv::BackendType::TRTLLM>(
-        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
-        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
-        cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
-        cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
-        chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
-        use_ce_transfer, kv_dim,
-        gpu_block_stride_in_bytes, sync, ce_config, enable_transfer_trace);
-    break;
-  case flexkv::BackendType::SGLANG:
-    flexkv::transfer_kv_blocks<flexkv::BackendType::SGLANG>(
-        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
-        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
-        cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
-        cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
-        chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
-        use_ce_transfer, kv_dim,
-        gpu_block_stride_in_bytes, sync, ce_config, enable_transfer_trace);
-    break;
-  }
+  });
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -288,32 +270,16 @@ void transfer_kv_blocks_gds_binding(
       gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes,
       gpu_layer_stride_in_bytes);
 
-  switch (backend_type) {
-  case flexkv::BackendType::VLLM:
-    flexkv::transfer_kv_blocks_gds<flexkv::BackendType::VLLM>(
+  // Same tag dispatch as the host-device path: the GDS transfer is templated
+  // on the same layout enum, so it gets the same one-line treatment.
+  flexkv::with_tensor_kind(backend_type, [&](auto tag) {
+    flexkv::transfer_kv_blocks_gds<decltype(tag)::value>(
         gds_manager, gpu_layer_id_list, handler, ssd_block_ids, gpu_block_ids,
         ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes,
         ssd_kv_stride_in_bytes, block_size_in_bytes, ssd_copy_off_inside_chunks,
         ssd_block_stride_in_bytes, gpu_device_id, num_blocks_per_file,
         total_layers, is_read, verbose, kv_dim);
-    break;
-  case flexkv::BackendType::TRTLLM:
-    flexkv::transfer_kv_blocks_gds<flexkv::BackendType::TRTLLM>(
-        gds_manager, gpu_layer_id_list, handler, ssd_block_ids, gpu_block_ids,
-        ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes,
-        ssd_kv_stride_in_bytes, block_size_in_bytes, ssd_copy_off_inside_chunks,
-        ssd_block_stride_in_bytes, gpu_device_id, num_blocks_per_file,
-        total_layers, is_read, verbose, kv_dim);
-    break;
-  case flexkv::BackendType::SGLANG:
-    flexkv::transfer_kv_blocks_gds<flexkv::BackendType::SGLANG>(
-        gds_manager, gpu_layer_id_list, handler, ssd_block_ids, gpu_block_ids,
-        ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes,
-        ssd_kv_stride_in_bytes, block_size_in_bytes, ssd_copy_off_inside_chunks,
-        ssd_block_stride_in_bytes, gpu_device_id, num_blocks_per_file,
-        total_layers, is_read, verbose, kv_dim);
-    break;
-  }
+  });
 }
 
 // GDS Manager Python bindings
@@ -456,7 +422,13 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("is_blockfirst") = false,
         py::arg("ce_gather_threads") = 4,
         py::arg("ce_gather_nt") = true,
-        py::arg("enable_transfer_trace") = false);
+        py::arg("enable_transfer_trace") = false,
+        // The body launches CUDA work and (when sync=true) blocks in
+        // cudaStreamSynchronize. Holding the GIL across that freezes every
+        // other thread in the worker process -- including the mp.Queue feeder
+        // that reports completed ops -- for the whole transfer. Nothing below
+        // touches a Python object; argument casting happens before the guard.
+        py::call_guard<py::gil_scoped_release>());
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory", py::arg("ioctx"),
         py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),
@@ -467,254 +439,10 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("is_read"), py::arg("num_blocks_per_file"),
         py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
         py::arg("kv_dim") = 2,
-        py::arg("ssd_io_opt") = true);
-  py::class_<flexkv::LayerwiseTransferGroup>(m, "LayerwiseTransferGroup")
-      .def(py::init([](int num_gpus,
-                       const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-                       torch::Tensor &cpu_blocks,
-                       std::map<int, std::vector<std::string>> &ssd_files,
-                       int num_layers, torch::Tensor &gpu_kv_strides_tensor,
-                       torch::Tensor &gpu_block_strides_tensor,
-                       torch::Tensor &gpu_layer_strides_tensor,
-                       torch::Tensor &gpu_chunk_sizes_tensor, int iouring_entries,
-                       int iouring_flags, torch::Tensor &layer_eventfds_tensor,
-                       int tp_size,
-                       bool has_swa,
-                       const std::vector<std::vector<torch::Tensor>> &swa_gpu_blocks,
-                       torch::Tensor swa_cpu_blocks,
-                       std::map<int, std::vector<std::string>> swa_ssd_files,
-                       torch::Tensor swa_gpu_kv_strides_tensor,
-                       torch::Tensor swa_gpu_block_strides_tensor,
-                       torch::Tensor swa_gpu_layer_strides_tensor,
-                       torch::Tensor swa_gpu_chunk_sizes_tensor,
-                       int64_t ce_segment_threshold,
-                       bool ce_path_opt,
-                       int ce_force_path,
-                       bool ce_enable_memcpy2d,
-                       bool is_blockfirst,
-                       int num_kv_heads,
-                       int ce_gather_threads,
-                       bool ce_gather_nt, bool ssd_io_opt) {
-            flexkv::CETransferConfig cfg;
-            cfg.segment_threshold = ce_segment_threshold;
-            cfg.path_opt_enabled = ce_path_opt;
-            cfg.force_path = ce_force_path;
-            cfg.enable_memcpy2d = ce_enable_memcpy2d;
-            cfg.is_blockfirst = is_blockfirst;
-            cfg.num_kv_heads = num_kv_heads;
-            cfg.gather_threads = ce_gather_threads;
-            cfg.gather_nt = ce_gather_nt;
-             return new flexkv::LayerwiseTransferGroup(
-                 num_gpus, gpu_blocks, cpu_blocks, ssd_files, num_layers,
-                 gpu_kv_strides_tensor, gpu_block_strides_tensor,
-                 gpu_layer_strides_tensor, gpu_chunk_sizes_tensor,
-                 iouring_entries, iouring_flags, layer_eventfds_tensor,
-                 tp_size, has_swa, swa_gpu_blocks, swa_cpu_blocks,
-                 swa_ssd_files, swa_gpu_kv_strides_tensor,
-                 swa_gpu_block_strides_tensor, swa_gpu_layer_strides_tensor,
-                 swa_gpu_chunk_sizes_tensor, ssd_io_opt, cfg);
-           }),
-           py::arg("num_gpus"), py::arg("gpu_blocks"), py::arg("cpu_blocks"),
-           py::arg("ssd_files"), py::arg("num_layers"),
-           py::arg("gpu_kv_strides_tensor"),
-           py::arg("gpu_block_strides_tensor"),
-           py::arg("gpu_layer_strides_tensor"),
-           py::arg("gpu_chunk_sizes_tensor"), py::arg("iouring_entries"),
-           py::arg("iouring_flags"), py::arg("layer_eventfds_tensor"),
-           py::arg("tp_size"),
-           py::arg("has_swa") = false,
-           py::arg("swa_gpu_blocks") =
-               std::vector<std::vector<torch::Tensor>>(),
-           py::arg("swa_cpu_blocks") = torch::empty({0}),
-           py::arg("swa_ssd_files") =
-               std::map<int, std::vector<std::string>>(),
-           py::arg("swa_gpu_kv_strides_tensor") = torch::empty({0}),
-           py::arg("swa_gpu_block_strides_tensor") = torch::empty({0}),
-           py::arg("swa_gpu_layer_strides_tensor") = torch::empty({0}),
-           py::arg("swa_gpu_chunk_sizes_tensor") = torch::empty({0}),
-           py::arg("ce_segment_threshold") = 8,
-           py::arg("ce_path_opt") = true,
-           py::arg("ce_force_path") = -1,
-           py::arg("ce_enable_memcpy2d") = false,
-           py::arg("is_blockfirst") = false,
-           py::arg("num_kv_heads") = 1,
-           py::arg("ce_gather_threads") = 4,
-           py::arg("ce_gather_nt") = true, py::arg("ssd_io_opt") = true)
-      .def(py::init([](
-          int num_gpus,
-          const std::vector<std::vector<std::vector<torch::Tensor>>>
-              &gpu_blocks_per_group,
-          torch::Tensor &cpu_blocks,
-          std::map<int, std::vector<std::string>> &ssd_files,
-          int num_original_layers,
-          const std::vector<std::vector<std::pair<int, int>>> &layer_members,
-          const std::vector<int> &group_num_layers,
-          const std::vector<int64_t> &group_cpu_offset_bytes,
-          const std::vector<int64_t> &group_ssd_offset_bytes,
-          const std::vector<int64_t> &group_cpu_layer_strides,
-          const std::vector<int64_t> &group_cpu_kv_strides,
-          const std::vector<int64_t> &group_ssd_layer_strides,
-          const std::vector<int64_t> &group_ssd_kv_strides,
-          const std::vector<int64_t> &group_chunk_sizes,
-          const std::vector<int64_t> &group_h2d_cpu_kv_strides,
-          const std::vector<int64_t> &group_h2d_cpu_layer_strides,
-          const std::vector<int64_t> &group_cpu_block_strides,
-          const std::vector<int64_t> &group_cpu_tp_strides,
-          const std::vector<int64_t> &group_gpu_kv_strides,
-          const std::vector<int64_t> &group_gpu_block_strides,
-          const std::vector<int64_t> &group_gpu_layer_strides,
-          const std::vector<int64_t> &group_gpu_chunk_sizes,
-          int iouring_entries, int iouring_flags,
-          torch::Tensor &layer_eventfds_tensor, int tp_size, bool has_swa,
-          const std::vector<std::vector<torch::Tensor>> &swa_gpu_blocks,
-          torch::Tensor swa_cpu_blocks,
-          std::map<int, std::vector<std::string>> swa_ssd_files,
-          torch::Tensor swa_gpu_kv_strides_tensor,
-          torch::Tensor swa_gpu_block_strides_tensor,
-          torch::Tensor swa_gpu_layer_strides_tensor,
-          torch::Tensor swa_gpu_chunk_sizes_tensor,
-          int64_t ce_segment_threshold, bool ce_path_opt, int ce_force_path,
-          bool ce_enable_memcpy2d, bool is_blockfirst, int num_kv_heads,
-          int ce_gather_threads, bool ce_gather_nt, bool ssd_io_opt) {
-            flexkv::CETransferConfig cfg;
-            cfg.segment_threshold = ce_segment_threshold;
-            cfg.path_opt_enabled = ce_path_opt;
-            cfg.force_path = ce_force_path;
-            cfg.enable_memcpy2d = ce_enable_memcpy2d;
-            cfg.is_blockfirst = is_blockfirst;
-            cfg.num_kv_heads = num_kv_heads;
-            cfg.gather_threads = ce_gather_threads;
-            cfg.gather_nt = ce_gather_nt;
-            return new flexkv::LayerwiseTransferGroup(
-                num_gpus, gpu_blocks_per_group, cpu_blocks, ssd_files,
-                num_original_layers, layer_members, group_num_layers,
-                group_cpu_offset_bytes, group_ssd_offset_bytes,
-                group_cpu_layer_strides, group_cpu_kv_strides,
-                group_ssd_layer_strides, group_ssd_kv_strides,
-                group_chunk_sizes, group_h2d_cpu_kv_strides,
-                group_h2d_cpu_layer_strides, group_cpu_block_strides,
-                group_cpu_tp_strides, group_gpu_kv_strides,
-                group_gpu_block_strides, group_gpu_layer_strides,
-                group_gpu_chunk_sizes, iouring_entries, iouring_flags,
-                layer_eventfds_tensor, tp_size, has_swa, swa_gpu_blocks,
-                swa_cpu_blocks, swa_ssd_files, swa_gpu_kv_strides_tensor,
-                swa_gpu_block_strides_tensor, swa_gpu_layer_strides_tensor,
-                swa_gpu_chunk_sizes_tensor, ssd_io_opt, cfg);
-          }),
-          py::arg("num_gpus"), py::arg("gpu_blocks_per_group"),
-          py::arg("cpu_blocks"), py::arg("ssd_files"),
-          py::arg("num_original_layers"), py::arg("layer_members"),
-          py::arg("group_num_layers"), py::arg("group_cpu_offset_bytes"),
-          py::arg("group_ssd_offset_bytes"), py::arg("group_cpu_layer_strides"),
-          py::arg("group_cpu_kv_strides"), py::arg("group_ssd_layer_strides"),
-          py::arg("group_ssd_kv_strides"), py::arg("group_chunk_sizes"),
-          py::arg("group_h2d_cpu_kv_strides"),
-          py::arg("group_h2d_cpu_layer_strides"),
-          py::arg("group_cpu_block_strides"), py::arg("group_cpu_tp_strides"),
-          py::arg("group_gpu_kv_strides"), py::arg("group_gpu_block_strides"),
-          py::arg("group_gpu_layer_strides"), py::arg("group_gpu_chunk_sizes"),
-          py::arg("iouring_entries"), py::arg("iouring_flags"),
-          py::arg("layer_eventfds_tensor"), py::arg("tp_size"),
-          py::arg("has_swa") = false,
-          py::arg("swa_gpu_blocks") =
-              std::vector<std::vector<torch::Tensor>>(),
-          py::arg("swa_cpu_blocks") = torch::empty({0}),
-          py::arg("swa_ssd_files") =
-              std::map<int, std::vector<std::string>>(),
-          py::arg("swa_gpu_kv_strides_tensor") = torch::empty({0}),
-          py::arg("swa_gpu_block_strides_tensor") = torch::empty({0}),
-          py::arg("swa_gpu_layer_strides_tensor") = torch::empty({0}),
-          py::arg("swa_gpu_chunk_sizes_tensor") = torch::empty({0}),
-          py::arg("ce_segment_threshold") = 8,
-          py::arg("ce_path_opt") = true,
-          py::arg("ce_force_path") = -1,
-          py::arg("ce_enable_memcpy2d") = false,
-          py::arg("is_blockfirst") = false,
-          py::arg("num_kv_heads") = 1,
-          py::arg("ce_gather_threads") = 4,
-          py::arg("ce_gather_nt") = true, py::arg("ssd_io_opt") = true)
-      .def("init_swa_multi_group",
-           &flexkv::LayerwiseTransferGroup::init_swa_multi_group,
-           py::arg("swa_gpu_blocks_per_group"), py::arg("swa_cpu_blocks"),
-           py::arg("swa_ssd_files"), py::arg("swa_layer_members"),
-           py::arg("swa_group_num_layers"),
-           py::arg("swa_group_cpu_offset_bytes"),
-           py::arg("swa_group_ssd_offset_bytes"),
-           py::arg("swa_group_cpu_layer_strides"),
-           py::arg("swa_group_cpu_kv_strides"),
-           py::arg("swa_group_ssd_layer_strides"),
-           py::arg("swa_group_ssd_kv_strides"),
-           py::arg("swa_group_chunk_sizes"),
-           py::arg("swa_group_h2d_cpu_kv_strides"),
-           py::arg("swa_group_h2d_cpu_layer_strides"),
-           py::arg("swa_group_cpu_block_strides"),
-           py::arg("swa_group_cpu_tp_strides"),
-           py::arg("swa_group_gpu_kv_strides"),
-           py::arg("swa_group_gpu_block_strides"),
-           py::arg("swa_group_gpu_layer_strides"),
-           py::arg("swa_group_gpu_chunk_sizes"),
-           py::arg("iouring_entries") = 512, py::arg("iouring_flags") = 0)
-      .def("layerwise_transfer",
-           &flexkv::LayerwiseTransferGroup::layerwise_transfer,
-           py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
-           py::arg("ssd_layer_stride_in_bytes"),
-           py::arg("ssd_kv_stride_in_bytes"), py::arg("num_blocks_per_file"),
-           py::arg("round_robin"), py::arg("num_threads_per_device"),
-           py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),
-           py::arg("cpu_kv_stride_in_bytes"),
-           py::arg("cpu_layer_stride_in_bytes"),
-           py::arg("cpu_block_stride_in_bytes"),
-           py::arg("cpu_chunk_size_in_bytes"),
-           py::arg("h2d_cpu_kv_stride_in_bytes"),
-           py::arg("h2d_cpu_layer_stride_in_bytes"),
-           py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_cta_num"),
-           py::arg("use_ce_transfer"), py::arg("num_layers"),
-           py::arg("layer_granularity"), py::arg("kv_dim"),
-           py::arg("num_kv_heads"),
-           py::arg("counter_id") = 0,
-           py::arg("swa_h2d_src") = torch::empty({0}),
-           py::arg("swa_h2d_dst") = torch::empty({0}),
-           py::arg("swa_disk2h_src") = torch::empty({0}),
-           py::arg("swa_disk2h_dst") = torch::empty({0}),
-           py::arg("swa_cpu_kv_stride_in_bytes") = 0,
-           py::arg("swa_cpu_layer_stride_in_bytes") = 0,
-           py::arg("swa_cpu_block_stride_in_bytes") = 0,
-           py::arg("swa_cpu_chunk_size_in_bytes") = 0,
-           py::arg("swa_h2d_cpu_kv_stride_in_bytes") = 0,
-           py::arg("swa_h2d_cpu_layer_stride_in_bytes") = 0,
-           py::arg("swa_cpu_tp_stride_in_bytes") = 0,
-           py::arg("swa_ssd_layer_stride_in_bytes") = 0,
-           py::arg("swa_ssd_kv_stride_in_bytes") = 0,
-           py::arg("swa_num_blocks_per_file") = 0,
-           py::arg("kv_shared_across_ranks_mode") = "sharded",
-           py::arg("notify_mode") = "hostfunc",
-           py::arg("enable_trace") = false)
-      .def("layerwise_transfer_multi_group",
-           &flexkv::LayerwiseTransferGroup::layerwise_transfer_multi_group,
-           py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
-           py::arg("num_blocks_per_file"), py::arg("round_robin"),
-           py::arg("num_threads_per_device"), py::arg("gpu_block_id_tensor"),
-           py::arg("cpu_block_id_tensor"), py::arg("transfer_cta_num"),
-           py::arg("use_ce_transfer"), py::arg("kv_dim"),
-           py::arg("num_kv_heads"),
-           py::arg("counter_id") = 0,
-           py::arg("swa_h2d_src") = torch::empty({0}),
-           py::arg("swa_h2d_dst") = torch::empty({0}),
-           py::arg("swa_disk2h_src") = torch::empty({0}),
-           py::arg("swa_disk2h_dst") = torch::empty({0}),
-           py::arg("swa_cpu_kv_stride_in_bytes") = 0,
-           py::arg("swa_cpu_layer_stride_in_bytes") = 0,
-           py::arg("swa_cpu_block_stride_in_bytes") = 0,
-           py::arg("swa_cpu_chunk_size_in_bytes") = 0,
-           py::arg("swa_h2d_cpu_kv_stride_in_bytes") = 0,
-           py::arg("swa_h2d_cpu_layer_stride_in_bytes") = 0,
-           py::arg("swa_cpu_tp_stride_in_bytes") = 0,
-           py::arg("swa_ssd_layer_stride_in_bytes") = 0,
-           py::arg("swa_ssd_kv_stride_in_bytes") = 0,
-           py::arg("swa_num_blocks_per_file") = 0,
-           py::arg("kv_shared_across_ranks_mode") = "sharded",
-           py::arg("notify_mode") = "hostfunc",
-           py::arg("enable_trace") = false);
+        py::arg("ssd_io_opt") = true,
+        // Blocking io_uring submit/reap across num_threads_per_device threads;
+        // no Python API is touched inside. See transfer_kv_blocks above.
+        py::call_guard<py::gil_scoped_release>());
 
 #ifdef FLEXKV_ENABLE_CFS
   m.def("transfer_kv_blocks_remote", &transfer_kv_blocks_remote,
@@ -827,7 +555,15 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("layer_id"), py::arg("layer_granularity"),
            py::arg("kv_dim"), py::arg("num_kv_heads"),
            py::arg("kv_shared_across_ranks_mode") = "sharded",
-           py::arg("designated_rank") = 0);
+           py::arg("designated_rank") = 0,
+           py::arg("sync") = true,
+           // Fans out to per-rank threads and joins on all of them, each of
+           // which ends in cudaStreamSynchronize. See transfer_kv_blocks.
+           py::call_guard<py::gil_scoped_release>())
+      .def("wait_all_streams",
+           &flexkv::TPTransferThreadGroup::wait_all_streams,
+           // Pure cudaStreamSynchronize fan-out; see tp_group_transfer.
+           py::call_guard<py::gil_scoped_release>());
 #ifdef FLEXKV_ENABLE_NVCOMP
   // nvcomp ANS variant: tp_group_transfer_ans() lazily initializes from the
   // constructor config and returns total compressed bytes across ranks.
@@ -849,6 +585,147 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_size_table_block_stride"),
            py::arg("cpu_size_table_layer_stride"));
 #endif // FLEXKV_ENABLE_NVCOMP
+
+  // ---- Region batch ----
+  py::enum_<flexkv::TransferBackendKind>(m, "TransferBackendKind")
+      .value("AUTO", flexkv::TransferBackendKind::AUTO)
+      .value("SM_KERNEL", flexkv::TransferBackendKind::SM_KERNEL)
+      .value("COPY_ENGINE", flexkv::TransferBackendKind::COPY_ENGINE)
+      .value("GDS", flexkv::TransferBackendKind::GDS)
+      .value("NIXL", flexkv::TransferBackendKind::NIXL)
+      .value("MOONCAKE", flexkv::TransferBackendKind::MOONCAKE);
+
+  py::class_<flexkv::RegionDesc>(m, "RegionDesc")
+      .def(py::init<>())
+      .def_readwrite("name", &flexkv::RegionDesc::name)
+      .def_readwrite("cpu_ptr", &flexkv::RegionDesc::cpu_ptr)
+      .def_readwrite("cpu_kv_stride_in_bytes",
+                     &flexkv::RegionDesc::cpu_kv_stride_in_bytes)
+      .def_readwrite("cpu_layer_stride_in_bytes",
+                     &flexkv::RegionDesc::cpu_layer_stride_in_bytes)
+      .def_readwrite("cpu_block_stride_in_bytes",
+                     &flexkv::RegionDesc::cpu_block_stride_in_bytes)
+      .def_readwrite("cpu_tp_stride_in_bytes",
+                     &flexkv::RegionDesc::cpu_tp_stride_in_bytes)
+      .def_readwrite("gpu_block_ptrs_flat",
+                     &flexkv::RegionDesc::gpu_block_ptrs_flat)
+      .def_readwrite("num_tensors_per_gpu",
+                     &flexkv::RegionDesc::num_tensors_per_gpu)
+      .def_readwrite("gpu_kv_strides_in_bytes",
+                     &flexkv::RegionDesc::gpu_kv_strides_in_bytes)
+      .def_readwrite("gpu_block_strides_in_bytes",
+                     &flexkv::RegionDesc::gpu_block_strides_in_bytes)
+      .def_readwrite("gpu_layer_strides_in_bytes",
+                     &flexkv::RegionDesc::gpu_layer_strides_in_bytes)
+      .def_readwrite("gpu_chunk_sizes_in_bytes",
+                     &flexkv::RegionDesc::gpu_chunk_sizes_in_bytes)
+      .def_readwrite("num_layers", &flexkv::RegionDesc::num_layers)
+      .def_readwrite("kv_dim", &flexkv::RegionDesc::kv_dim)
+      .def_readwrite("num_kv_heads", &flexkv::RegionDesc::num_kv_heads);
+
+  py::enum_<flexkv::RankShareMode>(m, "RankShareMode")
+      .value("SHARDED", flexkv::RankShareMode::SHARDED)
+      .value("ALL_WRITE", flexkv::RankShareMode::ALL_WRITE)
+      .value("RANK0_ONLY", flexkv::RankShareMode::RANK0_ONLY)
+      .value("LAYER_PARALLEL", flexkv::RankShareMode::LAYER_PARALLEL)
+      .value("RANK_ROTATE", flexkv::RankShareMode::RANK_ROTATE);
+
+  // The Python side stores this mode as the config string it came from;
+  // parsing it here (rather than mapping it in Python) keeps the accepted
+  // spellings and the degrade-to-sharded fallback in one place.
+  m.def("parse_rank_share_mode", &flexkv::parse_rank_share_mode,
+        py::arg("mode"));
+
+  py::class_<flexkv::RegionRequest>(m, "RegionRequest")
+      .def(py::init<>())
+      .def_readwrite("region_index", &flexkv::RegionRequest::region_index)
+      .def_readwrite("gpu_block_id_tensor",
+                     &flexkv::RegionRequest::gpu_block_id_tensor)
+      .def_readwrite("cpu_block_id_tensor",
+                     &flexkv::RegionRequest::cpu_block_id_tensor)
+      .def_readwrite("layer_id", &flexkv::RegionRequest::layer_id)
+      .def_readwrite("layer_granularity",
+                     &flexkv::RegionRequest::layer_granularity)
+      .def_readwrite("is_host_to_device",
+                     &flexkv::RegionRequest::is_host_to_device)
+      .def_readwrite("transfer_num_cta",
+                     &flexkv::RegionRequest::transfer_num_cta)
+      .def_readwrite("backend", &flexkv::RegionRequest::backend)
+      .def_readwrite("use_ce_transfer",
+                     &flexkv::RegionRequest::use_ce_transfer)
+      .def_readwrite("rank_share_mode",
+                     &flexkv::RegionRequest::rank_share_mode)
+      .def_readwrite("designated_rank",
+                     &flexkv::RegionRequest::designated_rank)
+      .def_readwrite("milestone_layer",
+                     &flexkv::RegionRequest::milestone_layer);
+
+  py::class_<flexkv::RegionBatchGroup>(m, "RegionBatchGroup")
+      .def(py::init([](const std::vector<int64_t> &gpu_device_ids,
+                       const std::vector<flexkv::RegionDesc> &regions,
+                       int64_t ce_segment_threshold, bool ce_path_opt,
+                       int ce_force_path, bool ce_enable_memcpy2d,
+                       bool is_blockfirst, int num_kv_heads,
+                       int ce_gather_threads, bool ce_gather_nt) {
+             flexkv::CETransferConfig cfg;
+             cfg.segment_threshold = ce_segment_threshold;
+             cfg.path_opt_enabled = ce_path_opt;
+             cfg.force_path = ce_force_path;
+             cfg.enable_memcpy2d = ce_enable_memcpy2d;
+             cfg.is_blockfirst = is_blockfirst;
+             cfg.num_kv_heads = num_kv_heads;
+             cfg.gather_threads = ce_gather_threads;
+             cfg.gather_nt = ce_gather_nt;
+             return new flexkv::RegionBatchGroup(gpu_device_ids, regions, cfg);
+           }),
+           py::arg("gpu_device_ids"), py::arg("regions"),
+           py::arg("ce_segment_threshold") = 8, py::arg("ce_path_opt") = true,
+           py::arg("ce_force_path") = -1,
+           py::arg("ce_enable_memcpy2d") = false,
+           py::arg("is_blockfirst") = false, py::arg("num_kv_heads") = 1,
+           py::arg("ce_gather_threads") = 4, py::arg("ce_gather_nt") = true)
+      .def_property_readonly("num_regions",
+                             &flexkv::RegionBatchGroup::num_regions)
+      .def_property_readonly("num_gpus", &flexkv::RegionBatchGroup::num_gpus)
+      .def("submit", &flexkv::RegionBatchGroup::submit, py::arg("requests"),
+           py::arg("sync") = true,
+           // Fans out to per-rank threads; with sync=true each ends in
+           // cudaStreamSynchronize. Holding the GIL across that would stall
+           // every other thread in the worker process.
+           py::call_guard<py::gil_scoped_release>())
+      .def("wait_all_streams", &flexkv::RegionBatchGroup::wait_all_streams,
+           py::call_guard<py::gil_scoped_release>())
+      .def("set_layer_eventfds",
+           &flexkv::RegionBatchGroup::set_layer_eventfds, py::arg("fds_tensor"),
+           py::arg("tp_size"), py::arg("num_layers"),
+           py::arg("notify_mode") = "hostfunc")
+      .def_property_readonly(
+          "layer_notification_enabled",
+          &flexkv::RegionBatchGroup::layer_notification_enabled)
+      .def("submit_layerwise", &flexkv::RegionBatchGroup::submit_layerwise,
+           py::arg("requests"), py::arg("empty_layers"), py::arg("counter_id"),
+           // Same reasoning as submit(): fans out to per-rank threads. It
+           // returns after the launches, but the fan-out itself joins.
+           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "wait_layer_completion",
+          [](flexkv::RegionBatchGroup &self, double timeout_s) {
+            std::string err;
+            bool ok = false;
+            {
+              // Released only around the blocking wait -- make_tuple below
+              // builds Python objects and needs the GIL back, which is why
+              // this is a scoped release rather than a call_guard.
+              py::gil_scoped_release unlock;
+              ok = self.wait_layer_completion(timeout_s, &err);
+            }
+            return py::make_tuple(ok, err);
+          },
+          py::arg("timeout_s") = 600.0)
+      .def("update_region_gpu_ptrs",
+           &flexkv::RegionBatchGroup::update_region_gpu_ptrs,
+           py::arg("region_index"), py::arg("gpu_block_ptrs_flat"),
+           py::call_guard<py::gil_scoped_release>());
 
 #ifdef FLEXKV_ENABLE_GDS
   py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")
@@ -873,7 +750,9 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ssd_tp_stride_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"),
            py::arg("layer_granularity"), py::arg("kv_dim"),
-           py::arg("num_kv_heads") = 1);
+           py::arg("num_kv_heads") = 1,
+           // Same reasoning as TPTransferThreadGroup::tp_group_transfer.
+           py::call_guard<py::gil_scoped_release>());
 #endif
 
   // Add Hasher class binding

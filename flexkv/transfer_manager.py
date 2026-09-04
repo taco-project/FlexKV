@@ -27,6 +27,7 @@ from flexkv.common.config import (
 )
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.pool import PoolId
 from flexkv.common.transfer import DeviceType
 from flexkv.common.storage import KVCacheLayout
 from flexkv.storage.storage_engine import StorageEngine
@@ -453,16 +454,16 @@ class TransferManager:
         if self.swa_layer_groups is not None:
             swa_grouped_gpu_blocks_per_group = {}
             swa_grouped_gpu_layouts_per_group = {}
-        if self.storage_engine.has_storage_handle(DeviceType.CPU, is_swa=True):
+        if self.storage_engine.has_storage_handle(DeviceType.CPU, pool_id=PoolId.SWA):
             swa_gpu_handles = {}
             for registration_key in sorted(self.all_swa_gpu_blocks.keys()):
                 device_id = self.gpu_device_id_mapping[registration_key]
-                if self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_swa=True):
+                if self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, pool_id=PoolId.SWA):
                     worker_key = self.gpu_worker_key_mapping[registration_key]
                     if worker_key not in swa_gpu_handles:
                         swa_gpu_handles[worker_key] = []
                     swa_gpu_handles[worker_key].append(
-                        self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_swa=True))
+                        self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, pool_id=PoolId.SWA))
                     if self.swa_layer_groups is not None:
                         swa_grouped_gpu_blocks_per_group.setdefault(
                             worker_key, []
@@ -472,18 +473,18 @@ class TransferManager:
                         ).append(self.all_swa_gpu_layouts_per_group[registration_key])
 
         swa_cpu_handle =(
-         self.storage_engine.get_storage_handle(DeviceType.CPU, is_swa=True)
-         if self.storage_engine.has_storage_handle(DeviceType.CPU, is_swa=True)
+         self.storage_engine.get_storage_handle(DeviceType.CPU, pool_id=PoolId.SWA)
+         if self.storage_engine.has_storage_handle(DeviceType.CPU, pool_id=PoolId.SWA)
          else None
          )
         swa_ssd_handle = (
-         self.storage_engine.get_storage_handle(DeviceType.SSD, is_swa=True)
-         if self.storage_engine.has_storage_handle(DeviceType.SSD, is_swa=True)
+         self.storage_engine.get_storage_handle(DeviceType.SSD, pool_id=PoolId.SWA)
+         if self.storage_engine.has_storage_handle(DeviceType.SSD, pool_id=PoolId.SWA)
          else None
          )
         swa_remote_handle = (
-         self.storage_engine.get_storage_handle(DeviceType.REMOTE, is_swa=True)
-         if self.storage_engine.has_storage_handle(DeviceType.REMOTE, is_swa=True)
+         self.storage_engine.get_storage_handle(DeviceType.REMOTE, pool_id=PoolId.SWA)
+         if self.storage_engine.has_storage_handle(DeviceType.REMOTE, pool_id=PoolId.SWA)
          else None
          )
 

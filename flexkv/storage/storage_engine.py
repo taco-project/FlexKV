@@ -8,6 +8,7 @@ import hashlib
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
+from flexkv.common.pool import PoolEndpoint, PoolId
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
 from flexkv.storage.allocator import (
@@ -37,6 +38,36 @@ def _resolve_layer_groups(
     return resolved
 
 
+def _resolve_pool(pool_id: Optional[PoolId], is_swa: bool) -> PoolId:
+    """Which pool a caller meant, from either selector.
+
+    ``is_swa`` is kept as an alias because ~30 call sites spell it that way.
+    Passing both is an error rather than a precedence rule: a caller that says
+    ``pool_id=FULL_KV, is_swa=True`` has a bug, and silently honouring either
+    would hide it.
+    """
+    if pool_id is None:
+        return PoolId.from_is_swa(is_swa)
+    if is_swa and not pool_id.is_swa:
+        raise ValueError(
+            f"conflicting pool selectors: pool_id={pool_id.name} and "
+            f"is_swa=True; pass one")
+    return pool_id
+
+
+def _pool_from_kwargs(kwargs: Dict[str, Any]) -> PoolId:
+    """``allocate``'s pool selector, popped out of its **kwargs bag.
+
+    Popped, not read: ``is_swa``/``pool_id`` are routing information for this
+    registry, and the per-device allocator branches below read the same bag.
+    Leaving them in has bitten before -- an allocator that forwards **kwargs
+    would see a key it has no parameter for.
+    """
+    pool_id = kwargs.pop('pool_id', None)
+    is_swa = kwargs.pop('is_swa', False)
+    return _resolve_pool(pool_id, is_swa)
+
+
 class StorageEngine:
     def _cpu_allocator(self) -> type[CPUAllocator] | type[HugePageAllocator]:
         if self._cache_config.use_hugepage_cpu_buffer:
@@ -49,11 +80,17 @@ class StorageEngine:
                  num_layers_per_pp_stage: int,
                  swa_layer_groups: Optional[List[LayerGroupSpec]] = None):
         """Initialize storage engine"""
-        self._storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
-        # SWA dedicated GPU pool handles, physically isolated from the main-KV
-        # _storage_handles so the SAME physical device_id can hold both a main-KV
-        # GPU handle and an independent SWA GPU handle without key collision.
-        self._swa_storage_handles: Dict[Tuple[DeviceType, int], StorageHandle] = {}
+        # One registry, keyed by the endpoint (pool + tier) plus device id.
+        #
+        # It used to be two dicts -- ``_storage_handles`` and
+        # ``_swa_storage_handles`` -- because the SAME physical device_id holds
+        # both a main-KV GPU handle and an independent SWA one, and a
+        # (DeviceType, device_id) key cannot tell them apart. The pool is what
+        # distinguishes them, so the pool is in the key; two dicts selected by
+        # a bool were the same statement made in a shape that could only ever
+        # hold two pools, and every accessor had to re-derive the container
+        # from that bool.
+        self._handles: Dict[Tuple[PoolEndpoint, int], StorageHandle] = {}
         self._model_config = model_config
         self._cache_config = cache_config
 
@@ -181,7 +218,7 @@ class StorageEngine:
                     dtype=torch.uint8,
                     device_id=0,
                     raw_data=None,
-                    is_swa=True,
+                    pool_id=PoolId.SWA,
                     pin_memory=swa_cfg.pin_memory,
                 )
 
@@ -212,7 +249,7 @@ class StorageEngine:
                     dtype=torch.uint8,
                     device_id=0,
                     raw_data=None,
-                    is_swa=True,
+                    pool_id=PoolId.SWA,
                     cache_dir=self._cache_config.ssd_cache_dir,
                     max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
                 )
@@ -255,7 +292,7 @@ class StorageEngine:
                         dtype=torch.uint8,
                         device_id=0,
                         raw_data=None,
-                        is_swa=True,
+                        pool_id=PoolId.SWA,
                         file_path=swa_remote_path,
                         remote_config_custom=self._cache_config.remote_config_custom,
                     )
@@ -281,12 +318,12 @@ class StorageEngine:
                                 dtype: torch.dtype = torch.uint8) -> None:
         """Register the SWA dedicated GPU pool (channel B).
 
-        Stored in the independent ``_swa_storage_handles`` dict (via
-        ``is_swa=True``), keyed by the ORIGINAL physical ``device_id``. This
-        physically isolates it from the main-KV GPU handle for the same device,
-        so there is no key collision and no magic offset. Reuses the standard
-        GPU allocate path (GPUAllocator.from_raw_data), which maps each
-        TensorSharedHandle via CUDA IPC into the worker process.
+        Registered under ``SWA@GPU`` at the ORIGINAL physical ``device_id``,
+        which is what keeps it distinct from the main-KV GPU handle for the
+        same device: the pool is in the key, so there is no collision and no
+        magic offset. Reuses the standard GPU allocate path
+        (GPUAllocator.from_raw_data), which maps each TensorSharedHandle via
+        CUDA IPC into the worker process.
         """
         self.allocate(
             device_type=DeviceType.GPU,
@@ -294,18 +331,18 @@ class StorageEngine:
             dtype=dtype,
             device_id=device_id,
             raw_data=swa_blocks,
-            is_swa=True,
+            pool_id=PoolId.SWA,
         )
 
     def get_swa_storage_handle(self, device_id: int = 0) -> StorageHandle:
         """Return the SWA dedicated GPU StorageHandle for a physical device."""
         return self.get_storage_handle(
-            DeviceType.GPU, device_id, is_swa=True
+            DeviceType.GPU, device_id, pool_id=PoolId.SWA
         )
 
     def has_swa_storage_handle(self, device_id: int = 0) -> bool:
         return self.has_storage_handle(
-            DeviceType.GPU, device_id, is_swa=True
+            DeviceType.GPU, device_id, pool_id=PoolId.SWA
         )
 
     def allocate(self,
@@ -339,12 +376,11 @@ class StorageEngine:
         Returns:
             bool: True if allocator created successfully, False if already exists.
         """
-        # Route to the SWA-dedicated dict when is_swa=True so the same physical
-        # device_id can hold both a main-KV and an SWA GPU handle without collision.
-        is_swa = kwargs.get('is_swa', False)
-        storage_handles = self._swa_storage_handles if is_swa else self._storage_handles
-        key = (device_type, device_id)
-        if key in storage_handles:
+        # The pool is part of the key, so the same physical device_id can hold
+        # both a main-KV and an SWA handle without collision.
+        pool_id = _pool_from_kwargs(kwargs)
+        key = (PoolEndpoint(pool_id, device_type), device_id)
+        if key in self._handles:
             return False
 
         storage_handle: StorageHandle
@@ -411,11 +447,14 @@ class StorageEngine:
                 hash_value = hashlib.md5(server_recv_port.encode()).hexdigest()
                 rand_suffix = f"{hash_value[:6]}"
                 file_prefix = f"flexkv_ssdcache_{rand_suffix}"
-                # Physically separate the SWA SSD cache files from the main-KV
-                # ones: without this, both share the same prefix (server_recv_port
-                # is identical in-process) and overwrite each other on disk.
-                if is_swa:
-                    file_prefix = f"{file_prefix}_swa"
+                # Physically separate each non-default pool's SSD cache files
+                # from the main-KV ones: without this, both share the same
+                # prefix (server_recv_port is identical in-process) and
+                # overwrite each other on disk. FULL_KV keeps the bare prefix
+                # so existing cache files stay addressable; SWA still resolves
+                # to the "_swa" suffix it always had.
+                if pool_id is not PoolId.FULL_KV:
+                    file_prefix = f"{file_prefix}_{pool_id.name.lower()}"
                 storage_handle = SSDAllocator.allocate(
                     layout=layout,
                     dtype=dtype,
@@ -452,41 +491,59 @@ class StorageEngine:
                 )
         else:
             raise ValueError(f"Unsupported device type: {device_type}")
-        storage_handles[key] = storage_handle
+        self._handles[key] = storage_handle
         return True
 
     def get_storage_handle(self,
                            device_type: DeviceType,
                            device_id: int = 0,
-                           is_swa: bool = False) -> StorageHandle:
+                           is_swa: bool = False,
+                           pool_id: Optional[PoolId] = None) -> StorageHandle:
         """
         Get accessible handle for specified blocks.
 
         Args:
             device_type: Type of the device to get handle from.
             device_id: Device ID.
-            is_swa: Whether to fetch from the SWA-dedicated handle dict.
+            is_swa: Legacy alias for ``pool_id=PoolId.SWA``.
+            pool_id: Which pool's storage to fetch.
         """
-        storage_handles = self._swa_storage_handles if is_swa else self._storage_handles
-        key = (device_type, device_id)
-        if key not in storage_handles:
+        endpoint = PoolEndpoint(_resolve_pool(pool_id, is_swa), device_type)
+        key = (endpoint, device_id)
+        if key not in self._handles:
             raise ValueError(
-                f"Storage handle not found for device type: {device_type}, "
-                f"device id: {device_id}, is_swa: {is_swa}"
+                f"Storage handle not found for endpoint: {endpoint}, "
+                f"device id: {device_id}"
             )
-        return storage_handles[key]
+        return self._handles[key]
 
     def has_storage_handle(self,
                            device_type: DeviceType,
                            device_id: int = 0,
-                           is_swa: bool = False) -> bool:
+                           is_swa: bool = False,
+                           pool_id: Optional[PoolId] = None) -> bool:
         """
-        Check if storage handle exists for given device type and id.
+        Check if storage handle exists for given endpoint and device id.
 
         Args:
             device_type: Type of the device.
             device_id: Device ID.
-            is_swa: Whether to check the SWA-dedicated handle dict.
+            is_swa: Legacy alias for ``pool_id=PoolId.SWA``.
+            pool_id: Which pool's storage to check.
         """
-        storage_handles = self._swa_storage_handles if is_swa else self._storage_handles
-        return (device_type, device_id) in storage_handles
+        endpoint = PoolEndpoint(_resolve_pool(pool_id, is_swa), device_type)
+        return (endpoint, device_id) in self._handles
+
+    def pools_at(self, device_type: DeviceType, device_id: int = 0) -> List[PoolId]:
+        """Which pools have storage on this tier, in PoolId order.
+
+        The registry answers this directly now. With two dicts the same
+        question meant asking each one separately and stitching the answers
+        together, which is why the engine's "does this edge carry SWA?" tests
+        were spelled differently in each place that asked.
+        """
+        return sorted(
+            endpoint.pool_id
+            for (endpoint, did) in self._handles
+            if endpoint.device_type == device_type and did == device_id
+        )

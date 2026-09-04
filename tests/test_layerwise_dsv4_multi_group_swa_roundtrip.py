@@ -1,17 +1,23 @@
-"""DSv4-style layerwise multi-group + SWA roundtrip correctness test.
+"""DSv4-style multi-group + SWA roundtrip: what goes down comes back up.
 
-Simulates the production data path:
+Simulates the production data path end to end, through the one region batch:
 
-  1. PUT phase (D2H): seed GPU -> write main KV (c4 / c128 / indexer groups) + SWA to CPU
+  1. PUT phase (D2H): seed GPU -> write main KV (c4 / c128 / indexer groups)
+     plus SWA to CPU, as one batched submit over every region
   2. Zero GPU pools (prove the next step reads from CPU, not stale GPU)
-  3. GET phase (layerwise): ``layerwise_transfer_multi_group`` H2D for main KV + SWA
+  3. GET phase: per-layer H2D via ``submit_layerwise`` for main KV + SWA
   4. Byte-exact compare restored GPU blocks against the original seed
 
 Geometry mirrors DeepSeek V4:
   - ``c4`` group: compress_ratio=4 on CSA layers
   - ``c128`` group: compress_ratio=128 on HCA layers
   - ``c4_indexer`` group: indexer K on CSA layers (uint8)
-  - SWA sidecar: all original layers, independent LAYERFIRST pool
+  - SWA sidecar: all original layers, its own region and its own slot ids
+
+The D2H leg deliberately goes out as a single ``submit`` naming all four
+regions. That is the "submit SWA / full / states / indexer in one batch" the
+transfer refactor is for: the batch is just the request list, so a model with
+four regions costs one fan-out rather than four.
 
 Run:
     pytest tests/test_layerwise_dsv4_multi_group_swa_roundtrip.py -v
@@ -19,63 +25,19 @@ Run:
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Tuple
 
 import pytest
 import torch
 
-from flexkv.c_ext import LayerwiseTransferGroup, transfer_kv_blocks
 from flexkv.common.config import LayerGroupSpec, build_layer_member_map
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.transfer.region_batch import make_requests
 
 from test_layerwise_multi_group_swa import (
     MultiGroupFixture,
-    _compute_multi_group_strides,
-    _device,
-    _make_gpu_layout,
-    _make_group_gpu_tensors,
-    _make_multi_group_cpu_layout,
+    build_fixture,
+    h2d_requests,
 )
-
-IOURING_ENTRIES = 512
-IOURING_FLAGS = 0
-
-
-def _make_swa_layout(num_layers: int, num_blocks: int, tpb: int) -> KVCacheLayout:
-    return KVCacheLayout(
-        type=KVCacheLayoutType.LAYERFIRST,
-        num_layer=num_layers,
-        num_block=num_blocks,
-        tokens_per_block=tpb,
-        num_head=1,
-        head_size=SWA_BYTES_PER_TOKEN,
-        kv_dim=1,
-        num_kv_heads=1,
-    )
-
-
-def _compute_swa_strides(
-    swa_cpu_layout: KVCacheLayout,
-    swa_gpu_layout: KVCacheLayout,
-) -> Dict[str, object]:
-    dtype_size = torch.uint8.itemsize
-    return dict(
-        swa_cpu_chunk_size_in_bytes=swa_cpu_layout.get_chunk_size() * dtype_size,
-        swa_cpu_block_stride_in_bytes=swa_cpu_layout.get_block_stride() * dtype_size,
-        swa_cpu_kv_stride_in_bytes=swa_cpu_layout.get_kv_stride() * dtype_size,
-        swa_cpu_layer_stride_in_bytes=swa_cpu_layout.get_layer_stride() * dtype_size,
-        swa_h2d_cpu_kv_stride_in_bytes=swa_cpu_layout.get_kv_stride() * dtype_size,
-        swa_h2d_cpu_layer_stride_in_bytes=swa_cpu_layout.get_layer_stride() * dtype_size,
-        swa_cpu_tp_stride_in_bytes=swa_cpu_layout.get_block_stride() * dtype_size,
-        swa_gpu_kv_strides_tensor=torch.tensor(
-            [swa_gpu_layout.get_kv_stride() * dtype_size], dtype=torch.int64),
-        swa_gpu_block_strides_tensor=torch.tensor(
-            [swa_gpu_layout.get_block_stride() * dtype_size], dtype=torch.int64),
-        swa_gpu_layer_strides_tensor=torch.tensor(
-            [swa_gpu_layout.get_layer_stride() * dtype_size], dtype=torch.int64),
-        swa_gpu_chunk_sizes_tensor=torch.tensor(
-            [swa_gpu_layout.get_chunk_size() * dtype_size], dtype=torch.int64),
-    )
 
 # -------------------------- DSv4-like geometry --------------------------
 DEVICE_ID = 0
@@ -131,6 +93,18 @@ def _dsv4_layer_groups() -> List[LayerGroupSpec]:
     ]
 
 
+def _build_dsv4_fixture() -> MultiGroupFixture:
+    return build_fixture(
+        _dsv4_layer_groups(),
+        NUM_ORIGINAL_LAYERS,
+        has_swa=True,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        num_cpu_blocks=NUM_CPU_BLOCKS,
+        num_gpu_blocks=NUM_GPU_BLOCKS,
+        swa_bytes_per_token=SWA_BYTES_PER_TOKEN,
+    )
+
+
 def _bytes_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     """Compare tensors byte-for-byte (fp8-safe)."""
     if a.shape != b.shape:
@@ -179,207 +153,33 @@ def _seed_swa_gpu_layer(
     return expected
 
 
-def _group_gpu_ptrs(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
-    return torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64).pin_memory()
+def _d2h_everything(fx: MultiGroupFixture) -> None:
+    """One submit, every region: the main groups and SWA go out together.
 
-
-def _build_dsv4_fixture(layer_groups: List[LayerGroupSpec]) -> MultiGroupFixture:
-    device = _device()
-    cpu_layout = _make_multi_group_cpu_layout(
-        layer_groups, NUM_ORIGINAL_LAYERS, NUM_CPU_BLOCKS, TOKENS_PER_BLOCK,
-    )
-    gpu_layouts = [
-        _make_gpu_layout(g, NUM_GPU_BLOCKS, TOKENS_PER_BLOCK) for g in layer_groups
-    ]
-    strides = _compute_multi_group_strides(layer_groups, cpu_layout, gpu_layouts)
-
-    gpu_tensors_per_group = [
-        _make_group_gpu_tensors(g, NUM_GPU_BLOCKS, TOKENS_PER_BLOCK, device)
-        for g in layer_groups
-    ]
-    gpu_blocks_per_group = [[tensors] for tensors in gpu_tensors_per_group]
-
-    block_stride = cpu_layout.get_block_stride()
-    cpu_blocks = torch.zeros(
-        NUM_CPU_BLOCKS, block_stride, dtype=torch.uint8, pin_memory=True,
-    )
-    empty_eventfds = torch.empty(0, dtype=torch.int32)
-    ssd_files: Dict[int, List[str]] = {}
-
-    swa_layout = _make_swa_layout(
-        NUM_ORIGINAL_LAYERS, NUM_CPU_BLOCKS, TOKENS_PER_BLOCK,
-    )
-    swa_gpu_layout = _make_swa_layout(
-        NUM_ORIGINAL_LAYERS, NUM_GPU_BLOCKS, TOKENS_PER_BLOCK,
-    )
-    swa_strides = _compute_swa_strides(swa_layout, swa_gpu_layout)
-    swa_cpu = torch.zeros(swa_layout.kv_shape, dtype=torch.uint8, pin_memory=True)
-    swa_gpu_tensors = [
-        torch.zeros(
-            NUM_GPU_BLOCKS,
-            TOKENS_PER_BLOCK,
-            1,
-            SWA_BYTES_PER_TOKEN,
-            dtype=torch.uint8,
-            device=device,
-        )
-        for _ in range(NUM_ORIGINAL_LAYERS)
-    ]
-
-    group = LayerwiseTransferGroup(
-        num_gpus=1,
-        gpu_blocks_per_group=gpu_blocks_per_group,
-        cpu_blocks=cpu_blocks,
-        ssd_files=ssd_files,
-        num_original_layers=NUM_ORIGINAL_LAYERS,
-        layer_members=strides["layer_members"],
-        group_num_layers=strides["group_num_layers"],
-        group_cpu_offset_bytes=strides["group_cpu_offset_bytes"],
-        group_ssd_offset_bytes=strides["group_ssd_offset_bytes"],
-        group_cpu_layer_strides=strides["group_cpu_layer_strides"],
-        group_cpu_kv_strides=strides["group_cpu_kv_strides"],
-        group_ssd_layer_strides=strides["group_ssd_layer_strides"],
-        group_ssd_kv_strides=strides["group_ssd_kv_strides"],
-        group_chunk_sizes=strides["group_chunk_sizes"],
-        group_h2d_cpu_kv_strides=strides["group_h2d_cpu_kv_strides"],
-        group_h2d_cpu_layer_strides=strides["group_h2d_cpu_layer_strides"],
-        group_cpu_block_strides=strides["group_cpu_block_strides"],
-        group_cpu_tp_strides=strides["group_cpu_tp_strides"],
-        group_gpu_kv_strides=strides["group_gpu_kv_strides"],
-        group_gpu_block_strides=strides["group_gpu_block_strides"],
-        group_gpu_layer_strides=strides["group_gpu_layer_strides"],
-        group_gpu_chunk_sizes=strides["group_gpu_chunk_sizes"],
-        iouring_entries=IOURING_ENTRIES,
-        iouring_flags=IOURING_FLAGS,
-        layer_eventfds_tensor=empty_eventfds,
-        tp_size=1,
-        has_swa=True,
-        swa_gpu_blocks=[swa_gpu_tensors],
-        swa_cpu_blocks=swa_cpu,
-        swa_ssd_files=ssd_files,
-        swa_gpu_kv_strides_tensor=swa_strides["swa_gpu_kv_strides_tensor"],
-        swa_gpu_block_strides_tensor=swa_strides["swa_gpu_block_strides_tensor"],
-        swa_gpu_layer_strides_tensor=swa_strides["swa_gpu_layer_strides_tensor"],
-        swa_gpu_chunk_sizes_tensor=swa_strides["swa_gpu_chunk_sizes_tensor"],
-        is_blockfirst=True,
-    )
-
-    return MultiGroupFixture(
-        group=group,
-        layer_groups=layer_groups,
-        gpu_tensors_per_group=gpu_tensors_per_group,
-        cpu_blocks=cpu_blocks,
-        strides=strides,
-        num_original_layers=NUM_ORIGINAL_LAYERS,
-        swa_gpu_tensors=swa_gpu_tensors,
-        swa_cpu=swa_cpu,
-        swa_strides=swa_strides,
-    )
-
-
-def _d2h_main_group(
-    fx: MultiGroupFixture,
-    group_idx: int,
-    gpu_src: int,
-    cpu_dst: int,
-) -> None:
-    """GPU->CPU for one multi-group member (mirrors GPUCPUTransferWorker D2H)."""
-    g = fx.layer_groups[group_idx]
-    dtype_size = g.dtype.itemsize
-    gpu_layout = _make_gpu_layout(g, NUM_GPU_BLOCKS, TOKENS_PER_BLOCK)
-    tensors = fx.gpu_tensors_per_group[group_idx]
-
-    cpu_flat = fx.cpu_blocks.contiguous().view(-1)
-    cpu_off = fx.strides["group_cpu_offset_bytes"][group_idx]  # type: ignore[index]
-    cpu_for_group = cpu_flat[cpu_off:]
-
-    transfer_kv_blocks(
-        torch.tensor([gpu_src], dtype=torch.int64),
-        _group_gpu_ptrs(tensors),
-        gpu_layout.get_kv_stride() * dtype_size,
-        gpu_layout.get_block_stride() * dtype_size,
-        gpu_layout.get_layer_stride() * dtype_size,
-        torch.tensor([cpu_dst], dtype=torch.int64),
-        cpu_for_group,
-        fx.strides["group_cpu_kv_strides"][group_idx],  # type: ignore[index]
-        fx.strides["group_cpu_layer_strides"][group_idx],  # type: ignore[index]
-        fx.strides["group_cpu_block_strides"][group_idx],  # type: ignore[index]
-        fx.strides["group_chunk_sizes"][group_idx],  # type: ignore[index]
-        0,
-        g.num_layers,
-        4,
+    Two request lists rather than one because the two pools number their blocks
+    independently -- SWA block ``SWA_CPU_DST`` is not main-KV block
+    ``CPU_DST``. Same submit, so still one fan-out.
+    """
+    num_main_regions = len(fx.layer_groups)
+    requests = make_requests(
+        num_main_regions,
+        torch.tensor([GPU_SRC], dtype=torch.int64),
+        torch.tensor([CPU_DST], dtype=torch.int64),
         False,  # D2H
-        True,
-        gpu_layout.kv_dim,
-        0,
-    )
-
-
-def _d2h_swa(
-    fx: MultiGroupFixture,
-    gpu_src: int,
-    cpu_dst: int,
-) -> None:
-    assert fx.swa_strides is not None and fx.swa_gpu_tensors is not None
-    swa_layout = _make_swa_layout(
-        NUM_ORIGINAL_LAYERS, NUM_GPU_BLOCKS, TOKENS_PER_BLOCK,
-    )
-
-    transfer_kv_blocks(
-        torch.tensor([gpu_src], dtype=torch.int64),
-        _group_gpu_ptrs(fx.swa_gpu_tensors),
-        swa_layout.get_kv_stride(),
-        swa_layout.get_block_stride(),
-        swa_layout.get_layer_stride(),
-        torch.tensor([cpu_dst], dtype=torch.int64),
-        fx.swa_cpu.contiguous(),  # type: ignore[union-attr]
-        fx.swa_strides["swa_cpu_kv_stride_in_bytes"],  # type: ignore[index]
-        fx.swa_strides["swa_cpu_layer_stride_in_bytes"],  # type: ignore[index]
-        fx.swa_strides["swa_cpu_block_stride_in_bytes"],  # type: ignore[index]
-        fx.swa_strides["swa_cpu_chunk_size_in_bytes"],  # type: ignore[index]
-        0,
-        NUM_ORIGINAL_LAYERS,
-        4,
-        False,
-        True,
-        swa_layout.kv_dim,
-        0,
-    )
-
-
-def _layerwise_h2d_main_and_swa(fx: MultiGroupFixture, cpu_src: int, gpu_dst: int,
-                                swa_cpu_src: int, swa_gpu_dst: int) -> None:
-    assert fx.swa_strides is not None
-    empty = torch.empty(0, dtype=torch.int64)
-    fx.group.layerwise_transfer_multi_group(
-        empty,
-        empty,
-        num_blocks_per_file=0,
-        round_robin=1,
-        num_threads_per_device=4,
-        gpu_block_id_tensor=torch.tensor([gpu_dst], dtype=torch.int64),
-        cpu_block_id_tensor=torch.tensor([cpu_src], dtype=torch.int64),
-        transfer_cta_num=4,
+        transfer_num_cta=4,
         use_ce_transfer=True,
-        kv_dim=1,
-        num_kv_heads=1,
-        counter_id=0,
-        swa_h2d_src=torch.tensor([swa_cpu_src], dtype=torch.int64),
-        swa_h2d_dst=torch.tensor([swa_gpu_dst], dtype=torch.int64),
-        swa_disk2h_src=empty,
-        swa_disk2h_dst=empty,
-        swa_cpu_kv_stride_in_bytes=fx.swa_strides["swa_cpu_kv_stride_in_bytes"],
-        swa_cpu_layer_stride_in_bytes=fx.swa_strides["swa_cpu_layer_stride_in_bytes"],
-        swa_cpu_block_stride_in_bytes=fx.swa_strides["swa_cpu_block_stride_in_bytes"],
-        swa_cpu_chunk_size_in_bytes=fx.swa_strides["swa_cpu_chunk_size_in_bytes"],
-        swa_h2d_cpu_kv_stride_in_bytes=fx.swa_strides["swa_h2d_cpu_kv_stride_in_bytes"],
-        swa_h2d_cpu_layer_stride_in_bytes=fx.swa_strides["swa_h2d_cpu_layer_stride_in_bytes"],
-        swa_cpu_tp_stride_in_bytes=fx.swa_strides["swa_cpu_tp_stride_in_bytes"],
-        swa_ssd_layer_stride_in_bytes=0,
-        swa_ssd_kv_stride_in_bytes=0,
-        swa_num_blocks_per_file=0,
+        region_indices=list(range(num_main_regions)),
     )
-    torch.cuda.synchronize()
+    requests += make_requests(
+        fx.group.num_regions,
+        torch.tensor([GPU_SRC], dtype=torch.int64),
+        torch.tensor([SWA_CPU_DST], dtype=torch.int64),
+        False,
+        transfer_num_cta=4,
+        use_ce_transfer=True,
+        region_indices=[num_main_regions],
+    )
+    fx.group.submit(requests, True)
 
 
 def _zero_all_gpu(fx: MultiGroupFixture) -> None:
@@ -395,24 +195,22 @@ def _zero_all_gpu(fx: MultiGroupFixture) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestLayerwiseDsv4MultiGroupSwaRoundtrip:
     def test_dsv4_write_read_roundtrip_main_indexer_swa(self) -> None:
-        """GPU seed -> D2H (3 groups + SWA) -> layerwise H2D -> byte-exact restore."""
+        """GPU seed -> D2H (3 groups + SWA) -> per-layer H2D -> byte-exact restore."""
         torch.cuda.set_device(DEVICE_ID)
-        layer_groups = _dsv4_layer_groups()
-        fx = _build_dsv4_fixture(layer_groups)
+        fx = _build_dsv4_fixture()
         member_map = fx.strides["layer_member_map"]
 
         # --- Phase 0: seed GPU at GPU_SRC ---
         expected_main: Dict[Tuple[int, int, int], torch.Tensor] = {}
         for orig in range(NUM_ORIGINAL_LAYERS):
             for gi, local_id in member_map.members_of(orig):  # type: ignore[union-attr]
-                golden = _seed_gpu_layer(
+                expected_main[(orig, gi, local_id)] = _seed_gpu_layer(
                     fx.gpu_tensors_per_group[gi][local_id],
                     GPU_SRC,
                     orig,
                     gi,
                     local_id,
                 )
-                expected_main[(orig, gi, local_id)] = golden
 
         expected_swa: Dict[int, torch.Tensor] = {}
         assert fx.swa_gpu_tensors is not None
@@ -422,22 +220,26 @@ class TestLayerwiseDsv4MultiGroupSwaRoundtrip:
             )
         torch.cuda.synchronize()
 
-        # --- Phase 1: PUT (D2H) — write GPU -> CPU for all groups + SWA ---
-        for gi in range(len(layer_groups)):
-            _d2h_main_group(fx, gi, GPU_SRC, CPU_DST)
-        _d2h_swa(fx, GPU_SRC, SWA_CPU_DST)
-        torch.cuda.synchronize()
+        # --- Phase 1: PUT (D2H) — every region in one batch ---
+        _d2h_everything(fx)
 
         # --- Phase 2: zero GPU to ensure H2D really reads CPU ---
         _zero_all_gpu(fx)
-        for gi, local_id in [(0, 0)]:
-            assert fx.gpu_tensors_per_group[gi][local_id][GPU_SRC].sum().item() == 0
+        assert fx.gpu_tensors_per_group[0][0][GPU_SRC].sum().item() == 0
         assert fx.swa_gpu_tensors[0][GPU_SRC].sum().item() == 0
 
-        # --- Phase 3: GET (layerwise H2D) — restore into different GPU blocks ---
-        _layerwise_h2d_main_and_swa(
-            fx, CPU_DST, GPU_BACK, SWA_CPU_DST, SWA_GPU_BACK,
+        # --- Phase 3: GET (per-layer H2D) — restore into different GPU blocks ---
+        requests, empty_layers = h2d_requests(
+            fx, with_swa=True,
+            cpu_block=CPU_DST, gpu_block=GPU_BACK,
+            swa_cpu_block=SWA_CPU_DST, swa_gpu_block=SWA_GPU_BACK,
         )
+        assert empty_layers == [], (
+            "every DSv4 layer has a member; nothing may be posted early")
+        fx.group.submit_layerwise(requests, empty_layers, 0)
+        ok, err = fx.group.wait_layer_completion(120.0)
+        assert ok, f"layerwise H2D did not complete: {err}"
+        torch.cuda.synchronize()
 
         # --- Phase 4: byte-exact verification ---
         failures: List[str] = []

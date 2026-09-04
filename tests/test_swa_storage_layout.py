@@ -4,8 +4,9 @@ import pytest
 import torch
 
 from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
+from flexkv.common.pool import PoolId
 from flexkv.common.transfer import DeviceType
-from flexkv.storage.storage_engine import StorageEngine
+from flexkv.storage.storage_engine import StorageEngine, _resolve_pool
 
 pytestmark = pytest.mark.unit
 
@@ -32,7 +33,10 @@ def _capture_allocations(monkeypatch):
             "device_type": device_type,
             "layout": layout,
             "dtype": dtype,
-            "is_swa": bool(kwargs.get("is_swa", False)),
+            # Resolved through the same helper the real allocate() uses, so
+            # this probe keeps working whichever selector the caller spells.
+            "pool_id": _resolve_pool(kwargs.get("pool_id"),
+                                     bool(kwargs.get("is_swa", False))),
         })
         return True
 
@@ -44,7 +48,7 @@ def _swa_layout_by_device(allocations):
     return {
         item["device_type"]: item["layout"]
         for item in allocations
-        if item["is_swa"]
+        if item["pool_id"] is PoolId.SWA
     }
 
 

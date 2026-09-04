@@ -1304,6 +1304,73 @@ class GlobalCacheEngine:
             self.remote_cache_engine.recycle(remote_blocks)
         return self._empty_put_return(request_id)
 
+    @staticmethod
+    def _build_get_h2d_ops(transfer_graph: TransferOpGraph,
+                           cpu_blocks: np.ndarray,
+                           gpu_blocks: np.ndarray,
+                           resident_num_blocks: int,
+                           split: bool,
+                           dp_client_id: int,
+                           staged_predecessors: List[TransferOp]) -> List[TransferOp]:
+        """Build a GET's CPU->GPU op(s) and wire their staging dependencies.
+
+        ``cpu_blocks`` / ``gpu_blocks`` are laid out resident-first: the leading
+        ``resident_num_blocks`` entries are CPU cache hits whose data is already
+        in host memory, the rest are slots a DISK2H / REMOTE2H predecessor is
+        still filling.
+
+        When ``split`` is False this is the historical single H2D depending on
+        every predecessor.  When True it emits two ops: a resident lane with no
+        predecessors (so it launches as soon as the graph is submitted, in
+        parallel with the SSD/remote reads) and a staged lane carrying the
+        dependencies.  The staged lane binds its GPU ids at
+        ``gpu_bind_offset=resident_num_blocks`` because set_gpu_blocks()
+        otherwise assumes every H2D starts at the beginning of the slot_mapping.
+
+        Returns the ops that must be treated as the GET's completion terminals.
+        """
+        if not split:
+            op_h2d = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=TransferType.H2D,
+                src_block_ids=cpu_blocks,
+                dst_block_ids=gpu_blocks,
+                dp_client_id=dp_client_id,
+                src_is_staged=bool(staged_predecessors),
+            )
+            transfer_graph.add_transfer_op(op_h2d)
+            for pred in staged_predecessors:
+                transfer_graph.add_dependency(op_h2d.op_id, pred.op_id)
+            return [op_h2d]
+
+        assert 0 < resident_num_blocks < len(cpu_blocks)
+        op_resident = TransferOp(
+            graph_id=transfer_graph.graph_id,
+            transfer_type=TransferType.H2D,
+            src_block_ids=cpu_blocks[:resident_num_blocks],
+            dst_block_ids=gpu_blocks[:resident_num_blocks],
+            dp_client_id=dp_client_id,
+            gpu_bind_offset=0,
+            src_is_staged=False,
+        )
+        transfer_graph.add_transfer_op(op_resident)
+
+        op_staged = TransferOp(
+            graph_id=transfer_graph.graph_id,
+            transfer_type=TransferType.H2D,
+            src_block_ids=cpu_blocks[resident_num_blocks:],
+            dst_block_ids=gpu_blocks[resident_num_blocks:],
+            dp_client_id=dp_client_id,
+            gpu_bind_offset=resident_num_blocks,
+            src_is_staged=True,
+        )
+        transfer_graph.add_transfer_op(op_staged)
+        for pred in staged_predecessors:
+            transfer_graph.add_dependency(op_staged.op_id, pred.op_id)
+        # Both lanes are terminals: the GET is done only when the GPU holds all
+        # of fragment1..3, so reporting on either one alone would be a lie.
+        return [op_resident, op_staged]
+
     def _get_impl_global(self,
             request_id: int,
             sequence_meta: SequenceMeta,
@@ -1578,19 +1645,25 @@ class GlobalCacheEngine:
                 ),
             )
         if enable_gpu:
-            op_h2d = TransferOp(
-                graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.H2D,
-                src_block_ids = fragment123_cpu_blocks,
-                dst_block_ids = fragment123_gpu_blocks,
-                dp_client_id = dp_client_id,
-            )
-            transfer_graph.add_transfer_op(op_h2d)
-            if op_disk2h is not None:
-                transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
-            if op_remote2h is not None:
-                transfer_graph.add_dependency(op_h2d.op_id, op_remote2h.op_id)
-            finished_ops_ids.append(op_h2d.op_id)
+            # fragment1 is already CPU-resident (it came from the CPU index);
+            # only fragment2/3 are being filled by op_disk2h / op_remote2h. A
+            # single H2D over all three would gate the resident blocks on those
+            # reads, so split the lanes when both sides are non-empty and let
+            # the resident H2D start immediately.
+            staged_predecessors = [op for op in (op_disk2h, op_remote2h)
+                                   if op is not None]
+            split_h2d = bool(GLOBAL_CONFIG_FROM_ENV.split_resident_h2d
+                             and staged_predecessors
+                             and 0 < fragment1_num_blocks < len(fragment123_cpu_blocks))
+            for op_h2d in self._build_get_h2d_ops(
+                    transfer_graph=transfer_graph,
+                    cpu_blocks=fragment123_cpu_blocks,
+                    gpu_blocks=fragment123_gpu_blocks,
+                    resident_num_blocks=fragment1_num_blocks,
+                    split=split_h2d,
+                    dp_client_id=dp_client_id,
+                    staged_predecessors=staged_predecessors):
+                finished_ops_ids.append(op_h2d.op_id)
 
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
@@ -1952,20 +2025,34 @@ class GlobalCacheEngine:
             fragment12_cpu_blocks = fragment1_cpu_blocks
 
         if enable_gpu:
-            op_h2d = TransferOp(
-                graph_id = transfer_graph.graph_id,
-                transfer_type = TransferType.H2D,
-                src_block_ids = fragment12_cpu_blocks if not enable_gds else fragment1_cpu_blocks,
-                dst_block_ids = fragment12_gpu_blocks if not enable_gds \
-                    else fragment12_gpu_blocks[:fragment1_num_blocks],
-                dp_client_id = dp_client_id,
-            )
-            transfer_graph.add_transfer_op(op_h2d)
+            h2d_cpu_blocks = fragment12_cpu_blocks if not enable_gds else fragment1_cpu_blocks
+            h2d_gpu_blocks = fragment12_gpu_blocks if not enable_gds \
+                else fragment12_gpu_blocks[:fragment1_num_blocks]
+            staged_predecessors = []
             if op_disk2h is not None:
-                transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
-            if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
-                transfer_graph.add_dependency(op_h2d.op_id, op_peerh2h.op_id)
-            finished_ops_ids.append(op_h2d.op_id)
+                staged_predecessors.append(op_disk2h)
+            # A "remote" CPU match means fragment1 itself is staged in by
+            # op_peerh2h, so it is NOT resident and the split does not apply.
+            fragment1_is_staged = (cpu_matched_result.matched_pos == "remote"
+                                   and fragment1_num_blocks > 0)
+            if fragment1_is_staged:
+                staged_predecessors.append(op_peerh2h)
+            # GDS moves fragment2 straight to the GPU, so this H2D is fragment1
+            # only and has nothing to split off.
+            split_h2d = bool(GLOBAL_CONFIG_FROM_ENV.split_resident_h2d
+                             and not enable_gds
+                             and not fragment1_is_staged
+                             and op_disk2h is not None
+                             and 0 < fragment1_num_blocks < len(h2d_cpu_blocks))
+            for op_h2d in self._build_get_h2d_ops(
+                    transfer_graph=transfer_graph,
+                    cpu_blocks=h2d_cpu_blocks,
+                    gpu_blocks=h2d_gpu_blocks,
+                    resident_num_blocks=fragment1_num_blocks,
+                    split=split_h2d,
+                    dp_client_id=dp_client_id,
+                    staged_predecessors=staged_predecessors):
+                finished_ops_ids.append(op_h2d.op_id)
 
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:

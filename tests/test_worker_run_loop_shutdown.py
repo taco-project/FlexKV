@@ -66,7 +66,10 @@ class _SentinelPipe:
 
 
 def _worker(pipe, monkeypatch):
-    from flexkv.transfer import worker as worker_module
+    # ``TransferWorkerBase`` and its run loop live in workers/runtime.py now;
+    # flexkv.transfer.worker is a re-export façade, so it has no ``trace``
+    # module attribute to patch. The loop under test is unchanged.
+    from flexkv.transfer.workers import runtime as worker_module
 
     monkeypatch.setattr(
         worker_module.trace,
