@@ -131,7 +131,10 @@ def create_cpu_gpu_worker(
     op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
 
     # One worker class for every TP width, tp_size==1 included.
+    # completion=WHOLE: this arm measures plain H2D/D2H, and there is no
+    # sglang consumer here to hand over per-layer eventfds.
     worker_handle = GPUCPUTransferWorker.create_worker(
+        completion=CompletionContract.WHOLE,
         mp_ctx=mp.get_context('spawn'),
         finished_ops_queue=finished_ops_queue,
         op_buffer_tensor=op_buffer_tensor,

@@ -37,13 +37,12 @@ import numpy as np
 import torch
 
 from flexkv.common.transfer import TransferOp, TransferType
+from flexkv.transfer.completion import CompletionContract
 from flexkv.transfer.worker import (
     CPUSSDDiskTransferWorker,
     GDSTransferWorker,
     GPUCPUTransferWorker,
     WorkerHandle,
-    tpGDSTransferWorker,
-    tpGPUCPUTransferWorker,
 )
 from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -336,38 +335,26 @@ def create_cpu_gpu_worker_pair(
     for _ in range(2):
         finished_ops_queue = mp.Queue()
         op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
-        if model_config.tp_size == 1:
-            handle = GPUCPUTransferWorker.create_worker(
-                mp_ctx=mp.get_context("spawn"),
-                finished_ops_queue=finished_ops_queue,
-                op_buffer_tensor=op_buffer_tensor,
-                gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                cpu_blocks=cpu_handle.get_tensor(),
-                gpu_kv_layout=gpu_handles[0].kv_layout,
-                cpu_kv_layout=cpu_handle.kv_layout,
-                dtype=model_config.dtype,
-                gpu_device_id=0,
-                use_ce_transfer_h2d=use_ce_transfer,
-                use_ce_transfer_d2h=use_ce_transfer,
-                transfer_num_cta_h2d=transfer_num_cta,
-                transfer_num_cta_d2h=transfer_num_cta,
-            )
-        else:
-            handle = tpGPUCPUTransferWorker.create_worker(
-                mp_ctx=mp.get_context("spawn"),
-                finished_ops_queue=finished_ops_queue,
-                op_buffer_tensor=op_buffer_tensor,
-                gpu_blocks=[h.get_tensor_handle_list() for h in gpu_handles],
-                cpu_blocks=cpu_handle.get_tensor(),
-                gpu_kv_layouts=[h.kv_layout for h in gpu_handles],
-                cpu_kv_layout=cpu_handle.kv_layout,
-                dtype=model_config.dtype,
-                tp_group_size=model_config.tp_size,
-                use_ce_transfer_h2d=use_ce_transfer,
-                use_ce_transfer_d2h=use_ce_transfer,
-                transfer_num_cta_h2d=transfer_num_cta,
-                transfer_num_cta_d2h=transfer_num_cta,
-            )
+        # One worker class for every TP width, tp_size==1 included -- the two
+        # branches this used to have collapsed when the tp/non-tp classes
+        # merged. completion=WHOLE: this is plain H2D/D2H, with no sglang
+        # consumer to hand over per-layer eventfds.
+        handle = GPUCPUTransferWorker.create_worker(
+            mp_ctx=mp.get_context("spawn"),
+            finished_ops_queue=finished_ops_queue,
+            op_buffer_tensor=op_buffer_tensor,
+            gpu_blocks=[h.get_tensor_handle_list() for h in gpu_handles],
+            cpu_blocks=cpu_handle.get_tensor(),
+            gpu_kv_layouts=[h.kv_layout for h in gpu_handles],
+            cpu_kv_layout=cpu_handle.kv_layout,
+            dtype=model_config.dtype,
+            tp_group_size=model_config.tp_size,
+            completion=CompletionContract.WHOLE,
+            use_ce_transfer_h2d=use_ce_transfer,
+            use_ce_transfer_d2h=use_ce_transfer,
+            transfer_num_cta_h2d=transfer_num_cta,
+            transfer_num_cta_d2h=transfer_num_cta,
+        )
         pairs.append((handle, finished_ops_queue))
     return pairs
 
@@ -474,12 +461,15 @@ def _run_cpu_gpu_benchmark_worker(
             transfer_conn,
             finished_ops_queue,
             op_buffer_tensor,
-            gpu_blocks,
+            # Thread mode is tp_size==1: a one-GPU group, not a separate
+            # singular signature. The trailing 1 is tp_group_size, which the
+            # merged worker takes where gpu_device_id used to sit.
+            [gpu_blocks],
             cpu_blocks,
-            gpu_kv_layout,
+            [gpu_kv_layout],
             cpu_kv_layout,
             dtype,
-            0,
+            1,
             use_ce_transfer_h2d=use_ce_transfer,
             use_ce_transfer_d2h=use_ce_transfer,
             transfer_num_cta_h2d=transfer_num_cta,
@@ -727,32 +717,21 @@ def create_gpu_ssd_worker_pair(
     for _ in range(2):
         finished_ops_queue = mp.Queue()
         op_buffer_tensor = torch.empty((4, max_block_num), dtype=torch.int64).share_memory_()
-        if model_config.tp_size == 1:
-            handle = GDSTransferWorker.create_worker(
-                mp_ctx=mp.get_context("spawn"),
-                finished_ops_queue=finished_ops_queue,
-                op_buffer_tensor=op_buffer_tensor,
-                gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                ssd_files=ssd_handle.get_file_list(),
-                num_blocks_per_file=ssd_handle.num_blocks_per_file,
-                gpu_kv_layout=gpu_handles[0].kv_layout,
-                ssd_kv_layout=ssd_handle.kv_layout,
-                dtype=model_config.dtype,
-                gpu_device_id=0,
-            )
-        else:
-            handle = tpGDSTransferWorker.create_worker(
-                mp_ctx=mp.get_context("spawn"),
-                finished_ops_queue=finished_ops_queue,
-                op_buffer_tensor=op_buffer_tensor,
-                gpu_blocks=[h.get_tensor_handle_list() for h in gpu_handles],
-                ssd_files=ssd_handle.get_file_list(),
-                num_blocks_per_file=ssd_handle.num_blocks_per_file,
-                gpu_kv_layouts=[h.kv_layout for h in gpu_handles],
-                ssd_kv_layout=ssd_handle.kv_layout,
-                dtype=model_config.dtype,
-                tp_group_size=model_config.tp_size,
-            )
+        # Same merge as the CPU<->GPU pair above: the thread group already
+        # spawns one thread, stream and GDSManager per GPU, and num_gpus==1
+        # *is* the non-TP case.
+        handle = GDSTransferWorker.create_worker(
+            mp_ctx=mp.get_context("spawn"),
+            finished_ops_queue=finished_ops_queue,
+            op_buffer_tensor=op_buffer_tensor,
+            gpu_blocks=[h.get_tensor_handle_list() for h in gpu_handles],
+            ssd_files=ssd_handle.get_file_list(),
+            num_blocks_per_file=ssd_handle.num_blocks_per_file,
+            gpu_kv_layouts=[h.kv_layout for h in gpu_handles],
+            ssd_kv_layout=ssd_handle.kv_layout,
+            dtype=model_config.dtype,
+            tp_group_size=model_config.tp_size,
+        )
         pairs.append((handle, finished_ops_queue))
     return pairs
 
@@ -783,13 +762,15 @@ def _run_gds_benchmark_worker(
             transfer_conn,
             finished_ops_queue,
             op_buffer_tensor,
-            gpu_blocks=gpu_blocks,
+            # Thread mode is tp_size==1, which the merged worker expresses as
+            # a one-GPU group rather than a separate singular signature.
+            gpu_blocks=[gpu_blocks],
             ssd_files=ssd_files,
             num_blocks_per_file=num_blocks_per_file,
-            gpu_kv_layout=gpu_kv_layout,
+            gpu_kv_layouts=[gpu_kv_layout],
             ssd_kv_layout=ssd_kv_layout,
             dtype=dtype,
-            gpu_device_id=0,
+            tp_group_size=1,
         )
         ready_event.set()
         worker.run()
