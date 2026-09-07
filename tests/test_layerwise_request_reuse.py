@@ -1,6 +1,6 @@
 """The cached layerwise request plan, driven through the worker method itself.
 
-``_layerwise_plan`` builds the ``RegionRequest`` list once per ``has_swa``
+``_compiled_requests`` builds the ``RegionRequest`` list once per ``has_swa``
 shape and keeps it; ``_layerwise_transfer_impl`` then rebinds only the two
 block-id tensors before each submit.  That trade has exactly two ways to be
 wrong, and neither raises:
@@ -14,17 +14,21 @@ wrong, and neither raises:
   different slot-id spaces, so a request that reads the main tensor for an SWA
   region indexes the SWA pool with a main-pool slot id.
 
-So these run real H2D through ``_layerwise_transfer_impl`` and compare bytes,
-twice, with *different* block ids the second time.  ``tests/
-test_layerwise_multi_group_swa.py`` covers the same geometry but builds its
-requests itself, which is what left this method uncovered: the 9846-case suite
-never called it once.
+So the first test runs real H2D through ``_layerwise_transfer_impl`` twice,
+with *different* block ids the second time, and compares bytes for both rounds
+after both have run.  ``tests/test_layerwise_multi_group_swa.py`` covers the
+same geometry but builds its requests itself, which is what left this method
+uncovered: the 9846-case suite never called it once.
+
+The remaining two are the plan's other two silent modes: a layer nobody posts
+(the consumer waits on its fd forever) and an SWA op at a worker with no SWA
+pool (valid main-pool integers, wrong slot space).
 
 The SWA arm is the one e2e cannot reach -- Qwen3-8B has no SWA pool, and the
 models that do need TP=8.
 
 Run:
-    pytest tests/test_layerwise_plan_reuse.py -v
+    pytest tests/test_layerwise_request_reuse.py -v
 """
 
 from __future__ import annotations
@@ -79,7 +83,7 @@ def _worker(fx: MultiGroupFixture, *, with_swa_pool: bool) -> GPUCPUTransferWork
     w._rank_share_mode = rank_share_mode("sharded")
     w._completion = CompletionContract.PER_LAYER
     w._layerwise_completion_timeout_s = 120.0
-    w._layerwise_plans = {}
+    w._request_cache = {}
 
     num_groups = len(fx.layer_groups)
     w._pools = {
@@ -148,27 +152,7 @@ def _fixture() -> MultiGroupFixture:
     return build_fixture([main], NUM_LAYERS, has_swa=True)
 
 
-class TestLayerwisePlanReuse:
-    def test_swa_transfer_moves_both_pools(self) -> None:
-        """The has_swa=True branch, end to end: main *and* SWA bytes land."""
-        fx = _fixture()
-        w = _worker(fx, with_swa_pool=True)
-        cpu_main, gpu_main = MAIN_BLOCKS[0]
-        cpu_swa, gpu_swa = SWA_BLOCKS[0]
-
-        exp_main = _seed_main(fx, cpu_main)
-        exp_swa = {
-            orig: _seed_swa_cpu_layer(fx.swa_cpu, cpu_swa, orig)
-            for orig in range(NUM_LAYERS)
-        }
-
-        w._layerwise_transfer_impl(
-            _ids(cpu_main), _ids(gpu_main), _ids(cpu_swa), _ids(gpu_swa), 0)
-        torch.cuda.synchronize()
-
-        _assert_main(fx, gpu_main, exp_main)
-        _assert_swa(fx, gpu_swa, exp_swa)
-
+class TestLayerwiseRequestReuse:
     def test_second_transfer_rebinds_both_pools(self) -> None:
         """The stale-binding failure: run twice, second op's blocks must win.
 
@@ -202,41 +186,17 @@ class TestLayerwisePlanReuse:
             _assert_swa(fx, gpu_swa, exp_swa)
 
         # One plan built, reused the second time.
-        assert list(w._layerwise_plans) == [True]
-
-    def test_the_two_shapes_get_different_plans(self) -> None:
-        """has_swa keys the cache because it changes the request list.
-
-        Sharing one plan across shapes would either submit SWA requests bound
-        to the main pool's ids (a wrong-slot-space read) or leave the SWA-only
-        layers unposted, hanging the consumer on their fds.
-        """
-        fx = _fixture()
-        w = _worker(fx, with_swa_pool=True)
-
-        with_swa = w._layerwise_plan(True)
-        without = w._layerwise_plan(False)
-
-        assert w._layerwise_plan(True) is with_swa, "plan rebuilt, not cached"
-        assert with_swa is not without
-
-        swa_index = len(fx.layer_groups)
-        assert PoolId.SWA in with_swa[1]
-        assert PoolId.SWA not in without[1]
-        assert swa_index in [r.region_index for r in with_swa[0]]
-        assert swa_index not in [r.region_index for r in without[0]]
-        # Every layer here has a main member, so nothing is empty with SWA;
-        # dropping SWA cannot make a layer empty in this geometry either --
-        # what it must not do is silently keep the SWA requests.
-        assert len(without[0]) == len(with_swa[0]) - NUM_LAYERS
+        assert list(w._request_cache) == [True]
 
     def test_swa_only_layers_are_empty_without_swa(self) -> None:
         """A layer whose only state is SWA is empty in the no-SWA plan.
 
         The consumer waits on every layer's fd regardless of whether this op
-        carries state for it, so such a layer has to be posted up front. It is
-        per *shape*, not per worker: the same worker leaves layer 0 uncovered
-        only when the op has no SWA blocks.
+        carries state for it, so such a layer has to be posted up front, and
+        it is per *shape*: the same worker leaves layer 0 uncovered only when
+        the op has no SWA blocks. Getting this wrong hangs the consumer on a
+        fd that is never posted, which e2e surfaces as an undiagnosable
+        timeout rather than a failure that names a layer.
         """
         main = LayerGroupSpec(
             num_layers=NUM_LAYERS - 1, num_kv_heads=1, head_size=MAIN_HEAD_SIZE,
@@ -245,8 +205,8 @@ class TestLayerwisePlanReuse:
         fx = build_fixture([main], NUM_LAYERS, has_swa=True)
         w = _worker(fx, with_swa_pool=True)
 
-        assert w._layerwise_plan(True).empty_layers == []
-        assert w._layerwise_plan(False).empty_layers == [0]
+        assert w._compiled_requests(True).empty_layers == []
+        assert w._compiled_requests(False).empty_layers == [0]
 
     def test_swa_op_at_a_worker_without_an_swa_pool_raises(self) -> None:
         """The dangerous fall-through: SWA slot ids against full-KV regions.

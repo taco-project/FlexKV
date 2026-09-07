@@ -53,7 +53,7 @@ from flexkv.transfer.workers.runtime import (
 _EMPTY_BLOCK_IDS = torch.empty(0, dtype=torch.int64)
 
 
-class LayerwisePlan(NamedTuple):
+class LayerwiseRequests(NamedTuple):
     """The static half of a layerwise transfer: everything but the block ids.
 
     A layerwise submit is two separable things. This is the part fixed by the
@@ -63,7 +63,7 @@ class LayerwisePlan(NamedTuple):
     that actually changes from op to op; ``_layerwise_transfer_impl`` binds
     those onto ``requests`` just before submitting.
 
-    Splitting them is what makes the plan cacheable: see ``_layerwise_plan``
+    Splitting them is what makes the plan cacheable: see ``_compiled_requests``
     for why it is built once, and for the serialization this reuse relies on.
 
     ``pool_of[i]`` names the pool whose ids belong on ``requests[i]``; the two
@@ -634,8 +634,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         self._completion = completion
         self._layer_milestones = self._build_layer_milestones()
         # One plan per shape, keyed on whether the op carries SWA blocks.
-        # See LayerwisePlan and _layerwise_plan.
-        self._layerwise_plans: Dict[bool, LayerwisePlan] = {}
+        # See LayerwiseRequests and _compiled_requests.
+        self._request_cache: Dict[bool, LayerwiseRequests] = {}
         # Layers this model has no state for at all. Reported here only; the
         # list that gets posted is per transfer (see _layerwise_transfer_impl),
         # because an op that carries no SWA blocks leaves more layers uncovered
@@ -1202,13 +1202,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 self.tp_transfer_thread_group.wait_all_streams()
 
 
-    def _layerwise_plan(self, has_swa: bool) -> LayerwisePlan:
+    def _compiled_requests(self, has_swa: bool) -> LayerwiseRequests:
         """The plan for one layerwise shape, built on first use and reused.
 
         Building it is not free -- at DSv4 scale it is 128 ``RegionRequest``
         constructions plus 11 pybind setter calls each, per transfer, for a
         result that is byte-identical every time. Since none of those 11 fields
-        depend on the op (see ``LayerwisePlan``), the whole thing is cached.
+        depend on the op (see ``LayerwiseRequests``), the whole thing is cached.
 
         Keyed on ``has_swa`` because an op with no SWA blocks skips the SWA
         members entirely, which changes both the request list and the set of
@@ -1225,7 +1225,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         ever pipelines two layerwise ops would need a plan per in-flight op
         rather than a plan per shape.
         """
-        cached = self._layerwise_plans.get(has_swa)
+        cached = self._request_cache.get(has_swa)
         if cached is not None:
             return cached
 
@@ -1261,9 +1261,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 requests.append(req)
                 pool_of.append(pool_id)
 
-        plan = LayerwisePlan(requests, pool_of, empty_layers)
-        self._layerwise_plans[has_swa] = plan
-        return plan
+        compiled = LayerwiseRequests(requests, pool_of, empty_layers)
+        self._request_cache[has_swa] = compiled
+        return compiled
 
     def _layerwise_transfer_impl(
         self,
@@ -1297,7 +1297,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 f"[worker {self.worker_id}] layerwise op carries SWA block ids "
                 "but this worker has no SWA pool registered")
 
-        plan = self._layerwise_plan(has_swa)
+        plan = self._compiled_requests(has_swa)
         # Bind this op's ids onto the plan: the only per-op input there is. The
         # layerwise op carries one pair per pool it touches, and only two pools
         # exist today, so this is a dict rather than a widening of the op --
