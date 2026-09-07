@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from flexkv.transfer import worker
+from flexkv.transfer.workers import runtime
 
 
 class RegistrationStopped(Exception):
@@ -10,7 +11,7 @@ class RegistrationStopped(Exception):
 
 def stop_at_first_host_registration(monkeypatch, events):
     monkeypatch.setattr(
-        worker.torch.cuda,
+        torch.cuda,
         "set_device",
         lambda device: events.append(("set_device", device)),
     )
@@ -19,7 +20,13 @@ def stop_at_first_host_registration(monkeypatch, events):
         events.append(("register", None))
         raise RegistrationStopped
 
-    monkeypatch.setattr(worker, "cudaHostRegister", register)
+    # Patch where the *name is resolved*, not where the worker is imported
+    # from. Both calls this test intercepts live in ``TransferWorkerBase`` /
+    # ``ensure_cuda_device`` in ``workers.runtime``; ``flexkv.transfer.worker``
+    # is a re-export façade, so patching an attribute on it would rebind
+    # nothing the worker actually looks up and the real cudaHostRegister would
+    # run -- a green test that no longer tests anything.
+    monkeypatch.setattr(runtime, "cudaHostRegister", register)
 
 
 def test_gpu_cpu_worker_selects_device_before_host_registration(monkeypatch):
