@@ -1,14 +1,32 @@
-"""Compatibility façade over the :mod:`flexkv.transfer.workers` package.
+"""Compatibility façade over :mod:`flexkv.transfer.workers`.
 
-This module was a single 4345-line file holding every transfer worker. It was
-split one module per resource edge; see ``flexkv/transfer/workers/__init__.py``
-for the layout. The split was a pure move -- no symbol changed -- and this
-module re-exports the workers, the helpers, and the module-scope ``trace``
-handle, so both ``from flexkv.transfer.worker import X`` and the
-``worker.trace``-style attribute access the tests use keep working.
+The worker classes used to live here, in one file, and a lot of code -- inside
+the repo and outside it -- imports them from this path. They now live one per
+edge under ``flexkv/transfer/workers/``; this module re-exports them, along with
+the module-scope ``trace`` handle, so both ``from flexkv.transfer.worker import
+X`` and the ``worker.trace``-style attribute access the tests use keep working.
+
+Two names below are *not* workers and are re-exported for a different reason:
+``transfer_kv_blocks_remote`` and ``shared_transfer_kv_blocks_remote_read`` are
+``c_ext`` entry points that ``backends.py`` imports from this module lazily
+(inside ``PcfsRemoteBackend.attach``/``transfer``), and that tests monkeypatch
+here. They stay module-level attributes of the façade, ``None`` when the build
+has no CFS support, exactly as before.
 
 New code should import from ``flexkv.transfer.workers``.
 """
+
+# ``c_ext`` re-exports. Kept at module level, and imported the same defensive
+# way as before: a build without FLEXKV_ENABLE_CFS=1 has no such symbols, and
+# PcfsRemoteBackend.attach checks for None rather than catching ImportError.
+try:
+    from flexkv.c_ext import (
+        shared_transfer_kv_blocks_remote_read,
+        transfer_kv_blocks_remote,
+    )
+except ImportError:
+    transfer_kv_blocks_remote = None
+    shared_transfer_kv_blocks_remote_read = None
 
 from flexkv.transfer import trace  # noqa: F401
 from flexkv.transfer.workers import (  # noqa: F401
@@ -16,36 +34,43 @@ from flexkv.transfer.workers import (  # noqa: F401
     CPUSSDDiskTransferWorker,
     GDSTransferWorker,
     GPUCPUTransferWorker,
-    MooncakeStoreTransferWorker,
     NixlTransferWorker,
     PEER2CPUTransferWorker,
     TransferWorkerBase,
     WorkerHandle,
-    _register_mooncake_regions,
-    _split_mooncake_registration_regions,
-    _unregister_mooncake_regions,
-    _validate_multi_group_chunk_layout,
     ensure_cuda_device,
     import_tensor_handles,
     tpGDSTransferWorker,
 )
+
+# Not workers either. These are the geometry check and the Mooncake external-MR
+# helpers, which live beside the code that runs them (``workers/gpu_cpu.py``
+# and ``backends.py``) but are re-exported here because the regression suites
+# import them from this path.
+from flexkv.transfer.backends import (
+    _register_mooncake_regions,
+    _split_mooncake_registration_regions,
+    _unregister_mooncake_regions,
+)
+from flexkv.transfer.workers import _validate_multi_group_chunk_layout
 
 __all__ = [
     "CPURemoteTransferWorker",
     "CPUSSDDiskTransferWorker",
     "GDSTransferWorker",
     "GPUCPUTransferWorker",
-    "MooncakeStoreTransferWorker",
     "NixlTransferWorker",
     "PEER2CPUTransferWorker",
     "TransferWorkerBase",
     "WorkerHandle",
+    "ensure_cuda_device",
+    "import_tensor_handles",
+    "shared_transfer_kv_blocks_remote_read",
+    "transfer_kv_blocks_remote",
+    "_validate_multi_group_chunk_layout",
     "_register_mooncake_regions",
     "_split_mooncake_registration_regions",
     "_unregister_mooncake_regions",
-    "_validate_multi_group_chunk_layout",
-    "ensure_cuda_device",
-    "import_tensor_handles",
     "tpGDSTransferWorker",
     "trace",
 ]

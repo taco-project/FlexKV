@@ -41,8 +41,10 @@ from flexkv.transfer.worker import (
     tpGDSTransferWorker,
     NixlTransferWorker,
     PEER2CPUTransferWorker,
-    MooncakeStoreTransferWorker,
 )
+# The remote tier's engine is a backend now, not a worker class: both the
+# PCFS and the mooncake-store remote tiers run on CPURemoteTransferWorker.
+from flexkv.transfer.backends import MooncakeStoreBackend, PcfsRemoteBackend
 from flexkv.external.mooncake_store_keys import PoolKind
 from flexkv.transfer.compression import build_compressors
 from flexkv.transfer.completion import CompletionContract
@@ -491,37 +493,43 @@ class TransferEngine:
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                remote_file=self._remote_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
-                remote_kv_layout=self._remote_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
-                remote_config_custom=self._remote_handle.remote_config_custom,
-                enable_pcfs_sharing=self._enable_pcfs_sharing,
+                backend=PcfsRemoteBackend(
+                    remote_files=self._remote_handle.get_file_list(),
+                    remote_kv_layout=self._remote_handle.kv_layout,
+                    remote_config_custom=self._remote_handle.remote_config_custom,
+                    enable_pcfs_sharing=self._enable_pcfs_sharing,
+                ),
             )
             self.remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor = self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                remote_file=self._remote_handle.get_file_list(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
-                remote_kv_layout=self._remote_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
-                remote_config_custom=self._remote_handle.remote_config_custom,
+                backend=PcfsRemoteBackend(
+                    remote_files=self._remote_handle.get_file_list(),
+                    remote_kv_layout=self._remote_handle.kv_layout,
+                    remote_config_custom=self._remote_handle.remote_config_custom,
+                ),
             )
             self._register_worker(PoolId.FULL_KV, TransferType.H2REMOTE, self.remotecpu_write_worker)
             self._register_worker(PoolId.FULL_KV, TransferType.REMOTE2H, self.remotecpu_read_worker)
         elif (getattr(self.cache_config, 'use_mooncake_store_backend', False)
               and self._cpu_handle is not None):
-            self.mooncake_store_worker: WorkerHandle = MooncakeStoreTransferWorker.create_worker(
+            self.mooncake_store_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
                 op_buffer_tensor=self.pin_buffer.get_buffer(),
                 cpu_blocks=self._cpu_handle.get_worker_tensor(),
                 cpu_kv_layout=self._cpu_handle.kv_layout,
                 dtype=self._cpu_handle.dtype,
-                cache_config=self.cache_config,
-                pool_kind=PoolKind.KV,
+                backend=MooncakeStoreBackend(
+                    cache_config=self.cache_config,
+                    pool_kind=PoolKind.KV,
+                ),
             )
             self._register_worker(PoolId.FULL_KV, TransferType.H2REMOTE, self.mooncake_store_worker)
             self._register_worker(PoolId.FULL_KV, TransferType.REMOTE2H, self.mooncake_store_worker)
@@ -697,16 +705,18 @@ class TransferEngine:
             if (getattr(self.cache_config, 'use_mooncake_store_backend', False)
                     and self._swa_cpu_handle is not None):
                 self.swa_mooncake_store_worker: WorkerHandle = (
-                    MooncakeStoreTransferWorker.create_worker(
+                    CPURemoteTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
                         finished_ops_queue=self.finished_ops_queue,
                         op_buffer_tensor=self.pin_buffer.get_buffer(),
                         cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
                         cpu_kv_layout=self._swa_cpu_handle.kv_layout,
                         dtype=self._swa_cpu_handle.dtype,
-                        cache_config=self.cache_config,
-                        pool_kind=PoolKind.SWA,
-                        override_global_segment_size=0,
+                        backend=MooncakeStoreBackend(
+                            cache_config=self.cache_config,
+                            pool_kind=PoolKind.SWA,
+                            override_global_segment_size=0,
+                        ),
                     ))
                 self._register_worker(PoolId.SWA, TransferType.REMOTE2H, self.swa_mooncake_store_worker)
                 self._register_worker(PoolId.SWA, TransferType.H2REMOTE, self.swa_mooncake_store_worker)
@@ -718,23 +728,27 @@ class TransferEngine:
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
                     cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
-                    remote_file=self._swa_remote_handle.get_file_list(),
                     cpu_kv_layout=self._swa_cpu_handle.kv_layout,
-                    remote_kv_layout=self._swa_remote_handle.kv_layout,
                     dtype=self._swa_cpu_handle.dtype,
-                    remote_config_custom=self._swa_remote_handle.remote_config_custom,
-                    enable_pcfs_sharing=self._enable_pcfs_sharing,
+                    backend=PcfsRemoteBackend(
+                        remote_files=self._swa_remote_handle.get_file_list(),
+                        remote_kv_layout=self._swa_remote_handle.kv_layout,
+                        remote_config_custom=self._swa_remote_handle.remote_config_custom,
+                        enable_pcfs_sharing=self._enable_pcfs_sharing,
+                    ),
                 )
                 self.swa_remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
                     cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
-                    remote_file=self._swa_remote_handle.get_file_list(),
                     cpu_kv_layout=self._swa_cpu_handle.kv_layout,
-                    remote_kv_layout=self._swa_remote_handle.kv_layout,
                     dtype=self._swa_cpu_handle.dtype,
-                    remote_config_custom=self._swa_remote_handle.remote_config_custom,
+                    backend=PcfsRemoteBackend(
+                        remote_files=self._swa_remote_handle.get_file_list(),
+                        remote_kv_layout=self._swa_remote_handle.kv_layout,
+                        remote_config_custom=self._swa_remote_handle.remote_config_custom,
+                    ),
                 )
                 self._register_worker(PoolId.SWA, TransferType.REMOTE2H, self.swa_remotecpu_read_worker)
                 self._register_worker(PoolId.SWA, TransferType.H2REMOTE, self.swa_remotecpu_write_worker)

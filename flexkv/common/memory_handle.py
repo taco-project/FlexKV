@@ -54,6 +54,56 @@ CU_MEM_FABRIC_HANDLE_SIZE = 64
 # CUDA runtime error codes
 cudaSuccess = 0
 cudaErrorInvalidValue = 11
+cudaErrorAlreadyMapped = 207
+
+# Per-process registry of CUDA IPC mappings opened by this process.
+#
+# Two reasons this exists:
+#   1. cudaIpcOpenMemHandle must be paired with cudaIpcCloseMemHandle. Without
+#      the close, the mapping (and the exporter's allocation it pins) leaks for
+#      the lifetime of the process.
+#   2. Opening the *same* handle twice in one process is rejected by the driver
+#      with cudaErrorAlreadyMapped. Callers legitimately re-import the same
+#      handle (e.g. one handle referenced by several groups), so we cache the
+#      base pointer and hand back the existing mapping.
+#
+# Key: (device_id, handle_bytes) -> base pointer (int)
+_ipc_mappings: dict = {}
+_ipc_mappings_lock = None  # lazily created; see _get_ipc_lock
+
+
+def _get_ipc_lock():  # type: ignore[no-untyped-def]
+    global _ipc_mappings_lock
+    if _ipc_mappings_lock is None:
+        import threading
+        _ipc_mappings_lock = threading.Lock()
+    return _ipc_mappings_lock
+
+
+def close_all_cuda_ipc_handles() -> None:
+    """Close every CUDA IPC mapping opened by this process. Idempotent.
+
+    Must be called before the process exits (worker shutdown) so the exporting
+    process can actually free the underlying allocation. Errors are logged and
+    swallowed: this runs on the teardown path, where raising would mask the
+    original reason for shutting down.
+    """
+    with _get_ipc_lock():
+        mappings = list(_ipc_mappings.items())
+        _ipc_mappings.clear()
+    if not mappings:
+        return
+    flexkv_logger.info(f"Closing {len(mappings)} CUDA IPC mapping(s)")
+    for (device_id, _handle), base_ptr in mappings:
+        try:
+            result = cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(base_ptr))
+            if result != cudaSuccess:
+                flexkv_logger.warning(
+                    f"cudaIpcCloseMemHandle failed with error code {result} "
+                    f"for device {device_id} ptr=0x{base_ptr:x}"
+                )
+        except Exception as e:  # noqa: BLE001
+            flexkv_logger.warning(f"cudaIpcCloseMemHandle raised: {e}")
 
 # CUDA driver error codes / enums used by the VMM path.
 CUDA_SUCCESS = 0
@@ -1048,8 +1098,12 @@ class TensorSharedHandle:
             return tensor
 
         except Exception as e:
+            # Fail fast: returning an empty tensor here hides the failure and
+            # lets the caller issue transfers against a 0-element buffer, which
+            # surfaces much later as silent data corruption or an opaque
+            # out-of-bounds error in the transfer kernel.
             flexkv_logger.error("Import tensor handle failed: %s", e)
-            return torch.empty(0)
+            raise RuntimeError(f"Failed to import tensor handle for device {device}: {e}") from e
 
     @staticmethod
     def _create_tensor_from_cuda_ptr(
@@ -1216,25 +1270,35 @@ class TensorSharedHandle:
         handle = cudaIpcMemHandle_t()
         ctypes.memmove(ctypes.byref(handle), ipc_handle, 64)
 
-        # Open IPC memory handle to get base pointer
-        base_ptr = ctypes.c_void_p()
-        result = cudart.cudaIpcOpenMemHandle(
-            ctypes.byref(base_ptr),
-            handle,
-            ctypes.c_int(1),  # cudaIpcMemLazyEnablePeerAccess = 1
-        )
-        # Print GPU memory address for comparison with C++ side
+        # Open IPC memory handle to get base pointer, or reuse the mapping this
+        # process already holds for it (the driver rejects a second open of the
+        # same handle with cudaErrorAlreadyMapped).
+        cache_key = (device_id, bytes(ipc_handle))
+        with _get_ipc_lock():
+            cached_base = _ipc_mappings.get(cache_key)
+            if cached_base is None:
+                base_ptr = ctypes.c_void_p()
+                result = cudart.cudaIpcOpenMemHandle(
+                    ctypes.byref(base_ptr),
+                    handle,
+                    ctypes.c_int(1),  # cudaIpcMemLazyEnablePeerAccess = 1
+                )
+                # Print GPU memory address for comparison with C++ side
 
-        if result != cudaSuccess:
-            error_msg = f"cudaIpcOpenMemHandle failed with error code {result} for device {device_id}"
-            flexkv_logger.error(error_msg)
-            flexkv_logger.error(f"IPC handle bytes (full): {ipc_handle.hex()}")
-            flexkv_logger.error(f"Current CUDA device: {torch.cuda.current_device()}")
-            flexkv_logger.error(f"Target device: {device_id}")
-            raise RuntimeError(error_msg)
+                if result != cudaSuccess:
+                    error_msg = f"cudaIpcOpenMemHandle failed with error code {result} for device {device_id}"
+                    flexkv_logger.error(error_msg)
+                    flexkv_logger.error(f"IPC handle bytes (full): {ipc_handle.hex()}")
+                    flexkv_logger.error(f"Current CUDA device: {torch.cuda.current_device()}")
+                    flexkv_logger.error(f"Target device: {device_id}")
+                    raise RuntimeError(error_msg)
+                cached_base = base_ptr.value
+                # Registered for the paired close in close_all_cuda_ipc_handles().
+                _ipc_mappings[cache_key] = cached_base
 
         # Calculate the actual data pointer: base_ptr + offset
-        data_ptr = base_ptr.value + offset
+        base_ptr = ctypes.c_void_p(cached_base)
+        data_ptr = cached_base + offset
         if offset > 0:
             data_ptr_hex = hex(data_ptr)
             base_ptr_hex = hex(base_ptr.value)
