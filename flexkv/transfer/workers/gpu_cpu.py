@@ -619,7 +619,16 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         and PER_LAYER needs its eventfds, which is the handshake below.
         """
         if completion is None:
-            completion = GLOBAL_CONFIG_FROM_ENV.layerwise_completion_contract
+            # No socket means the caller cannot possibly be asking for
+            # PER_LAYER -- it has nothing to post to. Honouring the env
+            # default here would make every plain H2D/D2H worker raise below,
+            # which is an inverted default: the callers that omit the argument
+            # are exactly the callers that cannot satisfy it.
+            completion = (
+                GLOBAL_CONFIG_FROM_ENV.layerwise_completion_contract
+                if layerwise_eventfd_socket is not None
+                else CompletionContract.WHOLE
+            )
         if isinstance(completion, str):
             completion = CompletionContract.from_str(completion)
         self._completion = completion
