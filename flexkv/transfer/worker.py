@@ -2,9 +2,9 @@
 
 The worker classes used to live here, in one file, and a lot of code -- inside
 the repo and outside it -- imports them from this path. They now live one per
-edge under ``flexkv/transfer/workers/``; this module re-exports them, along with
-the module-scope ``trace`` handle, so both ``from flexkv.transfer.worker import
-X`` and the ``worker.trace``-style attribute access the tests use keep working.
+edge under ``flexkv/transfer/workers/``; this module re-exports them, along
+with the module-scope ``trace`` handle, so both paths -- and the
+``worker.trace``-style attribute access that predates the split -- keep working.
 
 Two names below are *not* workers and are re-exported for a different reason:
 ``transfer_kv_blocks_remote`` and ``shared_transfer_kv_blocks_remote_read`` are
@@ -34,13 +34,11 @@ from flexkv.transfer.workers import (  # noqa: F401
     CPUSSDDiskTransferWorker,
     GDSTransferWorker,
     GPUCPUTransferWorker,
-    NixlTransferWorker,
     PEER2CPUTransferWorker,
     TransferWorkerBase,
     WorkerHandle,
     ensure_cuda_device,
     import_tensor_handles,
-    tpGDSTransferWorker,
 )
 
 # Not workers either. These are the geometry check and the Mooncake external-MR
@@ -59,7 +57,6 @@ __all__ = [
     "CPUSSDDiskTransferWorker",
     "GDSTransferWorker",
     "GPUCPUTransferWorker",
-    "NixlTransferWorker",
     "PEER2CPUTransferWorker",
     "TransferWorkerBase",
     "WorkerHandle",
@@ -71,6 +68,5 @@ __all__ = [
     "_register_mooncake_regions",
     "_split_mooncake_registration_regions",
     "_unregister_mooncake_regions",
-    "tpGDSTransferWorker",
     "trace",
 ]

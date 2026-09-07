@@ -1,97 +1,51 @@
-"""CPU <-> peer CPU / peer SSD, with its own ZMQ + Redis control plane."""
-import contextlib
-import logging
-import math
-import os
-import copy
-import signal
+"""Peer-to-peer CPU <-> CPU / peer-SSD -> CPU transfers.
 
-import torch.multiprocessing as mp
+Moved here whole. Unlike the other edges this worker owns a control plane of its
+own (ZMQ server/client, Redis metadata, a mooncake RDMA engine), which is why it
+is the one module that pulls those dependencies in.
+"""
+
+import json
+import os
 import threading
 import time
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from torch.multiprocessing import Queue as MPQueue, Pipe as MPPipe
 from multiprocessing.connection import Connection
-from threading import Thread
-from typing import List, Any, Dict, Union, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import nvtx
 import torch
 import zmq
-import json
+from torch.multiprocessing import Queue as MPQueue
 
 from flexkv import c_ext
-
-from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
-
-# GDS imports are optional (only available when compiled with FLEXKV_ENABLE_GDS=1)
-try:
-    from flexkv.c_ext import transfer_kv_blocks_gds, TPGDSTransferThreadGroup
-except ImportError:
-    transfer_kv_blocks_gds = None
-    TPGDSTransferThreadGroup = None
-
-from flexkv.common.debug import flexkv_logger
-from flexkv.common.memory_handle import TensorSharedHandle, release_vmm_tensor
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
-from flexkv.common.transfer import get_nvtx_range_color, LayerwiseTransferOp
-from flexkv.common.config import (
-    CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig, LayerGroupSpec,
-)
-from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
-from flexkv.transfer.host_buffer import (
-    allocate_host_buffer,
-    cudaHostRegister,
-    safe_cuda_host_unregister,
-)
-
-
-from flexkv.transfer.compression.common.strategy import (
-    CompressionStrategy,
-    NullCompressionStrategy,
-)
-from flexkv.transfer.worker_op import (
-    WorkerLayerwiseTransferOp,
-    WorkerTransferOp,
-    WorkerTransferResult,
-)
-from flexkv.transfer import trace
-from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
-from flexkv.external.mooncake_store_keys import PoolKind, build_key
-from flexkv.external.mooncake_fault_inject import inject_mooncake_fault, is_mooncake_fault_inject_enabled
-from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
+from flexkv.c_ext import transfer_kv_blocks_ssd
 from flexkv.cache.redis_meta import RedisMeta
+from flexkv.common.config import (
+    CacheConfig,
+    GLOBAL_CONFIG_FROM_ENV,
+    MooncakeTransferEngineConfig,
+)
+from flexkv.common.debug import flexkv_logger
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.common.transfer import TransferType
+from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
+from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
+from flexkv.transfer.host_buffer import allocate_host_buffer
 from flexkv.transfer.utils import (
-    group_blocks_by_node_and_segment,
-    group_blocks_by_node,
-    split_contiguous_blocks,
-    RemoteSSD2HMetaInfo,
     NodeMetaInfo,
     RDMATaskInfo,
+    RemoteSSD2HMetaInfo,
+    group_blocks_by_node,
+    group_blocks_by_node_and_segment,
+    split_contiguous_blocks,
 )
-from flexkv.transfer.nixlutil import (
-    NIXL_CPU_FILE_BACKENDS,
-    NIXL_GPU_FILE_BACKENDS,
-    NixlAgentSession,
-    normalize_nixl_file_plugin_name,
-    file_path_for_ssd_block,
-    gpu_chunk_u8_view,
-    kv_chunk_byte_offset_in_block,
-    ssd_chunk_byte_offset_in_file,
+from flexkv.transfer.worker_op import WorkerTransferOp
+from flexkv.transfer.zmqHelper import (
+    NotifyMsg,
+    NotifyStatus,
+    SSDZMQClient,
+    SSDZMQServer,
 )
-try:
-    from flexkv.c_ext import (
-        transfer_kv_blocks_remote,
-        shared_transfer_kv_blocks_remote_read,
-    )
-except ImportError:
-    transfer_kv_blocks_remote = None
-    shared_transfer_kv_blocks_remote_read = None
-
-
 from flexkv.transfer.workers.runtime import TransferWorkerBase
 
 
@@ -1049,4 +1003,3 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             flexkv_logger.info(f"Fetched node {node_id} meta from Redis.")
 
         return self.node_metas[node_id]
-

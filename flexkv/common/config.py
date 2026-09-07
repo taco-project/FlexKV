@@ -379,6 +379,25 @@ class ModelConfig:
         return self.num_kv_heads * self.tp_size_per_node // max(1, self.tp_size)
 
     @property
+    def use_mla(self) -> bool:
+        """Whether this model's KV is MLA-shaped, i.e. one tensor not two.
+
+        ``kv_dim`` replaced this flag as the field, because the thing the code
+        actually needs is the multiplier (it appears in every size computation
+        above) rather than the boolean, and a bool cannot express a third
+        layout if one ever shows up. But the flag is part of the SGLang
+        connector's contract -- ``flexkv_connector.py`` reads
+        ``model_config.use_mla`` both for its FP4-scale log line and to pick the
+        registration layout -- and that file lives outside this repo. Dropping
+        the attribute surfaces there as an ``AttributeError`` inside a GPU
+        registration retry loop, which reports as "GPU register retry" for 360
+        attempts and then a startup timeout, naming nothing.
+
+        Derived, not stored, so it cannot drift from ``kv_dim``.
+        """
+        return self.kv_dim == 1
+
+    @property
     def bytes_per_token_per_layer(self) -> int:
         """Raw byte footprint of a single (layer, token) KV slot.
 
@@ -863,6 +882,15 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # group).  Off falls back to the per-group loop, which is also the
     # automatic fallback on a build whose extension has no RegionBatchGroup.
     region_batch=os.getenv('FLEXKV_REGION_BATCH', '1') not in
+        ('0', 'false', 'False'),
+
+    # Split a GET's H2D into a resident lane (CPU cache hits, no predecessor)
+    # and a staged lane (blocks a DISK2H / REMOTE2H is still filling).  Without
+    # this the two share one op, so a CPU hit waits for an SSD read of blocks it
+    # does not need -- the resident H2D and the SSD read serialize even though
+    # they touch disjoint block sets.  Costs one extra H2D op per GET.
+    # Set to 0 for the single-op behaviour.
+    split_resident_h2d=os.getenv('FLEXKV_SPLIT_RESIDENT_H2D', '1') not in
         ('0', 'false', 'False'),
 
     # Graceful shutdown timeout hierarchy (each layer waits for the next inner

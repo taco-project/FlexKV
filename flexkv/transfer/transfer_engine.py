@@ -32,21 +32,23 @@ from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, Co
 from flexkv.common.transfer import get_nvtx_range_color
 from flexkv.transfer.scheduler import TransferScheduler
 from flexkv.transfer import trace
-from flexkv.transfer.worker import (
+from flexkv.transfer.workers import (
     WorkerHandle,
     CPUSSDDiskTransferWorker,
     CPURemoteTransferWorker,
     GPUCPUTransferWorker,
     GDSTransferWorker,
-    tpGDSTransferWorker,
-    NixlTransferWorker,
     PEER2CPUTransferWorker,
 )
-# The remote tier's engine is a backend now, not a worker class: both the
-# PCFS and the mooncake-store remote tiers run on CPURemoteTransferWorker.
-from flexkv.transfer.backends import MooncakeStoreBackend, PcfsRemoteBackend
+# NIXL / PCFS / mooncake-store are I/O *engines*, not edges: each plugs into
+# the worker that already owns its edge. See flexkv/transfer/backends.py.
+from flexkv.transfer.backends import (
+    MooncakeStoreBackend,
+    NixlFileBackend,
+    PcfsRemoteBackend,
+)
 from flexkv.external.mooncake_store_keys import PoolKind
-from flexkv.transfer.compression import build_compressors
+from flexkv.transfer.compression import build_compressors, NullCompressionStrategy
 from flexkv.transfer.completion import CompletionContract
 from flexkv.transfer.layer_eventfd import build_layerwise_eventfd_socket_path
 from flexkv.transfer.worker_op import WorkerTransferResult
@@ -223,9 +225,6 @@ class TransferEngine:
         self._running = False
         self._gpu_mappings_suspended = False
 
-        self._child_id_to_child: Dict[int, TransferOp] = {}
-        self._child_to_parent_op_id: Dict[int, int] = {}
-
         self._compressors = build_compressors(
             cpu_handle=self._cpu_handle,
             ssd_handle=self._ssd_handle,
@@ -250,11 +249,10 @@ class TransferEngine:
         self._failed_parent_op_ids: Set[int] = set()
 
     # ---- multi-group worker kwargs -------------------------------------------
-    # There used to be four of these (main/SWA x TP=1/TP>1), and two of the
-    # four were defined twice over, the second definition silently shadowing
-    # the first.  They differed only in which three attributes they read and
-    # whether they transposed, so the pool is a parameter and one device is
-    # just ``num_devices == 1``.
+    # There used to be four of these (main/SWA x TP=1/TP>1).  They differed only
+    # in which three attributes they read and whether they transposed, so the
+    # pool is a parameter and the transpose is a branch.  The design doc calls
+    # the duplication out by name.
     def _multi_group_pool(self, pool_id: PoolId) -> tuple:
         """(layer_groups, blocks_by_worker_key, layouts_by_worker_key)."""
         if pool_id is PoolId.SWA:
@@ -270,10 +268,10 @@ class TransferEngine:
         """Multi-group handles/layouts for one worker, or {} if not applicable.
 
         Transposes the registry's [device][group] into the [group][device] a
-        worker consumes.  The old ``_tp1`` variants returned a single device's
-        own [group] lists; their only callers were the singular GPU<->CPU and
-        GDS worker classes, and the GPU<->CPU pair has been merged (a TP group
-        of one is ``num_devices == 1``).
+        worker consumes.  There used to be a ``tp=False`` mode returning a
+        single device's own [group] lists; its only callers were the singular
+        GPU<->CPU and GDS worker classes, and both have been merged into their
+        TP-shaped counterparts (one device is just ``num_devices == 1``).
         """
         layer_groups, blocks_by_key, layouts_by_key = self._multi_group_pool(pool_id)
         if (layer_groups is None or blocks_by_key is None
@@ -301,56 +299,22 @@ class TransferEngine:
             ],
         )
 
-    def _get_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
-        """[group] lists for a one-device worker (the surviving GDS classes)."""
-        layer_groups, blocks_by_key, layouts_by_key = self._multi_group_pool(
-            PoolId.FULL_KV)
-        if (layer_groups is None or blocks_by_key is None
-                or worker_key not in blocks_by_key):
-            return {}
-        per_device_group_blocks = blocks_by_key[worker_key][0]
-        per_device_group_layouts = layouts_by_key[worker_key][0]
-        if per_device_group_blocks is None or per_device_group_layouts is None:
-            return {}
-        return dict(
-            layer_groups=layer_groups,
-            gpu_blocks_per_group=per_device_group_blocks,
-            gpu_layouts_per_group=per_device_group_layouts,
-        )
-
-    def _get_swa_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
-        """[group] lists for a one-device SWA worker (the surviving GDS ones)."""
-        layer_groups, blocks_by_key, layouts_by_key = self._multi_group_pool(
-            PoolId.SWA)
-        if (layer_groups is None or blocks_by_key is None
-                or worker_key not in blocks_by_key):
-            return {}
-        per_device_group_blocks = blocks_by_key[worker_key][0]
-        per_device_group_layouts = layouts_by_key[worker_key][0]
-        if per_device_group_blocks is None or per_device_group_layouts is None:
-            return {}
-        return dict(
-            layer_groups=layer_groups,
-            gpu_blocks_per_group=per_device_group_blocks,
-            gpu_layouts_per_group=per_device_group_layouts,
-        )
-
-
     def _get_swa_kwargs(self, worker_key: WorkerKey) -> dict:
-        """SWA pool args for the GPU<->CPU worker (uniform or multi-group).
+        """SWA pool args, for any worker that carries SWA as a second pool.
 
-        SWA is one more pool on the worker that already owns this TP group's
-        GPUs, not a worker of its own: same GPUs, same direction, same layout
-        family, differing only in which pool the block ids index. Which is why
-        this is no longer ``_get_layerwise_swa_kwargs`` -- nothing in it was
-        layerwise.
+        Both ``GPUCPUTransferWorker`` and ``LayerwiseTransferWorker`` take SWA
+        this way now: it is one more pool on the worker that already owns this
+        TP group's GPUs, not a worker of its own. Which is why this is no
+        longer ``_get_layerwise_swa_kwargs`` -- nothing in it was layerwise.
 
-        No SSD args: the worker does not read SSD. Under layerwise the merge
-        emits a standalone DISK2H op that the LAYERWISE op depends on.
+        No SSD args: neither worker reads SSD -- the SSD->CPU read is a
+        standalone DISK2H op the merge emits.
         """
         if not self._has_swa:
             return {}
-
+        # Uniform and multi-group are mutually exclusive, not layered: a worker
+        # given both cannot tell which description of the same pool is
+        # authoritative, and LayerwiseWorker rejects the pair outright.
         if self._swa_layer_groups is not None:
             mg = self._get_multi_group_kwargs(worker_key, pool_id=PoolId.SWA)
             if not mg:
@@ -386,7 +350,9 @@ class TransferEngine:
 
         H2D and D2H differ only in which transfer types they are registered
         for -- the worker itself handles both directions -- so they share this.
-        SWA rides along as a second pool for the same reason.
+        SWA rides along as a second pool for the same reason: it is the same
+        GPUs, the same direction and the same layout family, differing only in
+        which pool the block ids index.
 
         LAYERWISE is the same worker once more, differing only in
         ``completion``: PER_LAYER makes it open the consumer's eventfd UDS and
@@ -416,6 +382,47 @@ class TransferEngine:
             **self._get_swa_kwargs(worker_key),
         )
 
+    def _create_gds_worker(
+        self, worker_key: WorkerKey, gpu_handles: list, ssd_handle: Any,
+        *, pool_id: PoolId = PoolId.FULL_KV, backend: Any = None,
+    ) -> WorkerHandle:
+        """Spawn one GPU<->SSD GDS worker for a TP group of any size.
+
+        Same merge as ``_create_gpu_cpu_worker``: ``TPGDSTransferThreadGroup``
+        already spawns one thread, one stream and one ``GDSManager`` per GPU,
+        and ``num_gpus == 1`` *is* the non-TP case, so there is nothing for a
+        separate singular worker class to do. This used to be four call sites
+        -- main/SWA crossed with tp==1/tp>1 -- differing only in whether the
+        gpu args were scalars or one-element lists.
+
+        ``ssd_handle`` is this pool's SSD handle. Different pools are different
+        files here, which is why a non-default pool's GDS edge is still its own
+        worker rather than a second pool the way GPU<->CPU is.
+
+        ``backend`` replaces cuFile with another engine on the same edge --
+        ``NixlFileBackend("GDS_MT", ...)`` is the one in tree. That used to be
+        a whole separate worker class re-deriving the geometry computed here.
+        """
+        return GDSTransferWorker.create_worker(
+            mp_ctx=self.mp_ctx,
+            finished_ops_queue=self.finished_ops_queue,
+            op_buffer_tensor=self.pin_buffer.get_buffer(),
+            gpu_blocks=[h.get_tensor_handle_list() for h in gpu_handles],
+            ssd_files=ssd_handle.get_file_list(),
+            num_blocks_per_file=ssd_handle.num_blocks_per_file,
+            gpu_kv_layouts=[h.kv_layout for h in gpu_handles],
+            ssd_kv_layout=ssd_handle.kv_layout,
+            # Which side names the dtype differs by pool, and the two call
+            # sites disagreed before the merge: the main path took the SSD
+            # handle's, SWA the GPU handle's. They should agree; preserved
+            # rather than unified so the merge stays behaviour-preserving.
+            dtype=(ssd_handle.dtype if pool_id is PoolId.FULL_KV
+                   else gpu_handles[0].dtype),
+            tp_group_size=self.model_config.effective_tp_size_per_node,
+            backend=backend,
+            **self._get_multi_group_kwargs(worker_key, pool_id=pool_id),
+        )
+
     def _init_workers(self) -> None:
         if self._running:
             return
@@ -431,20 +438,32 @@ class TransferEngine:
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
         
-        # H2D worker
+        # H2D / D2H workers. One worker class for every TP width: tp==1 is
+        # num_gpus==1 inside TPTransferThreadGroup, which spawns one thread and
+        # one stream per GPU either way.
+        # A worker that got SWA pool args serves SWA ops of the same transfer
+        # type on the same handle, so it registers under both pools. Sharing a
+        # worker is a fact about registration, not something dispatch should
+        # rediscover by falling back (see _worker_entry_for).
+        _gpu_cpu_pools = [PoolId.FULL_KV]
+        if any(self._get_swa_kwargs(worker_key)
+               for worker_key in self.gpu_handle_groups):
+            _gpu_cpu_pools.append(PoolId.SWA)
+
         if not _enable_layerwise:
             self.h2d_workers: Dict[WorkerKey, WorkerHandle] = {
                 worker_key: self._create_gpu_cpu_worker(worker_key, gpu_handles)
                 for worker_key, gpu_handles in self.gpu_handle_groups.items()
             }
-            self._register_worker(PoolId.FULL_KV, TransferType.H2D, self.h2d_workers)
+            for _pool in _gpu_cpu_pools:
+                self._register_worker(_pool, TransferType.H2D, self.h2d_workers)
 
-        # D2H worker
         self.d2h_workers: Dict[WorkerKey, WorkerHandle] = {
             worker_key: self._create_gpu_cpu_worker(worker_key, gpu_handles)
             for worker_key, gpu_handles in self.gpu_handle_groups.items()
         }
-        self._register_worker(PoolId.FULL_KV, TransferType.D2H, self.d2h_workers)
+        for _pool in _gpu_cpu_pools:
+            self._register_worker(_pool, TransferType.D2H, self.d2h_workers)
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
             ssd_layer_groups = self.model_config.layer_groups
@@ -455,6 +474,16 @@ class TransferEngine:
             # SSD binding, so the merge hoists the SSD read to a standalone
             # DISK2H op the LAYERWISE op depends on -- and that op has to find a
             # worker here.
+            if _enable_layerwise:
+                # The layerwise per-layer H2D reads raw CPU blocks; a
+                # compressing DISK2H worker would write a different byte layout
+                # than it expects. check_engine_nvcomp_enable() already disables
+                # nvcomp under layerwise, so this only guards against that
+                # coupling being broken later.
+                assert isinstance(self._compressors["cpu_ssd"],
+                                  NullCompressionStrategy), \
+                    ("layerwise requires an uncompressed CPU<->SSD path "
+                     "(layerwise H2D reads raw CPU blocks)")
             self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
                 finished_ops_queue=self.finished_ops_queue,
@@ -539,71 +568,39 @@ class TransferEngine:
             assert self._ssd_handle is not None
             if self.cache_config.enable_nixl:
                 flexkv_logger.info(
-                    "[transfer_engine] GDS path using NixlTransferWorker (NIXL GDS_MT)"
+                    "[transfer_engine] GDS edge using the NIXL GDS_MT backend"
                 )
                 if self.model_config.effective_tp_size_per_node != 1:
                     raise RuntimeError(
                         "enable_nixl requires effective_tp_size_per_node==1 (validated in KVTaskManager)"
                     )
+                # Same worker, same edge geometry, different engine: only the
+                # library that issues the read changes.
                 self.gds_workers: Dict[WorkerKey, WorkerHandle] = {
-                    worker_key: NixlTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        nixl_backend="GDS_MT",
-                        ssd_files=self._ssd_handle.get_file_list(),
-                        num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
-                        dtype=self._ssd_handle.dtype,
-                        ssd_kv_layout=self._ssd_handle.kv_layout,
-                        gpu_kv_layout=gpu_handles[0].kv_layout,
-                        cpu_kv_layout=self._cpu_handle.kv_layout,
-                        nixl_extra_config=self.cache_config.nixl_extra_config,
-                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                        cpu_blocks=None,
-                        gpu_device_id=gpu_handles[0].gpu_device_id,
-                    )
-                    for worker_key, gpu_handles in self.gpu_handle_groups.items()
-                }
-            elif self.model_config.effective_tp_size_per_node == 1:
-                self.gds_workers: Dict[WorkerKey, WorkerHandle] = {
-                    worker_key: GDSTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                        ssd_files=self._ssd_handle.get_file_list(),
-                        num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
-                        gpu_kv_layout=gpu_handles[0].kv_layout,
-                        ssd_kv_layout=self._ssd_handle.kv_layout,
-                        dtype=self._ssd_handle.dtype,
-                        gpu_device_id=gpu_handles[0].gpu_device_id,
-                        **self._get_multi_group_kwargs_tp1(worker_key),
+                    worker_key: self._create_gds_worker(
+                        worker_key, gpu_handles, self._ssd_handle,
+                        backend=NixlFileBackend(
+                            "GDS_MT",
+                            self._ssd_handle.get_file_list(),
+                            self.cache_config.nixl_extra_config,
+                        ),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
             else:
-                self.gds_workers = {
-                    worker_key: tpGDSTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
-                        ssd_files=self._ssd_handle.get_file_list(),
-                        num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
-                        gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
-                        ssd_kv_layout=self._ssd_handle.kv_layout,
-                        dtype=self._ssd_handle.dtype,
-                        tp_group_size=self.model_config.effective_tp_size_per_node,
-                        **self._get_multi_group_kwargs(worker_key),
-                    )
+                self.gds_workers: Dict[WorkerKey, WorkerHandle] = {
+                    worker_key: self._create_gds_worker(
+                        worker_key, gpu_handles, self._ssd_handle)
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
             self._register_worker(PoolId.FULL_KV, TransferType.DISK2D, self.gds_workers)
             self._register_worker(PoolId.FULL_KV, TransferType.D2DISK, self.gds_workers)
         if GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
-            # The same GPU<->CPU worker as H2D/D2H above.  The only
+            # Same worker class as H2D/D2H, same pools, same regions. The only
             # difference is the completion contract: PER_LAYER makes it receive
-            # the consumer's eventfds and post one per model layer.
+            # the consumer's eventfds and post one per model layer. SWA and the
+            # multi-group state pools ride along exactly as they do for H2D --
+            # they are pools of this worker, not a separate worker.
             self.layerwise_workers: Dict[WorkerKey, WorkerHandle] = {}
             for worker_key, gpu_handles in self.gpu_handle_groups.items():
                 self.layerwise_workers[worker_key] = self._create_gpu_cpu_worker(
@@ -622,7 +619,8 @@ class TransferEngine:
                     f"effective_tp_size_per_node={self.model_config.effective_tp_size_per_node}, "
                     f"layer_groups={'yes' if self.model_config.layer_groups else 'no'}")
 
-            self._register_worker(PoolId.FULL_KV, TransferType.LAYERWISE, self.layerwise_workers)
+            for _pool in _gpu_cpu_pools:
+                self._register_worker(_pool, TransferType.LAYERWISE, self.layerwise_workers)
 
         if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
             or (self._ssd_handle and self.cache_config.enable_p2p_ssd)):
@@ -652,24 +650,16 @@ class TransferEngine:
             if self.cache_config.enable_p2p_ssd:
                 self._register_worker(PoolId.FULL_KV, TransferType.PEERSSD2H, self.cpu_remote_cpu_worker)
 
-        # ---- SWA rides the main GPU<->CPU worker ----
-        # There used to be four worker maps here (H2D/D2H x TP=1/TP>1), bound
-        # to the dedicated SWA pools.  They are gone: the SWA pool is passed to
-        # _create_gpu_cpu_worker as a second pool on the worker that already
-        # owns this TP group's GPUs, so the same handle serves PoolId.SWA.
-        # Same GPUs, same direction, same layout family -- only the block ids
-        # index a different pool.
+        # ---- SWA workers for the tiers that own separate storage -----------
+        # GPU<->CPU is NOT here any more: SWA is a second pool inside the same
+        # GPUCPUTransferWorker (see _get_swa_kwargs and worker._Pool), because
+        # it is the same GPUs and the same direction with only the block ids
+        # pointing at a different pool. What remains are the tiers where SWA
+        # really does address different storage -- its own SSD files, its own
+        # remote namespace -- and where there is therefore nothing to merge.
         if self._has_swa:
-            # When layerwise is on, SWA H2D always runs inside the LAYERWISE
-            # op; the standalone H2D registration only exists when it is off.
-            if not _enable_layerwise:
-                self._register_worker(PoolId.SWA, TransferType.H2D, self.h2d_workers)
-                flexkv_logger.info("TransferEngine: swa H2D served by the main GPU<->CPU worker")
-            self._register_worker(PoolId.SWA, TransferType.D2H, self.d2h_workers)
-            flexkv_logger.info("TransferEngine: swa D2H served by the main GPU<->CPU worker")
-
             if self._swa_ssd_handle is not None and self._swa_cpu_handle is not None:
-                self.swa_h2disk_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
+                swa_h2disk_worker = CPUSSDDiskTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
@@ -682,9 +672,9 @@ class TransferEngine:
                     cache_config=self._cache_config,
                     layer_groups=self._swa_layer_groups,
                 )
-                self._register_worker(PoolId.SWA, TransferType.H2DISK, self.swa_h2disk_worker)
+                self._register_worker(PoolId.SWA, TransferType.H2DISK, swa_h2disk_worker)
 
-                self.swa_disk2h_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
+                swa_disk2h_worker = CPUSSDDiskTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
@@ -697,14 +687,14 @@ class TransferEngine:
                     cache_config=self._cache_config,
                     layer_groups=self._swa_layer_groups,
                 )
-                self._register_worker(PoolId.SWA, TransferType.DISK2H, self.swa_disk2h_worker)
+                self._register_worker(PoolId.SWA, TransferType.DISK2H, swa_disk2h_worker)
                 flexkv_logger.info("TransferEngine: swa CPU<->SSD workers initialized")
 
 
             # ---- SWA CPU<->Remote workers -----------------------------------
             if (getattr(self.cache_config, 'use_mooncake_store_backend', False)
                     and self._swa_cpu_handle is not None):
-                self.swa_mooncake_store_worker: WorkerHandle = (
+                swa_mooncake_store_worker = (
                     CPURemoteTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
                         finished_ops_queue=self.finished_ops_queue,
@@ -718,12 +708,12 @@ class TransferEngine:
                             override_global_segment_size=0,
                         ),
                     ))
-                self._register_worker(PoolId.SWA, TransferType.REMOTE2H, self.swa_mooncake_store_worker)
-                self._register_worker(PoolId.SWA, TransferType.H2REMOTE, self.swa_mooncake_store_worker)
+                self._register_worker(PoolId.SWA, TransferType.REMOTE2H, swa_mooncake_store_worker)
+                self._register_worker(PoolId.SWA, TransferType.H2REMOTE, swa_mooncake_store_worker)
                 flexkv_logger.info(
                     "TransferEngine: swa mooncake-store workers initialized")
             elif self._swa_remote_handle is not None and self._swa_cpu_handle is not None:
-                self.swa_remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
+                swa_remotecpu_read_worker = CPURemoteTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
@@ -737,7 +727,7 @@ class TransferEngine:
                         enable_pcfs_sharing=self._enable_pcfs_sharing,
                     ),
                 )
-                self.swa_remotecpu_write_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
+                swa_remotecpu_write_worker = CPURemoteTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
                     op_buffer_tensor=self.pin_buffer.get_buffer(),
@@ -750,50 +740,28 @@ class TransferEngine:
                         remote_config_custom=self._swa_remote_handle.remote_config_custom,
                     ),
                 )
-                self._register_worker(PoolId.SWA, TransferType.REMOTE2H, self.swa_remotecpu_read_worker)
-                self._register_worker(PoolId.SWA, TransferType.H2REMOTE, self.swa_remotecpu_write_worker)
+                self._register_worker(PoolId.SWA, TransferType.REMOTE2H, swa_remotecpu_read_worker)
+                self._register_worker(PoolId.SWA, TransferType.H2REMOTE, swa_remotecpu_write_worker)
                 flexkv_logger.info("TransferEngine: swa CPU<->Remote workers initialized")
 
 
             if self.cache_config.enable_gds and self._swa_ssd_handle is not None:
-                if self.model_config.effective_tp_size_per_node == 1:
-                    self._swa_gds_workers: Dict[WorkerKey, WorkerHandle] = {
-                        worker_key: GDSTransferWorker.create_worker(
-                            mp_ctx=self.mp_ctx,
-                            finished_ops_queue=self.finished_ops_queue,
-                            op_buffer_tensor=self.pin_buffer.get_buffer(),
-                            gpu_blocks=swa_handles[0].get_tensor_handle_list(),
-                            ssd_files=self._swa_ssd_handle.get_file_list(),
-                            num_blocks_per_file=self._swa_ssd_handle.num_blocks_per_file,
-                            gpu_kv_layout=swa_handles[0].kv_layout,
-                            ssd_kv_layout=self._swa_ssd_handle.kv_layout,
-                            dtype=swa_handles[0].dtype,
-                            gpu_device_id=swa_handles[0].gpu_device_id,
-                            **self._get_swa_multi_group_kwargs_tp1(worker_key),
-                        )
-                        for worker_key, swa_handles in self._swa_gpu_handles.items()
-                    }
-                else:
-                    self._swa_gds_workers = {
-                        worker_key: tpGDSTransferWorker.create_worker(
-                            mp_ctx=self.mp_ctx,
-                            finished_ops_queue=self.finished_ops_queue,
-                            op_buffer_tensor=self.pin_buffer.get_buffer(),
-                            gpu_blocks=[h.get_tensor_handle_list() for h in swa_handles],
-                            ssd_files=self._swa_ssd_handle.get_file_list(),
-                            num_blocks_per_file=self._swa_ssd_handle.num_blocks_per_file,
-                            gpu_kv_layouts=[h.kv_layout for h in swa_handles],
-                            ssd_kv_layout=self._swa_ssd_handle.kv_layout,
-                            dtype=swa_handles[0].dtype,
-                            tp_group_size=self.model_config.effective_tp_size_per_node,
-                            **self._get_multi_group_kwargs(worker_key, pool_id=PoolId.SWA),
-                        )
-                        for worker_key, swa_handles in self._swa_gpu_handles.items()
-                    }
-                self._register_worker(PoolId.SWA, TransferType.DISK2D, self._swa_gds_workers)
-                self._register_worker(PoolId.SWA, TransferType.D2DISK, self._swa_gds_workers)
+                # SWA GDS stays a worker of its own -- unlike GPU<->CPU, this
+                # tier really does address different storage (its own SSD
+                # files), so there is no pool to merge it into.
+                swa_gds_workers: Dict[WorkerKey, WorkerHandle] = {
+                    worker_key: self._create_gds_worker(
+                        worker_key, swa_handles, self._swa_ssd_handle,
+                        pool_id=PoolId.SWA)
+                    for worker_key, swa_handles in self._swa_gpu_handles.items()
+                }
+                self._register_worker(PoolId.SWA, TransferType.DISK2D, swa_gds_workers)
+                self._register_worker(PoolId.SWA, TransferType.D2DISK, swa_gds_workers)
                 flexkv_logger.info("TransferEngine: swa GDS workers initialized")
-            self._has_swa = True
+            flexkv_logger.info(
+                "TransferEngine: swa GPU<->CPU is a pool on the main workers; "
+                f"separate-storage swa workers: "
+                f"{sorted(t.name for t in self._workers.get(PoolId.SWA, {}))}")
 
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
@@ -819,17 +787,13 @@ class TransferEngine:
                 flexkv_logger.debug(f"still waiting for {label} to ready")
             flexkv_logger.debug(f"{label} is ready")
 
-        # Wait for all main KV workers to ready
-        for transfer_type, worker in self._worker_map.items():
-            if isinstance(worker, dict):
-                for wk, w in worker.items():
-                    _wait_worker_ready(w, transfer_type, wk)
-            else:
-                _wait_worker_ready(worker, transfer_type)
-
-        # Wait for all SWA dedicated workers to be ready
-        if self._has_swa:
-            for transfer_type, worker in self._swa_worker_map.items():
+        # Wait for every worker of every pool. One loop: a SWA-only worker is
+        # a worker, and skipping it used to depend on a separate ``_has_swa``
+        # test that could disagree with what was actually registered.
+        # ``_collect_worker_handles`` is not reused here because the label
+        # wants the transfer type and worker key, which it drops.
+        for worker_map in self._workers.values():
+            for transfer_type, worker in worker_map.items():
                 if isinstance(worker, dict):
                     for wk, w in worker.items():
                         _wait_worker_ready(w, transfer_type, wk)
@@ -840,9 +804,14 @@ class TransferEngine:
         if _enable_layerwise:
             assert TransferType.H2D not in self._worker_map, \
                 "H2D worker should not exist in layerwise mode (fused into layerwise worker)"
-            # DISK2H deliberately *is* registered: the SSD read is hoisted out
-            # of the layerwise op (see merge_to_batch_graph) because the
-            # PER_LAYER worker has no SSD binding to fuse it into.
+            # DISK2H deliberately *is* registered under layerwise: the SSD read
+            # is hoisted out of the LAYERWISE op (see merge_to_batch_graph)
+            # because the PER_LAYER worker has no SSD binding to fuse it into,
+            # so the hoisted op has nowhere to run without this worker.
+            assert (self._ssd_handle is None or self._cpu_handle is None
+                    or TransferType.DISK2H in self._worker_map), \
+                ("DISK2H worker must exist under layerwise "
+                 "(the LAYERWISE op does not perform the SSD read)")
             assert TransferType.LAYERWISE in self._worker_map, \
                 "LAYERWISE worker must exist when layerwise transfer is enabled"
 
@@ -851,8 +820,12 @@ class TransferEngine:
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
         self._scheduler_thread.start()
 
-    # ------------------------------------------------------------------
-    # Worker registry: {pool_id: {transfer_type: handle-or-WorkerKey-dict}}.
+    # ---- the worker registry -------------------------------------------------
+    # One registry keyed by (pool, transfer type). There used to be two maps,
+    # ``_worker_map`` and ``_swa_worker_map``, walked by two loops, cleared in
+    # two places, dispatched through two branches -- all because the pool was a
+    # bool that had to be turned back into a container by every reader. A pool
+    # is a key, so it keys the map.
     #
     # A miss is an error, never a fallback to another pool -- see
     # _worker_entry_for. Where one worker serves two pools (GPU<->CPU, where
@@ -897,50 +870,16 @@ class TransferEngine:
     ) -> None:
         self._workers[PoolId.FULL_KV] = value
 
-    @property
-    def _swa_worker_map(self) -> Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]]:
-        """The SWA pool's workers, as the flat map this class used to hold.
-
-        Same live view as ``_worker_map``, one pool over. It stays for now
-        because ~10 call sites still address SWA by name rather than by
-        ``op.pool_id``; ``_worker_entry_for`` is the one that does not.
-        """
-        return self._workers.setdefault(PoolId.SWA, {})
-
-    @_swa_worker_map.setter
-    def _swa_worker_map(
-        self, value: Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]]
-    ) -> None:
-        self._workers[PoolId.SWA] = value
-
-    def _worker_entry_for(
-        self, op: TransferOp
-    ) -> Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]:
-        """The worker (or PP-sibling dict) that serves this op.
-
-        Looked up by ``(op.pool_id, op.transfer_type)``, with no fallback to
-        another pool: each pool registers its own workers for every tier it
-        uses, and a pool's worker addresses that pool's slot-id space. Serving
-        a SWA op from the full-KV worker would read the right transfer type out
-        of the wrong pool -- silently, and with no way to notice downstream.
-        A miss is a registration bug, so it raises, as it did before the
-        registry replaced the two hand-maintained maps.
-        """
-        entry = self._workers.get(op.pool_id, {}).get(op.transfer_type)
-        if entry is None:
-            kind = "" if op.pool_id is PoolId.FULL_KV else f"{op.pool_id.name} "
-            raise ValueError(f"Unsupported {kind}transfer type: {op.transfer_type}")
-        return entry
-
     def _collect_worker_handles(self) -> List[WorkerHandle]:
         """Every distinct worker handle this engine owns, each listed once.
 
         The registry is keyed by ``(pool, TransferType)``, and one worker
         answers several of those keys -- mooncake-store and the peer worker
-        each serve a read and a write type, GDS serves DISK2D and D2DISK -- so
-        a plain walk yields the same handle repeatedly. That matters because
-        the caller starts one shutdown *thread per element*: duplicates meant
-        two threads racing on one process's join/terminate/close.
+        each serve a read and a write type, GDS serves DISK2D and D2DISK, and
+        a GPU<->CPU worker serves both pools -- so a plain walk yields the same
+        handle repeatedly. That matters because the caller starts one shutdown
+        *thread per element*: duplicates meant two threads racing on one
+        process's join/terminate/close.
 
         Deduped by identity, not by ``worker_id``: two handles are the same
         worker only if they are the same object, and identity needs no
@@ -1194,10 +1133,7 @@ class TransferEngine:
         _discard_failed_op: a parent op's pin buffer is registered (and thus
         freed) at this level only when its worker_map entry resolves to a
         single worker. Dict-keyed entries (PP fan-out) register and free each
-        replica individually.
-
-        Resolves through the same (pool, type) lookup dispatch uses, so the
-        two cannot disagree about which worker an op went to."""
+        replica individually."""
         try:
             resolved_worker = self._worker_entry_for(op)
         except ValueError:
@@ -1372,9 +1308,6 @@ class TransferEngine:
                 graph_id=op.graph_id,
                 src_block_ids_h2d=op.src_block_ids_h2d.copy(),
                 dst_block_ids_h2d=op.dst_block_ids_h2d.copy(),
-                # No disk2h ids: a merged DISK2H is hoisted to an op of its own
-                # on the graph and dispatched to the CPU<->SSD worker, so a
-                # layerwise replica carries only the H2D half.
                 # SWA ids must be carried through PP fan-out replicas, otherwise
                 # each PP sibling's worker would only see main-KV ids and the SWA
                 # layer-fused branch in cpp would be silently skipped.
@@ -1397,82 +1330,35 @@ class TransferEngine:
                 f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
                 f"worker_key={wk}, pending_count={op.pending_count}")
 
-    def _assign_swa_op_to_worker(self, op: TransferOp) -> None:
-        """Route a graph-built ``is_swa=True`` op to the SWA worker map.
+    def _worker_entry_for(
+        self, op: TransferOp
+    ) -> Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]:
+        """The worker (or PP-sibling dict) that serves this op.
 
-        Structurally identical to the main-KV dispatch path:
-          * dict worker_entry (H2D/D2H, keyed by WorkerKey for PP siblings)
-            -> PP fan-out: derive one replica per sibling, register each,
-               track in _child_to_parent_op_id, pending_count++ per replica.
-            This is needed because each PP stage holds its own slice of SWA
-            layers, exactly like the main-KV path: a single submit to one
-            sibling would silently drop the other stages\' SWA data.
-          * single-instance worker_entry (CPU<->SSD / CPU<->Remote)
-            -> no fan-out; pending_count++ and submit op directly.
-            register_op_to_buffer + op_id_to_op are done by the scheduler
-            upstream for this branch, exactly like main-KV single-worker.
+        Looked up by (pool, transfer type), with no fallback to another pool.
+        Where SWA rides the full-KV worker -- GPU<->CPU, where a non-default
+        pool is a *pool on the same worker*: same GPUs, same direction, same
+        regions, selected from ``op.pool_id`` -- that sharing is expressed by
+        registering the same handle under both pools, not by failing the SWA
+        lookup and landing on the full-KV entry. A miss is then a registration
+        bug rather than a silent read of the wrong slot-id space, so it raises.
         """
-        worker_entry = self._worker_entry_for(op)
-
-        if isinstance(worker_entry, dict):
-            sibling_keys = self._match_pp_siblings(worker_entry, op.dp_client_id)
-            if not sibling_keys:
-                raise ValueError(
-                    f"No SWA_{op.transfer_type.name} worker found matching "
-                    f"dp_client_id={op.dp_client_id}; "
-                    f"available worker keys={list(worker_entry.keys())}"
-                )
-            for wk in sibling_keys:
-                replica = TransferOp(
-                    graph_id=op.graph_id,
-                    transfer_type=op.transfer_type,
-                    src_block_ids=op.src_block_ids.copy(),
-                    dst_block_ids=op.dst_block_ids.copy(),
-                    dp_client_id=op.dp_client_id,
-                    is_swa=True,
-                    mooncake_store_swa_block_hashes=(
-                        list(op.mooncake_store_swa_block_hashes)
-                        if op.mooncake_store_swa_block_hashes is not None else None),
-                )
-                register_op_to_buffer(replica, self.pin_buffer)
-                self._child_id_to_child[replica.op_id] = replica
-                self._child_to_parent_op_id[replica.op_id] = op.op_id
-                self.op_id_to_nvtx_range[replica.op_id] = nvtx.start_range(
-                    f"schedule SWA_{op.transfer_type.name}_REPLICA op_id: {replica.op_id}, "
-                    f"graph_id: {replica.graph_id}, worker_key={wk}",
-                    color=get_nvtx_range_color(replica.graph_id),
-                )
-                op.pending_count += 1
-                worker_entry[wk].submit_transfer(replica)
-                flexkv_logger.debug(
-                    f"[TransferEngine] SWA_{op.transfer_type.name} fan-out: "
-                    f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
-                    f"worker_key={wk}, pending_count={op.pending_count}"
-                )
-        else:
-            self.op_id_to_nvtx_range[op.op_id] = nvtx.start_range(
-                f"schedule SWA_{op.transfer_type.name} op_id: {op.op_id}, "
-                f"graph_id: {op.graph_id}, successors: {op.successors}",
-                color=get_nvtx_range_color(op.graph_id),
-            )
-            op.pending_count += 1
-            worker_entry.submit_transfer(op)
-            flexkv_logger.debug(
-                f"[TransferEngine] Submitted SWA op {op.op_id}: "
-                f"type={op.transfer_type.name}, single-worker, "
-                f"blocks={op.src_block_ids.size}, pending_count={op.pending_count}"
-            )
+        entry = self._workers.get(op.pool_id, {}).get(op.transfer_type)
+        if entry is None:
+            kind = "" if op.pool_id is PoolId.FULL_KV else f"{op.pool_id.name} "
+            raise ValueError(f"Unsupported {kind}transfer type: {op.transfer_type}")
+        return entry
 
     def _assign_op_to_worker(self, op: TransferOp) -> None:
-        """Assign operation to appropriate worker."""
-        if op.transfer_type == TransferType.VIRTUAL:
-            return
+        """Assign operation to appropriate worker.
 
-        if op.pool_id is not PoolId.FULL_KV:
-            # Non-default-pool ops are built directly in the transfer graph
-            # with their pool_id set; they are NOT derived from full-KV ops at
-            # dispatch time.
-            self._assign_swa_op_to_worker(op)
+        One path for main KV and SWA. They used to be two near-identical
+        functions (``_assign_swa_op_to_worker`` said so in its own docstring:
+        "structurally identical to the main-KV dispatch path"); the only real
+        difference was which map to look in, which ``_worker_entry_for``
+        answers, and which hash list a replica carries.
+        """
+        if op.transfer_type == TransferType.VIRTUAL:
             return
 
         if op.transfer_type == TransferType.LAYERWISE:
@@ -1482,11 +1368,14 @@ class TransferEngine:
             return
 
         worker = self._worker_entry_for(op)
+        label = f"{op.pool_id.name}_{op.transfer_type.name}"
         if isinstance(worker, dict):
+            # PP fan-out: each stage holds its own slice of the layers, so a
+            # single submit to one sibling would silently drop the others'.
             sibling_keys = self._match_pp_siblings(worker, op.dp_client_id)
             if not sibling_keys:
                 raise ValueError(
-                    f"No MAIN_KV_{op.transfer_type.name} worker found matching "
+                    f"No {label} worker found matching "
                     f"dp_client_id={op.dp_client_id}; "
                     f"available worker keys={list(worker.keys())}"
                 )
@@ -1497,26 +1386,35 @@ class TransferEngine:
                     src_block_ids=op.src_block_ids.copy(),
                     dst_block_ids=op.dst_block_ids.copy(),
                     dp_client_id=op.dp_client_id,
+                    # pool_id, not is_swa: the replica must address the same
+                    # slot-id space as its parent, and a bool could only carry
+                    # two of them.
+                    pool_id=op.pool_id,
                     mooncake_store_block_hashes=(
                         op.mooncake_store_block_hashes.copy()
                         if op.mooncake_store_block_hashes is not None else None),
+                    mooncake_store_swa_block_hashes=(
+                        list(op.mooncake_store_swa_block_hashes)
+                        if op.mooncake_store_swa_block_hashes is not None else None),
                 )
                 register_op_to_buffer(replica, self.pin_buffer)
                 self._child_id_to_child[replica.op_id] = replica
                 self._child_to_parent_op_id[replica.op_id] = op.op_id
                 self.op_id_to_nvtx_range[replica.op_id] = nvtx.start_range(
-                    f"schedule {replica.transfer_type.name}_REPLICA op_id: {replica.op_id}, "
+                    f"schedule {label}_REPLICA op_id: {replica.op_id}, "
                     f"graph_id: {replica.graph_id}, worker_key={wk}",
                     color=get_nvtx_range_color(replica.graph_id))
                 op.pending_count += 1
                 worker[wk].submit_transfer(replica)
                 flexkv_logger.debug(
-                    f"[TransferEngine] MAIN_KV_{op.transfer_type.name} fan-out: "
+                    f"[TransferEngine] {label} fan-out: "
                     f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
                     f"worker_key={wk}, pending_count={op.pending_count}")
         else:
+            # No fan-out; register_op_to_buffer + op_id_to_op were done by the
+            # scheduler upstream for this branch.
             self.op_id_to_nvtx_range[op.op_id] = nvtx.start_range(
-                f"schedule {op.transfer_type.name} "
+                f"schedule {label} "
                 f"op_id: {op.op_id}, graph_id: {op.graph_id}, "
                 f"successors: {op.successors}",
                 color=get_nvtx_range_color(op.graph_id),
@@ -1602,11 +1500,9 @@ class TransferEngine:
             )
         imported = 0
         for worker_key, handles in gpu_handle_groups.items():
-            payload = (
-                handles[0].get_tensor_handle_list()
-                if self.model_config.effective_tp_size_per_node == 1
-                else [handle.get_tensor_handle_list() for handle in handles]
-            )
+            # Always the plural shape now: one worker class, one payload shape,
+            # for every TP width.
+            payload = [handle.get_tensor_handle_list() for handle in handles]
             imported += int(
                 self.h2d_workers[worker_key].control("resume_gpu", payload)
             )

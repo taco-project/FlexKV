@@ -29,11 +29,7 @@ from flexkv.transfer import trace
 trace.configure(GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace)
 
 from flexkv.transfer.workers.cpu_ssd import CPUSSDDiskTransferWorker  # noqa: E402
-# ``tpGDSTransferWorker`` and ``NixlTransferWorker`` are obsoleted by the
-# backends, but ``transfer_engine.py`` still instantiates them until the next
-# commit rewires it; they stay exported until then so every commit imports.
-from flexkv.transfer.workers.gds import GDSTransferWorker, tpGDSTransferWorker  # noqa: E402
-from flexkv.transfer.workers.nixl import NixlTransferWorker  # noqa: E402
+from flexkv.transfer.workers.gds import GDSTransferWorker  # noqa: E402
 from flexkv.transfer.workers.gpu_cpu import (  # noqa: E402
     GPUCPUTransferWorker,
     _validate_multi_group_chunk_layout,
@@ -51,7 +47,6 @@ __all__ = [
     "CPURemoteTransferWorker",
     "CPUSSDDiskTransferWorker",
     "GDSTransferWorker",
-    "NixlTransferWorker",
     "GPUCPUTransferWorker",
     "_validate_multi_group_chunk_layout",
     "PEER2CPUTransferWorker",
@@ -59,5 +54,4 @@ __all__ = [
     "WorkerHandle",
     "ensure_cuda_device",
     "import_tensor_handles",
-    "tpGDSTransferWorker",
 ]
