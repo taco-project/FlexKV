@@ -26,6 +26,12 @@ class WorkerHandle:
         self.transfer_conn = transfer_conn
         self.process = process
         self.ready_event = ready_event
+        # One handle is reachable from several TransferType keys (a mooncake
+        # or GDS worker serves both directions), and TransferEngine shuts
+        # handles down one thread each -- so shutdown() can be entered twice,
+        # concurrently, on the same object. See the note on shutdown().
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_done = False
 
     def submit_transfer(self, op: Union[TransferOp, LayerwiseTransferOp]) -> None:
         if isinstance(op, LayerwiseTransferOp):
@@ -63,28 +69,43 @@ class WorkerHandle:
         return reply.get("result")
 
     def shutdown(self) -> None:
-        try:
-            self.transfer_conn.send(None)
-        except (BrokenPipeError, OSError, EOFError):
-            pass  # Pipe already closed / peer gone
+        """Stop the worker process. Idempotent and safe to call concurrently.
 
-        timeout = float(GLOBAL_CONFIG_FROM_ENV.worker_shutdown_timeout_s)
-        self.process.join(timeout=timeout)
-        if self.process.is_alive():
-            flexkv_logger.warning(
-                f"[WorkerHandle] worker {self.worker_id} still alive after "
-                f"{timeout:.0f}s graceful shutdown; force terminate"
-            )
-            self.process.terminate()
-            self.process.join(timeout=30)
+        The second caller must not re-enter the body: ``process.terminate()``
+        and ``transfer_conn.close()`` race with the first caller's
+        ``join()``/``close()``, and ``__del__`` can fire the whole sequence a
+        third time from the GC thread. Holding the lock for the *duration* --
+        not just around the flag -- also makes a second caller block until the
+        process is really gone, so ``shutdown(); assert not is_alive()`` holds
+        whichever call site wins.
+        """
+        with self._shutdown_lock:
+            if self._shutdown_done:
+                return
+            self._shutdown_done = True
+
+            try:
+                self.transfer_conn.send(None)
+            except (BrokenPipeError, OSError, EOFError):
+                pass  # Pipe already closed / peer gone
+
+            timeout = float(GLOBAL_CONFIG_FROM_ENV.worker_shutdown_timeout_s)
+            self.process.join(timeout=timeout)
             if self.process.is_alive():
-                self.process.kill()
-                self.process.join()
+                flexkv_logger.warning(
+                    f"[WorkerHandle] worker {self.worker_id} still alive after "
+                    f"{timeout:.0f}s graceful shutdown; force terminate"
+                )
+                self.process.terminate()
+                self.process.join(timeout=30)
+                if self.process.is_alive():
+                    self.process.kill()
+                    self.process.join()
 
-        try:
-            self.transfer_conn.close()
-        except Exception:
-            pass
+            try:
+                self.transfer_conn.close()
+            except Exception:
+                pass
 
     def __del__(self) -> None:
         try:

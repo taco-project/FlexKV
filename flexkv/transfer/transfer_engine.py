@@ -18,7 +18,7 @@ import time
 import multiprocessing as mp
 import selectors
 import os
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import contextlib
 import nvtx
@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.pool import PoolId
 from flexkv.common.storage import StorageHandle
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp, WorkerKey
 from flexkv.common.transfer import get_nvtx_range_color
@@ -443,7 +444,10 @@ class TransferEngine:
     def _init_workers(self) -> None:
         if self._running:
             return
-        self._worker_map: Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]] = {}
+        # Registry is per-pool and created on demand; clear rather than
+        # rebind, so a retry after a rolled-back init starts from empty
+        # without leaving a stale dict reachable through the compat views.
+        self._workers.clear()
 
         assert self._cpu_handle is not None
         # When layerwise is on, SWA/state H2D is always fused into the LAYERWISE
@@ -496,7 +500,7 @@ class TransferEngine:
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
-            self._worker_map[TransferType.H2D] = self.h2d_workers
+            self._register_worker(PoolId.FULL_KV, TransferType.H2D, self.h2d_workers)
 
         # D2H worker
         if self.model_config.effective_tp_size_per_node == 1:
@@ -541,7 +545,7 @@ class TransferEngine:
                 )
                 for worker_key, gpu_handles in self.gpu_handle_groups.items()
             }
-        self._worker_map[TransferType.D2H] = self.d2h_workers
+        self._register_worker(PoolId.FULL_KV, TransferType.D2H, self.d2h_workers)
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
             ssd_layer_groups = self.model_config.layer_groups
@@ -561,7 +565,7 @@ class TransferEngine:
                     compressor=self._compressors["cpu_ssd"],
                     layer_groups=ssd_layer_groups,
                 )
-                self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
+                self._register_worker(PoolId.FULL_KV, TransferType.DISK2H, self.cpussd_read_worker)
 
             # H2DISK worker
             self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
@@ -578,7 +582,7 @@ class TransferEngine:
                 compressor=self._compressors["cpu_ssd"],
                 layer_groups=ssd_layer_groups,
             )
-            self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
+            self._register_worker(PoolId.FULL_KV, TransferType.H2DISK, self.cpussd_write_worker)
         if self._remote_handle is not None and self._cpu_handle is not None:
             self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
@@ -603,8 +607,8 @@ class TransferEngine:
                 dtype=self._cpu_handle.dtype,
                 remote_config_custom=self._remote_handle.remote_config_custom,
             )
-            self._worker_map[TransferType.H2REMOTE] = self.remotecpu_write_worker
-            self._worker_map[TransferType.REMOTE2H] = self.remotecpu_read_worker
+            self._register_worker(PoolId.FULL_KV, TransferType.H2REMOTE, self.remotecpu_write_worker)
+            self._register_worker(PoolId.FULL_KV, TransferType.REMOTE2H, self.remotecpu_read_worker)
         elif (getattr(self.cache_config, 'use_mooncake_store_backend', False)
               and self._cpu_handle is not None):
             self.mooncake_store_worker: WorkerHandle = MooncakeStoreTransferWorker.create_worker(
@@ -617,8 +621,8 @@ class TransferEngine:
                 cache_config=self.cache_config,
                 pool_kind=PoolKind.KV,
             )
-            self._worker_map[TransferType.H2REMOTE] = self.mooncake_store_worker
-            self._worker_map[TransferType.REMOTE2H] = self.mooncake_store_worker
+            self._register_worker(PoolId.FULL_KV, TransferType.H2REMOTE, self.mooncake_store_worker)
+            self._register_worker(PoolId.FULL_KV, TransferType.REMOTE2H, self.mooncake_store_worker)
             flexkv_logger.info(
                 "[TransferEngine] mooncake-store workers created for H2REMOTE/REMOTE2H")
         if self.cache_config.enable_gds:
@@ -684,8 +688,8 @@ class TransferEngine:
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
-            self._worker_map[TransferType.DISK2D] = self.gds_workers
-            self._worker_map[TransferType.D2DISK] = self.gds_workers
+            self._register_worker(PoolId.FULL_KV, TransferType.DISK2D, self.gds_workers)
+            self._register_worker(PoolId.FULL_KV, TransferType.D2DISK, self.gds_workers)
         if GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
             ssd_files = {} if self._ssd_handle is None else self._ssd_handle.get_file_list()
             ssd_kv_layout = None if self._ssd_handle is None else self._ssd_handle.kv_layout
@@ -729,7 +733,7 @@ class TransferEngine:
                     f"layer_groups={'yes' if self.model_config.layer_groups else 'no'}, "
                     f"has_ssd={len(ssd_files) > 0}")
 
-            self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
+            self._register_worker(PoolId.FULL_KV, TransferType.LAYERWISE, self.layerwise_workers)
 
         if self.cache_config.enable_kv_sharing and self._cpu_handle is not None and (self.cache_config.enable_p2p_cpu \
             or (self._ssd_handle and self.cache_config.enable_p2p_ssd)):
@@ -755,9 +759,9 @@ class TransferEngine:
             )
             # NOTE: now peerH2H and peerSSD2H op use the same worker
             if self.cache_config.enable_p2p_cpu:
-                self._worker_map[TransferType.PEERH2H] = self.cpu_remote_cpu_worker
+                self._register_worker(PoolId.FULL_KV, TransferType.PEERH2H, self.cpu_remote_cpu_worker)
             if self.cache_config.enable_p2p_ssd:
-                self._worker_map[TransferType.PEERSSD2H] = self.cpu_remote_cpu_worker
+                self._register_worker(PoolId.FULL_KV, TransferType.PEERSSD2H, self.cpu_remote_cpu_worker)
 
         # ---- SWA dedicated worker map ----
         # Reuses GPUCPUTransferWorker / tpGPUCPUTransferWorker exactly like the
@@ -766,7 +770,7 @@ class TransferEngine:
         # Uniform SWA uses the legacy single-group worker. DSv4 state sidecars
         # reuse this channel with heterogeneous multi-group worker arguments.
         if self._has_swa:
-            self._swa_worker_map: Dict[TransferType, Dict[WorkerKey, WorkerHandle]] = {}
+            # Already empty: _init_workers cleared the whole registry above.
             # When layerwise is on, SWA H2D always runs inside LAYERWISE
             # (uniform via launch_swa_h2d_layer_, multi-group via
             # launch_swa_mg_h2d_layer_). Standalone SWA H2D workers are only
@@ -812,7 +816,7 @@ class TransferEngine:
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()
                     }
-                self._swa_worker_map[TransferType.H2D] = self._swa_h2d_workers
+                self._register_worker(PoolId.SWA, TransferType.H2D, self._swa_h2d_workers)
                 flexkv_logger.info("TransferEngine: swa H2D workers initialized")
             # D2H swa worker
             if self.model_config.effective_tp_size_per_node == 1:
@@ -856,7 +860,7 @@ class TransferEngine:
                     for worker_key, swa_handles in self._swa_gpu_handles.items()
                 }
 
-            self._swa_worker_map[TransferType.D2H] = self._swa_d2h_workers
+            self._register_worker(PoolId.SWA, TransferType.D2H, self._swa_d2h_workers)
             flexkv_logger.info("TransferEngine: swa D2H workers initialized")
 
             if self._swa_ssd_handle is not None and self._swa_cpu_handle is not None:
@@ -873,7 +877,7 @@ class TransferEngine:
                     cache_config=self._cache_config,
                     layer_groups=self._swa_layer_groups,
                 )
-                self._swa_worker_map[TransferType.H2DISK] = self.swa_h2disk_worker
+                self._register_worker(PoolId.SWA, TransferType.H2DISK, self.swa_h2disk_worker)
 
                 self.swa_disk2h_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
@@ -888,7 +892,7 @@ class TransferEngine:
                     cache_config=self._cache_config,
                     layer_groups=self._swa_layer_groups,
                 )
-                self._swa_worker_map[TransferType.DISK2H] = self.swa_disk2h_worker
+                self._register_worker(PoolId.SWA, TransferType.DISK2H, self.swa_disk2h_worker)
                 flexkv_logger.info("TransferEngine: swa CPU<->SSD workers initialized")
 
 
@@ -907,8 +911,8 @@ class TransferEngine:
                         pool_kind=PoolKind.SWA,
                         override_global_segment_size=0,
                     ))
-                self._swa_worker_map[TransferType.REMOTE2H] = self.swa_mooncake_store_worker
-                self._swa_worker_map[TransferType.H2REMOTE] = self.swa_mooncake_store_worker
+                self._register_worker(PoolId.SWA, TransferType.REMOTE2H, self.swa_mooncake_store_worker)
+                self._register_worker(PoolId.SWA, TransferType.H2REMOTE, self.swa_mooncake_store_worker)
                 flexkv_logger.info(
                     "TransferEngine: swa mooncake-store workers initialized")
             elif self._swa_remote_handle is not None and self._swa_cpu_handle is not None:
@@ -935,8 +939,8 @@ class TransferEngine:
                     dtype=self._swa_cpu_handle.dtype,
                     remote_config_custom=self._swa_remote_handle.remote_config_custom,
                 )
-                self._swa_worker_map[TransferType.REMOTE2H] = self.swa_remotecpu_read_worker
-                self._swa_worker_map[TransferType.H2REMOTE] = self.swa_remotecpu_write_worker
+                self._register_worker(PoolId.SWA, TransferType.REMOTE2H, self.swa_remotecpu_read_worker)
+                self._register_worker(PoolId.SWA, TransferType.H2REMOTE, self.swa_remotecpu_write_worker)
                 flexkv_logger.info("TransferEngine: swa CPU<->Remote workers initialized")
 
 
@@ -975,8 +979,8 @@ class TransferEngine:
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()
                     }
-                self._swa_worker_map[TransferType.DISK2D] = self._swa_gds_workers
-                self._swa_worker_map[TransferType.D2DISK] = self._swa_gds_workers
+                self._register_worker(PoolId.SWA, TransferType.DISK2D, self._swa_gds_workers)
+                self._register_worker(PoolId.SWA, TransferType.D2DISK, self._swa_gds_workers)
                 flexkv_logger.info("TransferEngine: swa GDS workers initialized")
             self._has_swa = True
             # Must mirror the create condition above.
@@ -1044,18 +1048,117 @@ class TransferEngine:
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
         self._scheduler_thread.start()
 
+    # ------------------------------------------------------------------
+    # Worker registry: {pool_id: {transfer_type: handle-or-WorkerKey-dict}}.
+    #
+    # A miss is an error, never a fallback to another pool -- see
+    # _worker_entry_for. Where one worker serves two pools (GPU<->CPU, where
+    # SWA is a pool on the same worker), that handle is registered under both
+    # pool ids at registration time, so the lookup hits directly.
+
+    @property
+    def _workers(self) -> Dict[PoolId, Dict[TransferType, Any]]:
+        """``{pool_id: {transfer_type: handle-or-WorkerKey-dict}}``.
+
+        Created on demand rather than in ``__init__`` so the rollback and
+        shutdown paths -- which run when init failed partway -- and the tests
+        that build a bare engine with ``object.__new__`` all see an empty
+        registry instead of an ``AttributeError``.
+        """
+        workers = self.__dict__.get("_pool_workers")
+        if workers is None:
+            workers = self.__dict__["_pool_workers"] = {}
+        return workers
+
+    def _register_worker(
+        self,
+        pool_id: PoolId,
+        transfer_type: TransferType,
+        worker: Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]],
+    ) -> None:
+        self._workers.setdefault(pool_id, {})[transfer_type] = worker
+
+    @property
+    def _worker_map(self) -> Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]]:
+        """The full-KV workers, as the flat map this class has always exposed.
+
+        A live view, not a copy: ``self._worker_map[X] = w`` still registers,
+        and the tests that build a bare engine by assigning this attribute
+        still work (see the setter).
+        """
+        return self._workers.setdefault(PoolId.FULL_KV, {})
+
+    @_worker_map.setter
+    def _worker_map(
+        self, value: Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]]
+    ) -> None:
+        self._workers[PoolId.FULL_KV] = value
+
+    @property
+    def _swa_worker_map(self) -> Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]]:
+        """The SWA pool's workers, as the flat map this class used to hold.
+
+        Same live view as ``_worker_map``, one pool over. It stays for now
+        because ~10 call sites still address SWA by name rather than by
+        ``op.pool_id``; ``_worker_entry_for`` is the one that does not.
+        """
+        return self._workers.setdefault(PoolId.SWA, {})
+
+    @_swa_worker_map.setter
+    def _swa_worker_map(
+        self, value: Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]]
+    ) -> None:
+        self._workers[PoolId.SWA] = value
+
+    def _worker_entry_for(
+        self, op: TransferOp
+    ) -> Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]:
+        """The worker (or PP-sibling dict) that serves this op.
+
+        Looked up by ``(op.pool_id, op.transfer_type)``, with no fallback to
+        another pool: each pool registers its own workers for every tier it
+        uses, and a pool's worker addresses that pool's slot-id space. Serving
+        a SWA op from the full-KV worker would read the right transfer type out
+        of the wrong pool -- silently, and with no way to notice downstream.
+        A miss is a registration bug, so it raises, as it did before the
+        registry replaced the two hand-maintained maps.
+        """
+        entry = self._workers.get(op.pool_id, {}).get(op.transfer_type)
+        if entry is None:
+            kind = "" if op.pool_id is PoolId.FULL_KV else f"{op.pool_id.name} "
+            raise ValueError(f"Unsupported {kind}transfer type: {op.transfer_type}")
+        return entry
+
     def _collect_worker_handles(self) -> List[WorkerHandle]:
+        """Every distinct worker handle this engine owns, each listed once.
+
+        The registry is keyed by ``(pool, TransferType)``, and one worker
+        answers several of those keys -- mooncake-store and the peer worker
+        each serve a read and a write type, GDS serves DISK2D and D2DISK -- so
+        a plain walk yields the same handle repeatedly. That matters because
+        the caller starts one shutdown *thread per element*: duplicates meant
+        two threads racing on one process's join/terminate/close.
+
+        Deduped by identity, not by ``worker_id``: two handles are the same
+        worker only if they are the same object, and identity needs no
+        assumption about how ids are assigned. Insertion order is preserved so
+        shutdown logs stay stable.
+        """
         handles: List[WorkerHandle] = []
-        for worker in getattr(self, "_worker_map", {}).values():
-            if isinstance(worker, dict):
-                handles.extend(worker.values())
-            else:
-                handles.append(worker)
-        for worker in getattr(self, "_swa_worker_map", {}).values():
-            if isinstance(worker, dict):
-                handles.extend(worker.values())
-            else:
-                handles.append(worker)
+        seen: Set[int] = set()
+
+        def _add(handle: WorkerHandle) -> None:
+            if id(handle) not in seen:
+                seen.add(id(handle))
+                handles.append(handle)
+
+        for worker_map in self._workers.values():
+            for worker in worker_map.values():
+                if isinstance(worker, dict):
+                    for sub in worker.values():
+                        _add(sub)
+                else:
+                    _add(worker)
         return handles
 
     def _shutdown_worker_handles(self, handles: List[WorkerHandle]) -> None:
@@ -1097,9 +1200,7 @@ class TransferEngine:
             f"rolling back {len(handles)} already-created worker(s)"
         )
         self._shutdown_worker_handles(handles)
-        self._worker_map = {}
-        if hasattr(self, "_swa_worker_map"):
-            self._swa_worker_map = {}
+        self._workers.clear()
 
     def start(self) -> None:
         try:
@@ -1290,12 +1391,15 @@ class TransferEngine:
         _discard_failed_op: a parent op's pin buffer is registered (and thus
         freed) at this level only when its worker_map entry resolves to a
         single worker. Dict-keyed entries (PP fan-out) register and free each
-        replica individually."""
-        if getattr(op, "is_swa", False):
-            resolved_worker = self._swa_worker_map.get(op.transfer_type)
-        else:
-            resolved_worker = self._worker_map.get(op.transfer_type)
-        return resolved_worker is not None and not isinstance(resolved_worker, dict)
+        replica individually.
+
+        Resolves through the same (pool, type) lookup dispatch uses, so the
+        two cannot disagree about which worker an op went to."""
+        try:
+            resolved_worker = self._worker_entry_for(op)
+        except ValueError:
+            return False
+        return not isinstance(resolved_worker, dict)
 
     def _finalize_or_discard(self, op: TransferOp, finished_ops: List[TransferOp]) -> None:
         """Route a fully-drained op: discard if any replica of it failed,
@@ -1505,9 +1609,7 @@ class TransferEngine:
             register_op_to_buffer + op_id_to_op are done by the scheduler
             upstream for this branch, exactly like main-KV single-worker.
         """
-        if op.transfer_type not in self._swa_worker_map:
-            raise ValueError(f"Unsupported SWA transfer type: {op.transfer_type}")
-        worker_entry = self._swa_worker_map[op.transfer_type]
+        worker_entry = self._worker_entry_for(op)
 
         if isinstance(worker_entry, dict):
             sibling_keys = self._match_pp_siblings(worker_entry, op.dp_client_id)
@@ -1563,21 +1665,20 @@ class TransferEngine:
         if op.transfer_type == TransferType.VIRTUAL:
             return
 
-        if op.is_swa:
-            # SWA ops are built directly in the transfer graph (is_swa=True)
-            # and routed to _swa_worker_map; they are NOT derived from main-KV
-            # ops at dispatch time.
+        if op.pool_id is not PoolId.FULL_KV:
+            # Non-default-pool ops are built directly in the transfer graph
+            # with their pool_id set; they are NOT derived from full-KV ops at
+            # dispatch time.
             self._assign_swa_op_to_worker(op)
             return
 
-        if op.transfer_type not in self._worker_map:
-            raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
-
         if op.transfer_type == TransferType.LAYERWISE:
+            if op.transfer_type not in self._worker_map:
+                raise ValueError(f"Unsupported transfer type: {op.transfer_type}")
             self._assign_layerwise_op_to_workers(op)
             return
 
-        worker = self._worker_map[op.transfer_type]
+        worker = self._worker_entry_for(op)
         if isinstance(worker, dict):
             sibling_keys = self._match_pp_siblings(worker, op.dp_client_id)
             if not sibling_keys:
