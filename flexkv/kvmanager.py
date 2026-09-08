@@ -15,7 +15,7 @@
 
 import os
 import subprocess
-from typing import Optional, Tuple, List, Dict, Union, Iterable
+from typing import Optional, Tuple, List, Dict, Union, Iterable, Sequence
 import time
 
 import numpy as np
@@ -25,6 +25,7 @@ from flexkv import c_ext
 from flexkv.server.client import KVDPClient
 from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
+from flexkv.prefetch.types import PrefetchCapabilities, PrefetchHandle, PrefetchOptions, PrefetchSnapshot
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.common.debug import eviction_log_aggregator, flexkv_logger
@@ -304,10 +305,65 @@ class KVManager:
             )
         return task_id
 
+    def prefetch_capabilities(self) -> PrefetchCapabilities:
+        if self.server_client_mode:
+            return self.dp_client.prefetch_control("capabilities")
+        return self.kv_task_engine.prefetch_capabilities()
+
+    def start_prefetch(
+        self, token_ids: Union[np.ndarray, torch.Tensor], options: Optional[PrefetchOptions] = None,
+        namespace: Optional[List[str]] = None,
+    ) -> PrefetchHandle:
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+        if self.server_client_mode:
+            return self.dp_client.prefetch_control(
+                "start", token_ids=token_ids, options=options, namespace=namespace)
+        return self.kv_task_engine.start_prefetch(token_ids, options, namespace)
+
+    def progress_prefetch(
+        self, handles: Sequence[PrefetchHandle], demand_handles: Sequence[PrefetchHandle] = (),
+    ) -> Dict[PrefetchHandle, PrefetchSnapshot]:
+        if self.server_client_mode:
+            return self.dp_client.prefetch_control("progress", handles=handles, demand_handles=demand_handles)
+        return self.kv_task_engine.progress_prefetch(handles, demand_handles)
+
+    def poll_prefetch(
+        self, handles: Sequence[PrefetchHandle]
+    ) -> Dict[PrefetchHandle, PrefetchSnapshot]:
+        return self.progress_prefetch(handles)
+
+    def notify_prefetch_demand(
+        self, handles: Sequence[PrefetchHandle]
+    ) -> Dict[PrefetchHandle, PrefetchSnapshot]:
+        return self.progress_prefetch(handles, demand_handles=handles)
+
+    def stop_prefetch(self, handle: PrefetchHandle, reason: str = "request_abort") -> PrefetchSnapshot:
+        if self.server_client_mode:
+            return self.dp_client.prefetch_control("stop", handle=handle, reason=reason)
+        return self.kv_task_engine.stop_prefetch(handle, reason)
+
+    def release_prefetch(self, handle: PrefetchHandle) -> None:
+        if self.server_client_mode:
+            return self.dp_client.prefetch_control("release", handle=handle)
+        return self.kv_task_engine.release_prefetch(handle)
+
+    def wait_prefetch(self, handle: PrefetchHandle, timeout_s: float = 20.0) -> PrefetchSnapshot:
+        deadline = time.monotonic() + max(0, timeout_s)
+        while True:
+            snapshot = self.poll_prefetch([handle])[handle]
+            if snapshot.terminal:
+                return snapshot
+            if time.monotonic() >= deadline:
+                raise TimeoutError("prefetch wait timed out; session remains active")
+            time.sleep(min(0.002, max(0, deadline - time.monotonic())))
+
     def launch(self,
                task_ids: Union[int, List[int]],
                slot_mappings: Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]],
-               swa_slot_mappings: Optional[Union[np.ndarray, List[Optional[np.ndarray]], torch.Tensor, List[Optional[torch.Tensor]]]] = None,
+               swa_slot_mappings: Optional[
+                   Union[np.ndarray, List[Optional[np.ndarray]], torch.Tensor, List[Optional[torch.Tensor]]]
+               ] = None,
                as_batch: bool = False,
                layerwise_transfer: bool = False,
                counter_id: int = 0) -> List[int]:

@@ -33,7 +33,7 @@ import signal
 import socket
 import struct
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -99,7 +99,7 @@ class FlexKVHostReleaseShim:
     ``FlexKVConnector.shutdown()`` so unpin stays on that same path.
     """
 
-    def __init__(self, connector: "FlexKVConnector") -> None:
+    def __init__(self, connector: FlexKVConnector) -> None:
         self._connector = connector
 
     def destroy(self) -> None:
@@ -163,6 +163,20 @@ class FlexKVConnector:
         )
         self.model_config = self.flexkv_config.model_config
         self.cache_config = self.flexkv_config.cache_config
+        self._chunked_prefetch = bool(self.cache_config.enable_chunked_prefetch)
+        if self._chunked_prefetch:
+            from flexkv.prefetch.types import PrefetchOptions
+            opts = dict(self.cache_config.prefetch_options or {})
+            opts.setdefault(
+                "policy",
+                getattr(server_args, "hicache_storage_prefetch_policy", "wait_complete"),
+            )
+            self._chunked_prefetch_options = PrefetchOptions(**opts)
+            self._chunked_prefetch_options.validate()
+            self.cache_config.prefetch_options = opts
+        self._prefetch_sessions = {}
+        self._prefetch_result_sessions = {}
+        self._prefetch_loaded_spans = {}
         self._label = f"[model_config={self.model_config}, rank_info={self.rank_info}]"
 
         # 2. Cross-rank sync context.
@@ -213,6 +227,17 @@ class FlexKVConnector:
         self._dsv4_layer_groups: List[Dict[str, Any]] = []
         self._dsv4_state_groups: List[Dict[str, Any]] = []
         kv_caches, indexer_buffers = self._resolve_kv_buffers(kvcache)
+        if self._swa_kv_pool is not None and self.cache_config.swa is not None:
+            buffers = self._swa_kv_pool.kv_buffer
+            snapshot_bytes = sum(
+                buffer[0].numel() * buffer.element_size() for buffer in buffers
+            )
+            for group in self._dsv4_state_groups:
+                snapshot_bytes += sum(
+                    int(group["sub_page_size"]) * buffer[0].numel() * buffer.element_size()
+                    for buffer in group["buffers"]
+                )
+            self.cache_config.swa.snapshot_bytes = snapshot_bytes
 
         # Heterogeneous groups change the bytes represented by one logical
         # FlexKV block. Recompute CPU/SSD capacities before KVManager starts.
@@ -289,6 +314,24 @@ class FlexKVConnector:
         if self._sync_ctx.is_sync_leader:
             self._wait_kv_manager_ready()
 
+        if self._chunked_prefetch:
+            status = {"error": None}
+            if self._sync_ctx.is_sync_leader:
+                try:
+                    caps = self.kv_manager.prefetch_capabilities()
+                    if not caps.stop_and_drain or caps.protocol_version != 1:
+                        raise RuntimeError("server lacks chunked prefetch stop/drain support")
+                    if self._swa_kv_pool is not None and not caps.partial_swa_checkpoints:
+                        raise RuntimeError("server lacks SWA checkpoint prefetch support")
+                except Exception as exc:
+                    status["error"] = str(exc)
+            if self._sync_ctx.needs_sync:
+                status = self._sync_ctx.scatter(
+                    status, channel=FlexKVScatterChannel.PREFETCH_START
+                )
+            if status["error"]:
+                raise RuntimeError(status["error"])
+
         # 10. Per-rank in-flight tracking.
         # Loads
         self._pending_lookups: Dict[str, int] = {}  # rid -> fkv_task_id
@@ -319,10 +362,8 @@ class FlexKVConnector:
         #   * atexit runs kv_manager.shutdown() (cudaHostUnregister).
         #   * Stretch the parent's scheduler-exit wait so kill_process_tree
         #     does not SIGKILL mid-unpin (generic env, not FlexKV-named in TM).
-        try:
+        with suppress(Exception):
             signal.signal(signal.SIGINT, signal.SIG_IGN)
-        except Exception:  # noqa: BLE001
-            pass
         # Graceful shutdown timeout hierarchy (see FlexKV config.py):
         #   tokenizer wait (this env)                   = 1200s
         #     > TM parent-side wait (FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S) = 900s
@@ -502,6 +543,7 @@ class FlexKVConnector:
                 res = self.kv_manager.get_match(
                     token_ids=tids_np,
                     token_mask=mask_np,
+                    cpu_only=getattr(self, "_chunked_prefetch", False),
                     swa_aware=self._swa_kv_pool is not None,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -585,10 +627,14 @@ class FlexKVConnector:
                 )
             self._pending_lookups[rid] = fkv_task_id
             self._pending_lookup_contexts[rid] = context
+            # The held GET has pinned its CPU prefix; transfer the result lease.
+            self._release_prefetch_result(rid)
         elif hit_length > 0 and fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
             assert self.kv_manager is not None
             self.kv_manager.cancel([fkv_task_id])
 
+        if rid is not None:
+            self._release_prefetch_result(rid)
         return fkv_task_id, hit_length
 
     def release_pending(self, rid: str) -> None:
@@ -1257,40 +1303,38 @@ class FlexKVConnector:
         completed_rids: List[str] = []
         completed_by_rid: Dict[str, Any] = {}
 
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            if self._inflight_stores:
-                fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
-                try:
-                    completed_dict = (
-                        self.kv_manager.wait(
-                            list(fk_to_rid.keys()),
-                            timeout=0.0,
-                            completely=True,
-                        )
-                        or {}
+        if (self._sync_ctx.is_sync_leader and self.kv_manager is not None
+                and self._inflight_stores):
+            fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
+            try:
+                completed_dict = (
+                    self.kv_manager.wait(
+                        list(fk_to_rid), timeout=0.0, completely=True
                     )
-                except Exception as exc:  # noqa: BLE001
-                    rid = next(iter(self._inflight_stores))
-                    context = getattr(self, "_inflight_store_contexts", {}).get(rid)
-                    context = context or self._new_op_context(
-                        "store", rid, task_id=self._inflight_stores[rid]
-                    )
-                    self._log_cache_op(
-                        context,
-                        "poll",
-                        "failed",
-                        task_id=-1,
-                        flexkv_task_ids=list(fk_to_rid),
-                        error=str(exc),
-                    )
-                    completed_dict = {}
-                for fk_tid, response in completed_dict.items():
-                    status = _status_value(response)
-                    if not _is_terminal_status(status):
-                        continue
-                    rid = fk_to_rid[fk_tid]
-                    completed_rids.append(rid)
-                    completed_by_rid[rid] = response
+                    or {}
+                )
+            except Exception as exc:  # noqa: BLE001
+                rid = next(iter(self._inflight_stores))
+                context = getattr(self, "_inflight_store_contexts", {}).get(rid)
+                context = context or self._new_op_context(
+                    "store", rid, task_id=self._inflight_stores[rid]
+                )
+                self._log_cache_op(
+                    context,
+                    "poll",
+                    "failed",
+                    task_id=-1,
+                    flexkv_task_ids=list(fk_to_rid),
+                    error=str(exc),
+                )
+                completed_dict = {}
+            for fk_tid, response in completed_dict.items():
+                status = _status_value(response)
+                if not _is_terminal_status(status):
+                    continue
+                rid = fk_to_rid[fk_tid]
+                completed_rids.append(rid)
+                completed_by_rid[rid] = response
 
         if self._sync_ctx.needs_sync:
             completed_rids = self._sync_ctx.scatter(
@@ -1377,9 +1421,12 @@ class FlexKVConnector:
         rid: str,
         token_ids: List[int],
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+        *, candidate_start_token: int = 0,
     ) -> int:
         if not self._prefetch_enabled or not rid:
             return -1
+        if getattr(self, "_chunked_prefetch", False):
+            return self._start_chunked_prefetch(rid, token_ids, candidate_start_token)
         context = self._new_op_context("prefetch", rid, sglang_req_id)
         task_id = -1
         planned_tokens = 0
@@ -1434,6 +1481,8 @@ class FlexKVConnector:
         return task_id
 
     def check_prefetch_progress(self, rid: str) -> bool:
+        if getattr(self, "_chunked_prefetch", False):
+            return self._check_chunked_prefetch(rid)
         if not self._prefetch_enabled:
             return True
         task_id = self._ongoing_prefetches.get(rid, -1)
@@ -1502,11 +1551,88 @@ class FlexKVConnector:
             )
         return done
 
+    def _start_chunked_prefetch(self, rid, token_ids, candidate_start_token=0):
+        if rid in self._prefetch_sessions:
+            return self._prefetch_sessions[rid].session_id
+        self._release_prefetch_result(rid)
+        payload = {"handle": None, "error": None}
+        if self._sync_ctx.is_sync_leader:
+            try:
+                payload["handle"] = self.kv_manager.start_prefetch(
+                    np.asarray(token_ids, dtype=np.int64),
+                    replace(
+                        self._chunked_prefetch_options,
+                        candidate_start_token=candidate_start_token,
+                        swa_aware=self._swa_kv_pool is not None,
+                    ),
+                )
+            except Exception as exc:
+                payload["error"] = str(exc)
+        if self._sync_ctx.needs_sync:
+            payload = self._sync_ctx.scatter(
+                payload, channel=FlexKVScatterChannel.PREFETCH_START
+            )
+        if payload["error"]:
+            logger.warning("[FlexKV] prefetch admission failed: %s", payload["error"])
+            return -1
+        handle = payload["handle"]
+        self._prefetch_sessions[rid] = handle
+        return handle.session_id
+
+    def _check_chunked_prefetch(self, rid):
+        handle = self._prefetch_sessions.get(rid)
+        if handle is None:
+            return True
+        payload = {"snapshot": None, "error": None}
+        if self._sync_ctx.is_sync_leader:
+            try:
+                payload["snapshot"] = self.kv_manager.progress_prefetch(
+                    [handle], demand_handles=[handle]
+                )[handle]
+            except Exception as exc:
+                payload["error"] = str(exc)
+        if self._sync_ctx.needs_sync:
+            payload = self._sync_ctx.scatter(
+                payload, channel=FlexKVScatterChannel.PREFETCH_PROGRESS
+            )
+        if payload["error"]:
+            # Do not let any rank compute with a stale/incomplete prefix.
+            raise RuntimeError("FlexKV prefetch progress failed: " + payload["error"])
+        snapshot = payload["snapshot"]
+        if not snapshot.terminal:
+            return False
+        self._prefetch_sessions.pop(rid)
+        self._prefetch_result_sessions[rid] = handle
+        self._prefetch_loaded_tokens[rid] = snapshot.loaded_tokens if snapshot.lease_valid else 0
+        self._prefetch_loaded_spans[rid] = snapshot.l3_loaded_spans if snapshot.lease_valid else ()
+        return True
+
+    def _release_prefetch_result(self, rid):
+        handle = getattr(self, "_prefetch_result_sessions", {}).pop(rid, None)
+        if handle is not None and self._sync_ctx.is_sync_leader:
+            self.kv_manager.release_prefetch(handle)
+
+    def pop_prefetch_loaded_span(self, rid):
+        spans = getattr(self, "_prefetch_loaded_spans", {}).pop(rid, ())
+        tokens = self.pop_prefetch_loaded_tokens(rid)
+        return tokens, spans[0][0] if spans else None
+
     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
         """Return the successfully materialized REMOTE2H prefix once."""
         return int(self._prefetch_loaded_tokens.pop(rid, 0))
 
     def cancel_prefetch(self, rid: str) -> None:
+        if getattr(self, "_chunked_prefetch", False):
+            handle = self._prefetch_sessions.pop(rid, None)
+            if handle is not None and self._sync_ctx.is_sync_leader:
+                # release seals the session, whose resource ledger survives
+                # this request-facing tracking entry until every graph drains.
+                self.kv_manager.release_prefetch(handle)
+            self._release_prefetch_result(rid)
+            self._prefetch_loaded_spans.pop(rid, None)
+            self._prefetch_loaded_tokens.pop(rid, None)
+            self.release_pending(rid)
+            return
         self._pending_lookups.pop(rid, None)
         lookup_context = getattr(self, "_pending_lookup_contexts", {}).pop(rid, None)
         if lookup_context is not None:
@@ -1553,6 +1679,12 @@ class FlexKVConnector:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
+        if getattr(self, "_chunked_prefetch", False):
+            for rid in list(self._prefetch_sessions):
+                self.cancel_prefetch(rid)
+            for rid in list(self._prefetch_result_sessions):
+                self._release_prefetch_result(rid)
+            self._prefetch_loaded_spans.clear()
         # Layerwise launch merges the lookup task into a new batch task. Wait
         # for those returned batch task IDs before the scheduler clears GPU
         # slot ownership or the eventfd producer ring is reused. ``completely``
