@@ -153,16 +153,20 @@ Timeout budget is `min(max_s, base_s + per_ki_s * candidate_tokens / 1024)`;
 `timeout_budget_s` overrides the formula. Configuration policy wins over SGLang's
 `--hicache-storage-prefetch-policy` when both are supplied.
 
-The SGLang changes are integrated into the existing
-[FlexKV adaptation PR #31781](https://github.com/sgl-project/sglang/pull/31781),
-at commit `e5b00611bd`. Use that revision with this FlexKV version. It retains
-the adaptation's newer restore/abort/reset ownership and deferred Store handling.
+The SGLang changes are proposed in
+[review PR XingLiu1/sglang#6](https://github.com/XingLiu1/sglang/pull/6),
+head `2f91f9f5f0`, targeting `agent/flexkv-dsv4-main`. That branch is the source
+of the upstream [FlexKV adaptation PR #31781](https://github.com/sgl-project/sglang/pull/31781).
+The prefetch changes require review and are not yet incorporated into that
+adaptation branch. Use the review PR head with this FlexKV version for testing.
 
 The companion `flexkv/integration/sglang/sglang_chunked_prefetch.patch` is an
-incremental patch against that PR's previous commit `16780ea0c8`. From that
-checkout, run `git apply --check /path/to/sglang_chunked_prefetch.patch` followed
-by `git apply /path/to/sglang_chunked_prefetch.patch`. Do not apply it again on
-`e5b00611bd`, or directly on SGLang main. The separate PR #38451 is superseded.
+incremental patch against the adaptation branch at `4b76341435` (the same source
+tree as `16780ea0c8`). From that checkout, run
+`git apply --check /path/to/sglang_chunked_prefetch.patch` followed by
+`git apply /path/to/sglang_chunked_prefetch.patch`. Do not apply it again on the
+review PR head, or directly on SGLang main. The separate upstream PR #38451 is
+superseded by the branch-targeted review PR.
 
 The adapter starts prefetch on queue entry without a foreground remote lookup,
 emits demand at scheduler candidacy, propagates abort, and passes actual

@@ -260,7 +260,7 @@ chunk 结束在 checkpoint 时，向原 Full 图附加现有 SWA peer op，使�
 | SGLang | [connector.py](../../flexkv/integration/sglang/connector.py)、[配套 patch](../../flexkv/integration/sglang/sglang_chunked_prefetch.patch) | 入队/demand/abort、TP 一致性、CPU-only LOOKUP、准入和两次 lease 交接 |
 | 回归与模型验收 | [prefetch tests](../../tests/prefetch)、[实机报告](chunked_prefetch_validation.md) | 部分读取、乱序完成、停止竞态、真实数据一致性及模型 checkpoint |
 
-FlexKV PR 基线为 `016c290`。SGLang 改动已汇入已有的 [FlexKV 适配 PR #31781](https://github.com/sgl-project/sglang/pull/31781)，提交为 `e5b00611bd`，保留该分支已有的 restore/abort/reset 修复。配套 patch 是相对于该 PR 前一提交 `16780ea0c8` 的增量，不能直接应用到 main，也不应在新提交上重复应用。关闭开关是启动时回退方式，运行中已有工作仍必须经过 drain。
+FlexKV PR 基线为 `016c290`。SGLang 改动通过 [分支间 PR XingLiu1/sglang#6](https://github.com/XingLiu1/sglang/pull/6) 提交，head=`2f91f9f5f0`，base=`agent/flexkv-dsv4-main`；评审后才进入上游 [适配 PR #31781](https://github.com/sgl-project/sglang/pull/31781)。配套 patch 以适配分支 `4b76341435`（源码树与 `16780ea0c8` 一致）为基线，不能直接应用到 main，也不应在评审 PR head 上重复应用。关闭开关是启动时回退方式，运行中已有工作仍必须经过 drain。
 
 ### 8.2 已有证据与尚需完成的验证
 

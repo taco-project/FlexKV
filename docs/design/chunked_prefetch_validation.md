@@ -1,11 +1,15 @@
 # Chunked prefetch validation
 
-## Existing adaptation PR: September 8, 2026
+## Adaptation-branch review PR: September 8, 2026
 
-The SGLang changes are now integrated into the existing FlexKV adaptation
-[PR #31781](https://github.com/sgl-project/sglang/pull/31781), commit
-`e5b00611bd`, on top of `16780ea0c8`. The separate PR #38451 is superseded.
-The companion patch is incremental against `16780ea0c8`, not SGLang main.
+The SGLang changes are proposed in
+[XingLiu1/sglang#6](https://github.com/XingLiu1/sglang/pull/6), targeting
+`agent/flexkv-dsv4-main`, the branch used by upstream PR #31781. They are not
+yet incorporated into that branch. The review head `2f91f9f5f0` has exactly the
+same source tree as the tested `e5b00611bd`; only branch ancestry changed.
+The prior direct push was reverted at `4b76341435`, restoring the adaptation
+branch's source tree exactly to `16780ea0c8`. The companion patch targets that
+restored tree. Standalone upstream PR #38451 is superseded by the review PR.
 
 **167 SGLang tests and 12 subtests passed** in the isolated CPU container.
 This covers the new prefetch contracts plus the existing ordinary/hybrid restore,
