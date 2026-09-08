@@ -153,15 +153,22 @@ Timeout budget is `min(max_s, base_s + per_ki_s * candidate_tokens / 1024)`;
 `timeout_budget_s` overrides the formula. Configuration policy wins over SGLang's
 `--hicache-storage-prefetch-policy` when both are supplied.
 
-The companion `flexkv/integration/sglang/sglang_chunked_prefetch.patch` targets
-SGLang `5aab054ec8` and must be used with this FlexKV version. From that SGLang
-checkout, run `git apply --check /path/to/sglang_chunked_prefetch.patch` followed by
-`git apply /path/to/sglang_chunked_prefetch.patch`. This is a standalone patch for
-that baseline, not a patch to stack blindly on the older broad integration patch. It routes the radix wrapper to the maintained FlexKV package connector,
-starts prefetch on queue entry, emits demand at scheduler candidacy, propagates
-abort, and passes actual L3-loaded spans to existing hit accounting. It enables
-these hooks independently of `hicache_storage_backend`; no HiCache backend needs
-to be configured. Chunked-mode foreground LOOKUP searches CPU only.
+The SGLang changes are integrated into the existing
+[FlexKV adaptation PR #31781](https://github.com/sgl-project/sglang/pull/31781),
+at commit `e5b00611bd`. Use that revision with this FlexKV version. It retains
+the adaptation's newer restore/abort/reset ownership and deferred Store handling.
+
+The companion `flexkv/integration/sglang/sglang_chunked_prefetch.patch` is an
+incremental patch against that PR's previous commit `16780ea0c8`. From that
+checkout, run `git apply --check /path/to/sglang_chunked_prefetch.patch` followed
+by `git apply /path/to/sglang_chunked_prefetch.patch`. Do not apply it again on
+`e5b00611bd`, or directly on SGLang main. The separate PR #38451 is superseded.
+
+The adapter starts prefetch on queue entry without a foreground remote lookup,
+emits demand at scheduler candidacy, propagates abort, and passes actual
+L3-loaded spans to existing hit accounting. These hooks are independent of
+`hicache_storage_backend`; no HiCache backend needs to be configured.
+Chunked-mode foreground LOOKUP searches CPU only after prefetch stop-and-drain.
 
 The first SGLang adapter version skips this optional prefetch for `extra_key` or
 `cache_salt` requests because the existing foreground adapter has no consistent

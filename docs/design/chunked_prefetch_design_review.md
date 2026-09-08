@@ -125,7 +125,7 @@
 
 | 阶段 | 对接动作 | 需要保证的事情 |
 |---|---|---|
-| 请求入队 | adapter 用完整 token 链启动预取 | 不需要另行配置 HiCache backend；FlexKV 配置中的 policy 优先于 SGLang 策略参数 |
+| 请求入队 | adapter 用完整 token 链启动预取，不提前做前台远端 LOOKUP | 不需要另行配置 HiCache backend；FlexKV 配置中的 policy 优先于 SGLang 策略参数 |
 | 成为调度候选 | scheduler 检查进度并发送 demand | `best_effort` 在这里停止，不能等实际 forward 才通知；非终态请求继续等待 |
 | 预取终态 | 前台 LOOKUP 仅匹配 CPU，取得 held GET 对 CPU 前缀的引用后再 release 预取 lease | 若此时又自动从远端补齐整段，会抵消 timeout/best_effort 的停止效果 |
 | 准入与恢复 | 检查 token 预算、prefill chunk 形状和 SWA 容量，通过后才下发 H2D | 准入推迟时释放对应 held task/标记；空 batch 遇 `NO_TOKEN` 必须允许下一轮重试 |
@@ -260,7 +260,7 @@ chunk 结束在 checkpoint 时，向原 Full 图附加现有 SWA peer op，使�
 | SGLang | [connector.py](../../flexkv/integration/sglang/connector.py)、[配套 patch](../../flexkv/integration/sglang/sglang_chunked_prefetch.patch) | 入队/demand/abort、TP 一致性、CPU-only LOOKUP、准入和两次 lease 交接 |
 | 回归与模型验收 | [prefetch tests](../../tests/prefetch)、[实机报告](chunked_prefetch_validation.md) | 部分读取、乱序完成、停止竞态、真实数据一致性及模型 checkpoint |
 
-本轮 PR 基线为 FlexKV `016c290`、SGLang `5aab054ec8`，本文描述其上当前未合入的实现。接入其他版本时先核对配套 patch；关闭开关是启动时回退方式，运行中已有工作仍必须经过 drain。
+FlexKV PR 基线为 `016c290`。SGLang 改动已汇入已有的 [FlexKV 适配 PR #31781](https://github.com/sgl-project/sglang/pull/31781)，提交为 `e5b00611bd`，保留该分支已有的 restore/abort/reset 修复。配套 patch 是相对于该 PR 前一提交 `16780ea0c8` 的增量，不能直接应用到 main，也不应在新提交上重复应用。关闭开关是启动时回退方式，运行中已有工作仍必须经过 drain。
 
 ### 8.2 已有证据与尚需完成的验证
 

@@ -1,6 +1,22 @@
 # Chunked prefetch validation
 
-## PR revision: September 8, 2026
+## Existing adaptation PR: September 8, 2026
+
+The SGLang changes are now integrated into the existing FlexKV adaptation
+[PR #31781](https://github.com/sgl-project/sglang/pull/31781), commit
+`e5b00611bd`, on top of `16780ea0c8`. The separate PR #38451 is superseded.
+The companion patch is incremental against `16780ea0c8`, not SGLang main.
+
+**167 SGLang tests and 12 subtests passed** in the isolated CPU container.
+This covers the new prefetch contracts plus the existing ordinary/hybrid restore,
+abort/reset ownership, eviction, factory registry, and PrefillAdder regressions.
+The existing eviction fixture was updated from the removed runtime-context and
+`evict` mock APIs to `get_serving`/`get_spec` and `evict_for_alloc`.
+Pinned Ruff/isort, formatting, registered-test rules and patch applicability pass.
+The FlexKV runtime is unchanged from the 456-pass result below. No new GPU/model
+or performance run was performed for this integration.
+
+## Earlier standalone PR revision: September 8, 2026
 
 The integration was rebased onto FlexKV `016c290` and SGLang `5aab054ec8`.
 `chunk_target_bytes` was removed before release; `chunk_max_blocks` is the single
