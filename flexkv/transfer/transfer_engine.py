@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.transfer.cuda_sync import synchronize_cuda_devices
 from flexkv.common.storage import StorageHandle
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp, WorkerKey
 from flexkv.common.transfer import get_nvtx_range_color
@@ -94,40 +95,10 @@ def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
         pin_buffer.free_slot(op.dst_slot_id)
 
 
-def _te_bounded_cuda_sync(timeout_s: float) -> None:
-    """torch.cuda.synchronize() with a wall-clock cap.
+def _te_bounded_cuda_sync(device_ids: List[int], timeout_s: float) -> bool:
+    """Bound the drain of this process's contexts on the registered GPUs."""
+    return synchronize_cuda_devices(device_ids, timeout_s, name="flexkv-te")
 
-    Runs the sync in a daemon thread so a wedged GPU cannot prevent
-    TransferEngine.shutdown from returning. Failure / timeout is logged
-    but not raised — this is called from the shutdown finally.
-    """
-    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
-        return
-    done = threading.Event()
-    err: List[BaseException] = []
-
-    def _run() -> None:
-        try:
-            torch.cuda.synchronize()
-        except BaseException as e:  # noqa: BLE001
-            err.append(e)
-        finally:
-            done.set()
-
-    t = threading.Thread(
-        target=_run, name="flexkv-te-cuda-drain", daemon=True,
-    )
-    t.start()
-    if not done.wait(timeout=timeout_s):
-        flexkv_logger.warning(
-            f"TransferEngine.shutdown: cuda synchronize did not finish in "
-            f"{timeout_s:.0f}s (GPU likely wedged); continuing"
-        )
-        return
-    if err:
-        flexkv_logger.warning(
-            f"TransferEngine.shutdown: cuda synchronize failed: {err[0]!r}"
-        )
 
 class TransferEngine:
     def __init__(self,
@@ -1752,7 +1723,14 @@ class TransferEngine:
                     self.finished_ops_queue.get_nowait()
 
             torch.cuda.empty_cache()
-            # Bounded sync: a wedged GPU here would keep the TM process alive
-            # past shutdown, forcing the parent-side SIGTERM/SIGKILL. Workers
-            # have already unpinned; TM does not itself hold CPU pin refs.
-            _te_bounded_cuda_sync(timeout_s=15.0) # hardcode for now
+            # Worker processes drain their own contexts. Drain this process's
+            # contexts separately, using registered GPU IDs rather than the
+            # default device of a fresh daemon thread.
+            device_ids = sorted({
+                handle.gpu_device_id
+                for groups in (self.gpu_handle_groups, self._swa_gpu_handles or {})
+                for handles in groups.values()
+                for handle in handles
+                if handle.gpu_device_id is not None
+            })
+            _te_bounded_cuda_sync(device_ids, timeout_s=15.0)

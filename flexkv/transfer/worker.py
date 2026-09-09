@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from torch.multiprocessing import Queue as MPQueue, Pipe as MPPipe
 from multiprocessing.connection import Connection
 from threading import Thread
-from typing import List, Any, Dict, Union, Optional, Tuple
+from typing import List, Any, Dict, Union, Optional, Tuple, Set
 
 import numpy as np
 import nvtx
@@ -33,6 +33,7 @@ except ImportError:
     TPGDSTransferThreadGroup = None
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.transfer.cuda_sync import synchronize_cuda_devices
 from flexkv.common.memory_handle import TensorSharedHandle, release_vmm_tensor
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
@@ -48,8 +49,10 @@ from flexkv.transfer.host_buffer import (
 )
 
 
-def ensure_cuda_device(device: Union[int, torch.device, None]) -> None:
-    """Bind this process's CUDA context before IPC import / host register / Stream.
+def ensure_cuda_device(
+    device: Union[int, torch.device, None], *, cuda_device_ids: Optional[Set[int]] = None
+) -> None:
+    """Bind this thread's CUDA context before IPC import / host register / Stream.
 
     Workers must call this *before* any CUDA API. Otherwise the default device
     (usually GPU 0) gets a context from every worker, which under DP exhausts
@@ -66,14 +69,16 @@ def ensure_cuda_device(device: Union[int, torch.device, None]) -> None:
         if idx < 0:
             return
     torch.cuda.set_device(idx)
+    if cuda_device_ids is not None:
+        cuda_device_ids.add(idx)
 
 
 def import_tensor_handles(
-    handles: List["TensorSharedHandle"],
+    handles: List["TensorSharedHandle"], *, cuda_device_ids: Optional[Set[int]] = None
 ) -> List[torch.Tensor]:
     """Import CUDA IPC tensors after switching to their owning device."""
     if handles:
-        ensure_cuda_device(handles[0].device)
+        ensure_cuda_device(handles[0].device, cuda_device_ids=cuda_device_ids)
     return [h.get_tensor() for h in handles]
 
 
@@ -310,6 +315,11 @@ except ImportError:
     shared_transfer_kv_blocks_remote_read = None
 
 
+# Failed drains must not release registered backing storage during object GC.
+# These references live until this worker process exits.
+_undrained_host_regions: List[List[Tuple[torch.Tensor, str]]] = []
+
+
 class TransferWorkerBase(ABC):
     _worker_id_counter = 0
     _worker_id_lock = threading.Lock()
@@ -319,6 +329,7 @@ class TransferWorkerBase(ABC):
         # call shutdown() even when ``__init__`` fails mid-way after some pins.
         obj = super().__new__(cls)
         obj._host_registered = []
+        obj._cuda_device_ids = set()
         obj._shutdown_done = False
         obj._op_buffer_pinned = False
         return obj
@@ -338,6 +349,13 @@ class TransferWorkerBase(ABC):
         self._host_registered: List[Tuple[torch.Tensor, str]] = []
         self._shutdown_done = False
 
+    def _ensure_cuda_device(self, device: Union[int, torch.device, None]) -> None:
+        ensure_cuda_device(device, cuda_device_ids=self._cuda_device_ids)
+
+    def _import_tensor_handles(self, handles: List[TensorSharedHandle]) -> List[torch.Tensor]:
+        # Record each owning device before IPC import, including partial init.
+        return import_tensor_handles(handles, cuda_device_ids=self._cuda_device_ids)
+
     def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
         """cudaHostRegister and track for paired unregister in shutdown()."""
         size_gb = tensor.numel() * tensor.element_size() / (1024 ** 3)
@@ -347,6 +365,8 @@ class TransferWorkerBase(ABC):
         )
         cudaHostRegister(tensor)
         self._host_registered.append((tensor, label or "host"))
+        # CPU-only workers can initialize CUDA through host registration too.
+        self._cuda_device_ids.add(torch.cuda.current_device())
 
     def _pin_op_buffer(self) -> None:
         """Pin the shared op buffer after the worker has bound its CUDA device.
@@ -374,16 +394,15 @@ class TransferWorkerBase(ABC):
             f"{len(registered)} host region(s)"
         )
         flexkv_logger.info(msg)
-        # Drain in-flight CUDA work before unpinning host memory that
-        # DMA / kernels may still be touching.
-        #
-        # torch.cuda.synchronize() releases the GIL and blocks in the driver;
-        # if the GPU is wedged (hung kernel, TDR, faulty NVLink) it can hang
-        # forever. We run it in a daemon thread with a bounded join so a
-        # wedged GPU cannot prevent cudaHostUnregister from firing — the
-        # kernel behind the DMA is already dead, so proceeding with unpin
-        # is the correct action; the sentinel thread dies with the process.
-        self._drain_cuda_bounded(worker_id, timeout_s=30.0)
+        # A timeout does not prove that DMA has stopped. Keep registered
+        # buffers alive until process exit if any owning device fails to drain.
+        if not self._drain_cuda_bounded(worker_id, timeout_s=30.0):
+            _undrained_host_regions.append(registered)
+            flexkv_logger.warning(
+                "[worker %s] CUDA drain incomplete; retaining %d host regions until process exit",
+                worker_id, len(registered),
+            )
+            return
         # Unregister in reverse order of registration.
         while registered:
             tensor, label = registered.pop()
@@ -391,43 +410,11 @@ class TransferWorkerBase(ABC):
         self._op_buffer_pinned = False
         self._host_registered = registered
 
-    @staticmethod
-    def _drain_cuda_bounded(worker_id: Any, timeout_s: float) -> None:
-        """Best-effort torch.cuda.synchronize() with a wall-clock cap.
-
-        Returns whether the sync actually completed. Failure / timeout is
-        logged but not raised — unpin must proceed either way.
-        """
-        if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
-            return
-        done = threading.Event()
-        err: List[BaseException] = []
-
-        def _run() -> None:
-            try:
-                torch.cuda.synchronize()
-            except BaseException as e:  # noqa: BLE001
-                err.append(e)
-            finally:
-                done.set()
-
-        t = threading.Thread(
-            target=_run,
-            name=f"flexkv-worker-{worker_id}-cuda-drain",
-            daemon=True,
+    def _drain_cuda_bounded(self, worker_id: Any, timeout_s: float) -> bool:
+        """Drain all devices used by this worker, including TP and partial init."""
+        return synchronize_cuda_devices(
+            self._cuda_device_ids, timeout_s, name=f"flexkv-worker-{worker_id}"
         )
-        t.start()
-        if not done.wait(timeout=timeout_s):
-            flexkv_logger.warning(
-                f"[worker {worker_id}] cuda synchronize did not finish in "
-                f"{timeout_s:.0f}s (GPU likely wedged); proceeding with unpin"
-            )
-            return
-        if err:
-            flexkv_logger.warning(
-                f"[worker {worker_id}] cuda synchronize before unpin failed: "
-                f"{err[0]!r}"
-            )
 
     @classmethod
     def _get_worker_id(cls) -> int:
@@ -926,7 +913,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
 
         # Bind CUDA device BEFORE host-register / IPC import / Stream creation.
-        ensure_cuda_device(gpu_device_id)
+        self._ensure_cuda_device(gpu_device_id)
 
         self._pin_op_buffer()
         # Register CPU tensors with CUDA
@@ -936,7 +923,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
 
         self.gpu_device_id = gpu_device_id
         self._gpu_block_count = len(gpu_blocks)
-        self.gpu_blocks = import_tensor_handles(gpu_blocks)
+        self.gpu_blocks = self._import_tensor_handles(gpu_blocks)
         # Get pointers first
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
         self.gpu_tensor_ptrs = self.gpu_blocks_ptrs
@@ -1059,7 +1046,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             dtype_size_g = g.dtype.itemsize
 
             # Resolve GPU tensors for this group
-            group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+            group_gpu_blocks = self._import_tensor_handles(gpu_blocks_per_group[gi])
             self._multi_group_gpu_blocks_keepalive.append(group_gpu_blocks)
             group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
 
@@ -1165,7 +1152,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 f"Expected {self._gpu_block_count} GPU blocks, "
                 f"got {len(gpu_blocks)}"
             )
-        self.gpu_blocks = import_tensor_handles(gpu_blocks)
+        self.gpu_blocks = self._import_tensor_handles(gpu_blocks)
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
         self.gpu_tensor_ptrs = self.gpu_blocks_ptrs
         return len(self.gpu_blocks)
@@ -1332,12 +1319,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         # Bind primary GPU + pin op buffer before any CUDA IPC import.
         if gpu_blocks and gpu_blocks[0]:
-            ensure_cuda_device(gpu_blocks[0][0].device)
+            self._ensure_cuda_device(gpu_blocks[0][0].device)
         self._pin_op_buffer()
         # Handle tensor import for multi-process case — set_device per GPU first.
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
-            imported_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
+            imported_gpu_blocks.append(self._import_tensor_handles(handles_in_one_gpu))
         self._gpu_block_counts = [len(handles) for handles in gpu_blocks]
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
@@ -1495,7 +1482,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             # Import tensors from handles (bind CUDA device per GPU first)
             imported_group_blocks = []
             for handles_in_one_gpu in group_gpu_blocks_per_gpu:
-                imported_group_blocks.append(import_tensor_handles(handles_in_one_gpu))
+                imported_group_blocks.append(self._import_tensor_handles(handles_in_one_gpu))
             self._multi_group_gpu_blocks_keepalive.append(imported_group_blocks)
 
             # Build flat pointer list for this group
@@ -1626,7 +1613,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 f"Expected GPU block counts {self._gpu_block_counts}, got {counts}"
             )
         imported_gpu_blocks = [
-            import_tensor_handles(handles) for handles in gpu_blocks
+            self._import_tensor_handles(handles) for handles in gpu_blocks
         ]
         gpu_block_ptrs_flat = [
             tensor.data_ptr()
@@ -2183,9 +2170,9 @@ class GDSTransferWorker(TransferWorkerBase):
         # Initialize base class first
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
 
-        ensure_cuda_device(gpu_device_id)
+        self._ensure_cuda_device(gpu_device_id)
         self._pin_op_buffer()
-        self.gpu_blocks = import_tensor_handles(gpu_blocks)
+        self.gpu_blocks = self._import_tensor_handles(gpu_blocks)
         self.gpu_blocks_ptrs = self._get_layer_ptrs(self.gpu_blocks)
         self.gpu_layer_ptrs = self.gpu_blocks_ptrs
         self.num_blocks_per_file = num_blocks_per_file
@@ -2297,7 +2284,7 @@ class GDSTransferWorker(TransferWorkerBase):
             # handle different attention backend layouts (flash_attn vs triton).
             if gpu_layouts_per_group is not None:
                 gpu_layout = gpu_layouts_per_group[gi]
-                group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+                group_gpu_blocks = self._import_tensor_handles(gpu_blocks_per_group[gi])
                 gpu_strides = self._get_gpu_strides_from_tensor(
                     group_gpu_blocks[0], tpb_g, dtype_size_g, self.kv_dim,
                 ) if len(group_gpu_blocks) > 1 else None
@@ -2316,7 +2303,7 @@ class GDSTransferWorker(TransferWorkerBase):
 
             # GPU pointers for this group
             if gpu_blocks_per_group is not None:
-                group_gpu_blocks = import_tensor_handles(gpu_blocks_per_group[gi])
+                group_gpu_blocks = self._import_tensor_handles(gpu_blocks_per_group[gi])
                 self._multi_group_gpu_blocks_keepalive.append(group_gpu_blocks)
                 group_gpu_ptrs = self._get_layer_ptrs(group_gpu_blocks)
             else:
@@ -2499,12 +2486,12 @@ class tpGDSTransferWorker(TransferWorkerBase):
 
         assert len(gpu_blocks) == tp_group_size
         if gpu_blocks and gpu_blocks[0]:
-            ensure_cuda_device(gpu_blocks[0][0].device)
+            self._ensure_cuda_device(gpu_blocks[0][0].device)
         self._pin_op_buffer()
         # Handle tensor import for multi-process case — set_device per GPU first.
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
-            imported_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
+            imported_gpu_blocks.append(self._import_tensor_handles(handles_in_one_gpu))
         self.gpu_blocks = imported_gpu_blocks
         self.num_blocks_per_file = num_blocks_per_file
         self.num_files = sum(len(file_list) for file_list in ssd_files.values())
@@ -2849,7 +2836,7 @@ class NixlTransferWorker(TransferWorkerBase):
 
         # Pin after optional GPU bind so GPU backends do not create a GPU0 context.
         if be in NIXL_GPU_FILE_BACKENDS:
-            ensure_cuda_device(gpu_device_id)
+            self._ensure_cuda_device(gpu_device_id)
         self._pin_op_buffer()
         if (
             gpu_kv_layout.num_layer != cpu_kv_layout.num_layer
@@ -2914,7 +2901,7 @@ class NixlTransferWorker(TransferWorkerBase):
         self._session = NixlAgentSession(be, nixl_extra_config or {})
 
         if be in NIXL_GPU_FILE_BACKENDS:
-            self.gpu_blocks = import_tensor_handles(gpu_blocks)  # type: ignore[arg-type]
+            self.gpu_blocks = self._import_tensor_handles(gpu_blocks)  # type: ignore[arg-type]
             if len(self.gpu_blocks) == 1:
                 self.gpu_block_type_ = 1
             elif len(self.gpu_blocks) == self.num_layers:
