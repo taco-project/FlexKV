@@ -1,5 +1,73 @@
 # Chunked prefetch validation
 
+## Idle control polling fix: September 10, 2026
+
+Revision `ae634ee` suspends control-thread polling when no prefetch session or
+submitted task is active. New commands wake it immediately; retained results
+still wake at their TTL. Active work keeps the existing 2 ms polling interval,
+and available chunk windows continue without an extra wait. The transfer
+protocol, worker and native extension are unchanged.
+
+**191 focused Linux tests passed; 9 skipped.** This includes real background
+threads, command/stop wakeup races, TTL reclamation, native radix/CPU publication,
+IPC integration and task lifecycle. The nine unsupported Python-radix SWA
+combinations were skipped; corresponding C++ cases executed. The same 87-test
+runtime/coordinator subset also passed locally.
+
+GLM-5.2-FP8 ran on 8 H20 GPUs, TP8, BF16 KV, eager execution, page size 64,
+prefill chunk 256 and a 16,640-token GPU pool. CPU cache was 64 GiB; the
+node-local Mooncake RDMA pool was 256 GiB, with SSD disabled. Each request
+generated 32 greedy tokens. Client concurrency was 8 or 32 for the hot tests;
+the server admitted at most four concurrent requests.
+
+The original baseline uses FlexKV `016c290` and the original SGLang adaptation
+plus its independent one-line idle-admission retry fix. The pre-fix and fixed
+variants use FlexKV `7df07a5` and `ae634ee`, respectively, with the same SGLang
+review head `2f91f9f5f0`. Two rounds used opposite orders, with 420 measured
+requests total. Main comparisons used `chunk_max_blocks=128`, window 2.
+
+| Scenario | Pre-fix throughput change | Fixed throughput change |
+|---|---:|---:|
+| Full L3 restore, serial | -2.68% | +0.56% |
+| GPU-hot, client C8 | -2.46% | -0.41% |
+| GPU-hot, client C32 | -4.08% | -0.85% |
+
+Changes are the median of the two differences against their own round's
+baseline. Fixed per-round ranges were -0.11% to +1.22%, -0.83% to +0.00%, and
+-1.09% to -0.62%, respectively. Every measured request matched its complete
+reference output token IDs. Each serial group restored 826 blocks through both
+REMOTE2H and H2D; hot groups had no transfer completions. These short, controlled
+runs show the large regression has receded, not statistically established zero
+overhead or production performance.
+
+Separate hot diagnostics, excluded from these throughput comparisons, reduced
+control-thread CPU use from 1.70 s / 47.35 s to 0.03 s / 45.33 s (about 98%
+less CPU per unit time). This is thread CPU accounting, not a sampled GIL share.
+
+A separate 70-request `chunk_max_blocks=32` check completed all restores,
+including eight chunks for each 16K prefix. Serial throughput was 5.298 output
+tokens/s with TTFT p95 0.754 s; hot C8/C32 were 21.781/21.790 tokens/s. This is a
+single additional check, not a balanced sweep establishing an optimal chunk size.
+
+With chunk 32 and a 30 ms timeout budget, all six serial requests matched their
+output references. Four 8K/16K requests sealed on deadline at 30.30-30.99 ms,
+restoring only the first 4,096 tokens in two chunks. They then drained for
+64.99-66.87 ms before returning at 95.53-97.86 ms. The two 2K requests had already
+submitted their single chunk and completed fully. The deadline stops future
+submission; it does not cancel already submitted I/O or guarantee a 30 ms return.
+
+All six best-effort requests also matched their output references. Five stopped
+on scheduler demand: two had submitted no chunk and returned no storage prefix;
+three drained two already submitted chunks and returned 4,096 tokens. One 2K
+request had already submitted its sole chunk and completed fully. The interrupted
+inflight requests drained for 85.71-87.54 ms. These checks cover both early demand
+and demand with active I/O, separately from the noninterrupted performance table.
+
+The prior mixed-capacity C8 OOM and shutdown resource-hook gap remain open and
+were excluded from this focused performance fix. They are not cleared by these
+successful noninterrupted workloads. No new V4 Flash or long-duration run is
+claimed for this revision.
+
 ## Adaptation-branch review PR: September 8, 2026
 
 The SGLang changes are proposed in
@@ -74,10 +142,11 @@ acceptance of the September 8 rebase or its changed chunk sizes.
 
 ## Before broader enablement
 
-The feature remains disabled by default. Repeat GPU/model correctness on the
-rebased versions and retune block/window sizes. Cython release builds,
+The feature remains disabled by default. The September 10 run covers the
+node-local TP8 eager configuration described above; other model and execution
+configurations still need GPU/model validation and block/window tuning. Cython release builds,
 DP/layerwise configurations, sustained failure injection, dedicated prefetch
 Prometheus instrumentation and long-term resource trends remain outstanding.
-Same-cache-state repeated performance A/B and prolonged load tests are required
-before claiming TTFT/throughput improvements or production readiness. SSD, P2P,
+Broader same-cache-state performance A/B and prolonged load tests are required
+before extending the controlled results to production readiness. SSD, P2P,
 multi-node and TRT-remote prefetch are explicitly outside this version's scope.
