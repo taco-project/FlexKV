@@ -1,5 +1,82 @@
 # Chunked prefetch validation
 
+## SGLang whole-task policy routing: September 10, 2026
+
+Revision `837d3a4` routes SGLang's effective `wait_complete` policy to the
+original `prefetch_async` path and disables the chunk runtime before creating
+KVManager. `timeout` and `best_effort` retain chunked sessions when the feature
+flag is enabled. Explicit FlexKV policy configuration takes precedence over
+the SGLang policy argument. The explicit low-level session API still supports
+`wait_complete`; this change does not alter that API or reconfigure an external
+KVServer. The worker, native extension and transfer protocol are unchanged.
+
+**197 focused Linux tests passed; 9 skipped.** This includes six new constructor
+routing/precedence cases plus the runtime, coordinator, native integration,
+planner and task-lifecycle coverage. Skips remain unsupported Python-radix SWA
+combinations. Changed-file Ruff and whitespace checks pass.
+
+The same GLM-5.2-FP8 / 8 H20 / TP8 eager configuration below is used for four
+arms on this single source revision, with SGLang review head `2f91f9f5f0`:
+
+| Arm | Effective service path | Chunk blocks | Timeout budget |
+|---|---|---:|---:|
+| `wait_whole` | Original whole-task API; no chunk runtime | Not used | Not used |
+| `timeout_whole` | Session API; one graph per request | 4096 | 60 s |
+| `timeout128` | Session API | 128 | 60 s |
+| `timeout32` | Session API | 32 | 60 s |
+
+The chunk window is two; reserved and pinned limits are 16/60 GiB in each
+timeout arm. The largest 16K restore fits the one-graph arm's byte budget.
+Comparing chunked timeout against one-graph timeout measures the overall effect
+of segmentation within the same framework, including planning, IPC and backend
+batch shape. Comparing one-graph timeout against `wait_whole` measures framework
+and ownership-path entry cost. Neither comparison isolates pure IPC overhead.
+
+Two rounds used opposite arm orders. **560 measured requests and 24 separate
+cold-reference checks passed**, comparing all 32 output token IDs. Each arm had
+six serial L3 requests and 32 requests each at client C8/C32; the server admitted
+at most four concurrent requests. Every serial arm restored the same 826 blocks
+through both REMOTE2H and H2D. The four arms completed 6/6/8/26 remote graphs per
+round, respectively; each 16K request used 1/1/2/8 graphs. All timeout serial
+sessions ended with `reason=complete`, with zero deadlines across all model logs.
+Hot batches used the same 1,984-token GPU prefix and had no transfer completions.
+Post-measurement thread snapshots found no chunk control/sender threads for
+`wait_whole` and found both threads for each timeout arm.
+
+| Comparison | Serial L3 throughput | Hot C8 throughput | Hot C32 throughput |
+|---|---:|---:|---:|
+| One-graph timeout / whole-task wait | +0.66% | -0.20% | +0.48% |
+| Timeout 128 / one-graph timeout | +0.88% | +0.90% | -0.06% |
+| Timeout 32 / one-graph timeout | +0.98% | +0.75% | +0.32% |
+| Timeout 128 / whole-task wait | +1.55% | +0.67% | +0.41% |
+| Timeout 32 / whole-task wait | +1.65% | +0.54% | +0.80% |
+
+Values are the median of the two within-round percentage differences. For the
+segmentation comparisons, per-round ranges were +0.52% to +1.23% (128) and
++0.78% to +1.17% (32) for L3; hot C8 ranges were -0.90% to +2.70% and +0.12% to
++1.39%, while hot C32 ranges were -0.73% to +0.61% and -0.01% to +0.66%.
+
+For 16K prefixes, median TTFT in rounds one/two was 863/869 ms for `wait_whole`,
+843/862 ms for one-graph timeout, 748/760 ms for chunk 128, and 760/786 ms for
+chunk 32. Each value has only two samples. The latter two also had lower session
+elapsed times; their successful restore size was identical. More graphs did not
+produce an observed large regression in this workload, but short runs do not
+establish zero overhead or an optimal chunk size. Session elapsed and summed
+worker transfer durations are not interchangeable with end-to-end TTFT.
+
+Sampled CPU throttling, memory-cgroup failures and RDMA error/discard deltas
+were zero. GPU memory peaked at 97,357 MiB per GPU. Existing FlexKV Python and
+Mooncake metrics were collected; the C++ endpoint was unavailable. Counters do
+not replace worker-completion and output evidence, especially where the new
+chunk path is not fully covered by legacy transfer counters.
+
+This matrix covers serial L3 restores and shared-prefix GPU-hot pressure. The
+previous mixed-capacity C8 OOM and shutdown resource-hook gap remain open. It is
+not concurrent cold-L3, V4 Flash, a fresh native release build or a long soak.
+
+The prior idle-polling results below used chunked `wait_complete` sessions in
+SGLang. They describe the earlier routing and remain historical evidence.
+
 ## Idle control polling fix: September 10, 2026
 
 Revision `ae634ee` suspends control-thread polling when no prefetch session or

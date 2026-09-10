@@ -3,6 +3,17 @@
 Read the [Chinese implementation guide and sequence diagrams](chunked_prefetch.md) first.
 This reference retains the detailed interface and ownership contracts.
 
+When chunked prefetch is enabled, SGLang routes the configured `wait_complete`
+policy to the original whole-task `prefetch_async` API and disables the chunk
+runtime before creating KVManager.
+`timeout` and `best_effort` use the session API below. An explicit FlexKV policy
+takes precedence over SGLang's policy argument. The explicit session API retains
+its existing `wait_complete` support for direct callers; SGLang's whole-task
+route does not use it. An external KVServer retains its own runtime configuration;
+clients do not reconfigure an already running server. With the feature flag off,
+SGLang always uses the original path; setting a timeout policy alone does not
+enable chunking or deadline-based stopping.
+
 ## Scope and semantics
 
 This opt-in implementation adds `wait_complete`, `timeout`, and `best_effort` to

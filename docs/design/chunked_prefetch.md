@@ -6,7 +6,21 @@
 
 本文先说明行为和时序；完整接口、配置与异常约定见 [开发参考](chunked_prefetch_reference.md)。
 
-## 1. 三种策略只决定一件事：何时停止增加新工作
+## 1. SGLang 服务路由与会话策略
+
+启用 `enable_chunked_prefetch` 后，SGLang 按最终生效的策略选择路径：`wait_complete` 复用原始整任务 `prefetch_async`，在创建 KVManager 前关闭分段运行时；`timeout`、`best_effort` 使用下述分段会话。显式 FlexKV 配置优先，未指定 policy 时沿用 SGLang 的 `hicache_storage_prefetch_policy`。因此服务配置为 `wait_complete` 时，chunk/window 和分段预算不参与执行。总开关关闭时仍走原始路径，配置 timeout 不会单独启用分段或超时停止。
+
+```mermaid
+flowchart LR
+    E{"enable_chunked_prefetch?"} -->|否| W
+    E -->|是| D{"最终 policy 为 wait_complete?"}
+    D -->|是| W["原始 prefetch_async<br/>整任务下发并等待完成"]
+    D -->|否| C["start_prefetch<br/>timeout / best_effort 分段会话"]
+    W --> T["原传输 worker"]
+    C --> T
+```
+
+以下停止条件表描述显式 `start_prefetch` 会话 API。该 API 仍兼容直接调用的 `wait_complete` 会话，SGLang 的整任务 `wait_complete` 不经过它。由调用方创建的 KVManager/内嵌 server 接收上述有效配置；独立 external server 的运行时由它自己的配置决定，客户端不会重配已运行的 server。
 
 | 策略 | 何时停止下发 | 适用意图 |
 |---|---|---|

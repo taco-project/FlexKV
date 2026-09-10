@@ -12,6 +12,8 @@
 
 原先整段下发后等待完成，无法在请求进入调度或时间预算用完时减少后续预取。新的停止粒度是 **chunk 对应的传输图**：缩小单次下发范围，才能在图之间停止。
 
+**SGLang 服务路由（2026-09-10 更新）：** 启用分段总开关后，`wait_complete` 仍保留原始整任务 `prefetch_async`，在创建 KVManager 前关闭分段运行时；`timeout` 和 `best_effort` 进入分段会话。显式 FlexKV policy 优先，否则使用 SGLang 的策略参数。总开关关闭时始终走原始路径，不启用 timeout 停止。下面的策略表和线程/lease 流程描述显式会话 API；该 API 的 `wait_complete` 兼容能力保留，服务侧的整任务路径不经过它。external server 仍按自身配置启动，客户端不会更改已运行的 server。
+
 | 策略 | 停止新增图的条件 | 调用方可以期待的行为 |
 |---|---|---|
 | `wait_complete` | 全部计划已下发；容量不足或错误也会停止 | 尽量取完远端连续命中前缀，仍可能得到部分或空结果 |
@@ -309,7 +311,7 @@ Python 与 C++ 都在所在进程网络命名空间的 `127.0.0.1:<port>/metrics
 例如以下为字段含义示例，不是本轮压测结果：
 
 ```text
-[FlexKV-Prefetch] epoch=example session_id=12 policy=timeout reason=timeout submitted_chunks=2 sealed_submit_seq=2 loaded_tokens=128 elapsed_ms=35.460 drain_ms=5.131 error=None
+[FlexKV-Prefetch] epoch=example session_id=12 policy=timeout reason=deadline submitted_chunks=2 sealed_submit_seq=2 loaded_tokens=128 elapsed_ms=35.460 drain_ms=5.131 error=None
 ```
 
 这表示 deadline 后没有新增图，两个已登记 chunk 排空后才返回。`loaded_tokens` 是可交付范围内成功发布的 L3 tokens，不是 metadata 命中量，也不是 H2D 已完成量。`elapsed_ms > timeout_budget` 本身不是违约；需要同时看 seal 后提交序号是否增长、drain 是否异常。
