@@ -174,6 +174,11 @@ class FlexKVConnector:
             self._chunked_prefetch_options = PrefetchOptions(**opts)
             self._chunked_prefetch_options.validate()
             self.cache_config.prefetch_options = opts
+            # wait_complete needs the original whole-task path. Disable the
+            # chunk runtime before KVManager is created, including its threads.
+            if self._chunked_prefetch_options.policy == "wait_complete":
+                self._chunked_prefetch = False
+                self.cache_config.enable_chunked_prefetch = False
         self._prefetch_sessions = {}
         self._prefetch_result_sessions = {}
         self._prefetch_loaded_spans = {}

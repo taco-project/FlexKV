@@ -26,6 +26,57 @@ from flexkv.server.request import PrefetchControlRequest, WaitRequest
 from test_coordinator import Backend, Clock
 
 
+@pytest.mark.parametrize(
+    "enabled,explicit,server_policy,expected",
+    [
+        (True, "wait_complete", "timeout", False),
+        (True, None, "wait_complete", False),
+        (True, "timeout", "wait_complete", True),
+        (True, None, "timeout", True),
+        (True, "best_effort", "wait_complete", True),
+        (False, "timeout", "timeout", False),
+    ],
+)
+def test_connector_routes_policy_before_runtime_creation(
+    monkeypatch, enabled, explicit, server_policy, expected
+):
+    import flexkv.integration.sglang.connector as module
+
+    cfg = CacheConfig(
+        enable_chunked_prefetch=enabled,
+        prefetch_options={"policy": explicit} if explicit is not None else {},
+    )
+    config = NS(
+        cache_config=cfg,
+        model_config=ModelConfig(),
+        post_init_from_sglang_config=Mock(return_value=NS()),
+    )
+    monkeypatch.setattr(module.FlexKVConfig, "from_env", lambda: config)
+
+    class ConfigResolved(Exception):
+        pass
+
+    # Stop before distributed/GPU setup; routing must already be finalized
+    # before the downstream KVManager sees its cache configuration.
+    monkeypatch.setattr(module.FlexKVComm, "__init__", Mock(side_effect=ConfigResolved))
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    with pytest.raises(ConfigResolved):
+        connector.__init__(
+            sgl_model_config=NS(),
+            server_args=NS(hicache_storage_prefetch_policy=server_policy),
+            page_size=64,
+            kvcache=None,
+            tp_rank=0,
+            dp_rank=0,
+            pp_rank=0,
+            attn_cp_rank=0,
+        )
+    assert connector._chunked_prefetch is expected
+    assert cfg.enable_chunked_prefetch is expected
+    if enabled:
+        assert cfg.prefetch_options["policy"] == (explicit or server_policy)
+
+
 @pytest.fixture
 def engine():
     e = KVTaskEngine.__new__(KVTaskEngine)
