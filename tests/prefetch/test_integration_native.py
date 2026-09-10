@@ -1,6 +1,7 @@
 """Native imports, real task-engine dispatch, ZMQ control and rank agreement."""
 
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 import threading
@@ -15,7 +16,7 @@ import zmq
 
 from flexkv.common.config import ModelConfig, CacheConfig
 from flexkv.integration.sglang.connector import FlexKVConnector
-from flexkv.kvtask import KVTaskEngine, KVTaskManager
+from flexkv.kvtask import KVTaskEngine, KVTaskManager, TaskStatus
 from flexkv.prefetch.coordinator import PrefetchCoordinator
 from flexkv.prefetch.runtime import TaskRuntime
 from flexkv.prefetch.types import PrefetchOptions, PrefetchCapabilities
@@ -30,6 +31,7 @@ def engine():
     e = KVTaskEngine.__new__(KVTaskEngine)
     e.transfer_handles = []
     e.tasks = {}
+    e._terminal_tasks = OrderedDict()
     e.graph_to_task = {}
     e._update_tasks = lambda timeout=0: None
     e._wait_impl = lambda *args, **kwargs: {}  # a legacy request remains running
@@ -40,6 +42,32 @@ def engine():
     yield e
     e._runtime.stop()
     e._runtime = None  # __del__ has no owned transfer process
+
+
+def test_runtime_polls_running_store_tail_but_not_held_plan(engine):
+    def check():
+        engine.tasks[7] = NS(status=TaskStatus.RUNNING)
+        engine.graph_to_task[107] = 7
+        assert engine._next_runtime_wakeup(0.002) == 0.002
+        engine.tasks[7].status = TaskStatus.UNREADY
+        assert engine._next_runtime_wakeup(0.002) is None
+        engine.tasks.clear()
+        engine.graph_to_task.clear()
+
+    engine._runtime.call(check)
+
+
+def test_retained_result_expires_without_foreground_polling(engine):
+    def start():
+        engine._prefetch = PrefetchCoordinator(
+            Backend(target=0), result_ttl_s=0.03)
+        return engine._prefetch.start([1], PrefetchOptions())
+
+    handle = engine._runtime.call(start)
+    with engine._runtime.changed:
+        assert engine._runtime.changed.wait_for(
+            lambda: handle in engine._prefetch.expired, timeout=2)
+    assert len(engine._prefetch.backend.releases) == 1
 
 
 def test_capability_gate_runs_before_any_resource_allocation(monkeypatch):

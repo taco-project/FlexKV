@@ -1062,6 +1062,19 @@ class KVTaskEngine(KVTaskManager):
             self._runtime = TaskRuntime(self)
             self._runtime.start()
 
+    def _next_runtime_wakeup(self, poll_s):
+        # Held GET plans have no submitted I/O. Only RUNNING graphs require
+        # completion polling, including async PUT tails after request return.
+        if any(self.tasks[tid].status == TaskStatus.RUNNING
+               for tid in self.graph_to_task.values()):
+            return poll_s
+        delay = self._prefetch.next_wakeup(poll_s)
+        if self._terminal_tasks:
+            completed_at = next(iter(self._terminal_tasks.values()))
+            expiry = max(0, completed_at + 1800 - time.monotonic())
+            delay = expiry if delay is None else min(delay, expiry)
+        return delay
+
     @on_runtime
     def prefetch_capabilities(self) -> PrefetchCapabilities:
         if not hasattr(self, "_prefetch"):

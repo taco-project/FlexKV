@@ -98,6 +98,36 @@ def finish(coordinator, chunk, success=None):
     coordinator.on_completion(completion)
 
 
+def test_wakeup_tracks_active_work_then_result_expiry():
+    c, b, clock, h = setup()
+    assert c.next_wakeup(0.002) == 0.002
+    for _ in range(10):
+        c.tick()
+        for chunk in list(b.sent):
+            finish(c, chunk)
+    assert c.snapshot(h).terminal
+    assert c.next_wakeup(0.002) == c.result_ttl_s
+    clock.now = c.result_ttl_s
+    assert c.next_wakeup(0.002) == 0
+    c.tick()
+    assert c.snapshot(h).state == "expired"
+    assert c.next_wakeup(0.002) is None
+    assert len(b.releases) == 1
+
+
+def test_stopped_session_keeps_polling_until_inflight_drains():
+    c, b, clock, h = setup("timeout")
+    c.tick()
+    clock.now = 5
+    c.tick()
+    assert c.snapshot(h).stop_reason == "deadline"
+    assert c.next_wakeup(0.002) == 0.002
+    finish(c, b.sent[0])
+    c.tick()
+    assert c.snapshot(h).terminal
+    assert c.next_wakeup(0.002) == c.result_ttl_s
+
+
 @pytest.mark.parametrize("policy", ["wait_complete", "timeout", "best_effort"])
 def test_no_poll_needed_to_finish_all_chunks(policy):
     c, b, clock, h = setup(policy)

@@ -63,9 +63,11 @@ window of two chunks overlaps next-chunk planning/submission with current transf
 multiple sessions' graphs can share a batch. This is the TBO-inspired pipeline
 mechanism. An end-to-end speedup has not been established by the completed correctness tests.
 
-The runtime bridges existing non-selectable completion handles with a 2 ms poll;
-commands wake it immediately. It fills another window slot immediately when
-possible, and sleeps when no new chunk was admitted. Foreground planning remains
+The runtime polls existing non-selectable completion handles every 2 ms while
+prefetch or a RUNNING graph is active, including asynchronous PUT tails. It fills
+another window slot immediately when possible. Without active work it waits for
+a command or the next retained-result expiry, avoiding idle polling beside TP0.
+Commands wake it immediately; held GET plans do not require polling. Foreground planning remains
 serialized by the owner; a long synchronous foreground operation or an in-flight
 SDK metadata call is not preempted. Metadata hashing/query runs in its own executor
 without the radix lock and stops between bounded query batches. SDK call latency

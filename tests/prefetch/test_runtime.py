@@ -1,6 +1,6 @@
 """Actual background threads and pipes; transfer bytes are tested separately."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import threading
 import time
 from types import SimpleNamespace as NS
@@ -16,6 +16,7 @@ class Engine:
         self._prefetch = NS(tick=lambda: 0, sessions={}, reserved_bytes=0)
         self.owners = set()
         self.ticks = 0
+        self.polling = True
         self._runtime = TaskRuntime(self)
 
     def _update_tasks(self, timeout):
@@ -24,6 +25,9 @@ class Engine:
 
     def _reap_completed_tasks(self):
         pass
+
+    def _next_runtime_wakeup(self, poll_s):
+        return poll_s if self.polling else None
 
     @on_runtime
     def mutation(self):
@@ -56,6 +60,63 @@ def test_runtime_failure_wakes_callers_and_retains_failure():
     assert not engine._runtime.thread.is_alive()
     with pytest.raises(RuntimeError, match="retained"):
         engine.mutation()
+
+
+def test_idle_runtime_sleeps_and_command_wakes_it():
+    engine = Engine()
+    engine.polling = False
+    idle = threading.Event()
+    original_wait = engine._runtime.wake.wait
+
+    def wait(timeout):
+        if timeout is None:
+            idle.set()
+        return original_wait(timeout)
+
+    engine._runtime.wake.wait = wait
+    engine._runtime.start()
+    try:
+        assert idle.wait(2)
+        initial = engine.ticks
+        # Several former 2ms polling periods must pass without another tick.
+        with engine._runtime.changed:
+            assert not engine._runtime.changed.wait_for(
+                lambda: engine.ticks != initial, timeout=0.04)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(engine.mutation).result(timeout=2) == initial
+    finally:
+        engine._runtime.stop()
+
+
+def test_idle_runtime_drains_more_than_one_command_batch():
+    engine = Engine()
+    engine.polling = False
+    futures = [Future() for _ in range(200)]
+    for future in futures:
+        engine._runtime.commands.put((future, lambda: 42, (), {}))
+    engine._runtime.start()
+    try:
+        assert [future.result(timeout=2) for future in futures] == [42] * 200
+    finally:
+        engine._runtime.stop()
+
+
+def test_stop_between_loop_entry_and_event_clear_does_not_sleep():
+    engine = Engine()
+    engine.polling = False
+    original_clear = engine._runtime.wake.clear
+
+    def clear():
+        engine._runtime.stop()
+        original_clear()
+
+    engine._runtime.wake.clear = clear
+    engine._runtime.start()
+    try:
+        engine._runtime.thread.join(timeout=2)
+        assert not engine._runtime.thread.is_alive()
+    finally:
+        engine._runtime.stop()
 
 
 def test_outbox_hides_blocked_send_and_serializes_writes():

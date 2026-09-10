@@ -358,6 +358,17 @@ class PrefetchCoordinator:
             session.error,
         )
 
+    def next_wakeup(self, poll_s):
+        """Keep active work moving; retained results only need their TTL timer."""
+        now = self.clock()
+        delay = None
+        for session in self.sessions.values():
+            if session.terminal_at is None:
+                return poll_s
+            expiry = max(0, session.terminal_at + self.result_ttl_s - now)
+            delay = expiry if delay is None else min(delay, expiry)
+        return delay
+
     def reap(self):
         now = self.clock()
         for handle, session in list(self.sessions.items()):

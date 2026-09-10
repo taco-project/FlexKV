@@ -323,6 +323,7 @@ def _cpu_pipe_worker(command, result, shared, allow):
 
 
 def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
+    from collections import OrderedDict
     import multiprocessing as mp
     from flexkv.kvtask import KVTaskEngine
     from flexkv.transfer_manager import (
@@ -357,6 +358,7 @@ def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
     engine.cache_engine, engine._prefetch = env.engine.cache_engine, env.c
     engine._prefetch_backend, engine._prefetch_options = env.planner, PrefetchOptions()
     engine.tasks, engine.graph_to_task = {}, {}
+    engine._terminal_tasks = OrderedDict()
     engine.uncompleted_ops, engine.uncompleted_op_results, engine.uncompleted_graphs = (
         {},
         {},

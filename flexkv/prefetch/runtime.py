@@ -20,8 +20,9 @@ def on_runtime(method):
 class TaskRuntime:
     """Own engine state; callers wait on Futures without consuming result pipes.
 
-    A bounded 2ms poll bridges existing handles without selectable completion
-    descriptors (notably remote handles). Wakeups on commands are immediate.
+    Poll active work every 2ms because existing handles lack selectable
+    completion descriptors. When idle, sleep until a command or a retained
+    result expires, so a hot GPU cache does not pay for background polling.
     Each pass reserves at most one chunk/session to bound control work.
     """
 
@@ -94,7 +95,15 @@ class TaskRuntime:
                     and len(s.chunks) < s.options.max_inflight_chunks
                     for s in active
                 )
-                self.wake.wait(0 if runnable and submitted else self.poll_s)
+                if self.stopping:
+                    break
+                # A command batch is bounded above; pending commands must not
+                # sleep after their wake event was consumed at loop entry.
+                if (runnable and submitted) or not self.commands.empty():
+                    timeout = 0
+                else:
+                    timeout = self.engine._next_runtime_wakeup(self.poll_s)
+                self.wake.wait(timeout)
         except BaseException as exc:
             self.error = exc
         finally:
