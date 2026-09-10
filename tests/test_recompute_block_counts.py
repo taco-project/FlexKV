@@ -76,3 +76,48 @@ def test_recompute_matches_heterogeneous_layout_block_size() -> None:
     assert recompute_cache_block_counts(model_config, cache_config) is True
     assert cache_config.num_cpu_blocks == expected_blocks
     assert cache_config.num_cpu_blocks != uniform_blocks
+
+
+def test_compact_indexer_reclaims_capacity_at_fixed_bytes() -> None:
+    num_layers = 8
+    active_indexer_layers = [0, 3, 7]
+    model_config = ModelConfig(
+        num_layers=num_layers,
+        num_kv_heads=1,
+        head_size=576,
+        kv_dim=1,
+        tp_size=4,
+        dtype=torch.bfloat16,
+    )
+    cache_config = CacheConfig(tokens_per_block=64)
+    user_config = UserConfig(
+        # Synthetic fixed byte budget.
+        cpu_cache_gb=1,
+        ssd_cache_gb=0,
+    )
+    rank_info = RankInfo(model_config=model_config)
+    update_default_config_from_user_config(rank_info, cache_config, user_config)
+    model_config.layer_groups = [
+        LayerGroupSpec(
+            num_layers=num_layers,
+            num_kv_heads=1,
+            head_size=576,
+            layer_indices=list(range(num_layers)),
+            compress_ratio=1,
+            dtype=torch.bfloat16,
+        ),
+        LayerGroupSpec(
+            num_layers=len(active_indexer_layers),
+            num_kv_heads=1,
+            head_size=8448,
+            layer_indices=active_indexer_layers,
+            compress_ratio=64,
+            dtype=torch.uint8,
+        ),
+    ]
+
+    assert recompute_cache_block_counts(model_config, cache_config) is True
+    compact_bytes = 4 * (8 * 64 * 576 * 2 + 3 * 8448)
+    aliased_bytes = 4 * (8 * 64 * 576 * 2 + 8 * 8448)
+    assert cache_config.num_cpu_blocks == (1 << 30) // compact_bytes
+    assert cache_config.num_cpu_blocks > (1 << 30) // aliased_bytes

@@ -118,6 +118,18 @@ class TransferManager:
                 f"intra_client_id (registered so far: "
                 f"{sorted(self.all_gpu_blocks)}).")
         else:
+            if (
+                req.layer_groups is not None
+                and self.model_config.layer_groups is not None
+                and self.model_config.layer_groups != req.layer_groups
+            ):
+                # Validate before mutating any registration maps.  Compact
+                # indexer groups must be identical on every TP/ordinary-CP
+                # rank; a CP layer-split rank-local group is not supported.
+                raise ValueError(
+                    "layer groups differ across GPU registrations: "
+                    f"worker={registration_key}"
+                )
             try:
                 self.all_gpu_blocks[registration_key] = req.handles
                 self.all_gpu_layouts[registration_key] = req.gpu_layout
