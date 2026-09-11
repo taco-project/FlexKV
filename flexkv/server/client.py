@@ -389,6 +389,32 @@ class KVTPClient:
         swa_handles_per_group: Optional[List[List[torch.Tensor]]] = None,
         resume: bool = False,
     ) -> None:
+        group_fields = (layer_groups, gpu_layouts, handles_per_group)
+        if any(value is not None for value in group_fields) and not all(
+            value is not None for value in group_fields
+        ):
+            raise ValueError(
+                "layer_groups, gpu_layouts, and handles_per_group must be "
+                "provided together"
+            )
+        if layer_groups is not None:
+            if not (
+                len(layer_groups) == len(gpu_layouts) == len(handles_per_group)
+            ):
+                raise ValueError("multi-group registration length mismatch")
+            for group_idx, (spec, layout, group_handles) in enumerate(
+                zip(layer_groups, gpu_layouts, handles_per_group, strict=True)
+            ):
+                if not (
+                    spec.num_layers
+                    == layout.num_layer
+                    == len(group_handles)
+                ):
+                    raise ValueError(
+                        "multi-group layer count mismatch: "
+                        f"group={group_idx} spec={spec.num_layers} "
+                        f"layout={layout.num_layer} handles={len(group_handles)}"
+                    )
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
         swa_group_fields = (

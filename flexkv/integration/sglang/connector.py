@@ -76,6 +76,15 @@ class _CacheOpContext:
     task_id: int = -1
 
 
+@dataclass(frozen=True)
+class _IndexerBufferGroup:
+    """Physical indexer buffers plus their original layer ids."""
+
+    buffers: Tuple[torch.Tensor, ...]
+    layer_indices: Tuple[int, ...]
+    logical_layer_count: int
+
+
 def _status_value(response: Any) -> str:
     status = getattr(response, "status", None)
     value = getattr(status, "value", status)
@@ -212,11 +221,14 @@ class FlexKVConnector:
         self._is_dsv4 = hasattr(kvcache, "c4_kv_pool")
         self._dsv4_layer_groups: List[Dict[str, Any]] = []
         self._dsv4_state_groups: List[Dict[str, Any]] = []
-        kv_caches, indexer_buffers = self._resolve_kv_buffers(kvcache)
+        self._deduplicate_indexer_group = os.getenv(
+            "FLEXKV_DEDUP_INDEXER_GROUP", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
 
         # Heterogeneous groups change the bytes represented by one logical
         # FlexKV block. Recompute CPU/SSD capacities before KVManager starts.
-        self._apply_layer_groups_for_cache_sizing(kv_caches, indexer_buffers)
+        self._apply_layer_groups_for_cache_sizing(kv_caches, indexer_group)
         self._label = f"[model_config={self.model_config}, rank_info={self.rank_info}]"
 
         # 5. On multi-node setups, every node beyond node 0 needs a
@@ -258,7 +270,7 @@ class FlexKVConnector:
             intra_client_id=self.rank_info.intra_client_id,
             device_id=self.rank_info.local_rank,
         )
-        self._register_with_retry(kv_caches, indexer_buffers)
+        self._register_with_retry(kv_caches, indexer_group)
 
         # 8. Layerwise transfer plumbing.
         self.enable_layerwise = bool(
@@ -1781,20 +1793,119 @@ class FlexKVConnector:
             )
         return resolved
 
+    @staticmethod
+    def _compact_indexer_buffers(
+        indexer_buffers: Sequence[torch.Tensor],
+        skip_topk_layers: Sequence[bool],
+        *,
+        layer_shard_enabled: bool,
+    ) -> _IndexerBufferGroup:
+        """Drop static ``skip_topk`` aliases from the FlexKV indexer group.
+
+        This first implementation supports ordinary TP/CP, where every cache
+        rank exposes the same physical Index-K buffers.  DSA cache layer split
+        also represents non-owned *active* layers as zero-row tensors; those
+        require an owner-aware registration protocol and must not be inferred
+        from tensor shape here.
+        """
+        buffers = list(indexer_buffers)
+        skip_mask = [bool(value) for value in skip_topk_layers]
+        if layer_shard_enabled:
+            raise RuntimeError(
+                "FLEXKV_DEDUP_INDEXER_GROUP does not yet support "
+                "CP DSA cache layer split; disable "
+                "--enable-dsa-cache-layer-split or disable indexer dedup"
+            )
+        if len(skip_mask) != len(buffers):
+            raise RuntimeError(
+                "FlexKV indexer skip-topk metadata length mismatch: "
+                f"mask={len(skip_mask)} buffers={len(buffers)}"
+            )
+
+        active_buffers: List[torch.Tensor] = []
+        active_layer_indices: List[int] = []
+        sample: Optional[torch.Tensor] = None
+        for layer_idx, (buffer, skip_topk) in enumerate(zip(buffers, skip_mask, strict=True)):
+            if buffer.ndim != 2:
+                raise RuntimeError(
+                    f"FlexKV indexer layer {layer_idx} expects a 2D buffer, "
+                    f"got shape={tuple(buffer.shape)}"
+                )
+            if skip_topk:
+                continue
+            if buffer.shape[0] == 0:
+                raise RuntimeError(
+                    "FlexKV active indexer layer has no physical buffer: "
+                    f"layer={layer_idx} shape={tuple(buffer.shape)}"
+                )
+            if sample is None:
+                sample = buffer
+            elif (
+                buffer.shape != sample.shape
+                or buffer.dtype != sample.dtype
+                or buffer.device != sample.device
+            ):
+                raise RuntimeError(
+                    "FlexKV active indexer buffers must share shape, dtype, "
+                    f"and device: layer={layer_idx} shape={tuple(buffer.shape)} "
+                    f"dtype={buffer.dtype} device={buffer.device}; "
+                    f"expected_shape={tuple(sample.shape)} "
+                    f"expected_dtype={sample.dtype} expected_device={sample.device}"
+                )
+            active_buffers.append(buffer)
+            active_layer_indices.append(layer_idx)
+
+        if not active_buffers:
+            raise RuntimeError("FlexKV indexer dedup found no active Index-K layers")
+        active_ptrs = [buffer.data_ptr() for buffer in active_buffers]
+        if len(set(active_ptrs)) != len(active_ptrs):
+            raise RuntimeError(
+                "FlexKV active indexer buffers unexpectedly alias each other"
+            )
+        return _IndexerBufferGroup(
+            buffers=tuple(active_buffers),
+            layer_indices=tuple(active_layer_indices),
+            logical_layer_count=len(buffers),
+        )
+
     def _resolve_kv_buffers(
         self, kvcache: Any
-    ) -> Tuple[List[torch.Tensor], Optional[List[torch.Tensor]]]:
+    ) -> Tuple[List[torch.Tensor], Optional[_IndexerBufferGroup]]:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
         if indexer_buffers:
-            indexer_buffers = self._alias_empty_indexer_buffers(indexer_buffers)
+            if self._deduplicate_indexer_group:
+                indexer_group = self._compact_indexer_buffers(
+                    indexer_buffers,
+                    getattr(kvcache, "skip_topk_layers", ()),
+                    layer_shard_enabled=bool(
+                        getattr(kvcache, "layer_shard_enabled", False)
+                    ),
+                )
+                logger.info(
+                    "[FlexKV] compacted indexer group: logical_layers=%d "
+                    "physical_layers=%d skipped_layers=%d layer_indices=%s",
+                    indexer_group.logical_layer_count,
+                    len(indexer_group.buffers),
+                    indexer_group.logical_layer_count - len(indexer_group.buffers),
+                    list(indexer_group.layer_indices),
+                )
+            else:
+                aliased = self._alias_empty_indexer_buffers(list(indexer_buffers))
+                indexer_group = _IndexerBufferGroup(
+                    buffers=tuple(aliased),
+                    layer_indices=tuple(range(len(aliased))),
+                    logical_layer_count=len(aliased),
+                )
+        else:
+            indexer_group = None
         if not self._is_dsv4:
             if hasattr(kvcache, "kv_buffer"):
-                return list(kvcache.kv_buffer), indexer_buffers
+                return list(kvcache.kv_buffer), indexer_group
             if hasattr(kvcache, "k_buffer"):
                 return (
                     list(kvcache.k_buffer) + list(kvcache.v_buffer),
-                    indexer_buffers,
+                    indexer_group,
                 )
             raise AttributeError(
                 f"Unsupported KV cache type {type(kvcache).__name__}: "
@@ -1996,9 +2107,16 @@ class FlexKVConnector:
     def _build_indexer_layer_group_specs(
         self,
         kv_caches: List[torch.Tensor],
-        indexer_buffers: List[torch.Tensor],
+        indexer_group: _IndexerBufferGroup,
     ) -> List[LayerGroupSpec]:
         _, num_kv_heads, head_size = kv_caches[0].shape
+        if indexer_group.logical_layer_count != self.rank_info.num_layers_per_pp_stage:
+            raise RuntimeError(
+                "FlexKV indexer logical layer count mismatch: "
+                f"indexer={indexer_group.logical_layer_count} "
+                f"pp_stage={self.rank_info.num_layers_per_pp_stage}"
+            )
+        indexer_buffers = indexer_group.buffers
         return [
             LayerGroupSpec(
                 num_layers=self.rank_info.num_layers_per_pp_stage,
@@ -2017,7 +2135,7 @@ class FlexKVConnector:
                 # Describe that row as one page so the worker does not
                 # multiply it by page_size a second time.
                 head_size=indexer_buffers[0].shape[1],
-                layer_indices=list(range(len(indexer_buffers))),
+                layer_indices=list(indexer_group.layer_indices),
                 compress_ratio=self.page_size,
                 dtype=indexer_buffers[0].dtype,
             ),
@@ -2026,15 +2144,15 @@ class FlexKVConnector:
     def _apply_layer_groups_for_cache_sizing(
         self,
         kv_caches: List[torch.Tensor],
-        indexer_buffers: Optional[List[torch.Tensor]],
+        indexer_group: Optional[_IndexerBufferGroup],
     ) -> None:
         if self.model_config.layer_groups is None:
             layer_groups = None
             if self._is_dsv4:
                 layer_groups = self._build_dsv4_layer_group_specs()
-            elif indexer_buffers:
+            elif indexer_group is not None:
                 layer_groups = self._build_indexer_layer_group_specs(
-                    kv_caches, indexer_buffers
+                    kv_caches, indexer_group
                 )
             else:
                 return
@@ -2123,7 +2241,7 @@ class FlexKVConnector:
     def _register_with_retry(
         self,
         kv_caches: List[torch.Tensor],
-        indexer_buffers: Optional[List[torch.Tensor]] = None,
+        indexer_group: Optional[_IndexerBufferGroup] = None,
         max_retries: int = 360,
     ) -> None:
         """Retry GPU registration. On node_rank>0, the
@@ -2131,7 +2249,7 @@ class FlexKVConnector:
         to ~6 minutes."""
         for attempt in range(max_retries):
             try:
-                self._register_to_server(kv_caches, indexer_buffers)
+                self._register_to_server(kv_caches, indexer_group)
                 return
             except Exception as exc:  # noqa: BLE001
                 if attempt == max_retries - 1:
@@ -2149,18 +2267,18 @@ class FlexKVConnector:
     def _register_to_server(
         self,
         kv_caches: List[torch.Tensor],
-        indexer_buffers: Optional[List[torch.Tensor]] = None,
+        indexer_group: Optional[_IndexerBufferGroup] = None,
     ) -> None:
         assert len(kv_caches) > 0
         if self._is_dsv4:
             self._register_dsv4_to_server(kv_caches)
         else:
-            self._register_standard_to_server(kv_caches, indexer_buffers)
+            self._register_standard_to_server(kv_caches, indexer_group)
 
     def _register_standard_to_server(
         self,
         kv_caches: List[torch.Tensor],
-        indexer_buffers: Optional[List[torch.Tensor]] = None,
+        indexer_group: Optional[_IndexerBufferGroup] = None,
     ) -> None:
         assert (
             kv_caches[0].ndim == 3
@@ -2184,7 +2302,8 @@ class FlexKVConnector:
         )
 
         indexer_layout = None
-        if indexer_buffers is not None and len(indexer_buffers) > 0:
+        if indexer_group is not None:
+            indexer_buffers = indexer_group.buffers
             indexer_tensor = indexer_buffers[0]
             assert indexer_tensor.ndim == 2, (
                 f"Expected 2D indexer tensor (num_pages, page_stride_size), "
@@ -2202,12 +2321,13 @@ class FlexKVConnector:
                 num_kv_heads=1,
             )
 
-        if indexer_buffers and indexer_layout is not None:
+        if indexer_group is not None and indexer_layout is not None:
+            indexer_buffers = indexer_group.buffers
             self.tp_client.register_to_server(
                 kv_caches=list(kv_caches) + list(indexer_buffers),
                 kv_layout=gpu_layout,
                 layer_groups=self._build_indexer_layer_group_specs(
-                    kv_caches, indexer_buffers
+                    kv_caches, indexer_group
                 ),
                 gpu_layouts=[gpu_layout, indexer_layout],
                 handles_per_group=[list(kv_caches), list(indexer_buffers)],
