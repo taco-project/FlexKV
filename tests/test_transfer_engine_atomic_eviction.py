@@ -57,13 +57,16 @@ def _make_op(transfer_type: TransferType = TransferType.D2H,
 
 
 def _make_layerwise_op(**kwargs) -> LayerwiseTransferOp:
-    """Create a minimal LayerwiseTransferOp for testing."""
+    """Create a minimal LayerwiseTransferOp for testing.
+
+    No disk2h ids: a merged DISK2H is now hoisted to an op of its own on the
+    graph rather than carried inside the layerwise op, so the layerwise op
+    describes only the H2D half.
+    """
     defaults = dict(
         graph_id=0,
         src_block_ids_h2d=np.array([0, 1], dtype=np.int64),
         dst_block_ids_h2d=np.array([2, 3], dtype=np.int64),
-        src_block_ids_disk2h=np.array([], dtype=np.int64),
-        dst_block_ids_disk2h=np.array([], dtype=np.int64),
         dp_client_id=0,
     )
     defaults.update(kwargs)

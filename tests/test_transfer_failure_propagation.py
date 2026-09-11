@@ -20,6 +20,7 @@ import pytest
 from flexkv import c_ext
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.pool import PoolId
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.transfer import (
     CompletedOp,
@@ -142,17 +143,61 @@ class _EngineHarness:
         self._child_to_parent_op_id = {}
         self._failed_graph_ids = set()
         self._failed_parent_op_ids = set()
-        self._worker_map = {}
-        self._swa_worker_map = {}
+        # The registry is keyed by (pool, transfer type); ``_worker_map`` and
+        # ``_swa_worker_map`` are live views onto two of its pools, so seeding
+        # ``_workers`` is what makes all three consistent.
+        self._workers = {}
         self.pin_buffer = None
         self.completed_queue = Queue()
         self.scheduler = TransferScheduler()
 
+    _worker_map = TransferEngine._worker_map
+    _swa_worker_map = TransferEngine._swa_worker_map
+    _worker_entry_for = TransferEngine._worker_entry_for
     _handle_failed_op = TransferEngine._handle_failed_op
     _discard_failed_op = TransferEngine._discard_failed_op
     _finalize_or_discard = TransferEngine._finalize_or_discard
     _emit_drained_graph_failures = TransferEngine._emit_drained_graph_failures
     _op_buffer_registered_here = TransferEngine._op_buffer_registered_here
+
+
+def test_dispatch_never_crosses_pools():
+    """An SWA op must not land on the full-KV worker when SWA is unregistered.
+
+    The two pools are two slot-id spaces, so serving one from the other's
+    worker reads the right transfer type out of the wrong pool -- silently,
+    and with nothing downstream able to notice. A missing (pool, type) is a
+    registration bug, so the lookup raises instead of falling back.
+    """
+    engine = _EngineHarness()
+    sentinel = object()
+    engine._workers = {PoolId.FULL_KV: {TransferType.H2D: sentinel}}
+
+    full_op = TransferOp(graph_id=0, transfer_type=TransferType.H2D,
+                         src_block_ids=np.array([0]), dst_block_ids=np.array([0]))
+    assert engine._worker_entry_for(full_op) is sentinel
+
+    swa_op = TransferOp(graph_id=0, transfer_type=TransferType.H2D,
+                        src_block_ids=np.array([0]), dst_block_ids=np.array([0]),
+                        pool_id=PoolId.SWA)
+    with pytest.raises(ValueError, match="SWA"):
+        engine._worker_entry_for(swa_op)
+
+
+def test_dispatch_finds_a_worker_shared_by_both_pools():
+    """Where one worker does serve both pools (GPU<->CPU), that is expressed
+    by registering the same handle twice -- so the SWA lookup hits directly."""
+    engine = _EngineHarness()
+    shared = object()
+    engine._workers = {
+        PoolId.FULL_KV: {TransferType.D2H: shared},
+        PoolId.SWA: {TransferType.D2H: shared},
+    }
+    for pool in (PoolId.FULL_KV, PoolId.SWA):
+        op = TransferOp(graph_id=0, transfer_type=TransferType.D2H,
+                        src_block_ids=np.array([0]), dst_block_ids=np.array([0]),
+                        pool_id=pool)
+        assert engine._worker_entry_for(op) is shared
 
 
 def test_failed_op_fails_graph_and_emits_after_drain():
