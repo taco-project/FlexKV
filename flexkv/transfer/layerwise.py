@@ -20,11 +20,7 @@ from flexkv.common.transfer import WorkerKey
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp
-from flexkv.transfer.worker import (
-    TransferWorkerBase,
-    ensure_cuda_device,
-    import_tensor_handles,
-)
+from flexkv.transfer.worker import TransferWorkerBase
 
 
 def build_layerwise_eventfd_socket_path(
@@ -117,11 +113,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         # Under DP each LayerwiseWorker owns one GPU; without this every worker
         # would create a default context on GPU0 and starve it.
         if gpu_blocks and gpu_blocks[0]:
-            ensure_cuda_device(gpu_blocks[0][0].device)
+            self._ensure_cuda_device(gpu_blocks[0][0].device)
         self._pin_op_buffer()
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
-            imported_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
+            imported_gpu_blocks.append(self._import_tensor_handles(handles_in_one_gpu))
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type (uint8 in multi-group)
         self.kv_dim = gpu_kv_layouts[0].kv_dim
@@ -222,7 +218,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             )
             imported_swa_gpu_blocks: List[List[torch.Tensor]] = []
             for handles_in_one_gpu in swa_gpu_blocks:
-                imported_swa_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
+                imported_swa_gpu_blocks.append(self._import_tensor_handles(handles_in_one_gpu))
             self.swa_gpu_blocks = imported_swa_gpu_blocks
             swa_cpu_blocks = materialize_worker_tensor(swa_cpu_blocks)
             self._register_host_tensor(swa_cpu_blocks, "layerwise_swa_cpu_pool")
@@ -502,7 +498,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
             imported_group_blocks: List[List[torch.Tensor]] = []
             for handles_for_device in group_blocks_per_device:
-                imported_group_blocks.append(import_tensor_handles(handles_for_device))
+                imported_group_blocks.append(self._import_tensor_handles(handles_for_device))
             gpu_blocks_per_group_tensors.append(imported_group_blocks)
 
             for layout in group_layouts_per_device:
