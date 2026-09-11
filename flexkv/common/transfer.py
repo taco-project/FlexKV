@@ -118,6 +118,7 @@ class DeviceType(IntEnum):
     REMOTE = 3
     PEERCPU = 4
     PEERSSD = 5
+    CXL = 6  # CXL memory expander (NUMA node with memory but no CPUs)
 
 class TransferType(Enum):
     H2D    = "H2D"
@@ -132,6 +133,11 @@ class TransferType(Enum):
     H2PEERH = "H2PEERH"
     PEERSSD2H = "PEERSSD2H"
     H2PEERSSD = "H2PEERSSD"
+    # CXL memory tier transfers
+    H2CXL = "H2CXL"        # Host DDR -> CXL memory
+    CXL2H = "CXL2H"        # CXL memory -> Host DDR
+    CXL2DISK = "CXL2DISK"  # CXL memory -> SSD
+    DISK2CXL = "DISK2CXL"  # SSD -> CXL memory
 
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2

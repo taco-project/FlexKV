@@ -307,6 +307,7 @@ class StorageHandle:
     # Optional metadata
     num_blocks_per_file: Optional[int] = None
     gpu_device_id: Optional[int] = None
+    cxl_numa_node: Optional[int] = None  # NUMA node for CXL memory
     remote_config_custom: Optional[Dict[str, Any]] = None
     worker_data: Optional[Any] = None
 
