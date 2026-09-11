@@ -587,6 +587,8 @@ class SWAPoolConfig:
     # True when the SWA page also carries heterogeneous sidecar groups (for
     # example DeepSeek-V4 attention/indexer compress states).
     multi_group: bool = False
+    # Inferred by the framework adapter, including all SWA/state sidecars.
+    snapshot_bytes: Optional[int] = None
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
     pin_memory: bool = True            # Use pinned memory for async DMA
 
@@ -638,8 +640,10 @@ class CacheConfig:
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
 
-    distributed_node_id: int = -1 # only used when distributed cpu/ssd and only can be set when redis_meta_client initialized
-    num_tmp_cpu_blocks: int = 500 # only used when distributed ssd p2p, it controls the number blocks of temp cpu buffer which used for copy data from ssd to cpu
+    # Assigned after Redis metadata initialization for distributed CPU/SSD.
+    distributed_node_id: int = -1
+    # CPU staging capacity for distributed SSD P2P copies.
+    num_tmp_cpu_blocks: int = 500
     # When True, the main CPU KV cache is allocated from Linux HugePages via
     # ``mmap(MAP_HUGETLB)`` instead of regular CPU memory. Requires pre-reserved
     # huge pages on the host (see ``/proc/sys/vm/nr_hugepages``). Falls back
@@ -716,6 +720,13 @@ class CacheConfig:
     # until that worker is registered, otherwise SWA ops would hit "Unsupported
     # transfer type" in the transfer engine. Flip to True once the worker lands.
     enable_swa_transfer: bool = False
+
+    enable_chunked_prefetch: bool = False
+    prefetch_options: Optional[Dict[str, Any]] = None
+    prefetch_max_sessions: int = 128
+    prefetch_max_reserved_bytes: int = 512 * 1024 * 1024
+    prefetch_max_pinned_bytes: int = 2 * 1024 * 1024 * 1024
+    prefetch_result_ttl_s: float = 60.0
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
@@ -880,12 +891,20 @@ class UserConfig:
     local_ip: Optional[str] = None
     redis_password: Optional[str] = None
     node_ttl_seconds: Optional[int] = None
-    kv_cache_dtype: Optional[str] = None  # Override kv_cache_dtype when TRT config uses "auto". Supported values: "fp8", "float8", "e4m3", "fp16", "float16", "bf16", "bfloat16", "fp32", "float32", "nvfp4" (packed fp4+fp8-scale, stored as uint8)
+    # Override TRT's "auto": fp8/fp16/bf16/fp32 aliases, or packed nvfp4 (uint8).
+    kv_cache_dtype: Optional[str] = None
     # DeepSeek-V4 SWA sidecar policy. None/True enables attention and indexer
     # compress-state I/O together with SWA; False keeps the legacy SWA-only
     # path. None is intentionally distinct from False so old configs default
     # to the correctness-preserving state restore path.
     swa_multi_group: Optional[bool] = None
+
+    enable_chunked_prefetch: bool = False
+    prefetch_options: Optional[Dict[str, Any]] = None
+    prefetch_max_sessions: int = 128
+    prefetch_max_reserved_bytes: int = 512 * 1024 * 1024
+    prefetch_max_pinned_bytes: int = 2 * 1024 * 1024 * 1024
+    prefetch_result_ttl_s: float = 60.0
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
@@ -946,6 +965,12 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
 def load_user_config_from_env() -> UserConfig:
     swa_multi_group_env = os.getenv('FLEXKV_SWA_MULTI_GROUP')
     return UserConfig(
+        enable_chunked_prefetch=bool(int(os.getenv('FLEXKV_ENABLE_CHUNKED_PREFETCH', 0))),
+        prefetch_options=json.loads(os.getenv('FLEXKV_PREFETCH_OPTIONS', '{}')),
+        prefetch_max_sessions=int(os.getenv('FLEXKV_PREFETCH_MAX_SESSIONS', 128)),
+        prefetch_max_reserved_bytes=int(os.getenv('FLEXKV_PREFETCH_MAX_RESERVED_BYTES', 512 * 1024 * 1024)),
+        prefetch_max_pinned_bytes=int(os.getenv('FLEXKV_PREFETCH_MAX_PINNED_BYTES', 2 * 1024 * 1024 * 1024)),
+        prefetch_result_ttl_s=float(os.getenv('FLEXKV_PREFETCH_RESULT_TTL_S', 60)),
         cpu_cache_gb=int(os.getenv('FLEXKV_CPU_CACHE_GB', 16)),
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
         ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./flexkv_ssd")),
@@ -1077,6 +1102,12 @@ def recompute_cache_block_counts(
 def update_default_config_from_user_config(rank_info: RankInfo,
                                            cache_config: CacheConfig,
                                            user_config: UserConfig) -> None:
+    cache_config.enable_chunked_prefetch = user_config.enable_chunked_prefetch
+    cache_config.prefetch_options = user_config.prefetch_options
+    cache_config.prefetch_max_sessions = user_config.prefetch_max_sessions
+    cache_config.prefetch_max_reserved_bytes = user_config.prefetch_max_reserved_bytes
+    cache_config.prefetch_max_pinned_bytes = user_config.prefetch_max_pinned_bytes
+    cache_config.prefetch_result_ttl_s = user_config.prefetch_result_ttl_s
     block_size_in_bytes = block_size_in_bytes_for_cache(
         rank_info.model_config, cache_config, rank_info)
 

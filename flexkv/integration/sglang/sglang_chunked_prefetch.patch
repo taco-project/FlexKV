@@ -1,0 +1,790 @@
+diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
+index 4d68b4c4d7..6d89c2f3dd 100644
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -836,6 +836,32 @@ class PrefillAdder:
+         now_input_len = now_input_len // self.page_size * self.page_size
+         return max(0, now_input_len - prefix_len)
+
++    def _check_prefill_shape(
++        self,
++        prefix_len: int,
++        total_len: int,
++        chunk_limit: Optional[int],
++        alignment: Optional[int],
++    ) -> Optional[AddReqResult]:
++        input_tokens = self.ceil_paged_tokens(total_len - prefix_len)
++        if (
++            self.rem_chunk_tokens is None
++            and self.can_run_list
++            and input_tokens >= self.rem_input_tokens
++        ):
++            return AddReqResult.OTHER
++        if self.dllm_config is not None:
++            if self.rem_dllm_tokens <= 0:
++                return AddReqResult.OTHER
++            assert alignment is None, "truncation alignment is not supported for dllm"
++        elif chunk_limit is not None and input_tokens > chunk_limit:
++            input_tokens = self._get_chunked_prefill_len(
++                prefix_len, chunk_limit, alignment
++            )
++            if input_tokens <= 0:
++                return AddReqResult.OTHER
++        return self._check_prefill_tile_budget(input_tokens)
++
+     def budget_state(self):
+         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
+         if not no_token and self.is_hybrid_swa:
+@@ -1326,42 +1352,15 @@ class PrefillAdder:
+             # the waiting-queue rematch overwrites the request-owned slot list and
+             # those allocations become unreachable.
+             projected_prefix_len = prefix_len + req.host_hit_length
+-            projected_input_tokens = self.ceil_paged_tokens(
+-                len(req.full_untruncated_fill_ids) - projected_prefix_len
+-            )
+-            will_chunk = (
+-                self.dllm_config is None
+-                and chunk_tokens_limit is not None
+-                and projected_input_tokens > chunk_tokens_limit
+-            )
+-            trunc_len = None
+-            if self.dllm_config is not None:
+-                if self.rem_dllm_tokens <= 0:
+-                    return AddReqResult.OTHER
+-                assert truncation_align_size is None, (
+-                    "truncation_align_size is not supported for dllm prefill"
+-                )
+-                if (
+-                    tile_stop := self._check_prefill_tile_budget(projected_input_tokens)
+-                ) is not None:
+-                    return tile_stop
+-            elif not will_chunk:
+-                if (
+-                    tile_stop := self._check_prefill_tile_budget(projected_input_tokens)
+-                ) is not None:
+-                    return tile_stop
+-            else:
+-                trunc_len = self._get_chunked_prefill_len(
++            if (
++                shape_stop := self._check_prefill_shape(
+                     projected_prefix_len,
++                    len(req.full_untruncated_fill_ids),
+                     chunk_tokens_limit,
+                     truncation_align_size,
+                 )
+-                if trunc_len <= 0:
+-                    return AddReqResult.OTHER
+-                if (
+-                    tile_stop := self._check_prefill_tile_budget(trunc_len)
+-                ) is not None:
+-                    return tile_stop
++            ) is not None:
++                return shape_stop
+
+             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
+             # report not-prefillable via finalize()) and before init_load_back
+@@ -1399,6 +1398,31 @@ class PrefillAdder:
+                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+             )
+
++            # A recoverable restore miss leaves a larger prefill to compute.
++            # Re-evaluate its shape before committing this request to the batch.
++            if prefix_len != projected_prefix_len:
++                if (
++                    shape_stop := self._check_prefill_shape(
++                        prefix_len,
++                        len(req.full_untruncated_fill_ids),
++                        chunk_tokens_limit,
++                        truncation_align_size,
++                    )
++                ) is not None:
++                    return shape_stop
++            will_chunk = (
++                self.dllm_config is None
++                and chunk_tokens_limit is not None
++                and input_tokens > chunk_tokens_limit
++            )
++            trunc_len = (
++                self._get_chunked_prefill_len(
++                    prefix_len, chunk_tokens_limit, truncation_align_size
++                )
++                if will_chunk
++                else None
++            )
++
+             if self.dllm_config is not None:
+                 # Budget and tile gates for this request already ran above,
+                 # before init_load_back(), so only the commit remains here.
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 5c0d0dcc8d..efa53795ad 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3117,7 +3117,7 @@ class Scheduler(
+                 )
+         elif self.enable_flexkv:
+             logger.info(f"[FlexKV] sglang startprefetch: request={req.rid}")
+-            # Wait-complete FlexKV prefetch: tree_cache owns token selection.
++            # The adapter starts either legacy or chunked prefetch from its config.
+             self.tree_cache.prefetch_request(req)
+
+     def _retry_missed_storage_prefetches(self):
+@@ -3886,9 +3886,11 @@ class Scheduler(
+                 if res == AddReqResult.NO_TOKEN:
+                     if (
+                         self.enable_hierarchical_cache
++                        or self.enable_flexkv
+                         or self.enable_unified_cache_external_linker
+                     ):
+-                        # Set batch_is_full after making sure there are requests that can be served
++                        # An idle FlexKV batch must retry when host-cache pressure
++                        # clears; no running decode can reset batch_is_full for it.
+                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                             not running_batch.is_empty()
+                         )
+diff --git a/python/sglang/srt/mem_cache/storage/flexkv/README.md b/python/sglang/srt/mem_cache/storage/flexkv/README.md
+index beca6b6c99..3a4066c54e 100644
+--- a/python/sglang/srt/mem_cache/storage/flexkv/README.md
++++ b/python/sglang/srt/mem_cache/storage/flexkv/README.md
+@@ -10,6 +10,26 @@ Remote offload). Same integration pattern as
+
+ ---
+
++## Optional chunked prefetch
++
++Pair this integration with [FlexKV #291](https://github.com/taco-project/FlexKV/pull/291)
++to enable `wait_complete`, `timeout`, or `best_effort` in FlexKV's
++`prefetch_options`. The new mode is disabled by default; use
++`enable_chunked_prefetch=true` in the existing FlexKV JSON configuration.
++`chunk_max_blocks` is the single chunk-size control. Configuration, interfaces,
++resource limits, sequence diagrams and monitoring boundaries are described in
++FlexKV's `docs/design/chunked_prefetch_reference.md`.
++
++Queue entry passes the complete token hash chain without a foreground remote
++lookup or GPU allocation. Scheduler candidacy signals demand through
++`check_prefetch_progress`; the connector stops new chunks according to the
++policy, drains already claimed work, and hands the protected CPU prefix to the
++existing restore path. This does not require a HiCache storage backend. Timeout
++limits further submissions, so the final response also includes drain time.
++Requests with `extra_key` or `cache_salt` skip this optional prefetch path until
++the foreground adapter carries the same namespace. Existing legacy prefetch
++remains available when chunked prefetch is disabled.
++
+ ## Quick start (single H20, single GPU, Qwen3-8B)
+
+ This walks through everything the verification on H20-GPU-11 actually
+diff --git a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_hybrid_radix_cache.py b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_hybrid_radix_cache.py
+index 427935a15e..65bfec6f44 100644
+--- a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_hybrid_radix_cache.py
++++ b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_hybrid_radix_cache.py
+@@ -707,32 +707,51 @@ class FlexKVHybridRadixCache(BasePrefixCache):
+         # flush, whose connector reset fences H2D before freeing them.
+
+     def prefetch_request(self, req: Req) -> None:
+-        """Wait-complete FlexKV prefetch; see FlexKVRadixCache.prefetch_request."""
++        """Start queued prefetch without a foreground lookup or H2D allocation."""
++        # Foreground lookup runs after stop-and-drain, otherwise it could fetch
++        # the whole remote prefix before the prefetch policy gets a chance to stop.
+         req.init_next_round_input(tree_cache=None, cow_mamba=False)
+         fill_ids = req.full_untruncated_fill_ids
+         if not fill_ids:
+             return
+         match_end = req._compute_max_prefix_len(len(fill_ids))
+-        self.prefetch_from_storage(req.rid, None, fill_ids[:match_end])
++        self.prefetch_from_storage(
++            req.rid,
++            None,
++            fill_ids[:match_end],
++            extra_key=req.extra_key,
++            cache_salt=req.cache_salt,
++        )
+
+     def prefetch_from_storage(
+         self,
+         rid: str,
+-        last_host_node: Any = None,
++        last_host_node=None,
+         token_ids=None,
+         last_hash=None,
+         prefix_keys=None,
++        *,
++        matched_prefix_tokens=None,
++        extra_key=None,
++        cache_salt=None,
+     ) -> None:
++        """Pass the complete token hash chain and the candidate's absolute offset."""
+         del last_host_node, last_hash, prefix_keys
+-        if not token_ids:
++        # The foreground adapter does not yet propagate namespace/salt.
++        # Skip this optional path until both lookup and prefetch use the same key.
++        if extra_key is not None or cache_salt is not None or not token_ids:
+             return
+-        ids = list(token_ids)
+-        if self.page_size > 1:
+-            aligned = (len(ids) // self.page_size) * self.page_size
+-            ids = ids[:aligned]
+-        if not ids:
++        prefix = [] if matched_prefix_tokens is None else list(matched_prefix_tokens)
++        ids = prefix + list(token_ids)
++        ids = ids[: len(ids) // self.page_size * self.page_size]
++        if len(ids) <= len(prefix):
+             return
+-        self.flexkv_connector.prefetch_async(rid, ids, sglang_req_id=rid)
++        if getattr(self.flexkv_connector, "_chunked_prefetch", False):
++            self.flexkv_connector.prefetch_async(
++                rid, ids, sglang_req_id=rid, candidate_start_token=len(prefix)
++            )
++        else:
++            self.flexkv_connector.prefetch_async(rid, ids, sglang_req_id=rid)
+
+     def check_prefetch_progress(self, rid: str) -> bool:
+         return self.flexkv_connector.check_prefetch_progress(rid)
+@@ -740,6 +759,11 @@ class FlexKVHybridRadixCache(BasePrefixCache):
+     def terminate_prefetch(self, rid: str) -> None:
+         self.flexkv_connector.cancel_prefetch(rid)
+
++    def pop_prefetch_loaded_span(self, rid: str) -> tuple[int, Optional[int]]:
++        if getattr(self.flexkv_connector, "_chunked_prefetch", False):
++            return self.flexkv_connector.pop_prefetch_loaded_span(rid)
++        return self.pop_prefetch_loaded_tokens(rid), None
++
+     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
+         pop = getattr(self.flexkv_connector, "pop_prefetch_loaded_tokens", None)
+         if callable(pop):
+diff --git a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
+index 11d792a245..95d530dfa2 100644
+--- a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
++++ b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
+@@ -957,19 +957,21 @@ class FlexKVRadixCache(RadixCache):
+         self.flexkv_connector.cancel_prefetch(rid)
+
+     def prefetch_request(self, req: Req) -> None:
+-        """Wait-complete FlexKV prefetch for a queued request.
+-
+-        Owns fill-id refresh / page alignment so the scheduler only needs
+-        ``tree_cache.prefetch_request(req)``. Does not call FlexKV lookup
+-        (that happens at admission after prefetch completes).
+-        """
++        """Start queued prefetch without a foreground lookup or H2D allocation."""
++        # Foreground lookup runs after stop-and-drain, otherwise it could fetch
++        # the whole remote prefix before the prefetch policy gets a chance to stop.
+         req.init_next_round_input(tree_cache=None, cow_mamba=False)
+         fill_ids = req.full_untruncated_fill_ids
+         if not fill_ids:
+             return
+         match_end = req._compute_max_prefix_len(len(fill_ids))
+-        tokens = fill_ids[:match_end]
+-        self.prefetch_from_storage(req.rid, None, tokens)
++        self.prefetch_from_storage(
++            req.rid,
++            None,
++            fill_ids[:match_end],
++            extra_key=req.extra_key,
++            cache_salt=req.cache_salt,
++        )
+
+     def prefetch_from_storage(
+         self,
+@@ -978,25 +980,28 @@ class FlexKVRadixCache(RadixCache):
+         token_ids=None,
+         last_hash=None,
+         prefix_keys=None,
++        *,
++        matched_prefix_tokens=None,
++        extra_key=None,
++        cache_salt=None,
+     ) -> None:
+-        """Kick off FlexKV prefetch (SSD/Remote/Mooncake → CPU).
+-
+-        Extra HiCache-style args (``last_host_node`` / hashes) are ignored;
+-        FlexKV addresses blocks by token ids.
+-        """
++        """Pass the complete token hash chain and the candidate's absolute offset."""
+         del last_host_node, last_hash, prefix_keys
+-        if not token_ids:
++        # The foreground adapter does not yet propagate namespace/salt.
++        # Skip this optional path until both lookup and prefetch use the same key.
++        if extra_key is not None or cache_salt is not None or not token_ids:
+             return
+-        ids = list(token_ids)
+-        if self.page_size > 1:
+-            aligned = (len(ids) // self.page_size) * self.page_size
+-            ids = ids[:aligned]
+-        if not ids:
++        prefix = [] if matched_prefix_tokens is None else list(matched_prefix_tokens)
++        ids = prefix + list(token_ids)
++        ids = ids[: len(ids) // self.page_size * self.page_size]
++        if len(ids) <= len(prefix):
+             return
+-        try:
++        if getattr(self.flexkv_connector, "_chunked_prefetch", False):
++            self.flexkv_connector.prefetch_async(
++                rid, ids, sglang_req_id=rid, candidate_start_token=len(prefix)
++            )
++        else:
+             self.flexkv_connector.prefetch_async(rid, ids, sglang_req_id=rid)
+-        except Exception as exc:  # noqa: BLE001
+-            logger.debug("[FlexKV] prefetch_from_storage: %s", exc)
+
+     def check_prefetch_progress(self, rid: str) -> bool:
+         return self.flexkv_connector.check_prefetch_progress(rid)
+@@ -1004,6 +1009,11 @@ class FlexKVRadixCache(RadixCache):
+     def terminate_prefetch(self, rid: str) -> None:
+         self.flexkv_connector.cancel_prefetch(rid)
+
++    def pop_prefetch_loaded_span(self, rid: str) -> tuple[int, Optional[int]]:
++        if getattr(self.flexkv_connector, "_chunked_prefetch", False):
++            return self.flexkv_connector.pop_prefetch_loaded_span(rid)
++        return self.pop_prefetch_loaded_tokens(rid), None
++
+     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
+         pop = getattr(self.flexkv_connector, "pop_prefetch_loaded_tokens", None)
+         if callable(pop):
+diff --git a/test/registered/unit/mem_cache/test_evict_from_tree_cache.py b/test/registered/unit/mem_cache/test_evict_from_tree_cache.py
+index e7841fc05a..7738d424fc 100644
+--- a/test/registered/unit/mem_cache/test_evict_from_tree_cache.py
++++ b/test/registered/unit/mem_cache/test_evict_from_tree_cache.py
+@@ -63,7 +63,8 @@ def _load_evict_from_tree_cache():
+         ),
+         "sglang.srt.runtime_context": _module(
+             "sglang.srt.runtime_context",
+-            get_server_args=lambda: SimpleNamespace(),
++            get_serving=lambda: SimpleNamespace(),
++            get_spec=lambda: SimpleNamespace(),
+         ),
+         "sglang.srt.utils.common": _module(
+             "sglang.srt.utils.common",
+@@ -105,7 +106,7 @@ def _make_evict_fixture(*, full_available: int, swa_available: int):
+     tree_cache = SimpleNamespace(
+         is_chunk_cache=lambda: False,
+         token_to_kv_pool_allocator=allocator,
+-        evict=MagicMock(side_effect=evict),
++        evict_for_alloc=MagicMock(side_effect=evict),
+     )
+     return tree_cache, availability
+
+@@ -115,7 +116,7 @@ def test_tail_only_demand_does_not_evict_available_swa():
+
+     evict_from_tree_cache(tree_cache, 128, swa_num_tokens=64)
+
+-    tree_cache.evict.assert_called_once_with(
++    tree_cache.evict_for_alloc.assert_called_once_with(
+         _EvictParams(num_tokens=48, swa_num_tokens=0)
+     )
+     assert availability == {"full": 128, "swa": 64}
+@@ -126,7 +127,7 @@ def test_tail_only_demand_evicts_only_swa_deficit():
+
+     evict_from_tree_cache(tree_cache, 128, swa_num_tokens=64)
+
+-    tree_cache.evict.assert_called_once_with(
++    tree_cache.evict_for_alloc.assert_called_once_with(
+         _EvictParams(num_tokens=0, swa_num_tokens=32)
+     )
+     assert availability == {"full": 128, "swa": 64}
+@@ -137,7 +138,7 @@ def test_tail_only_demand_with_enough_capacity_does_not_evict():
+
+     evict_from_tree_cache(tree_cache, 128, swa_num_tokens=64)
+
+-    tree_cache.evict.assert_not_called()
++    tree_cache.evict_for_alloc.assert_not_called()
+
+
+ def test_default_swa_demand_matches_full_demand():
+@@ -145,7 +146,7 @@ def test_default_swa_demand_matches_full_demand():
+
+     evict_from_tree_cache(tree_cache, 128)
+
+-    tree_cache.evict.assert_called_once_with(
++    tree_cache.evict_for_alloc.assert_called_once_with(
+         _EvictParams(num_tokens=0, swa_num_tokens=64)
+     )
+     assert availability == {"full": 128, "swa": 128}
+@@ -153,10 +154,10 @@ def test_default_swa_demand_matches_full_demand():
+
+ def test_evict_stops_when_cache_cannot_make_progress():
+     tree_cache, _ = _make_evict_fixture(full_available=0, swa_available=0)
+-    tree_cache.evict.side_effect = None
++    tree_cache.evict_for_alloc.side_effect = None
+
+     evict_from_tree_cache(tree_cache, 128, swa_num_tokens=64)
+
+-    tree_cache.evict.assert_called_once_with(
++    tree_cache.evict_for_alloc.assert_called_once_with(
+         _EvictParams(num_tokens=128, swa_num_tokens=64)
+     )
+diff --git a/test/registered/unit/mem_cache/test_flexkv_prefetch.py b/test/registered/unit/mem_cache/test_flexkv_prefetch.py
+new file mode 100644
+index 0000000000..7bc2b75932
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_flexkv_prefetch.py
+@@ -0,0 +1,358 @@
++"""CPU contract tests execute wrapper bodies without importing model kernels."""
++
++import ast
++import logging
++from pathlib import Path
++from types import MethodType
++from types import SimpleNamespace as NS
++from typing import Any, Optional
++from unittest.mock import Mock
++
++import pytest
++import torch
++
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=3, suite="base-a-test-cpu")
++
++ROOT = Path(__file__).resolve().parents[4]
++SOURCE = ROOT / "python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py"
++HYBRID = SOURCE.with_name("flexkv_hybrid_radix_cache.py")
++POLICY = ROOT / "python/sglang/srt/managers/schedule_policy.py"
++SCHEDULER = ROOT / "python/sglang/srt/managers/scheduler.py"
++
++
++def method(path, cls, name):
++    tree = ast.parse(path.read_text())
++    class_node = next(
++        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls
++    )
++    body = next(
++        n for n in class_node.body if isinstance(n, ast.FunctionDef) and n.name == name
++    )
++    body.decorator_list = []
++    namespace = {
++        "TreeNode": object,
++        "Req": object,
++        "Any": Any,
++        "Optional": Optional,
++        "AddReqResult": NS(OTHER="other"),
++        "torch": torch,
++        "InitLoadBackParams": object,
++        "_RestoreLease": NS,
++        "logger": logging.getLogger(__name__),
++    }
++    exec(
++        compile(ast.Module(body=[body], type_ignores=[]), str(path), "exec"), namespace
++    )
++    return namespace[name]
++
++
++@pytest.mark.parametrize("matched", [[], [10, 11, 12, 13]])
++def test_full_chain_and_candidate_offset(matched):
++    connector = Mock(_chunked_prefetch=True)
++    cache = NS(flexkv_connector=connector, page_size=1)
++    method(SOURCE, "FlexKVRadixCache", "prefetch_from_storage")(
++        cache, "r", None, [20, 21], None, None, matched_prefix_tokens=matched
++    )
++    connector.prefetch_async.assert_called_once_with(
++        "r", matched + [20, 21], sglang_req_id="r", candidate_start_token=len(matched)
++    )
++
++
++def test_scheduler_starts_flexkv_without_hicache_storage_backend():
++    cache = Mock()
++    scheduler = NS(enable_flexkv=True, enable_hicache_storage=False, tree_cache=cache)
++    req = NS(rid="r")
++    method(SCHEDULER, "Scheduler", "_prefetch_kvcache")(scheduler, req)
++    cache.prefetch_request.assert_called_once_with(req)
++
++
++@pytest.mark.parametrize(
++    "path,cls", [(SOURCE, "FlexKVRadixCache"), (HYBRID, "FlexKVHybridRadixCache")]
++)
++def test_queue_entry_does_not_lookup_remote_or_allocate_restore(path, cls):
++    cache = NS(prefetch_from_storage=Mock())
++    req = NS(
++        rid="r",
++        full_untruncated_fill_ids=list(range(10)),
++        extra_key=None,
++        cache_salt=None,
++        init_next_round_input=Mock(),
++        _compute_max_prefix_len=lambda n: n - 1,
++    )
++    method(path, cls, "prefetch_request")(cache, req)
++    req.init_next_round_input.assert_called_once_with(tree_cache=None, cow_mamba=False)
++    cache.prefetch_from_storage.assert_called_once_with(
++        "r",
++        None,
++        list(range(9)),
++        extra_key=None,
++        cache_salt=None,
++    )
++
++
++def test_abort_releases_flexkv_without_hicache_enabled():
++    cache = Mock()
++    scheduler = NS(
++        enable_flexkv=True,
++        enable_hicache_storage=False,
++        enable_hierarchical_cache=False,
++        enable_unified_cache_external_linker=False,
++        tree_cache=cache,
++    )
++    method(SCHEDULER, "Scheduler", "_release_aborted_request")(scheduler, "r")
++    cache.release_aborted_request.assert_called_once_with("r")
++
++
++def test_prefetch_stats_pass_through():
++    connector = Mock(_chunked_prefetch=True)
++    connector.pop_prefetch_loaded_span.return_value = (16, 32)
++    cache = NS(flexkv_connector=connector, page_size=1)
++    assert method(SOURCE, "FlexKVRadixCache", "pop_prefetch_loaded_span")(
++        cache, "r"
++    ) == (16, 32)
++
++
++@pytest.mark.parametrize("key,salt", [("adapter", None), (None, "salt")])
++def test_unsupported_namespace_does_not_use_unscoped_prefetch(key, salt):
++    connector = Mock()
++    cache = NS(flexkv_connector=connector, page_size=1)
++    method(SOURCE, "FlexKVRadixCache", "prefetch_from_storage")(
++        cache, "r", None, [1], extra_key=key, cache_salt=salt
++    )
++    connector.prefetch_async.assert_not_called()
++
++
++def test_empty_request_does_not_launch_prefetch():
++    cache = NS(prefetch_from_storage=Mock())
++    req = NS(full_untruncated_fill_ids=[], init_next_round_input=Mock())
++    method(SOURCE, "FlexKVRadixCache", "prefetch_request")(cache, req)
++    cache.prefetch_from_storage.assert_not_called()
++
++
++@pytest.mark.parametrize("matched", [[], [1, 2, 3, 4]])
++def test_hybrid_preserves_hash_chain_and_candidate(matched):
++    connector = Mock(_chunked_prefetch=True)
++    cache = NS(flexkv_connector=connector, page_size=1)
++    method(HYBRID, "FlexKVHybridRadixCache", "prefetch_from_storage")(
++        cache, "swa", None, [5, 6], matched_prefix_tokens=matched
++    )
++    connector.prefetch_async.assert_called_once_with(
++        "swa", matched + [5, 6], sglang_req_id="swa", candidate_start_token=len(matched)
++    )
++
++
++@pytest.mark.parametrize(
++    "prefix,limit,alignment,expected",
++    [
++        (0, 63, None, 0),
++        (64, 256, 512, 0),
++        (64, 512, 512, 512),
++        (0, 260, None, 256),
++        (65, 256, None, 255),
++    ],
++)
++def test_admission_chunk_boundary(prefix, limit, alignment, expected):
++    assert (
++        method(POLICY, "PrefillAdder", "_get_chunked_prefill_len")(
++            NS(page_size=64), prefix, limit, alignment
++        )
++        == expected
++    )
++
++
++@pytest.mark.parametrize(
++    "chunk_limit,remaining,align,dllm,tile,expected",
++    [
++        (32, 4096, None, None, None, "other"),
++        (256, 4096, 512, None, None, "other"),
++        (None, 1024, None, None, None, "other"),
++        (None, 4096, None, True, None, "other"),
++        (256, 4096, None, None, "other", "other"),
++        (256, 4096, None, None, None, None),
++    ],
++)
++def test_remaining_admission_gates_are_side_effect_free(
++    chunk_limit, remaining, align, dllm, tile, expected
++):
++    cache = NS(
++        page_size=64,
++        rem_chunk_tokens=chunk_limit,
++        can_run_list=[object()],
++        rem_input_tokens=remaining,
++        dllm_config=dllm,
++        rem_dllm_tokens=0,
++        ceil_paged_tokens=lambda n: (n + 63) // 64 * 64,
++        _check_prefill_tile_budget=Mock(return_value=tile),
++    )
++    calculate = method(POLICY, "PrefillAdder", "_get_chunked_prefill_len")
++    cache._get_chunked_prefill_len = lambda *args: calculate(cache, *args)
++    assert (
++        method(POLICY, "PrefillAdder", "_check_prefill_shape")(
++            cache, 1024, 3072, chunk_limit, align
++        )
++        == expected
++    )
++    assert len(cache.can_run_list) == 1
++
++
++@pytest.fixture
++def hybrid_restore():
++    req = NS(
++        rid="restore",
++        prefix_indices=torch.arange(256),
++        last_node=object(),
++        kv=NS(cache_protected_len=128),
++    )
++    slots = torch.arange(256, 768)
++    connector = Mock(enable_layerwise=False)
++    allocator = NS(free=Mock(), alloc_extend_swa_tail=Mock())
++    cache = NS(
++        flexkv_connector=connector,
++        page_size=256,
++        token_to_kv_pool_allocator=allocator,
++        _restore_generation=7,
++        _restore_leases={},
++        _aborted_restore_leases={},
++        _load_markers={req.rid: NS(device_length=256)},
++        _alloc_restore_slots=Mock(return_value=slots),
++        supports_swa=lambda: True,
++        _empty_indices=lambda: torch.empty(0, dtype=torch.int64),
++    )
++    cache._restore_lease_matches_req = method(
++        HYBRID, "FlexKVHybridRadixCache", "_restore_lease_matches_req"
++    )
++    for name in (
++        "_commit_restore",
++        "_validate_restore_lease",
++        "_forget_restore_lease",
++        "init_load_back",
++    ):
++        setattr(
++            cache,
++            name,
++            MethodType(method(HYBRID, "FlexKVHybridRadixCache", name), cache),
++        )
++
++    def retrieve(rid, actual_slots):
++        lease = cache._restore_leases[rid]
++        assert lease.device_indices is actual_slots
++        assert req.pending_restore_slots is actual_slots
++        return actual_slots.numel()
++
++    connector.retrieve_kv.side_effect = retrieve
++    return cache, req, slots
++
++
++def test_hybrid_restore_owns_slots_before_h2d_and_preserves_tree_boundary(
++    hybrid_restore,
++):
++    cache, req, slots = hybrid_restore
++    restored, node = cache.init_load_back(NS(req=req, host_hit_length=512))
++    assert restored is slots and node is req.last_node
++    assert req.kv.cache_protected_len == 256
++    assert req._flexkv_swa_evicted_seqlen == 512
++    assert req.pending_restore_slots is slots
++    cache._commit_restore(req)
++    assert not cache._restore_leases and req.pending_restore_slots is None
++    cache.token_to_kv_pool_allocator.free.assert_not_called()
++
++
++def test_hybrid_failed_restore_frees_once(hybrid_restore):
++    cache, req, slots = hybrid_restore
++    cache.flexkv_connector.retrieve_kv.side_effect = None
++    cache.flexkv_connector.retrieve_kv.return_value = 0
++    restored, _ = cache.init_load_back(NS(req=req, host_hit_length=512))
++    assert restored.numel() == 0 and not cache._restore_leases
++    cache.token_to_kv_pool_allocator.free.assert_called_once_with(slots)
++    assert req.pending_restore_slots is None
++
++
++def test_hybrid_duplicate_restore_does_not_allocate_again(hybrid_restore):
++    cache, req, _ = hybrid_restore
++    cache.init_load_back(NS(req=req, host_hit_length=512))
++    with pytest.raises(RuntimeError, match="before restore commit"):
++        cache.init_load_back(NS(req=req, host_hit_length=512))
++    assert cache._alloc_restore_slots.call_count == 1
++    assert req.rid in cache._restore_leases
++    cache.token_to_kv_pool_allocator.free.assert_not_called()
++
++
++def test_hybrid_stale_generation_cannot_free_current_slots(hybrid_restore):
++    cache, req, _ = hybrid_restore
++    cache.init_load_back(NS(req=req, host_hit_length=512))
++    req.pending_restore_generation -= 1
++    with pytest.raises(RuntimeError, match="lease mismatch"):
++        cache._commit_restore(req)
++    assert req.rid in cache._restore_leases
++    cache.token_to_kv_pool_allocator.free.assert_not_called()
++
++
++@pytest.mark.parametrize(
++    "flexkv,admitted,running,expected_full",
++    [
++        (True, False, False, False),
++        (True, True, False, True),
++        (True, False, True, True),
++        (False, False, False, True),
++    ],
++)
++def test_capacity_rejection_keeps_idle_flexkv_schedulable(
++    flexkv, admitted, running, expected_full
++):
++    """Execute the scheduler's NO_TOKEN handling, including rejected-req cleanup."""
++    tree = ast.parse(SCHEDULER.read_text())
++    cls = next(
++        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Scheduler"
++    )
++    method_node = next(
++        n
++        for n in cls.body
++        if isinstance(n, ast.FunctionDef) and n.name == "_get_new_batch_prefill_raw"
++    )
++    stop_branch = next(
++        n
++        for n in ast.walk(method_node)
++        if isinstance(n, ast.If)
++        and ast.unparse(n.test) == "res != AddReqResult.CONTINUE"
++    )
++    module = ast.fix_missing_locations(
++        ast.Module(
++            body=[
++                ast.For(
++                    target=ast.Name(id="_", ctx=ast.Store()),
++                    iter=ast.Tuple(elts=[ast.Constant(0)], ctx=ast.Load()),
++                    body=[stop_branch],
++                    orelse=[],
++                )
++            ],
++            type_ignores=[],
++        )
++    )
++    req = NS(kv=NS(holds_mamba=False))
++    batch = NS(batch_is_full=False, is_empty=lambda: not running)
++    namespace = dict(
++        self=NS(
++            enable_hierarchical_cache=False,
++            enable_unified_cache_external_linker=False,
++            enable_flexkv=flexkv,
++            tree_cache=NS(has_uncommitted_restore=lambda r: False),
++        ),
++        get_memory=lambda: NS(enable_flexkv=flexkv),
++        AddReqResult=NS(CONTINUE="continue", NO_TOKEN="no_token"),
++        res="no_token",
++        running_batch=batch,
++        adder=NS(can_run_list=[req] if admitted else []),
++        req=req,
++        has_uncommitted_restore=None,
++    )
++    exec(compile(module, str(SCHEDULER), "exec"), namespace)
++    assert batch.batch_is_full is expected_full
++    if not admitted:
++        assert req.kv.mamba_cow_src_index is None
++        assert req.kv.mamba_needs_clear is False
++
++
++if __name__ == "__main__":
++    raise SystemExit(pytest.main([__file__]))
+diff --git a/test/registered/unit/mem_cache/test_flexkv_prefetch_wiring.py b/test/registered/unit/mem_cache/test_flexkv_prefetch_wiring.py
+index c320230475..4246178c7f 100644
+--- a/test/registered/unit/mem_cache/test_flexkv_prefetch_wiring.py
++++ b/test/registered/unit/mem_cache/test_flexkv_prefetch_wiring.py
+@@ -54,6 +54,8 @@ def test_flexkv_radix_prefetch_request_page_aligns_and_launches():
+
+     req = MagicMock()
+     req.rid = "r1"
++    req.extra_key = None
++    req.cache_salt = None
+     req.full_untruncated_fill_ids = [1, 2, 3, 4, 5]
+     req._compute_max_prefix_len = MagicMock(return_value=4)
+     req.init_next_round_input = MagicMock()

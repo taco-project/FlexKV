@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -10,6 +10,21 @@ from flexkv.common.request import KVResponseStatus
 
 
 RegistrationKey = Tuple[int, int]
+
+
+@dataclass
+class PrefetchControlRequest:
+    dp_client_id: int
+    reply_port: str
+    action: str
+    payload: dict = field(default_factory=dict)
+    protocol_version: int = 1
+
+
+@dataclass
+class PrefetchControlResponse:
+    result: object = None
+    error: Optional[str] = None
 
 
 @dataclass
