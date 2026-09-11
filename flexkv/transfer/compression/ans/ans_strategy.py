@@ -190,22 +190,29 @@ class NvcompGpuCpuTpStrategy(CompressionStrategy):
             message=f"NvcompGpuCpuTpStrategy.run[{transfer_type.name}]",
             color="purple")
         try:
+            # Keyword args past the block-id tensors.  #257 inserted
+            # ``num_kv_heads`` between ``kv_dim`` and the size-table group, so
+            # a positional call silently shifts the four table arguments by one
+            # and comes up one short -- a TypeError before any byte moves.  The
+            # unit tests are the only other caller and they pass it; this is
+            # the live TP+nvcomp path.
             return int(worker.tp_transfer_thread_group.tp_group_transfer_ans(
                 gpu_block_id_list, cpu_block_id_list,
-                worker.cpu_kv_stride_in_bytes,
-                worker.cpu_layer_stride_in_bytes,
-                worker.cpu_block_stride_in_bytes,
-                worker.cpu_tp_stride_in_bytes,
-                transfer_num_cta,
-                transfer_type == TransferType.H2D,
-                use_ce_transfer,
-                0,
-                worker.num_layers,
-                worker.kv_dim,
-                self._table_ptr,
-                self._table_rank_stride,
-                self._table_block_stride,
-                self._table_layer_stride,
+                cpu_kv_stride_in_bytes=worker.cpu_kv_stride_in_bytes,
+                cpu_layer_stride_in_bytes=worker.cpu_layer_stride_in_bytes,
+                cpu_block_stride_in_bytes=worker.cpu_block_stride_in_bytes,
+                cpu_tp_stride_in_bytes=worker.cpu_tp_stride_in_bytes,
+                transfer_num_cta=transfer_num_cta,
+                is_host_to_device=transfer_type == TransferType.H2D,
+                use_ce_transfer=use_ce_transfer,
+                layer_id=0,
+                layer_granularity=worker.num_layers,
+                kv_dim=worker.kv_dim,
+                num_kv_heads=worker.num_kv_heads,
+                cpu_size_table_tp_ptr=self._table_ptr,
+                cpu_size_table_tp_rank_stride=self._table_rank_stride,
+                cpu_size_table_block_stride=self._table_block_stride,
+                cpu_size_table_layer_stride=self._table_layer_stride,
             ))
         finally:
             nvtx.end_range(nvtx_range)
