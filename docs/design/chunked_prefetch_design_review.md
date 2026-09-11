@@ -188,7 +188,7 @@ chunk 结束在 checkpoint 时，向原 Full 图附加现有 SWA peer op，使�
 
 <a id="s7"></a>
 
-## 7. 配置
+## 7. 配置与性能
 
 ### 7.1 日常调节：block 数、窗口和策略预算
 
@@ -246,6 +246,61 @@ chunk 结束在 checkpoint 时，向原 Full 图附加现有 SWA peer op，使�
 额度来自同一 CPU cache 池，不是额外分配的两个内存池。预算检查还保留 `已有 pin + 全部 staging <= pinned 上限`，避免完成时集体超额。实际 allocator 容量也会约束分配；触顶时 seal、drain，交付已保护的连续前缀，余下部分由模型计算。容量回退可能发生在 `wait_complete`，不能把策略名理解为内存充足的保证。
 
 默认值是保守起点，不应盲目随着并发放大。只有观察到 `reason=capacity` 且 CPU cache 仍有余量、前台延迟可接受时，再按限制所在阶段调节；有大量结果等待交接时优先检查调度、release 与 TTL。相关观测见第 9 节。
+
+### 7.3 性能修复与验证（2026-09-10）
+
+**结论：明显的吞吐回退已收敛。SGLang 的 wait_complete 复用整任务路径；长 timeout 分段完整恢复时，本轮未观察到明显分段损耗。有限样本不能证明严格零开销，chunk 也不是越小越好。**
+
+#### 做了哪些修复
+
+1. **消除空闲轮询（ae634ee）。** 此前没有活动预取或传输时，控制线程仍每 2 ms 扫描任务与保留结果。内嵌模式下它与 TP0 调度同处一个 Python 进程，GPU 热命中也会承担这部分控制开销。现在无活动工作时等待新命令或最近的结果 TTL；新命令立即唤醒，有活动预取/RUNNING 图时继续收完成，有空窗口立即补发，异步 PUT 尾部也会收齐。独立线程计数显示 CPU 核占用由约 3.59% 降至 0.066%，按耗时归一化下降约 98%；这不是 GIL 采样比例。分段关闭时本就不创建该线程，关闭组的小幅差值不能归因于这一根因。
+2. **wait_complete 回归整任务路由（837d3a4）。** SGLang 在创建 KVManager 前解析最终 policy：wait_complete 使用原始 prefetch_async，并关闭分段运行时；timeout/best_effort 在总开关开启时使用分段会话。显式 FlexKV policy 优先，否则沿用 SGLang 策略参数。底层显式 start_prefetch API 保留 wait_complete 会话兼容能力；独立 external server 仍按自身配置启动。worker、native extension、图格式和传输协议均未修改，stop 后等待 inflight drain 的规则不变。
+
+#### 修复前后：先确认回退收敛
+
+原始适配、修复前分段、修复后分段按相反顺序各跑两轮，共 420 条主对照请求。原始基线包含独立的一行空闲准入重试修复，其收益不计入分段。下表为相对同轮原始基线的吞吐变化中位数；这轮 SGLang 的 wait_complete 尚走分段会话，不能与后面的路由对照混合计算。
+
+| 场景 | 修复前 | 空闲轮询修复后 |
+|---|---:|---:|
+| L3 串行完整恢复 | −2.68% | +0.56% |
+| GPU 热缓存 C8 | −2.46% | −0.41% |
+| GPU 热缓存 C32 | −4.08% | −0.85% |
+
+修复后两轮范围分别为 −0.11%～+1.22%、−0.83%～+0.00%、−1.09%～−0.62%。完整输出 IDs 与真实层级检查均通过。
+
+#### 长 timeout：将框架接入与分段影响分开
+
+四组固定同一份代码，window=2：整任务 wait_complete；单大段 timeout（4096 blocks）；timeout128；timeout32。三个 timeout 均设 timeout_budget_s=60，reserved/pinned 上限为 16/60 GiB，16K 恢复能装入单大段预算。**所有日志中 deadline 为零，正式 L3 会话均以 reason=complete 结束。策略路径实际生效，但故意不触发中断，避免少读数据影响比较。**
+
+同样正序、逆序各一轮，共 560 条正式请求：每组 6 条 L3 串行，热 C8/C32 各 32 条；另有 24 条独立冷参考校验。每个 L3 组均实际 REMOTE2H/H2D 826 blocks，远端图数依次为 6/6/8/26；每条 16K 的图数为 1/1/2/8。线程快照确认整任务 wait 无分段控制/提交线程，timeout 组存在；热缓存计时区间无传输完成事件。
+
+| 吞吐对比（两轮配对中位数） | L3 串行 | 热 C8 | 热 C32 |
+|---|---:|---:|---:|
+| 单大段 timeout / 整任务 wait | +0.66% | −0.20% | +0.48% |
+| timeout128 / 单大段 timeout | +0.88% | +0.90% | −0.06% |
+| timeout32 / 单大段 timeout | +0.98% | +0.75% | +0.32% |
+
+第一行指征框架、调度和所有权路径的接入成本；后两行指征同一框架内的分段影响，包含构图、IPC 次数及后端批次形状变化，不能称为纯 IPC 成本。分段对照的 L3 两轮范围为 +0.52%～+1.23%（128）和 +0.78%～+1.17%（32）；热 C8 为 −0.90%～+2.70%、+0.12%～+1.39%，热 C32 为 −0.73%～+0.61%、−0.01%～+0.66%。
+
+| 16K 前缀 | TTFT 第一 / 第二轮 |
+|---|---:|
+| 整任务 wait_complete | 863 / 869 ms |
+| 单大段 timeout | 843 / 862 ms |
+| timeout128 | 748 / 760 ms |
+| timeout32 | 760 / 786 ms |
+
+每个 TTFT 数字仅含该轮两条 16K 请求的中位数，包含预取、H2D、剩余 prefill 与首 token 计算。8K 的单大段 timeout 为 563/565 ms，32-block 为 565/577 ms，增加约 2/11 ms；16K 的 32-block 也比 128-block 多约 12/26 ms。因此仍保留默认 128 blocks，不因本轮结果继续缩小粒度。当前 chunk 大小仅使用 chunk_max_blocks，旧示例中的 chunk_target_bytes 已移除，需要删除。
+
+#### 中断语义、测试环境与验证范围
+
+此前单独的 30 ms timeout 检查中，4 条长请求在 30.30～30.99 ms 停止新增图，已有两段排空后返回 4096 tokens；drain 为 64.99～66.87 ms，实际返回为 95.53～97.86 ms。best_effort 也覆盖了下发前 demand 和两段 inflight 时 demand。两种策略各 6 条输出校验通过。超时限制继续下发，不保证在预算时刻返回；它们与上面的无中断性能矩阵分开统计。
+
+本轮环境：GLM-5.2-FP8、8×H20、TP8、BF16 KV、eager，page=64、prefill chunk=256、GPU token pool=16640、CPU cache=64 GiB、专用 node-local Mooncake RDMA pool=256 GiB，SSD 关闭。使用固定前缀合成语料、greedy 32-token 输出；客户端 C8/C32，服务端 max_running_requests=4，TTFT 包含排队。
+
+路由修订的 Linux 回归为 197 passed、9 skipped（Python radix 不支持的 SWA 组合，对应 C++ 用例执行）；560 条正式请求及 24 条冷参考均比较完整输出 IDs。计时采样内传输失败、CPU throttling、内存 failcnt、RDMA error/discard 增量均为零。保留 Python/Mooncake Prometheus、资源采样和完成日志；通用 transfer counters 对新 chunk 覆盖不完整，准确图数与 block 数以 worker 完成日志核对。专用 prefetch 指标和 C++ metrics 抓取仍未齐备。
+
+**结论限于串行完整 L3 与共享前缀 GPU 热缓存压力。此前混合容量 C8 OOM、退出资源钩子缺口仍未修复；本轮不覆盖并发冷 L3、V4 Flash、DP/layerwise、Cython 发布构建或长稳，不宣告生产性能验收。** 性能代码为 ae634ee/837d3a4，配套 SGLang 为 2f91f9f5f0。详见 [FlexKV PR #291](https://github.com/taco-project/FlexKV/pull/291) 与 [仓库逐轮验证记录](https://github.com/taco-project/FlexKV/blob/5fca0e65817485b13c1a6e87a0a0108bd1bd6c79/docs/design/chunked_prefetch_validation.md)。
+
 
 <a id="s8"></a>
 
