@@ -930,16 +930,16 @@ PYBIND11_MODULE(c_ext, m) {
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
       .def(py::init([](int tokens_per_block, unsigned int max_num_blocks,
                        int hit_reward_seconds, std::string eviction_policy,
-                       int protected_threshold) {
+                       int protected_threshold, int sink_block_count) {
              auto policy = flexkv::parse_eviction_policy(eviction_policy);
              return new flexkv::CRadixTreeIndex(
                  tokens_per_block, max_num_blocks, hit_reward_seconds, policy,
-                 protected_threshold);
+                 protected_threshold, sink_block_count);
            }),
            py::arg("tokens_per_block"), py::arg("max_num_blocks") = 1000000,
            py::arg("hit_reward_seconds") = 0,
            py::arg("eviction_policy") = "lru",
-           py::arg("protected_threshold") = 2)
+           py::arg("protected_threshold") = 2, py::arg("sink_block_count") = 0)
       .def("is_empty", &flexkv::CRadixTreeIndex::is_empty)
       .def("reset", &flexkv::CRadixTreeIndex::reset)
       .def("lock", &flexkv::CRadixTreeIndex::lock, py::arg("node"))
@@ -963,9 +963,9 @@ PYBIND11_MODULE(c_ext, m) {
                &flexkv::CRadixTreeIndex::evict),
            py::arg("evicted_blocks"), py::arg("evicted_block_hashes"),
            py::arg("num_evicted"), py::call_guard<py::gil_scoped_release>())
-      .def("remove_unready_leaf",
-           &flexkv::CRadixTreeIndex::remove_unready_leaf, py::arg("node"),
-           py::arg("freed_blocks"), py::call_guard<py::gil_scoped_release>())
+      .def("remove_unready_leaf", &flexkv::CRadixTreeIndex::remove_unready_leaf,
+           py::arg("node"), py::arg("freed_blocks"),
+           py::call_guard<py::gil_scoped_release>())
       .def("total_cached_blocks", &flexkv::CRadixTreeIndex::total_cached_blocks)
       .def("total_unready_blocks",
            &flexkv::CRadixTreeIndex::total_unready_blocks)
@@ -999,16 +999,18 @@ PYBIND11_MODULE(c_ext, m) {
       .def("size", &flexkv::CRadixNode::size)
       .def("has_block_node_ids", &flexkv::CRadixNode::has_block_node_ids)
       // Structural / lock accessors — needed to assert the node-mount SWA
-      // invariants (I1/I2/I3) from Python against the production CRadixTreeIndex
-      // path (see tests/test_swa_node_mount.py). Previously only bound for
-      // the P2P LocalRadixTree, so the non-P2P DSv4 build had no way to read
-      // them and the C++ node-mount SWA path went untested.
+      // invariants (I1/I2/I3) from Python against the production
+      // CRadixTreeIndex path (see tests/test_swa_node_mount.py). Previously
+      // only bound for the P2P LocalRadixTree, so the non-P2P DSv4 build had no
+      // way to read them and the C++ node-mount SWA path went untested.
       .def("is_leaf", &flexkv::CRadixNode::is_leaf)
       .def("num_children", &flexkv::CRadixNode::get_num_children)
       .def("get_lock_cnt", &flexkv::CRadixNode::get_lock_cnt)
       .def("lock", &flexkv::CRadixNode::lock)
       .def("unlock", &flexkv::CRadixNode::unlock)
       .def("has_swa", &flexkv::CRadixNode::has_swa)
+      .def_property_readonly("block_offset",
+                             &flexkv::CRadixNode::get_block_offset)
       .def_property_readonly("parent", &flexkv::CRadixNode::get_parent,
                              py::return_value_policy::reference)
       // ===== SWA accessors (node-attached SWA state) =====

@@ -281,7 +281,8 @@ class CacheEngineAccel:
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector = None,
                  protected_threshold = 2,
-                 swa_config: Optional["SWAPoolConfig"] = None):
+                 swa_config: Optional["SWAPoolConfig"] = None,
+                 sink_block_count: int = 0):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -295,11 +296,14 @@ class CacheEngineAccel:
         if not isinstance(protected_threshold, int) or protected_threshold < 1:
             raise ValueError(f"Invalid protected_threshold: {protected_threshold}. "
                               f"protected_threshold must be an integer >= 1")
+        if not isinstance(sink_block_count, int) or sink_block_count < 0:
+            raise ValueError(f"Invalid sink_block_count: {sink_block_count}. "
+                              f"sink_block_count must be a non-negative integer")
 
         self.device_type = device_type
 
         self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy,
-                                     protected_threshold)
+                                     protected_threshold, sink_block_count)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
@@ -612,7 +616,8 @@ class CacheEngine:
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector = None,
                  protected_threshold = 2,
-                 swa_config: Optional["SWAPoolConfig"] = None):
+                 swa_config: Optional["SWAPoolConfig"] = None,
+                 sink_block_count: int = 0):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -626,13 +631,17 @@ class CacheEngine:
         if not isinstance(protected_threshold, int) or protected_threshold < 1:
             raise ValueError(f"Invalid protected_threshold: {protected_threshold}. "
                               f"protected_threshold must be an integer >= 1")
+        if not isinstance(sink_block_count, int) or sink_block_count < 0:
+            raise ValueError(f"Invalid sink_block_count: {sink_block_count}. "
+                              f"sink_block_count must be a non-negative integer")
 
         self.device_type = device_type
 
         self.index = RadixTreeIndex(tokens_per_block=tokens_per_block,
                                     hit_reward_seconds=hit_reward_seconds,
                                     eviction_policy=eviction_policy,
-                                    protected_threshold=protected_threshold)
+                                    protected_threshold=protected_threshold,
+                                    sink_block_count=sink_block_count)
 
         self.mempool = Mempool(num_total_blocks=num_total_blocks)
 
@@ -936,6 +945,7 @@ class GlobalCacheEngine:
         self.hit_reward_seconds = GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds
         self.eviction_policy = GLOBAL_CONFIG_FROM_ENV.eviction_policy
         self.protected_threshold = GLOBAL_CONFIG_FROM_ENV.slru_protected_threshold
+        self.sink_block_count = GLOBAL_CONFIG_FROM_ENV.sink_block_count
 
         # Initialize metrics collector for cache engine monitoring (before creating CacheEngines)
         self._metrics_collector = get_global_collector()
@@ -971,6 +981,7 @@ class GlobalCacheEngine:
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
                     swa_config=cache_config.swa,
+                    sink_block_count=self.sink_block_count,
                 )
             else:
                 self.cpu_cache_engine = CacheEngine(
@@ -985,6 +996,7 @@ class GlobalCacheEngine:
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
                     swa_config=cache_config.swa,
+                    sink_block_count=self.sink_block_count,
                 )
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
@@ -1004,6 +1016,7 @@ class GlobalCacheEngine:
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
                     swa_config=cache_config.swa,
+                    sink_block_count=self.sink_block_count,
                 )
             else:
                 self.ssd_cache_engine = CacheEngine(
@@ -1018,6 +1031,7 @@ class GlobalCacheEngine:
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
                     swa_config=cache_config.swa,
+                    sink_block_count=self.sink_block_count,
                 )
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
@@ -1043,6 +1057,7 @@ class GlobalCacheEngine:
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
                     swa_config=cache_config.swa,
+                    sink_block_count=self.sink_block_count,
                 )
             else:
                 self.remote_cache_engine = CacheEngine(
@@ -1057,6 +1072,7 @@ class GlobalCacheEngine:
                     metrics_collector=self._metrics_collector,
                     protected_threshold=self.protected_threshold,
                     swa_config=cache_config.swa,
+                    sink_block_count=self.sink_block_count,
                 )
             self.cache_engines[DeviceType.REMOTE] = self.remote_cache_engine
 
