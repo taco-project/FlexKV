@@ -13,6 +13,7 @@ from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutTyp
 from flexkv.common.transfer import DeviceType
 from flexkv.storage.allocator import (
     CPUAllocator,
+    CXLAllocator,
     GPUAllocator,
     HugePageAllocator,
     RemoteAllocator,
@@ -137,6 +138,25 @@ class StorageEngine:
                 device_type=DeviceType.CPU,
                 layout=self._cpu_layout,
                 dtype=buffer_dtype,
+            )
+
+        if self._cache_config.enable_cxl:
+            self._cxl_layout: Optional[KVCacheLayout] = KVCacheLayout(
+                type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,  # CXL uses same layout as CPU
+                num_layer=num_layers_per_pp_stage,
+                num_block=self._cache_config.num_cxl_blocks,
+                tokens_per_block=self._cache_config.tokens_per_block,
+                num_head=self._model_config.num_kv_heads_per_node,
+                head_size=self._model_config.head_size,
+                layer_groups=self._model_config.layer_groups,
+                tp_size=self._model_config.tp_size,
+            )
+            self.allocate(
+                device_type=DeviceType.CXL,
+                layout=self._cxl_layout,
+                dtype=buffer_dtype,
+                cxl_numa_node=self._cache_config.cxl_numa_node,
+                use_hugepages=self._cache_config.use_hugepage_cxl_buffer,
             )
 
         if self._cache_config.enable_ssd:
@@ -462,6 +482,20 @@ class StorageEngine:
                     file_prefix=file_prefix,
                     max_file_size_gb=max_file_size_gb
                 )
+        elif device_type == DeviceType.CXL:
+            cxl_numa_node = kwargs.get('cxl_numa_node', -1)
+            use_hugepages = kwargs.get('use_hugepages', False)
+            page_size_bytes = kwargs.get(
+                'page_size_bytes',
+                self._cache_config.hugepage_size_bytes,
+            )
+            storage_handle = CXLAllocator.allocate(
+                layout=layout,
+                dtype=dtype,
+                numa_node=cxl_numa_node,
+                use_hugepages=use_hugepages,
+                page_size_bytes=page_size_bytes,
+            )
         elif device_type == DeviceType.REMOTE:
             file_path = kwargs.get('file_path')
             remote_config_custom = kwargs.get('remote_config_custom')
