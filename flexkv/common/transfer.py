@@ -530,7 +530,15 @@ class TransferOpGraph:
                     else:
                         first = block_ids[:max_show].tolist()
                         last = block_ids[-max_show:].tolist()
-                        return f"{first[:-1]}...{last[-1]}] (n={block_ids.size})"
+                        # Explicit last index, not ``last[-1]``: release builds
+                        # cythonize this module with wraparound=False, under
+                        # which a negative *subscript* on a real list is not
+                        # folded to len + i -- it reads off the front and
+                        # segfaults.  Negative *slices* are unaffected (they go
+                        # through PySequence_GetSlice), so ``first[:-1]`` and
+                        # the numpy slices above are left alone.
+                        tail = last[len(last) - 1]
+                        return f"{first[:-1]}...{tail}] (n={block_ids.size})"
 
                 src_str = format_blocks(op.src_block_ids)
                 dst_str = format_blocks(op.dst_block_ids)
