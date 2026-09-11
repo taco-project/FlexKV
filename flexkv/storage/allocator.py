@@ -632,6 +632,241 @@ class HugePageAllocator(BaseStorageAllocator):
         )
 
 
+class CXLAllocator(BaseStorageAllocator):
+    """CXL memory allocator with NUMA binding.
+
+    Allocates KV cache memory on a CXL memory expander (Type 3 device),
+    which appears as a NUMA node with memory but no attached CPUs.
+
+    The allocator uses mmap + mbind(MPOL_BIND) to ensure pages are
+    physically allocated on the CXL NUMA node rather than local DDR.
+
+    Prerequisites:
+        * CXL device must be recognized by the kernel and appear as a NUMA node
+        * Check with: ``numactl --hardware`` (look for nodes with memory but no CPUs)
+        * Optionally reserve hugepages on the CXL node:
+          ``echo N > /sys/devices/system/node/node<X>/hugepages/hugepages-2048kB/nr_hugepages``
+
+    kwargs:
+        numa_node (int): NUMA node ID for CXL memory (-1 = auto-detect)
+        use_hugepages (bool): Use hugepages for allocation (default: False)
+        page_size_bytes (int): Hugepage size if use_hugepages=True (default: 2MiB)
+    """
+
+    @classmethod
+    def _detect_cxl_numa_node(cls) -> int:
+        """Auto-detect CXL NUMA node (a node with memory but no CPUs)."""
+        try:
+            import glob
+            nodes = sorted(glob.glob("/sys/devices/system/node/node*"))
+            for node_path in nodes:
+                node_id = int(os.path.basename(node_path).replace("node", ""))
+                cpulist_path = os.path.join(node_path, "cpulist")
+                meminfo_path = os.path.join(node_path, "meminfo")
+                if not os.path.exists(cpulist_path) or not os.path.exists(meminfo_path):
+                    continue
+                with open(cpulist_path) as f:
+                    cpulist = f.read().strip()
+                with open(meminfo_path) as f:
+                    meminfo = f.read()
+                has_cpus = bool(cpulist)
+                has_memory = "MemTotal:" in meminfo and "MemTotal:            0 kB" not in meminfo
+                if has_memory and not has_cpus:
+                    flexkv_logger.info(f"CXL: Auto-detected CXL NUMA node {node_id}")
+                    return node_id
+        except Exception as e:
+            flexkv_logger.warning(f"CXL: Failed to auto-detect NUMA node: {e}")
+        return -1
+
+    @classmethod
+    def _get_numa_node_memory_gb(cls, node_id: int) -> float:
+        """Get total memory in GB for a NUMA node."""
+        try:
+            meminfo_path = f"/sys/devices/system/node/node{node_id}/meminfo"
+            with open(meminfo_path) as f:
+                for line in f:
+                    if line.startswith("Node") and "MemTotal:" in line:
+                        kb = int(line.split()[-2])
+                        return kb / 1024 / 1024
+        except Exception:
+            pass
+        return 0.0
+
+    @classmethod
+    def allocate(cls,
+                 layout: KVCacheLayout,
+                 dtype: torch.dtype,
+                 **kwargs: Any) -> StorageHandle:
+        numa_node = int(kwargs.get("numa_node", -1))
+        use_hugepages = bool(kwargs.get("use_hugepages", False))
+        page_size_bytes = int(kwargs.get("page_size_bytes", DEFAULT_HUGE_PAGE_SIZE))
+
+        if numa_node < 0:
+            numa_node = cls._detect_cxl_numa_node()
+            if numa_node < 0:
+                raise RuntimeError(
+                    "CXL: No CXL NUMA node detected. Set FLEXKV_CXL_NUMA_NODE explicitly "
+                    "or verify CXL device is properly configured."
+                )
+
+        node_mem_gb = cls._get_numa_node_memory_gb(numa_node)
+        total_elements = layout.get_total_elements()
+        alloc_size_gb = total_elements * dtype.itemsize / (1024 ** 3)
+
+        flexkv_logger.info(
+            f"CXL allocate: {alloc_size_gb:.2f} GB on NUMA node {numa_node} "
+            f"(node has {node_mem_gb:.1f} GB total, hugepages={use_hugepages})"
+        )
+
+        if alloc_size_gb > node_mem_gb * 0.9:
+            flexkv_logger.warning(
+                f"CXL: Requested {alloc_size_gb:.2f} GB but node {numa_node} "
+                f"only has {node_mem_gb:.1f} GB total. Allocation may fail."
+            )
+
+        try:
+            physical_tensor = cls._alloc_numa_bound_tensor(
+                total_elements, dtype, numa_node, use_hugepages, page_size_bytes
+            )
+        except Exception as e:
+            flexkv_logger.error(f"CXL allocation failed: {e}")
+            raise
+
+        flexkv_logger.info(f"CXL: Successfully allocated {alloc_size_gb:.2f} GB on NUMA node {numa_node}")
+
+        return StorageHandle(
+            handle_type=AccessHandleType.TENSOR,
+            data=physical_tensor,
+            kv_layout=layout,
+            dtype=dtype,
+            cxl_numa_node=numa_node,
+        )
+
+    @classmethod
+    def _alloc_numa_bound_tensor(cls,
+                                  num_elements: int,
+                                  dtype: torch.dtype,
+                                  numa_node: int,
+                                  use_hugepages: bool = False,
+                                  page_size_bytes: int = DEFAULT_HUGE_PAGE_SIZE) -> torch.Tensor:
+        """Allocate a tensor bound to a specific NUMA node using libnuma."""
+        num_bytes = num_elements * dtype.itemsize
+
+        if use_hugepages:
+            aligned = _align_to_page(num_bytes, page_size_bytes)
+        else:
+            aligned = _align_to_page(num_bytes, 4096)
+
+        # Try libnuma-based allocation first (preferred method)
+        try:
+            libnuma = ctypes.CDLL("libnuma.so.1", use_errno=True)
+
+            # Check if NUMA is available
+            if libnuma.numa_available() < 0:
+                raise RuntimeError("NUMA not available on this system")
+
+            # Configure libnuma function signatures
+            libnuma.numa_alloc_onnode.restype = ctypes.c_void_p
+            libnuma.numa_alloc_onnode.argtypes = [ctypes.c_size_t, ctypes.c_int]
+            libnuma.numa_free.restype = None
+            libnuma.numa_free.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+
+            # Allocate memory on the specified NUMA node
+            ctypes.set_errno(0)
+            addr = libnuma.numa_alloc_onnode(aligned, numa_node)
+
+            if addr is None or addr == 0:
+                err = ctypes.get_errno()
+                raise RuntimeError(f"numa_alloc_onnode({aligned}, {numa_node}) failed: {os.strerror(err)}")
+
+            flexkv_logger.info(f"CXL: numa_alloc_onnode succeeded, addr={hex(addr)}, size={aligned}")
+
+            # Wrap in torch tensor
+            buf_type = (ctypes.c_uint8 * aligned)
+            raw = buf_type.from_address(addr)
+            np_arr = np.frombuffer(raw, dtype=np.uint8, count=num_bytes)
+            tensor = torch.frombuffer(np_arr, dtype=torch.uint8, count=num_bytes).view(dtype)[:num_elements]
+
+            # Register cleanup using numa_free
+            ptr = tensor.data_ptr()
+
+            def cleanup_numa(addr_val: int, size: int, data_ptr: int) -> None:
+                try:
+                    numa = ctypes.CDLL("libnuma.so.1", use_errno=True)
+                    numa.numa_free.restype = None
+                    numa.numa_free.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                    numa.numa_free(ctypes.c_void_p(addr_val), size)
+                except Exception:
+                    pass
+                _live_hugepage_mappings.pop(data_ptr, None)
+
+            finalizer = weakref.finalize(tensor, cleanup_numa, addr, aligned, ptr)
+            _live_hugepage_mappings[ptr] = _HugePageMapping(
+                finalizer=finalizer,
+                aligned=aligned,
+                path=None,
+            )
+
+            return tensor
+
+        except OSError as e:
+            flexkv_logger.warning(f"CXL: libnuma not available ({e}), falling back to mmap")
+
+        # Fallback: use mmap without NUMA binding
+        prot = _PROT_READ | _PROT_WRITE
+        flags = _MAP_PRIVATE | _MAP_ANONYMOUS
+
+        if use_hugepages:
+            page_shift = page_size_bytes.bit_length() - 1
+            flags |= _MAP_HUGETLB | (page_shift << _MAP_HUGE_SHIFT)
+
+        ctypes.set_errno(0)
+        addr = _libc.mmap(None, aligned, prot, flags, -1, 0)
+
+        if addr is None or addr == _MAP_FAILED:
+            err = ctypes.get_errno()
+            raise RuntimeError(f"CXL: mmap({aligned} bytes) failed: {os.strerror(err)}")
+
+        flexkv_logger.warning(f"CXL: Using mmap without NUMA binding (memory may not be on CXL node)")
+
+        # Wrap in torch tensor using numpy buffer
+        buf_type = (ctypes.c_uint8 * aligned)
+        raw = buf_type.from_address(addr)
+        np_arr = np.frombuffer(raw, dtype=np.uint8, count=num_bytes)
+        tensor = torch.frombuffer(np_arr, dtype=torch.uint8, count=num_bytes).view(dtype)[:num_elements]
+
+        # Register cleanup
+        ptr = tensor.data_ptr()
+        finalizer = weakref.finalize(tensor, _cleanup_hugepage_mapping,
+                                     addr, aligned, -1, None, ptr)
+        _live_hugepage_mappings[ptr] = _HugePageMapping(
+            finalizer=finalizer,
+            aligned=aligned,
+            path=None,
+        )
+
+        return tensor
+
+    @classmethod
+    def free(cls, accessible_handle: StorageHandle) -> None:
+        pass  # Memory will be freed when tensor is garbage collected
+
+    @classmethod
+    def from_raw_data(cls,
+                      data: torch.Tensor,
+                      layout: KVCacheLayout,
+                      dtype: torch.dtype,
+                      **kwargs: Any) -> StorageHandle:
+        numa_node = int(kwargs.get("numa_node", -1))
+        return StorageHandle(
+            handle_type=AccessHandleType.TENSOR,
+            data=data,
+            kv_layout=layout,
+            dtype=dtype,
+            cxl_numa_node=numa_node,
+        )
+
+
 class SSDAllocator(BaseStorageAllocator):
     @classmethod
     def allocate(cls,
