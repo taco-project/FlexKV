@@ -944,13 +944,11 @@ PYBIND11_MODULE(c_ext, m) {
       .def("reset", &flexkv::CRadixTreeIndex::reset)
       .def("lock", &flexkv::CRadixTreeIndex::lock, py::arg("node"))
       .def("unlock", &flexkv::CRadixTreeIndex::unlock, py::arg("node"))
-      .def("set_ready", &flexkv::CRadixTreeIndex::set_ready, py::arg("node"),
-           py::arg("ready"), py::arg("ready_length"))
       .def("insert", &flexkv::CRadixTreeIndex::insert,
            py::return_value_policy::reference, py::arg("physical_block_ids"),
            py::arg("block_hashes"), py::arg("num_blocks"),
-           py::arg("num_insert_blocks"), py::arg("ready") = true,
-           py::arg("node") = nullptr, py::arg("num_matched_blocks") = -1,
+           py::arg("num_insert_blocks"), py::arg("node") = nullptr,
+           py::arg("num_matched_blocks") = -1,
            py::arg("last_node_matched_length") = -1,
            py::call_guard<py::gil_scoped_release>())
       .def("evict",
@@ -963,13 +961,7 @@ PYBIND11_MODULE(c_ext, m) {
                &flexkv::CRadixTreeIndex::evict),
            py::arg("evicted_blocks"), py::arg("evicted_block_hashes"),
            py::arg("num_evicted"), py::call_guard<py::gil_scoped_release>())
-      .def("remove_unready_leaf",
-           &flexkv::CRadixTreeIndex::remove_unready_leaf, py::arg("node"),
-           py::arg("freed_blocks"), py::call_guard<py::gil_scoped_release>())
       .def("total_cached_blocks", &flexkv::CRadixTreeIndex::total_cached_blocks)
-      .def("total_unready_blocks",
-           &flexkv::CRadixTreeIndex::total_unready_blocks)
-      .def("total_ready_blocks", &flexkv::CRadixTreeIndex::total_ready_blocks)
       .def("match_prefix", &flexkv::CRadixTreeIndex::match_prefix,
            py::arg("block_hashes"), py::arg("num_blocks"),
            py::arg("update_cache_info"),
@@ -994,8 +986,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("swa_boundary"));
 
   py::class_<flexkv::CRadixNode>(m, "CRadixNode")
-      .def(py::init<flexkv::CRadixTreeIndex *, bool, int>())
-      .def(py::init<flexkv::CRadixTreeIndex *, bool, int, bool>())
+      .def(py::init<flexkv::CRadixTreeIndex *, int>())
+      .def(py::init<flexkv::CRadixTreeIndex *, int, bool>())
       .def("size", &flexkv::CRadixNode::size)
       .def("has_block_node_ids", &flexkv::CRadixNode::has_block_node_ids)
       // Structural / lock accessors — needed to assert the node-mount SWA
@@ -1006,6 +998,11 @@ PYBIND11_MODULE(c_ext, m) {
       .def("is_leaf", &flexkv::CRadixNode::is_leaf)
       .def("num_children", &flexkv::CRadixNode::get_num_children)
       .def("get_lock_cnt", &flexkv::CRadixNode::get_lock_cnt)
+      // Mirror of RadixNode.in_use(): a node is pinned iff its Full KV is
+      // locked or its SWA is locked. Under insert-after there is no readiness
+      // term -- every mounted node is readable -- so this is now the whole
+      // pin condition, and tests assert it on both node types.
+      .def("in_use", &flexkv::CRadixNode::in_use)
       .def("lock", &flexkv::CRadixNode::lock)
       .def("unlock", &flexkv::CRadixNode::unlock)
       .def("has_swa", &flexkv::CRadixNode::has_swa)
@@ -1023,19 +1020,16 @@ PYBIND11_MODULE(c_ext, m) {
 
   py::class_<flexkv::CMatchResult, std::shared_ptr<flexkv::CMatchResult>>(
       m, "CMatchResult")
-      .def(py::init<int, int, int, flexkv::CRadixNode *, flexkv::CRadixNode *,
-                    torch::Tensor, torch::Tensor>())
-      .def_readonly("last_ready_node", &flexkv::CMatchResult::last_ready_node)
+      .def(py::init<int, int, flexkv::CRadixNode *, torch::Tensor,
+                    torch::Tensor>())
       .def_readonly("last_node", &flexkv::CMatchResult::last_node)
       .def_readonly("physical_blocks", &flexkv::CMatchResult::physical_blocks)
       .def_readonly("block_node_ids", &flexkv::CMatchResult::block_node_ids)
-      .def_readonly("num_ready_matched_blocks",
-                    &flexkv::CMatchResult::num_ready_matched_blocks)
       .def_readonly("num_matched_blocks",
                     &flexkv::CMatchResult::num_matched_blocks)
       .def_readonly("last_node_matched_length",
                     &flexkv::CMatchResult::last_node_matched_length)
-      // ===== SWA node-mount: deepest ready node carrying a live SWA slot =====
+      // ===== SWA node-mount: deepest node carrying a live SWA slot =====
       .def_readonly("last_swa_node", &flexkv::CMatchResult::last_swa_node,
                     py::return_value_policy::reference)
       .def_readonly("swa_hit_blocks", &flexkv::CMatchResult::swa_hit_blocks);
@@ -1275,8 +1269,8 @@ PYBIND11_MODULE(c_ext, m) {
       .def("insert", &flexkv::LocalRadixTree::insert,
            py::return_value_policy::reference, py::arg("physical_block_ids"),
            py::arg("block_hashes"), py::arg("num_blocks"),
-           py::arg("num_insert_blocks"), py::arg("ready") = true,
-           py::arg("node") = nullptr, py::arg("num_matched_blocks") = -1,
+           py::arg("num_insert_blocks"), py::arg("node") = nullptr,
+           py::arg("num_matched_blocks") = -1,
            py::arg("last_node_matched_length") = -1,
            py::call_guard<py::gil_scoped_release>())
       .def("evict",
@@ -1293,9 +1287,6 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("block_hashes"), py::arg("num_blocks"),
            py::arg("update_cache_info") = true,
            py::call_guard<py::gil_scoped_release>())
-      .def("total_unready_blocks",
-           &flexkv::LocalRadixTree::total_unready_blocks)
-      .def("total_ready_blocks", &flexkv::LocalRadixTree::total_ready_blocks)
       .def("total_cached_blocks", &flexkv::LocalRadixTree::total_cached_blocks)
       .def("total_node_num", &flexkv::LocalRadixTree::total_node_num)
       .def("reset", &flexkv::LocalRadixTree::reset,
@@ -1312,9 +1303,7 @@ PYBIND11_MODULE(c_ext, m) {
       .def("dec_node_count", &flexkv::LocalRadixTree::dec_node_count)
       .def("lease_pool_capacity", &flexkv::LocalRadixTree::lease_pool_capacity)
       .def("lease_pool_free_size", &flexkv::LocalRadixTree::lease_pool_free_size)
-      .def("pending_queue_size", &flexkv::LocalRadixTree::pending_queue_size)
-      .def("set_ready", &flexkv::LocalRadixTree::set_ready, py::arg("node"),
-           py::arg("ready"), py::arg("ready_length") = -1);
+      .def("pending_queue_size", &flexkv::LocalRadixTree::pending_queue_size);
   m.attr("LocalRadixTree")
       .cast<py::class_<flexkv::LocalRadixTree, flexkv::CRadixTreeIndex>>()
       .def("drain_pending_queues",
@@ -1340,10 +1329,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("lock", &flexkv::DistributedRadixTree::lock, py::arg("node"))
       .def("unlock", &flexkv::DistributedRadixTree::unlock, py::arg("node"))
-      .def("is_empty", &flexkv::DistributedRadixTree::is_empty)
-      .def("set_ready", &flexkv::DistributedRadixTree::set_ready,
-           py::arg("node"), py::arg("ready") = true,
-           py::arg("ready_length") = -1);
+      .def("is_empty", &flexkv::DistributedRadixTree::is_empty);
 
   py::class_<flexkv::RefRadixTree, flexkv::CRadixTreeIndex>(m, "RefRadixTree")
       .def(py::init<int, unsigned int, uint32_t, uint32_t,

@@ -98,9 +98,6 @@ class DistributedRadixTree:
     def is_empty(self) -> bool:
         return bool(self._c.is_empty())
 
-    def set_ready(self, node: "CRadixNode", ready: bool = True, ready_length: int = -1) -> None:
-        self._c.set_ready(node, bool(ready), int(ready_length))
-
 
 class LocalRadixTree:
     def __init__(self,
@@ -182,12 +179,6 @@ class LocalRadixTree:
     def match_prefix(self, block_hashes: torch.Tensor, num_blocks: int, update_cache_info: bool = True):
         return self._c.match_prefix(block_hashes, int(num_blocks), bool(update_cache_info))
 
-    def total_unready_blocks(self) -> int:
-        return int(self._c.total_unready_blocks())
-
-    def total_ready_blocks(self) -> int:
-        return int(self._c.total_ready_blocks())
-
     def total_cached_blocks(self) -> int:
         return int(self._c.total_cached_blocks())
 
@@ -237,11 +228,8 @@ class LocalRadixTree:
     def dec_node_count(self) -> None:
         self._c.dec_node_count()
 
-    def set_ready(self, node: "CRadixNode", ready: bool = True, ready_length: int = -1) -> None:
-        self._c.set_ready(node, bool(ready), int(ready_length))
-
     def insert(self, physical_block_ids: torch.Tensor, block_hashes: torch.Tensor, 
-               num_blocks: int, num_insert_blocks: int = -1, ready: bool = True, 
+               num_blocks: int, num_insert_blocks: int = -1, 
                node: "CRadixNode" = None, num_matched_blocks: int = -1, 
                last_node_matched_length: int = -1) -> "CRadixNode":
         """Insert blocks into the LocalRadixTree.
@@ -251,7 +239,6 @@ class LocalRadixTree:
             block_hashes: Tensor containing block hash values
             num_blocks: Total number of blocks
             num_insert_blocks: Number of blocks to insert (-1 for all)
-            ready: Whether the inserted blocks are ready
             node: Last node for continuation (-1 for auto-match)
             num_matched_blocks: Number of matched blocks (-1 for auto-match)
             last_node_matched_length: Length of last node match (-1 for auto-match)
@@ -261,7 +248,7 @@ class LocalRadixTree:
         """
         return self._c.insert(
             physical_block_ids, block_hashes, int(num_blocks), int(num_insert_blocks),
-            bool(ready), node, int(num_matched_blocks), int(last_node_matched_length)
+            node, int(num_matched_blocks), int(last_node_matched_length)
         )
 
     def evict(self, evicted_blocks: torch.Tensor, num_evicted: int) -> int:

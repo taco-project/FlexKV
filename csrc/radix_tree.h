@@ -21,7 +21,6 @@ class CRadixTreeIndex;
 class CRadixNode {
 private:
   bool on_leaf;
-  bool ready;
   int lock_cnt;
   uint64_t grace_time;
   uint64_t last_access_time;
@@ -56,7 +55,7 @@ private:
   std::list<CRadixNode *>::iterator node_list_it;
 
 public:
-  CRadixNode(CRadixTreeIndex *index, bool ready, int lock_cnt,
+  CRadixNode(CRadixTreeIndex *index, int lock_cnt,
              bool enable_block_node_ids = false);
   ~CRadixNode();
 
@@ -228,9 +227,10 @@ public:
 
   bool is_leaf() { return get_num_children() == 0; }
 
-  // A node is in use (not full-evictable) if its Full KV is locked, its SWA is
-  // locked (I3: swa_lock_ref>0 implies it must stay), or it is not ready.
-  bool in_use() { return lock_cnt > 0 || swa_lock_ref > 0 || !ready; }
+  // A node is in use (not full-evictable) if its Full KV is locked or its SWA
+  // is locked (I3: swa_lock_ref>0 implies it must stay). Nodes are only mounted
+  // once their data is written, so every node in the tree is readable.
+  bool in_use() { return lock_cnt > 0 || swa_lock_ref > 0; }
 
   bool evictable();
 
@@ -246,10 +246,6 @@ public:
     lock_cnt--;
   }
 
-  void set_ready(bool ready) { this->ready = ready; }
-
-  bool is_ready() { return ready; }
-
   CRadixNode *split(int prefix_length);
   std::pair<std::deque<int64_t> *, std::deque<HashType> *> shrink(int length);
   std::deque<int64_t> *shrink_simple(int length);
@@ -258,34 +254,30 @@ public:
 
 class CMatchResult {
 public:
-  int num_ready_matched_blocks;
   int num_matched_blocks;
   int last_node_matched_length;
 
-  CRadixNode *last_ready_node;
   CRadixNode *last_node;
   torch::Tensor physical_blocks;
   torch::Tensor block_node_ids;
 
   // ===== SWA (node-mounted) =====
-  // Deepest fully-matched, ready node carrying a live SWA slot, and the
-  // ready-prefix block count ending at that node. This is the SWA hit (longest
+  // Deepest fully-matched node carrying a live SWA slot, and the matched
+  // prefix block count ending at that node. This is the SWA hit (longest
   // reusable trailing-SWA prefix) found in the SAME single forward pass as the
   // Full-KV match — no backtracking. nullptr / 0 when no SWA on the path.
   CRadixNode *last_swa_node = nullptr;
   int swa_hit_blocks = 0;
 
-  CMatchResult(int _num_ready_matched_blocks, int _num_matched_blocks,
-               int _last_node_matched_length, CRadixNode *_last_ready_node,
+  CMatchResult(int _num_matched_blocks, int _last_node_matched_length,
                CRadixNode *_last_node, torch::Tensor blocks,
                torch::Tensor block_node_ids = torch::Tensor(),
                CRadixNode *_last_swa_node = nullptr, int _swa_hit_blocks = 0)
-      : num_ready_matched_blocks(_num_ready_matched_blocks),
-        num_matched_blocks(_num_matched_blocks),
+      : num_matched_blocks(_num_matched_blocks),
         last_node_matched_length(_last_node_matched_length),
-        last_ready_node(_last_ready_node), last_node(_last_node),
-        physical_blocks(blocks), block_node_ids(block_node_ids),
-        last_swa_node(_last_swa_node), swa_hit_blocks(_swa_hit_blocks) {}
+        last_node(_last_node), physical_blocks(blocks),
+        block_node_ids(block_node_ids), last_swa_node(_last_swa_node),
+        swa_hit_blocks(_swa_hit_blocks) {}
 
   ~CMatchResult() {}
 };
@@ -331,7 +323,7 @@ protected:
                                   std::vector<int64_t> *out_hashes);
 
   // Walk up from `parent`, deleting each ancestor that is a meaningless
-  // tombstone leaf (leaf && swa_tombstone && lock_cnt==0 && ready) — invariant
+  // tombstone leaf (leaf && swa_tombstone && lock_cnt==0) — invariant
   // I2. Freed blocks/hashes append to out_blocks/out_hashes. Returns the last
   // surviving ancestor (a non-tombstone leaf, a locked node, root, or a
   // still-internal node) so the caller can reconsider it for eviction. The
@@ -602,21 +594,6 @@ public:
     }
   }
 
-  virtual void set_ready(CRadixNode *node, bool ready = true,
-                         int ready_length = -1) {
-    node->set_ready(ready);
-    if (ready_length > 0) {
-      ready_length -= node->size();
-      while (ready_length > 0) {
-        assert(node->get_parent() != nullptr);
-        node = node->get_parent();
-        ready_length -= node->size();
-        node->set_ready(true);
-      }
-      assert(ready_length == 0);
-    }
-  }
-
   int total_node_num() { return node_list.size() - 1; }
 
   int total_cached_blocks() {
@@ -628,38 +605,15 @@ public:
     return total_blocks;
   }
 
-  int total_ready_blocks() {
-    auto total_blocks = 0;
-    for (auto it = node_list.begin(); it != node_list.end(); it++) {
-      if ((*it)->is_ready()) {
-        total_blocks += (*it)->size();
-      }
-    }
-    return total_blocks;
-  }
-
-  int total_unready_blocks() {
-    return total_cached_blocks() - total_ready_blocks();
-  }
-
   virtual int evict(torch::Tensor &evicted_blocks, int num_evicted);
   virtual int evict(torch::Tensor &evicted_blocks,
                     torch::Tensor &evicted_block_hashes, int num_evicted);
-  // Roll back a not-yet-ready inserted leaf whose completion callback will
-  // never run (planned transfer aborted before launch). Removes the node only
-  // when unambiguously safe (still an unready, unlocked, SWA-unlocked leaf)
-  // and publishes its physical blocks into freed_blocks (resized; possibly
-  // plus a tombstone-leaf cascade, mirroring evict()). Returns the number of
-  // freed blocks; 0 when the node was left in place. Mirrors
-  // flexkv/cache/radixtree.py::remove_unready_leaf (the executable spec).
-  virtual int remove_unready_leaf(CRadixNode *node,
-                                  torch::Tensor &freed_blocks);
   virtual std::shared_ptr<CMatchResult>
   match_prefix(torch::Tensor &block_hashes, int num_blocks,
                bool update_cache_info = true);
   virtual CRadixNode *insert(torch::Tensor &physical_block_ids,
                              torch::Tensor &block_hashes, int num_blocks,
-                             int num_insert_blocks, bool ready = true,
+                             int num_insert_blocks,
                              CRadixNode *node = nullptr,
                              int num_matched_blocks = -1,
                              int last_node_matched_length = -1);
