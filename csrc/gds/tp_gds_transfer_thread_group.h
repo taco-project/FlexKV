@@ -1,18 +1,14 @@
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
 #include <cuda_runtime.h>
 #include <memory>
-#include <mutex>
-#include <thread>
 #include <torch/extension.h>
 #include <vector>
 #include <string>
 #include <map>
-#include <queue>
 #include <functional>
 #include <future>
+#include "../device_thread_pool.h"
 #include "../gtensor_handler.cuh"
 
 // Forward declaration
@@ -67,13 +63,13 @@ private:
   std::vector<GTensorHandler> gpu_tensor_handlers_;
   
   std::vector<GDSManager*> gds_managers_;
-  std::vector<std::thread> threads_;
-  std::vector<cudaStream_t> streams_;
 
-  std::vector<std::queue<Task>> queues_;
-  std::vector<std::mutex> mtxs_;
-  std::vector<std::condition_variable> cvs_;
-  std::atomic<bool> stop_pool_;
+  // Was a hand-rolled pool here too (threads_, streams_, queues_, mtxs_,
+  // cvs_, stop_pool_) -- the third copy of the same six members. See
+  // device_thread_pool.h for why the copies were a problem: they drifted, and
+  // this one leaked nothing only because its destructor happened to be the
+  // one that got fixed.
+  std::unique_ptr<DeviceThreadPool> pool_;
 };
 
 } // namespace flexkv 

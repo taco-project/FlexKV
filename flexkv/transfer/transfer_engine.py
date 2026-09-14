@@ -37,7 +37,6 @@ from flexkv.transfer.worker import (
     CPUSSDDiskTransferWorker,
     CPURemoteTransferWorker,
     GPUCPUTransferWorker,
-    tpGPUCPUTransferWorker,
     GDSTransferWorker,
     tpGDSTransferWorker,
     NixlTransferWorker,
@@ -46,10 +45,8 @@ from flexkv.transfer.worker import (
 )
 from flexkv.external.mooncake_store_keys import PoolKind
 from flexkv.transfer.compression import build_compressors
-from flexkv.transfer.layerwise import (
-    LayerwiseTransferWorker,
-    build_layerwise_eventfd_socket_path,
-)
+from flexkv.transfer.completion import CompletionContract
+from flexkv.transfer.layer_eventfd import build_layerwise_eventfd_socket_path
 from flexkv.transfer.worker_op import WorkerTransferResult
 from flexkv.common.config import (
     CacheConfig, LayerGroupSpec, ModelConfig, GLOBAL_CONFIG_FROM_ENV,
@@ -250,176 +247,116 @@ class TransferEngine:
         # finalized, when their pending_count drains to zero.
         self._failed_parent_op_ids: Set[int] = set()
 
-    def _get_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
-        """Get multi-group kwargs for TP=1 workers (GPUCPU / GDS)."""
-        if (self.model_config.layer_groups is None or
-                self._gpu_blocks_per_group is None or
-                worker_key not in self._gpu_blocks_per_group):
+    # ---- multi-group worker kwargs -------------------------------------------
+    # There used to be four of these (main/SWA x TP=1/TP>1), and two of the
+    # four were defined twice over, the second definition silently shadowing
+    # the first.  They differed only in which three attributes they read and
+    # whether they transposed, so the pool is a parameter and one device is
+    # just ``num_devices == 1``.
+    def _multi_group_pool(self, pool_id: PoolId) -> tuple:
+        """(layer_groups, blocks_by_worker_key, layouts_by_worker_key)."""
+        if pool_id is PoolId.SWA:
+            return (self._swa_layer_groups,
+                    self._swa_gpu_blocks_per_group,
+                    self._swa_gpu_layouts_per_group)
+        return (self.model_config.layer_groups,
+                self._gpu_blocks_per_group,
+                self._gpu_layouts_per_group)
+
+    def _get_multi_group_kwargs(self, worker_key: WorkerKey, *,
+                                pool_id: PoolId = PoolId.FULL_KV) -> dict:
+        """Multi-group handles/layouts for one worker, or {} if not applicable.
+
+        Transposes the registry's [device][group] into the [group][device] a
+        worker consumes.  The old ``_tp1`` variants returned a single device's
+        own [group] lists; their only callers were the singular GPU<->CPU and
+        GDS worker classes, and the GPU<->CPU pair has been merged (a TP group
+        of one is ``num_devices == 1``).
+        """
+        layer_groups, blocks_by_key, layouts_by_key = self._multi_group_pool(pool_id)
+        if (layer_groups is None or blocks_by_key is None
+                or layouts_by_key is None or worker_key not in blocks_by_key):
             return {}
-        # For TP=1, there's one device per WorkerKey
-        # _gpu_blocks_per_group[worker_key][0] = per-group handle lists for that device
-        per_device_group_blocks = self._gpu_blocks_per_group[worker_key][0]
-        per_device_group_layouts = self._gpu_layouts_per_group[worker_key][0]
+
+        per_device_blocks = blocks_by_key[worker_key]
+        per_device_layouts = layouts_by_key[worker_key]
+        # Device 0 standing in for "this worker registered nothing" is the
+        # historical emptiness check; keep it rather than inventing a new one.
+        if per_device_blocks[0] is None or per_device_layouts[0] is None:
+            return {}
+
+        num_groups = len(layer_groups)
+        num_devices = len(per_device_blocks)
+        return dict(
+            layer_groups=layer_groups,
+            gpu_blocks_per_group=[
+                [per_device_blocks[di][gi] for di in range(num_devices)]
+                for gi in range(num_groups)
+            ],
+            gpu_layouts_per_group=[
+                [per_device_layouts[di][gi] for di in range(num_devices)]
+                for gi in range(num_groups)
+            ],
+        )
+
+    def _get_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
+        """[group] lists for a one-device worker (the surviving GDS classes)."""
+        layer_groups, blocks_by_key, layouts_by_key = self._multi_group_pool(
+            PoolId.FULL_KV)
+        if (layer_groups is None or blocks_by_key is None
+                or worker_key not in blocks_by_key):
+            return {}
+        per_device_group_blocks = blocks_by_key[worker_key][0]
+        per_device_group_layouts = layouts_by_key[worker_key][0]
         if per_device_group_blocks is None or per_device_group_layouts is None:
             return {}
         return dict(
-            layer_groups=self.model_config.layer_groups,
+            layer_groups=layer_groups,
             gpu_blocks_per_group=per_device_group_blocks,
             gpu_layouts_per_group=per_device_group_layouts,
         )
 
-    def _get_multi_group_kwargs_tp(self, worker_key: WorkerKey) -> dict:
-        """Get multi-group kwargs for TP>1 workers (tpGPUCPU / tpGDS)."""
-        if (self.model_config.layer_groups is None or
-                self._gpu_blocks_per_group is None or
-                worker_key not in self._gpu_blocks_per_group):
-            return {}
-        # For TP>1, _gpu_blocks_per_group[worker_key] has tp_size entries (one per device)
-        # Each entry is List[List[TensorSharedHandle]] (per-group handle lists for that device)
-        per_device_data = self._gpu_blocks_per_group[worker_key]
-        per_device_layouts = self._gpu_layouts_per_group[worker_key]
-        if per_device_data[0] is None or per_device_layouts[0] is None:
-            return {}
-
-        num_groups = len(self.model_config.layer_groups)
-        num_devices = len(per_device_data)
-
-        # Restructure: from [device][group] -> [group][device]
-        # gpu_blocks_per_group[group_idx][device_idx] = handles for that group on that device
-        blocks_by_group = []
-        layouts_by_group = []
-        for gi in range(num_groups):
-            group_blocks_per_device = [per_device_data[di][gi] for di in range(num_devices)]
-            group_layouts_per_device = [per_device_layouts[di][gi] for di in range(num_devices)]
-            blocks_by_group.append(group_blocks_per_device)
-            layouts_by_group.append(group_layouts_per_device)
-
-        return dict(
-            layer_groups=self.model_config.layer_groups,
-            gpu_blocks_per_group=blocks_by_group,
-            gpu_layouts_per_group=layouts_by_group,
-        )
-
     def _get_swa_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
-        """Return DSv4 SWA/state sidecar groups for a one-device worker."""
-        if (
-            self._swa_layer_groups is None
-            or self._swa_gpu_blocks_per_group is None
-            or self._swa_gpu_layouts_per_group is None
-            or worker_key not in self._swa_gpu_blocks_per_group
-        ):
+        """[group] lists for a one-device SWA worker (the surviving GDS ones)."""
+        layer_groups, blocks_by_key, layouts_by_key = self._multi_group_pool(
+            PoolId.SWA)
+        if (layer_groups is None or blocks_by_key is None
+                or worker_key not in blocks_by_key):
             return {}
-        per_device_blocks = self._swa_gpu_blocks_per_group[worker_key][0]
-        per_device_layouts = self._swa_gpu_layouts_per_group[worker_key][0]
-        if per_device_blocks is None or per_device_layouts is None:
+        per_device_group_blocks = blocks_by_key[worker_key][0]
+        per_device_group_layouts = layouts_by_key[worker_key][0]
+        if per_device_group_blocks is None or per_device_group_layouts is None:
             return {}
         return dict(
-            layer_groups=self._swa_layer_groups,
-            gpu_blocks_per_group=per_device_blocks,
-            gpu_layouts_per_group=per_device_layouts,
+            layer_groups=layer_groups,
+            gpu_blocks_per_group=per_device_group_blocks,
+            gpu_layouts_per_group=per_device_group_layouts,
         )
 
-    def _get_swa_multi_group_kwargs_tp(self, worker_key: WorkerKey) -> dict:
-        """Return SWA/state sidecar groups reshaped as [group][device]."""
-        if (
-            self._swa_layer_groups is None
-            or self._swa_gpu_blocks_per_group is None
-            or self._swa_gpu_layouts_per_group is None
-            or worker_key not in self._swa_gpu_blocks_per_group
-        ):
-            return {}
-        per_device_blocks = self._swa_gpu_blocks_per_group[worker_key]
-        per_device_layouts = self._swa_gpu_layouts_per_group[worker_key]
-        if per_device_blocks[0] is None or per_device_layouts[0] is None:
-            return {}
-        num_groups = len(self._swa_layer_groups)
-        num_devices = len(per_device_blocks)
-        return dict(
-            layer_groups=self._swa_layer_groups,
-            gpu_blocks_per_group=[
-                [per_device_blocks[di][gi] for di in range(num_devices)]
-                for gi in range(num_groups)
-            ],
-            gpu_layouts_per_group=[
-                [per_device_layouts[di][gi] for di in range(num_devices)]
-                for gi in range(num_groups)
-            ],
-        )
 
-    def _get_swa_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
-        """Return DSv4 SWA/state sidecar groups for a one-device worker."""
-        if (
-            self._swa_layer_groups is None
-            or self._swa_gpu_blocks_per_group is None
-            or self._swa_gpu_layouts_per_group is None
-            or worker_key not in self._swa_gpu_blocks_per_group
-        ):
-            return {}
-        per_device_blocks = self._swa_gpu_blocks_per_group[worker_key][0]
-        per_device_layouts = self._swa_gpu_layouts_per_group[worker_key][0]
-        if per_device_blocks is None or per_device_layouts is None:
-            return {}
-        return dict(
-            layer_groups=self._swa_layer_groups,
-            gpu_blocks_per_group=per_device_blocks,
-            gpu_layouts_per_group=per_device_layouts,
-        )
+    def _get_swa_kwargs(self, worker_key: WorkerKey) -> dict:
+        """SWA pool args for the GPU<->CPU worker (uniform or multi-group).
 
-    def _get_swa_multi_group_kwargs_tp(self, worker_key: WorkerKey) -> dict:
-        """Return SWA/state sidecar groups reshaped as [group][device]."""
-        if (
-            self._swa_layer_groups is None
-            or self._swa_gpu_blocks_per_group is None
-            or self._swa_gpu_layouts_per_group is None
-            or worker_key not in self._swa_gpu_blocks_per_group
-        ):
-            return {}
-        per_device_blocks = self._swa_gpu_blocks_per_group[worker_key]
-        per_device_layouts = self._swa_gpu_layouts_per_group[worker_key]
-        if per_device_blocks[0] is None or per_device_layouts[0] is None:
-            return {}
-        num_groups = len(self._swa_layer_groups)
-        num_devices = len(per_device_blocks)
-        return dict(
-            layer_groups=self._swa_layer_groups,
-            gpu_blocks_per_group=[
-                [per_device_blocks[di][gi] for di in range(num_devices)]
-                for gi in range(num_groups)
-            ],
-            gpu_layouts_per_group=[
-                [per_device_layouts[di][gi] for di in range(num_devices)]
-                for gi in range(num_groups)
-            ],
-        )
+        SWA is one more pool on the worker that already owns this TP group's
+        GPUs, not a worker of its own: same GPUs, same direction, same layout
+        family, differing only in which pool the block ids index. Which is why
+        this is no longer ``_get_layerwise_swa_kwargs`` -- nothing in it was
+        layerwise.
 
-    def _get_layerwise_swa_kwargs(self, worker_key: WorkerKey) -> dict:
-        """SWA args for LayerwiseTransferWorker (uniform or multi-group).
-
-        When SWA is enabled, layerwise GET always binds SWA (and any C4 state
-        sidecars) into the LAYERWISE worker rather than a standalone H2D worker.
+        No SSD args: the worker does not read SSD. Under layerwise the merge
+        emits a standalone DISK2H op that the LAYERWISE op depends on.
         """
         if not self._has_swa:
             return {}
-        swa_ssd_files = (
-            self._swa_ssd_handle.get_file_list()
-            if self._swa_ssd_handle is not None else None)
-        swa_ssd_kv_layout = (
-            self._swa_ssd_handle.kv_layout
-            if self._swa_ssd_handle is not None else None)
-        swa_num_blocks_per_file = (
-            self._swa_ssd_handle.num_blocks_per_file
-            if self._swa_ssd_handle is not None else 0)
 
         if self._swa_layer_groups is not None:
-            mg = self._get_swa_multi_group_kwargs_tp(worker_key)
+            mg = self._get_multi_group_kwargs(worker_key, pool_id=PoolId.SWA)
             if not mg:
                 return {}
             return dict(
                 swa_cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
                 swa_cpu_kv_layout=self._swa_cpu_handle.kv_layout,
-                swa_ssd_files=swa_ssd_files,
-                swa_ssd_kv_layout=swa_ssd_kv_layout,
-                swa_num_blocks_per_file=swa_num_blocks_per_file,
+                swa_dtype=self._swa_gpu_handles[worker_key][0].dtype,
                 swa_layer_groups=mg["layer_groups"],
                 swa_gpu_blocks_per_group=mg["gpu_blocks_per_group"],
                 swa_gpu_layouts_per_group=mg["gpu_layouts_per_group"],
@@ -436,9 +373,45 @@ class TransferEngine:
             ],
             swa_cpu_kv_layout=self._swa_cpu_handle.kv_layout,
             swa_dtype=self._swa_gpu_handles[worker_key][0].dtype,
-            swa_ssd_files=swa_ssd_files,
-            swa_ssd_kv_layout=swa_ssd_kv_layout,
-            swa_num_blocks_per_file=swa_num_blocks_per_file,
+        )
+
+    def _create_gpu_cpu_worker(
+        self, worker_key: WorkerKey, gpu_handles: list,
+        completion: CompletionContract = CompletionContract.WHOLE,
+        layerwise_eventfd_socket: Optional[str] = None,
+    ) -> WorkerHandle:
+        """Spawn one CPU<->GPU worker for a TP group of any size.
+
+        H2D and D2H differ only in which transfer types they are registered
+        for -- the worker itself handles both directions -- so they share this.
+        SWA rides along as a second pool for the same reason.
+
+        LAYERWISE is the same worker once more, differing only in
+        ``completion``: PER_LAYER makes it open the consumer's eventfd UDS and
+        post a fd per model layer. That is why there is no layerwise worker
+        class any more -- per-layer completion is a contract, not a pool
+        layout, and everything else about the transfer is identical.
+        """
+        assert self._cpu_handle is not None
+        return GPUCPUTransferWorker.create_worker(
+            mp_ctx=self.mp_ctx,
+            finished_ops_queue=self.finished_ops_queue,
+            op_buffer_tensor=self.pin_buffer.get_buffer(),
+            gpu_blocks=[h.get_tensor_handle_list() for h in gpu_handles],
+            cpu_blocks=self._cpu_handle.get_worker_tensor(),
+            gpu_kv_layouts=[h.kv_layout for h in gpu_handles],
+            cpu_kv_layout=self._cpu_handle.kv_layout,
+            dtype=gpu_handles[0].dtype,
+            tp_group_size=self.model_config.effective_tp_size_per_node,
+            use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+            use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+            transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
+            transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
+            compressor=self._compressors["gpu_cpu"],
+            completion=completion,
+            layerwise_eventfd_socket=layerwise_eventfd_socket,
+            **self._get_multi_group_kwargs(worker_key),
+            **self._get_swa_kwargs(worker_key),
         )
 
     def _init_workers(self) -> None:
@@ -458,114 +431,43 @@ class TransferEngine:
         
         # H2D worker
         if not _enable_layerwise:
-            if self.model_config.effective_tp_size_per_node == 1:
-                self.h2d_workers: Dict[WorkerKey, WorkerHandle] = {
-                    worker_key: GPUCPUTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                        cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                        gpu_kv_layout=gpu_handles[0].kv_layout,
-                        cpu_kv_layout=self._cpu_handle.kv_layout,
-                        dtype=gpu_handles[0].dtype,
-                        gpu_device_id=gpu_handles[0].gpu_device_id,
-                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                        transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                        transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                        compressor=self._compressors["gpu_cpu"],
-                        **self._get_multi_group_kwargs_tp1(worker_key),
-                    )
-                    for worker_key, gpu_handles in self.gpu_handle_groups.items()
-                }
-            else:
-                self.h2d_workers = {
-                    worker_key: tpGPUCPUTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
-                        cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                        gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
-                        cpu_kv_layout=self._cpu_handle.kv_layout,
-                        dtype=gpu_handles[0].dtype,
-                        tp_group_size=self.model_config.effective_tp_size_per_node,
-                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                        transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                        transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                        compressor=self._compressors["gpu_cpu_tp"],
-                        **self._get_multi_group_kwargs_tp(worker_key),
-                    )
-                    for worker_key, gpu_handles in self.gpu_handle_groups.items()
-                }
+            self.h2d_workers: Dict[WorkerKey, WorkerHandle] = {
+                worker_key: self._create_gpu_cpu_worker(worker_key, gpu_handles)
+                for worker_key, gpu_handles in self.gpu_handle_groups.items()
+            }
             self._register_worker(PoolId.FULL_KV, TransferType.H2D, self.h2d_workers)
 
         # D2H worker
-        if self.model_config.effective_tp_size_per_node == 1:
-            self.d2h_workers: Dict[WorkerKey, WorkerHandle] = {
-                worker_key: GPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=gpu_handles[0].get_tensor_handle_list(),
-                    cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                    gpu_kv_layout=gpu_handles[0].kv_layout,
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    gpu_device_id=gpu_handles[0].gpu_device_id,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                    compressor=self._compressors["gpu_cpu"],
-                    **self._get_multi_group_kwargs_tp1(worker_key),
-                )
-                for worker_key, gpu_handles in self.gpu_handle_groups.items()
-            }
-        else:
-            self.d2h_workers = {
-                worker_key: tpGPUCPUTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
-                    cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                    gpu_kv_layouts=[gpu_handle.kv_layout for gpu_handle in gpu_handles],
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    tp_group_size=self.model_config.effective_tp_size_per_node,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                    compressor=self._compressors["gpu_cpu_tp"],
-                    **self._get_multi_group_kwargs_tp(worker_key),
-                )
-                for worker_key, gpu_handles in self.gpu_handle_groups.items()
-            }
+        self.d2h_workers: Dict[WorkerKey, WorkerHandle] = {
+            worker_key: self._create_gpu_cpu_worker(worker_key, gpu_handles)
+            for worker_key, gpu_handles in self.gpu_handle_groups.items()
+        }
         self._register_worker(PoolId.FULL_KV, TransferType.D2H, self.d2h_workers)
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
             ssd_layer_groups = self.model_config.layer_groups
-            # DISK2H worker
-            if not _enable_layerwise:
-                self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor = self.pin_buffer.get_buffer(),
-                    cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                    ssd_files=self._ssd_handle.get_file_list(),
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    ssd_kv_layout=self._ssd_handle.kv_layout,
-                    dtype=self._cpu_handle.dtype,
-                    num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
-                    cache_config=self._cache_config,
-                    compressor=self._compressors["cpu_ssd"],
-                    layer_groups=ssd_layer_groups,
-                )
-                self._register_worker(PoolId.FULL_KV, TransferType.DISK2H, self.cpussd_read_worker)
+            # DISK2H worker.
+            #
+            # Registered in layerwise mode too.  The layerwise worker is now an
+            # ordinary CPU<->GPU worker under a PER_LAYER contract and has no
+            # SSD binding, so the merge hoists the SSD read to a standalone
+            # DISK2H op the LAYERWISE op depends on -- and that op has to find a
+            # worker here.
+            self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor = self.pin_buffer.get_buffer(),
+                cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                ssd_files=self._ssd_handle.get_file_list(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                ssd_kv_layout=self._ssd_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
+                num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                cache_config=self._cache_config,
+                compressor=self._compressors["cpu_ssd"],
+                layer_groups=ssd_layer_groups,
+            )
+            self._register_worker(PoolId.FULL_KV, TransferType.DISK2H, self.cpussd_read_worker)
 
             # H2DISK worker
             self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
@@ -684,54 +586,33 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         tp_group_size=self.model_config.effective_tp_size_per_node,
-                        **self._get_multi_group_kwargs_tp(worker_key),
+                        **self._get_multi_group_kwargs(worker_key),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
                 }
             self._register_worker(PoolId.FULL_KV, TransferType.DISK2D, self.gds_workers)
             self._register_worker(PoolId.FULL_KV, TransferType.D2DISK, self.gds_workers)
         if GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
-            ssd_files = {} if self._ssd_handle is None else self._ssd_handle.get_file_list()
-            ssd_kv_layout = None if self._ssd_handle is None else self._ssd_handle.kv_layout
-            num_blocks_per_file = 0 if self._ssd_handle is None else self._ssd_handle.num_blocks_per_file
-
+            # The same GPU<->CPU worker as H2D/D2H above.  The only
+            # difference is the completion contract: PER_LAYER makes it receive
+            # the consumer's eventfds and post one per model layer.
             self.layerwise_workers: Dict[WorkerKey, WorkerHandle] = {}
             for worker_key, gpu_handles in self.gpu_handle_groups.items():
-                _layerwise_eventfd_socket = build_layerwise_eventfd_socket_path(
-                    dp_client_id=worker_key.dp_client_id,
-                    pp_rank=worker_key.pp_rank,
-                    model_config=self.model_config,
+                self.layerwise_workers[worker_key] = self._create_gpu_cpu_worker(
+                    worker_key,
+                    gpu_handles,
+                    completion=CompletionContract.PER_LAYER,
+                    layerwise_eventfd_socket=build_layerwise_eventfd_socket_path(
+                        dp_client_id=worker_key.dp_client_id,
+                        pp_rank=worker_key.pp_rank,
+                        model_config=self.model_config,
+                    ),
                 )
-
-                worker = LayerwiseTransferWorker.create_worker(
-                    mp_ctx=self.mp_ctx,
-                    finished_ops_queue=self.finished_ops_queue,
-                    op_buffer_tensor=self.pin_buffer.get_buffer(),
-                    gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
-                    cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                    ssd_files=ssd_files,
-                    gpu_kv_layouts=[handle.kv_layout for handle in gpu_handles],
-                    cpu_kv_layout=self._cpu_handle.kv_layout,
-                    ssd_kv_layout=ssd_kv_layout,
-                    dtype=gpu_handles[0].dtype,
-                    tp_group_size=self.model_config.effective_tp_size_per_node,
-                    layerwise_eventfd_socket=_layerwise_eventfd_socket,
-                    num_blocks_per_file=num_blocks_per_file,
-                    use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                    use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                    h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                    d2h_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                    # Fuse main-KV + uniform/multi-group SWA into one LAYERWISE op.
-                    **self._get_layerwise_swa_kwargs(worker_key),
-                    **self._get_multi_group_kwargs_tp(worker_key),
-                )
-                self.layerwise_workers[worker_key] = worker
 
                 flexkv_logger.debug(
                     f"[TransferEngine] Created layerwise worker for {worker_key}: "
                     f"effective_tp_size_per_node={self.model_config.effective_tp_size_per_node}, "
-                    f"layer_groups={'yes' if self.model_config.layer_groups else 'no'}, "
-                    f"has_ssd={len(ssd_files) > 0}")
+                    f"layer_groups={'yes' if self.model_config.layer_groups else 'no'}")
 
             self._register_worker(PoolId.FULL_KV, TransferType.LAYERWISE, self.layerwise_workers)
 
@@ -763,105 +644,21 @@ class TransferEngine:
             if self.cache_config.enable_p2p_ssd:
                 self._register_worker(PoolId.FULL_KV, TransferType.PEERSSD2H, self.cpu_remote_cpu_worker)
 
-        # ---- SWA dedicated worker map ----
-        # Reuses GPUCPUTransferWorker / tpGPUCPUTransferWorker exactly like the
-        # main-KV H2D/D2H workers, but bound to the dedicated SWA GPU/CPU pools
-        # and submitting completion onto the shared finished_ops_queue.
-        # Uniform SWA uses the legacy single-group worker. DSv4 state sidecars
-        # reuse this channel with heterogeneous multi-group worker arguments.
+        # ---- SWA rides the main GPU<->CPU worker ----
+        # There used to be four worker maps here (H2D/D2H x TP=1/TP>1), bound
+        # to the dedicated SWA pools.  They are gone: the SWA pool is passed to
+        # _create_gpu_cpu_worker as a second pool on the worker that already
+        # owns this TP group's GPUs, so the same handle serves PoolId.SWA.
+        # Same GPUs, same direction, same layout family -- only the block ids
+        # index a different pool.
         if self._has_swa:
-            # Already empty: _init_workers cleared the whole registry above.
-            # When layerwise is on, SWA H2D always runs inside LAYERWISE
-            # (uniform via launch_swa_h2d_layer_, multi-group via
-            # launch_swa_mg_h2d_layer_). Standalone SWA H2D workers are only
-            # created when layerwise transfer is disabled.
+            # When layerwise is on, SWA H2D always runs inside the LAYERWISE
+            # op; the standalone H2D registration only exists when it is off.
             if not _enable_layerwise:
-                if self.model_config.effective_tp_size_per_node == 1:
-                    self._swa_h2d_workers: Dict[WorkerKey, WorkerHandle] = {
-                        worker_key: GPUCPUTransferWorker.create_worker(
-                            mp_ctx=self.mp_ctx,
-                            finished_ops_queue=self.finished_ops_queue,
-                            op_buffer_tensor=self.pin_buffer.get_buffer(),
-                            gpu_blocks=swa_handles[0].get_tensor_handle_list(),
-                            cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
-                            gpu_kv_layout=swa_handles[0].kv_layout,
-                            cpu_kv_layout=self._swa_cpu_handle.kv_layout,
-                            dtype=swa_handles[0].dtype,
-                            gpu_device_id=swa_handles[0].gpu_device_id,
-                            use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                            use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                            transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                            transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                            **self._get_swa_multi_group_kwargs_tp1(worker_key),
-                        )
-                        for worker_key, swa_handles in self._swa_gpu_handles.items()
-                    }
-                else:
-                    self._swa_h2d_workers = {
-                        worker_key: tpGPUCPUTransferWorker.create_worker(
-                            mp_ctx=self.mp_ctx,
-                            finished_ops_queue=self.finished_ops_queue,
-                            op_buffer_tensor=self.pin_buffer.get_buffer(),
-                            gpu_blocks=[h.get_tensor_handle_list() for h in swa_handles],
-                            cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
-                            gpu_kv_layouts=[h.kv_layout for h in swa_handles],
-                            cpu_kv_layout=self._swa_cpu_handle.kv_layout,
-                            dtype=swa_handles[0].dtype,
-                            tp_group_size=self.model_config.effective_tp_size_per_node,
-                            use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                            use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                            transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                            transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                            **self._get_swa_multi_group_kwargs_tp(worker_key),
-                        )
-                        for worker_key, swa_handles in self._swa_gpu_handles.items()
-                    }
-                self._register_worker(PoolId.SWA, TransferType.H2D, self._swa_h2d_workers)
-                flexkv_logger.info("TransferEngine: swa H2D workers initialized")
-            # D2H swa worker
-            if self.model_config.effective_tp_size_per_node == 1:
-                self._swa_d2h_workers: Dict[WorkerKey, WorkerHandle] = {
-                    worker_key: GPUCPUTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=swa_handles[0].get_tensor_handle_list(),
-                        cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
-                        gpu_kv_layout=swa_handles[0].kv_layout,
-                        cpu_kv_layout=self._swa_cpu_handle.kv_layout,
-                        dtype=swa_handles[0].dtype,
-                        gpu_device_id=swa_handles[0].gpu_device_id,
-                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                        transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                        transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                        **self._get_swa_multi_group_kwargs_tp1(worker_key),
-                    )
-                    for worker_key, swa_handles in self._swa_gpu_handles.items()
-                }
-            else:
-                self._swa_d2h_workers = {
-                    worker_key: tpGPUCPUTransferWorker.create_worker(
-                        mp_ctx=self.mp_ctx,
-                        finished_ops_queue=self.finished_ops_queue,
-                        op_buffer_tensor=self.pin_buffer.get_buffer(),
-                        gpu_blocks=[h.get_tensor_handle_list() for h in swa_handles],
-                        cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
-                        gpu_kv_layouts=[h.kv_layout for h in swa_handles],
-                        cpu_kv_layout=self._swa_cpu_handle.kv_layout,
-                        dtype=swa_handles[0].dtype,
-                        tp_group_size=self.model_config.effective_tp_size_per_node,
-                        use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
-                        use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
-                        transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
-                        transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
-                        **self._get_swa_multi_group_kwargs_tp(worker_key),
-                        )
-                    for worker_key, swa_handles in self._swa_gpu_handles.items()
-                }
-
-            self._register_worker(PoolId.SWA, TransferType.D2H, self._swa_d2h_workers)
-            flexkv_logger.info("TransferEngine: swa D2H workers initialized")
+                self._register_worker(PoolId.SWA, TransferType.H2D, self.h2d_workers)
+                flexkv_logger.info("TransferEngine: swa H2D served by the main GPU<->CPU worker")
+            self._register_worker(PoolId.SWA, TransferType.D2H, self.d2h_workers)
+            flexkv_logger.info("TransferEngine: swa D2H served by the main GPU<->CPU worker")
 
             if self._swa_ssd_handle is not None and self._swa_cpu_handle is not None:
                 self.swa_h2disk_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
@@ -975,7 +772,7 @@ class TransferEngine:
                             ssd_kv_layout=self._swa_ssd_handle.kv_layout,
                             dtype=swa_handles[0].dtype,
                             tp_group_size=self.model_config.effective_tp_size_per_node,
-                            **self._get_swa_multi_group_kwargs_tp(worker_key),
+                            **self._get_multi_group_kwargs(worker_key, pool_id=PoolId.SWA),
                         )
                         for worker_key, swa_handles in self._swa_gpu_handles.items()
                     }
@@ -983,15 +780,6 @@ class TransferEngine:
                 self._register_worker(PoolId.SWA, TransferType.D2DISK, self._swa_gds_workers)
                 flexkv_logger.info("TransferEngine: swa GDS workers initialized")
             self._has_swa = True
-            # Must mirror the create condition above.
-            if not _enable_layerwise:
-                flexkv_logger.info(
-                    f"TransferEngine: swa workers initialized "
-                    f"({len(self._swa_h2d_workers)} H2D + {len(self._swa_d2h_workers)} D2H)")
-            else:
-                flexkv_logger.info(
-                    f"TransferEngine: swa inline workers initialized "
-                    f"(H2D fused into layerwise, {len(self._swa_d2h_workers)} D2H)")
 
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
@@ -1038,8 +826,9 @@ class TransferEngine:
         if _enable_layerwise:
             assert TransferType.H2D not in self._worker_map, \
                 "H2D worker should not exist in layerwise mode (fused into layerwise worker)"
-            assert TransferType.DISK2H not in self._worker_map, \
-                "DISK2H worker should not exist in layerwise mode (fused into layerwise worker)"
+            # DISK2H deliberately *is* registered: the SSD read is hoisted out
+            # of the layerwise op (see merge_to_batch_graph) because the
+            # PER_LAYER worker has no SSD binding to fuse it into.
             assert TransferType.LAYERWISE in self._worker_map, \
                 "LAYERWISE worker must exist when layerwise transfer is enabled"
 

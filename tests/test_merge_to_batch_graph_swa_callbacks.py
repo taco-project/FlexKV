@@ -70,18 +70,24 @@ def test_layerwise_merge_combines_main_and_swa_callbacks():
         layerwise_transfer=True,
     )
 
-    # Layerwise fuses both pools' DISK2H and H2D into the single LAYERWISE op
-    # (the cpp Step 0a read followed by the per-layer H2D), so the merged graph
-    # holds exactly one op and it is the batch end.
+    # A merged DISK2H is hoisted to an op of its own -- one per pool -- rather
+    # than folded into the layerwise op, so the fused graph is
+    # {main DISK2H, SWA DISK2H, layerwise}. Pick the layerwise op by type;
+    # ``_op_map`` order is insertion order and the hoisted ops come first.
     ops = list(merged._op_map.values())
-    assert merged.num_ops == 1
-    lw_op = ops[0]
-    assert isinstance(lw_op, LayerwiseTransferOp)
+    lw_op = next(op for op in ops if isinstance(op, LayerwiseTransferOp))
     assert batch_end_op_id == lw_op.op_id
+    assert merged.num_ops == 3
+    assert [op.transfer_type for op in ops if op is not lw_op] == [
+        TransferType.DISK2H, TransferType.DISK2H,
+    ]
 
-    # All four callbacks ride that one op: the fused transfer is what completes.
-    op_callbacks[lw_op.op_id]()
-    assert ctx["fired"] == ["main_disk2h", "main_h2d", "swa_disk2h", "swa_h2d"]
+    # The DISK2H callbacks ride their hoisted ops now (they fire at CPU-ready,
+    # which is when the blocks they publish actually exist); only the H2D
+    # halves ride the layerwise op.
+    for op in ops:
+        op_callbacks[op.op_id]()
+    assert ctx["fired"] == ["main_disk2h", "swa_disk2h", "main_h2d", "swa_h2d"]
 
 
 def test_non_layerwise_put_swa_callbacks_on_merged_ops():

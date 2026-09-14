@@ -28,7 +28,6 @@ from flexkv.transfer.workers import (  # noqa: F401
     ensure_cuda_device,
     import_tensor_handles,
     tpGDSTransferWorker,
-    tpGPUCPUTransferWorker,
 )
 
 __all__ = [
@@ -48,6 +47,5 @@ __all__ = [
     "ensure_cuda_device",
     "import_tensor_handles",
     "tpGDSTransferWorker",
-    "tpGPUCPUTransferWorker",
     "trace",
 ]

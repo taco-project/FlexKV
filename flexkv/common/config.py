@@ -833,6 +833,37 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     kv_shared_across_ranks_mode=os.getenv('FLEXKV_KV_SHARED_ACROSS_RANKS_MODE', 'sharded'),
 
     layerwise_notify_mode=os.getenv('FLEXKV_LAYERWISE_NOTIFY_MODE', 'hostfunc'),
+    # When the consumer of a CPU->GPU transfer is told a layer is readable:
+    # 'per_layer' (one eventfd per original layer, what sglang's overlapped
+    # attention needs) or 'whole' (told once, when the op lands). See
+    # flexkv/transfer/completion.py -- the contract picks the launch
+    # granularity, not the other way round.
+    layerwise_completion_contract=os.getenv(
+        'FLEXKV_LAYERWISE_COMPLETION_CONTRACT', 'per_layer'
+    ),
+    # How long a worker waits for a launched layerwise transfer to actually
+    # complete before failing the op. Only reached when the GPU is wedged.
+    # Keep < FLEXKV_WORKER_SHUTDOWN_TIMEOUT_S so a stuck transfer fails the op
+    # instead of hanging shutdown.
+    layerwise_completion_timeout_s=float(
+        os.getenv('FLEXKV_LAYERWISE_COMPLETION_TIMEOUT_S', 300)
+    ),
+
+    # CPU<->GPU worker waits on a CUDA event instead of letting the C++ binding
+    # call cudaStreamSynchronize while holding the GIL.  Same completion
+    # semantics, but multi-group stops synchronizing once per group and the
+    # rest of the worker process stays responsive during a transfer.
+    # Set to 0 to fall back to the in-binding sync.
+    gpu_cpu_event_sync=os.getenv('FLEXKV_GPU_CPU_EVENT_SYNC', '1') not in
+        ('0', 'false', 'False'),
+
+    # Multi-group CPU<->GPU goes through one RegionBatchGroup (all regions in
+    # one fan-out, launched back to back onto each rank's stream) instead of
+    # one TPTransferThreadGroup per group (a fan-out and a GIL round trip per
+    # group).  Off falls back to the per-group loop, which is also the
+    # automatic fallback on a build whose extension has no RegionBatchGroup.
+    region_batch=os.getenv('FLEXKV_REGION_BATCH', '1') not in
+        ('0', 'false', 'False'),
 
     # Graceful shutdown timeout hierarchy (each layer waits for the next inner
     # layer plus a small buffer to avoid mid-unpin SIGKILL):

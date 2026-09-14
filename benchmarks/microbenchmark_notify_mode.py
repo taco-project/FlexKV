@@ -13,14 +13,26 @@ Run:
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
 
 import torch
 
-from flexkv.c_ext import LayerwiseTransferGroup
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.transfer.region_batch import (
+    RegionSpec,
+    build_region_batch,
+    make_requests,
+)
+
+# The consumer's end of the eventfd protocol lives with the tests; a benchmark
+# of the notify path has to be that consumer, or ``LayerNotifier`` no-ops and
+# the numbers below measure the transfer with notification switched off.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests"))
+from eventfd_probe import Fds  # noqa: E402
 
 DTYPE = torch.float16
 ES = DTYPE.itemsize
@@ -65,23 +77,29 @@ def make_tensors(num_layers, num_blocks, tpb, head_dim, num_gpus):
     return gpu_layout, cpu_layout, all_gpu, cpu_kv
 
 
-def make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
-                         kv_dim=2, is_blockfirst=False):
-    def strides_tensor(getter):
-        return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
-    ssd_files = {}
-    layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
-
-    return LayerwiseTransferGroup(
-        num_gpus, all_gpu, cpu_kv, ssd_files, num_layers,
-        strides_tensor(gpu_layout.get_kv_stride),
-        strides_tensor(gpu_layout.get_block_stride),
-        strides_tensor(gpu_layout.get_layer_stride),
-        strides_tensor(gpu_layout.get_chunk_size),
-        0, 0, layer_eventfds_tensor, num_gpus,
-        kv_dim=kv_dim,
-        is_blockfirst=is_blockfirst,
+def make_group(cpu_kv, all_gpu, num_gpus, gpu_layout, cpu_layout, num_layers):
+    """One region over the whole KV pool -- the shape a single-group model has."""
+    spec = RegionSpec(
+        name="kv",
+        cpu_ptr=cpu_kv.data_ptr(),
+        cpu_kv_stride=cpu_layout.get_kv_stride() * ES,
+        cpu_layer_stride=cpu_layout.get_layer_stride() * ES,
+        cpu_block_stride=cpu_layout.get_block_stride() * ES,
+        cpu_tp_stride=(cpu_layout.get_block_stride() * ES) // num_gpus,
+        gpu_block_ptrs_flat=[all_gpu[g][l].data_ptr()
+                             for g in range(num_gpus)
+                             for l in range(num_layers)],
+        num_tensors_per_gpu=num_layers,
+        gpu_kv_strides=[gpu_layout.get_kv_stride() * ES] * num_gpus,
+        gpu_block_strides=[gpu_layout.get_block_stride() * ES] * num_gpus,
+        gpu_layer_strides=[gpu_layout.get_layer_stride() * ES] * num_gpus,
+        gpu_chunk_sizes=[gpu_layout.get_chunk_size() * ES] * num_gpus,
+        num_layers=num_layers,
+        kv_dim=1,
+        num_kv_heads=1,
     )
+    return build_region_batch(
+        [spec], list(range(num_gpus)), is_blockfirst=True, num_kv_heads=1)
 
 
 def bench_one(num_layers, num_blocks, tpb, head_dim, num_gpus, use_ce,
@@ -91,46 +109,33 @@ def bench_one(num_layers, num_blocks, tpb, head_dim, num_gpus, use_ce,
 
     block_ids = torch.arange(num_blocks, dtype=torch.int64).pin_memory()
 
-    cpu_stride_kv = cpu_layout.get_kv_stride() * ES
-    cpu_stride_layer = cpu_layout.get_layer_stride() * ES
-    cpu_stride_block = cpu_layout.get_block_stride() * ES
-    cpu_stride_tp = cpu_stride_block // num_gpus
-    chunk_size = gpu_layout.get_chunk_size() * ES
+    group = make_group(
+        cpu_kv, all_gpu, num_gpus, gpu_layout, cpu_layout, num_layers)
 
-    lw = make_layerwise_group(
-        cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
-        kv_dim=1, is_blockfirst=True,
-    )
+    # One request per layer, each tagged with the layer it closes: that tag is
+    # what makes this a per-layer transfer rather than a whole-block one.
+    requests = []
+    for layer in range(num_layers):
+        req = make_requests(
+            1, block_ids, block_ids, True,
+            transfer_num_cta=4, use_ce_transfer=use_ce,
+            layer_id=layer, layer_granularity=1)[0]
+        req.milestone_layer = layer
+        requests.append(req)
 
-    def run_once(group=lw):
-        empty_ids = torch.empty(0, dtype=torch.int64)
-        group.layerwise_transfer(
-            ssd_block_ids=empty_ids,
-            cpu_block_ids_d2h=empty_ids,
-            ssd_layer_stride_in_bytes=0,
-            ssd_kv_stride_in_bytes=0,
-            num_blocks_per_file=0,
-            round_robin=0,
-            num_threads_per_device=0,
-            gpu_block_id_tensor=block_ids,
-            cpu_block_id_tensor=block_ids,
-            cpu_kv_stride_in_bytes=cpu_stride_kv,
-            cpu_layer_stride_in_bytes=cpu_stride_layer,
-            cpu_block_stride_in_bytes=cpu_stride_block,
-            cpu_chunk_size_in_bytes=chunk_size,
-            h2d_cpu_kv_stride_in_bytes=cpu_stride_kv,
-            h2d_cpu_layer_stride_in_bytes=cpu_stride_layer,
-            cpu_tp_stride_in_bytes=cpu_stride_tp,
-            transfer_cta_num=4,
-            use_ce_transfer=use_ce,
-            num_layers=num_layers,
-            layer_granularity=1,
-            kv_dim=1,
-            num_kv_heads=1,
-            counter_id=0,
-            kv_shared_across_ranks_mode="sharded",
-            notify_mode=notify_mode,
-        )
+    fds = Fds(num_counters=1, tp_size=num_gpus, num_layers=num_layers)
+    group.set_layer_eventfds(
+        fds.tensor(), num_gpus, num_layers, notify_mode)
+
+    def run_once():
+        group.submit_layerwise(requests, [], 0)
+        ok, err = group.wait_layer_completion(120.0)
+        if not ok:
+            raise RuntimeError(f"layerwise transfer did not complete: {err}")
+        # Drain what this iteration posted, or the fds accumulate units across
+        # iterations and a real consumer would be reading stale readiness.
+        for layer in range(num_layers):
+            fds.units(layer)
 
     for _ in range(warmup):
         run_once()
@@ -144,7 +149,8 @@ def bench_one(num_layers, num_blocks, tpb, head_dim, num_gpus, use_ce,
         torch.cuda.synchronize()
         times.append((time.perf_counter() - t0) * 1000.0)  # ms
 
-    del lw
+    del group
+    fds.close()
     times_sorted = sorted(times)
     n = len(times_sorted)
 
