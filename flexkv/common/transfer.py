@@ -200,6 +200,23 @@ class TransferOp:
     # resolve to. (The property has to be attached after ``@dataclass`` runs;
     # inside the body the decorator would read it as the field's default.)
     is_swa: InitVar[Optional[bool]] = None
+    # Where this op's GPU-side ids start inside the request's slot_mapping.
+    #
+    # set_gpu_blocks() historically assumed every GPU-touching op of a graph
+    # covers a prefix of the slot_mapping (``target_gpu_blocks[:size]``), which
+    # only holds while a GET has exactly one H2D. Once the H2D is split into a
+    # CPU-resident lane and an SSD/REMOTE-staged lane, the second lane starts
+    # partway in, and binding it from index 0 would silently write the staged
+    # blocks over the resident ones' GPU slots.
+    #
+    # None keeps the legacy prefix (or, for D2DISK/DISK2D, suffix) behaviour.
+    gpu_bind_offset: Optional[int] = None
+    # True when this op's source blocks are produced by a predecessor in the
+    # same graph (DISK2H / REMOTE2H staging into CPU) rather than being already
+    # resident. Only meaningful on H2D. The batch merge keys off this to keep
+    # the resident lane free of the staged lane's dependencies -- merging the
+    # two would put the whole batch back behind the slowest SSD read.
+    src_is_staged: bool = False
     # Block content hashes for mooncake-store key-based addressing (main KV).
     mooncake_store_block_hashes: Optional[np.ndarray] = None
     # Tail-hash list for SWA mooncake REMOTE2H/H2REMOTE (one entry per SWA slot).
@@ -452,16 +469,37 @@ class TransferOpGraph:
                 target_gpu_blocks = swa_gpu_blocks[swa_base + swa_offset:
                                                    swa_base + next_swa_offset]
                 swa_offset = next_swa_offset
+            # gpu_bind_offset lets an op claim a window that does not start at 0
+            # (split H2D lanes: resident blocks first, staged blocks after).
+            offset = getattr(op, "gpu_bind_offset", None)
             if transfer_type.name.endswith("2D"):
-                if transfer_type == TransferType.DISK2D:
-                    op.dst_block_ids = target_gpu_blocks[-op.dst_block_ids.size:]
+                size = op.dst_block_ids.size
+                if offset is not None:
+                    if offset + size > target_gpu_blocks.size:
+                        raise ValueError(
+                            f"gpu_bind_offset out of range for op {op_id}: "
+                            f"offset={offset} size={size} "
+                            f"available={target_gpu_blocks.size}"
+                        )
+                    op.dst_block_ids = target_gpu_blocks[offset:offset + size]
+                elif transfer_type == TransferType.DISK2D:
+                    op.dst_block_ids = target_gpu_blocks[-size:]
                 else:
-                    op.dst_block_ids = target_gpu_blocks[:op.dst_block_ids.size]
+                    op.dst_block_ids = target_gpu_blocks[:size]
             else:
-                if transfer_type == TransferType.D2DISK:
-                    op.src_block_ids = target_gpu_blocks[-op.src_block_ids.size:]
+                size = op.src_block_ids.size
+                if offset is not None:
+                    if offset + size > target_gpu_blocks.size:
+                        raise ValueError(
+                            f"gpu_bind_offset out of range for op {op_id}: "
+                            f"offset={offset} size={size} "
+                            f"available={target_gpu_blocks.size}"
+                        )
+                    op.src_block_ids = target_gpu_blocks[offset:offset + size]
+                elif transfer_type == TransferType.D2DISK:
+                    op.src_block_ids = target_gpu_blocks[-size:]
                 else:
-                    op.src_block_ids = target_gpu_blocks[:op.src_block_ids.size]
+                    op.src_block_ids = target_gpu_blocks[:size]
             assert op.src_block_ids.size == op.dst_block_ids.size, \
                 f"src_block_ids.size={op.src_block_ids.size}, dst_block_ids.size={op.dst_block_ids.size}"
 
@@ -731,12 +769,17 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
             [np.asarray(op.mooncake_store_block_hashes) for op in ops]
         )
 
+    # A merged op is staged iff any input was: the merged block set then
+    # contains at least one block a predecessor still has to fill.  Callers must
+    # not merge across the lane boundary (see _split_h2d_lanes); this only keeps
+    # the flag honest on the merged op.
     merged_op = TransferOp(
         graph_id=graph.graph_id,
         transfer_type=transfer_type,
         src_block_ids=src_blocks,
         dst_block_ids=dst_blocks,
         dp_client_id=ops[0].dp_client_id,
+        src_is_staged=any(getattr(op, "src_is_staged", False) for op in ops),
         mooncake_store_block_hashes=merged_kv_hashes,
     )
     _attach_merged_callbacks(
@@ -794,6 +837,28 @@ def _merge_swa_ops(ops: List[TransferOp], transfer_type: TransferType,
     _attach_merged_callbacks(
         merged_op, ops, callbacks, op_callback_dict)
     return merged_op
+
+
+def _split_h2d_lanes(h2d_ops: List[TransferOp],
+                     h2d_callbacks: List[Tuple[TransferOp, Callable]],
+                     ) -> Tuple[List[TransferOp],
+                                List[Tuple[TransferOp, Callable]],
+                                List[TransferOp],
+                                List[Tuple[TransferOp, Callable]]]:
+    """Partition a batch's H2D ops into the resident and staged lanes.
+
+    Each callback travels with its own op, so a lane keeps exactly the callbacks
+    of the ops it kept -- and ``_attach_merged_callbacks`` can still compute each
+    callback's block span within its lane's merged op.
+    """
+    def _is_staged(op: TransferOp) -> bool:
+        return getattr(op, "src_is_staged", False)
+
+    resident_ops = [op for op in h2d_ops if not _is_staged(op)]
+    staged_ops = [op for op in h2d_ops if _is_staged(op)]
+    resident_cbs = [pair for pair in h2d_callbacks if not _is_staged(pair[0])]
+    staged_cbs = [pair for pair in h2d_callbacks if _is_staged(pair[0])]
+    return resident_ops, resident_cbs, staged_ops, staged_cbs
 
 
 def _bucket_has(*types: TransferType, ops_by_type: Dict[TransferType, List[TransferOp]],
@@ -942,9 +1007,26 @@ def merge_to_batch_graph(batch_id: int,
             ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
             merged_graph, callbacks_by_type[TransferType.DISK2H],
             local_cb_dict)
+        # Keep the resident lane out of the merged H2D when it is split (see
+        # CacheEngine._build_get_h2d_ops): fusing them back together would put
+        # every task's CPU hits behind the slowest DISK2H/REMOTE2H in the batch,
+        # which is exactly what the split exists to avoid. Layerwise folds both
+        # lanes into the LAYERWISE op anyway, so it keeps the single-bucket path.
+        h2d_ops = ops_by_type[TransferType.H2D]
+        h2d_callbacks = callbacks_by_type[TransferType.H2D]
+        merged_resident_h2d_op = None
+        if not layerwise_transfer and any(
+                getattr(op, "src_is_staged", False) for op in h2d_ops) and any(
+                not getattr(op, "src_is_staged", False) for op in h2d_ops):
+            resident_ops, resident_cbs, staged_ops, staged_cbs = _split_h2d_lanes(
+                h2d_ops, h2d_callbacks)
+            merged_resident_h2d_op = _merge_ops(
+                resident_ops, TransferType.H2D, merged_graph, resident_cbs,
+                local_cb_dict)
+            h2d_ops, h2d_callbacks = staged_ops, staged_cbs
         merged_h2d_op = _merge_ops(
-            ops_by_type[TransferType.H2D], TransferType.H2D,
-            merged_graph, callbacks_by_type[TransferType.H2D],
+            h2d_ops, TransferType.H2D,
+            merged_graph, h2d_callbacks,
             local_cb_dict)
         merged_remote2h_op = _merge_ops(
             ops_by_type[TransferType.REMOTE2H], TransferType.REMOTE2H,
@@ -1048,12 +1130,14 @@ def merge_to_batch_graph(batch_id: int,
                 layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
             batch_end_op_id = layerwise_transfer_op.op_id
         else:
-            for op in (merged_disk2h_op, merged_h2d_op,
+            for op in (merged_disk2h_op, merged_resident_h2d_op, merged_h2d_op,
                        merged_remote2h_op, merged_swa_disk2h_op,
                        merged_swa_h2d_op, merged_swa_remote2h_op):
                 if op is not None:
                     merged_graph.add_transfer_op(op)
 
+            # merged_resident_h2d_op deliberately gets no predecessors: its
+            # source blocks are already in host memory.
             if merged_h2d_op is not None:
                 if merged_disk2h_op is not None:
                     merged_graph.add_dependency(
@@ -1070,6 +1154,10 @@ def merge_to_batch_graph(batch_id: int,
                         merged_swa_h2d_op.op_id, merged_swa_remote2h_op.op_id)
 
             get_sinks: List[int] = []
+            if merged_resident_h2d_op is not None:
+                # The resident lane is an independent leaf, so the batch is only
+                # complete once it has landed too.
+                get_sinks.append(merged_resident_h2d_op.op_id)
             if merged_h2d_op is not None:
                 get_sinks.append(merged_h2d_op.op_id)
             if merged_swa_h2d_op is not None:
