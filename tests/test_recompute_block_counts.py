@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from flexkv.common.config import (
@@ -13,6 +14,8 @@ from flexkv.common.config import (
     update_default_config_from_user_config,
 )
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+
+pytestmark = pytest.mark.unit
 
 
 def test_recompute_matches_heterogeneous_layout_block_size() -> None:

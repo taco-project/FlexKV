@@ -12,6 +12,9 @@ from flexkv.server.client import KVTPClient
 from flexkv.transfer.worker import _validate_multi_group_chunk_layout
 
 
+pytestmark = pytest.mark.unit
+
+
 PAGE_SIZE = 64
 INDEX_HEAD_SIZE = 8448
 MAIN_HEAD_SIZE = 576

@@ -8,6 +8,8 @@ from flexkv.common.config import LayerGroupSpec, ModelConfig, RankInfo
 from flexkv.server.request import RegisterTPClientRequest
 from flexkv.transfer_manager import TransferManager
 
+pytestmark = pytest.mark.unit
+
 # Imported plainly, on purpose. An earlier version of this file stubbed
 # flexkv.transfer.transfer_engine in sys.modules to skip the CUDA/liburing
 # import cost, then tried to unwind the stub afterwards. Either half breaks the
