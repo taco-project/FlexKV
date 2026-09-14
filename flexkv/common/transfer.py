@@ -1,11 +1,24 @@
-import threading
-from dataclasses import dataclass, field, replace
+import itertools
+from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum, IntEnum
 from typing import ClassVar, List, Set, Dict, Callable, Tuple, Optional
 
 import numpy as np
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.pool import PoolId
+
+# ``arr.dtype == np.int64`` builds a dtype from the type object on every call;
+# comparing against a pre-built one skips that. Checked twice per TransferOp
+# and twelve times per LayerwiseTransferOp, on the request-rate path.
+#
+# Deliberately ``==`` and not ``is``: numpy interns scalar dtypes, so ``is``
+# would work for every construction path in this repo AND be faster still --
+# but np.longlong is a distinct object that compares equal, so an identity
+# check would reject a caller-supplied ``np.arange(n, dtype=np.longlong)``
+# that is bit-for-bit valid. Not worth 0.03us to turn a legal input into an
+# assertion failure.
+_INT64 = np.dtype(np.int64)
 
 
 @dataclass(frozen=True)
@@ -117,6 +130,17 @@ class TransferType(Enum):
     VIRTUAL = "Virtual"
     LAYERWISE = "LAYERWISE"
 
+
+# The transfer types that occupy a GPU block slot on one side, i.e. the ones
+# TransferOpGraph.set_gpu_blocks() has to late-bind. Kept next to the enum so a
+# new GPU-touching type is added here rather than found missing at bind time.
+_GPU_TRANSFER_TYPES = frozenset((
+    TransferType.H2D,
+    TransferType.D2H,
+    TransferType.D2DISK,
+    TransferType.DISK2D,
+))
+
 # class DistType(Enum):
 #     DISTH = "DISTH"
 #     DISTSSD = "DISTSSD"
@@ -132,8 +156,12 @@ class TransferOpStatus(Enum):
 
 @dataclass
 class TransferOp:
-    _next_op_id: ClassVar[int] = 0
-    _lock: ClassVar[threading.Lock] = threading.Lock()
+    # itertools.count().__next__ is implemented in C and never releases the GIL
+    # between reading and incrementing, so it hands out unique ids across
+    # threads without a lock -- same guarantee the explicit Lock gave, at ~1/4
+    # the cost. Kept as a ClassVar so ids stay global across all graphs, which
+    # merge_to_batch_graph relies on when it mixes ops from many tasks.
+    _op_id_counter: ClassVar["itertools.count"] = itertools.count()
 
     op_id: int = field(init=False)
     graph_id: int
@@ -155,13 +183,23 @@ class TransferOp:
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
     pending_count: int = 0
-    # ---- SWA (Sliding Window Attention) routing -------------------------------
-    # When True, this op moves SWA KV (an independent GPU/CPU/SSD/REMOTE pool with
-    # its own slot-id space), so the transfer engine routes it to the dedicated
-    # SWA worker (_swa_worker_map) instead of the main-KV worker. The op reuses the
-    # standard transfer_type (D2H/H2D/DISK2H/H2DISK/REMOTE2H/H2REMOTE); src/dst
-    # block ids are SWA-pool slot ids, NOT full-KV block ids.
-    is_swa: bool = False
+    # ---- which pool this op's block ids index --------------------------------
+    # A pool is one slot-id space. It is the *pool* that differs, not the
+    # transfer: the op reuses the standard transfer_type (D2H/H2D/DISK2H/
+    # H2DISK/REMOTE2H/H2REMOTE) and the very same worker, which holds one
+    # binding per pool and picks by this id.
+    #
+    # ``is_swa`` remains as a constructor alias and a read-only property.
+    # Passing both is an error rather than a precedence rule -- a caller that
+    # says ``pool_id=SWA, is_swa=False`` has a bug, and silently honouring
+    # either one would hide it.
+    pool_id: PoolId = PoolId.FULL_KV
+    # InitVar, so it is a constructor argument and *not* stored: the class
+    # attribute it leaves behind is replaced by a read-only property just
+    # below the class, which is what the ~100 existing ``op.is_swa`` readers
+    # resolve to. (The property has to be attached after ``@dataclass`` runs;
+    # inside the body the decorator would read it as the field's default.)
+    is_swa: InitVar[Optional[bool]] = None
     # Block content hashes for mooncake-store key-based addressing (main KV).
     mooncake_store_block_hashes: Optional[np.ndarray] = None
     # Tail-hash list for SWA mooncake REMOTE2H/H2REMOTE (one entry per SWA slot).
@@ -169,18 +207,37 @@ class TransferOp:
     # Filled by the scheduler as partial-capable worker completions arrive.
     block_results: Optional[Tuple[bool, ...]] = field(default=None, init=False)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, is_swa: Optional[bool] = None) -> None:
+        if is_swa is not None:
+            resolved = PoolId.from_is_swa(is_swa)
+            if self.pool_id != PoolId.FULL_KV and self.pool_id != resolved:
+                raise ValueError(
+                    f"conflicting pool selectors: pool_id={self.pool_id.name} "
+                    f"and is_swa={is_swa}; pass one")
+            self.pool_id = resolved
+        # Hoisted into locals: this runs once per op at request rate, and each
+        # ``self.x`` is a dict lookup. Reading the two arrays once and reusing
+        # them costs less than the six attribute loads the checks would
+        # otherwise do.
+        src = self.src_block_ids
+        dst = self.dst_block_ids
         if self.transfer_type != TransferType.VIRTUAL and \
-            self.src_block_ids.size != self.dst_block_ids.size:
+            src.size != dst.size:
             raise ValueError(f"src_block_ids and dst_block_ids must have the same number of physical blocks, but got "
-                             f"src_block_ids.size={self.src_block_ids.size}, "
-                             f"dst_block_ids.size={self.dst_block_ids.size}")
-        with TransferOp._lock:
-            self.op_id = TransferOp._next_op_id
-            TransferOp._next_op_id += 1
-        assert self.src_block_ids.dtype == np.int64
-        assert self.dst_block_ids.dtype == np.int64
-        self.valid_block_num = self.src_block_ids.size
+                             f"src_block_ids.size={src.size}, "
+                             f"dst_block_ids.size={dst.size}")
+        self.op_id = next(TransferOp._op_id_counter)
+        assert src.dtype == _INT64
+        assert dst.dtype == _INT64
+        self.valid_block_num = src.size
+
+
+# Attached after the decorator has run: inside the class body ``@dataclass``
+# would see a property object as the InitVar's default. Read-only on purpose --
+# the pool an op addresses is fixed when its block ids are chosen, and a
+# writable alias would let one be flipped without its ids being reinterpreted.
+TransferOp.is_swa = property(lambda self: self.pool_id is PoolId.SWA)
+
 
 @dataclass
 class LayerwiseTransferOp(TransferOp):
@@ -231,30 +288,35 @@ class LayerwiseTransferOp(TransferOp):
             dp_client_id=dp_client_id,
         )
 
-    def __post_init__(self) -> None:
-        super().__post_init__()
+    def __post_init__(self, is_swa: Optional[bool] = None) -> None:
+        # The InitVar is part of the base's ``__post_init__`` contract, so it
+        # has to be accepted and forwarded even though this class never passes
+        # one: a layerwise op fuses both pools in a single transfer rather than
+        # addressing one of them.
+        super().__post_init__(is_swa)
 
         assert self.src_block_ids_h2d.size == self.dst_block_ids_h2d.size
         assert self.src_block_ids_disk2h.size == self.dst_block_ids_disk2h.size
         assert self.swa_src_block_ids_h2d.size == self.swa_dst_block_ids_h2d.size
         assert self.swa_src_block_ids_disk2h.size == self.swa_dst_block_ids_disk2h.size
 
-        assert self.src_block_ids_h2d.dtype == np.int64
-        assert self.dst_block_ids_h2d.dtype == np.int64
-        assert self.src_block_ids_disk2h.dtype == np.int64
-        assert self.dst_block_ids_disk2h.dtype == np.int64
-        assert self.swa_src_block_ids_h2d.dtype == np.int64
-        assert self.swa_dst_block_ids_h2d.dtype == np.int64
-        assert self.swa_src_block_ids_disk2h.dtype == np.int64
-        assert self.swa_dst_block_ids_disk2h.dtype == np.int64
+        assert self.src_block_ids_h2d.dtype == _INT64
+        assert self.dst_block_ids_h2d.dtype == _INT64
+        assert self.src_block_ids_disk2h.dtype == _INT64
+        assert self.dst_block_ids_disk2h.dtype == _INT64
+        assert self.swa_src_block_ids_h2d.dtype == _INT64
+        assert self.swa_dst_block_ids_h2d.dtype == _INT64
+        assert self.swa_src_block_ids_disk2h.dtype == _INT64
+        assert self.swa_dst_block_ids_disk2h.dtype == _INT64
 
 
 class TransferOpGraph:
-    _next_graph_id = 0
-    _lock = threading.Lock()
+    # Lock-free for the same reason as TransferOp._op_id_counter: a C-level
+    # __next__ that cannot be interrupted mid-increment.
+    _graph_id_counter = itertools.count()
 
     def __init__(self) -> None:
-        self.graph_id = self._get_graph_id()
+        self.graph_id = next(TransferOpGraph._graph_id_counter)
         self._op_map: Dict[int, TransferOp] = {}
         self._ready_ops: Set[int] = set()
         self._trigger_ops: Set[int] = set()
@@ -268,10 +330,8 @@ class TransferOpGraph:
 
     @classmethod
     def _get_graph_id(cls) -> int:
-        with cls._lock:
-            graph_id = cls._next_graph_id
-            cls._next_graph_id += 1
-            return graph_id
+        """Kept as the named entry point; __init__ inlines the same counter."""
+        return next(cls._graph_id_counter)
 
     def set_graph_id(self, graph_id: int) -> None:
         self.graph_id = graph_id
@@ -302,10 +362,13 @@ class TransferOpGraph:
         # and set_gpu_blocks(gpu_blocks, swa_gpu_blocks) sorts them by op.is_swa at
         # bind time (full-KV <- gpu_blocks; SWA <- swa_gpu_blocks, or preserved when
         # swa_gpu_blocks is None). This is what test_set_gpu_blocks_swa exercises.
-        if op.transfer_type == TransferType.H2D or \
-            op.transfer_type == TransferType.D2H or \
-            op.transfer_type == TransferType.D2DISK or \
-            op.transfer_type == TransferType.DISK2D:
+        #
+        # Set membership rather than an == chain: the chain costs one Enum.__eq__
+        # per arm, so the ops that match NOTHING (DISK2H / REMOTE2H staging, the
+        # majority in a GET graph) pay all four. One hash lookup is ~2.5x cheaper
+        # for them, at the cost of ~0.02us for a leading H2D.
+        transfer_type = op.transfer_type
+        if transfer_type in _GPU_TRANSFER_TYPES:
             self._gpu_transfer_op_id.append(op.op_id)
         # SWA GPU-transfer ops are ALSO tracked separately so the node-mount
         # late-bind entry point set_swa_gpu_blocks() (used by kvtask + the
@@ -315,9 +378,12 @@ class TransferOpGraph:
         # untouched when swa_gpu_blocks is None (the kvtask two-call path), so only
         # set_swa_gpu_blocks() binds them there; set_gpu_blocks(gpu, swa_gpu) binds
         # them directly when a caller supplies the second arg.
+        # Left as an == chain: ``op.is_swa`` is False for almost every op, so the
+        # short circuit already skips the comparisons -- a set lookup here would
+        # only move cost onto the rare SWA path.
         if op.is_swa and (
-            op.transfer_type == TransferType.H2D or
-            op.transfer_type == TransferType.D2H):
+            transfer_type == TransferType.H2D or
+            transfer_type == TransferType.D2H):
             self._swa_gpu_transfer_op_id.append(op.op_id)
         self._ready_ops.add(op.op_id)
 
@@ -740,7 +806,7 @@ def _merge_swa_ops(ops: List[TransferOp], transfer_type: TransferType,
         src_block_ids=src_blocks,
         dst_block_ids=dst_blocks,
         dp_client_id=ops[0].dp_client_id,
-        is_swa=True,
+        pool_id=PoolId.SWA,
         mooncake_store_swa_block_hashes=merged_swa_hashes,
     )
     _attach_merged_callbacks(
@@ -958,6 +1024,9 @@ def merge_to_batch_graph(batch_id: int,
                 merged_graph.add_dependency(
                     layerwise_transfer_op.op_id, merged_swa_remote2h_op.op_id)
 
+            # DISK2H rides the LAYERWISE op as its fused Step 0a, so its
+            # callbacks fold in here with the H2D ones and fire when the whole
+            # fused transfer is done.
             layerwise_callbacks: List[Callable] = []
             layerwise_callbacks.extend(
                 callback for _, callback in callbacks_by_type[TransferType.DISK2H])
@@ -971,9 +1040,9 @@ def merge_to_batch_graph(batch_id: int,
                 layerwise_transfer_op, layerwise_callbacks, new_op_callback_dict)
             batch_end_op_id = layerwise_transfer_op.op_id
         else:
-            for op in (merged_disk2h_op, merged_h2d_op, merged_remote2h_op,
-                       merged_swa_disk2h_op, merged_swa_h2d_op,
-                       merged_swa_remote2h_op):
+            for op in (merged_disk2h_op, merged_h2d_op,
+                       merged_remote2h_op, merged_swa_disk2h_op,
+                       merged_swa_h2d_op, merged_swa_remote2h_op):
                 if op is not None:
                     merged_graph.add_transfer_op(op)
 

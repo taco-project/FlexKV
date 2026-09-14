@@ -70,12 +70,16 @@ def test_layerwise_merge_combines_main_and_swa_callbacks():
         layerwise_transfer=True,
     )
 
-    lw_op = next(iter(merged._op_map.values()))
-    assert batch_end_op_id == lw_op.op_id
+    # Layerwise fuses both pools' DISK2H and H2D into the single LAYERWISE op
+    # (the cpp Step 0a read followed by the per-layer H2D), so the merged graph
+    # holds exactly one op and it is the batch end.
+    ops = list(merged._op_map.values())
     assert merged.num_ops == 1
+    lw_op = ops[0]
     assert isinstance(lw_op, LayerwiseTransferOp)
-    assert lw_op.op_id in op_callbacks
+    assert batch_end_op_id == lw_op.op_id
 
+    # All four callbacks ride that one op: the fused transfer is what completes.
     op_callbacks[lw_op.op_id]()
     assert ctx["fired"] == ["main_disk2h", "main_h2d", "swa_disk2h", "swa_h2d"]
 

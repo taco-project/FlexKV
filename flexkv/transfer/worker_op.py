@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from flexkv.common.pool import PoolId
 from flexkv.common.transfer import TransferOp, TransferType, LayerwiseTransferOp
 
 
@@ -27,7 +28,17 @@ class WorkerTransferOp:
     src_block_node_ids: Optional[np.ndarray]
     mooncake_store_block_hashes: Optional[np.ndarray] = None
     mooncake_store_swa_block_hashes: Optional[list] = None
+    # Which KV pool this op's block ids index. Not a different kind of
+    # transfer -- same direction, same layout -- so it travels with the op and
+    # selects the pool binding on the worker side, instead of being inferred
+    # from which worker the engine happened to pick.
+    pool_id: PoolId = PoolId.FULL_KV
     prof_submitted_ns: int = 0
+
+    @property
+    def is_swa(self) -> bool:
+        """Kept for the readers that predate ``pool_id``; see PoolId."""
+        return self.pool_id is PoolId.SWA
 
     def __init__(self, transfer_op: TransferOp):
         self.transfer_op_id = transfer_op.op_id
@@ -40,6 +51,7 @@ class WorkerTransferOp:
         self.src_block_node_ids = transfer_op.src_block_node_ids
         self.mooncake_store_block_hashes = transfer_op.mooncake_store_block_hashes
         self.mooncake_store_swa_block_hashes = transfer_op.mooncake_store_swa_block_hashes
+        self.pool_id = getattr(transfer_op, "pool_id", PoolId.FULL_KV)
 
         if self.src_slot_id == -1 or self.dst_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
