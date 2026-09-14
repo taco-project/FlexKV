@@ -1,97 +1,39 @@
-"""CPU <-> local SSD transfers (io_uring)."""
-import contextlib
-import logging
-import math
-import os
-import copy
-import signal
+"""CPU <-> local SSD transfers.
 
-import torch.multiprocessing as mp
-import threading
+Native engine is io_uring (``c_ext.SSDIOCTX`` + ``transfer_kv_blocks_ssd``); a
+``StorageBackend`` replaces it wholesale when one is supplied.
+"""
+
 import time
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from torch.multiprocessing import Queue as MPQueue, Pipe as MPPipe
 from multiprocessing.connection import Connection
-from threading import Thread
-from typing import List, Any, Dict, Union, Optional, Tuple
+from typing import Any, Dict, List, Optional, Union
 
-import numpy as np
-import nvtx
 import torch
-import zmq
-import json
+from torch.multiprocessing import Queue as MPQueue
 
 from flexkv import c_ext
-
-from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
-
-# GDS imports are optional (only available when compiled with FLEXKV_ENABLE_GDS=1)
-try:
-    from flexkv.c_ext import transfer_kv_blocks_gds, TPGDSTransferThreadGroup
-except ImportError:
-    transfer_kv_blocks_gds = None
-    TPGDSTransferThreadGroup = None
-
-from flexkv.common.debug import flexkv_logger
-from flexkv.common.memory_handle import TensorSharedHandle, release_vmm_tensor
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
-from flexkv.common.transfer import get_nvtx_range_color, LayerwiseTransferOp
+from flexkv.c_ext import transfer_kv_blocks_ssd
 from flexkv.common.config import (
-    CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig, LayerGroupSpec,
+    CacheConfig,
+    GLOBAL_CONFIG_FROM_ENV,
+    LayerGroupSpec,
 )
+from flexkv.common.debug import flexkv_logger
+from flexkv.common.storage import KVCacheLayout
+from flexkv.common.transfer import TransferType
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
-from flexkv.transfer.host_buffer import (
-    allocate_host_buffer,
-    cudaHostRegister,
-    safe_cuda_host_unregister,
-)
-
-
+from flexkv.transfer.backends import StorageBackend
 from flexkv.transfer.compression.common.strategy import (
     CompressionStrategy,
     NullCompressionStrategy,
 )
-from flexkv.transfer.worker_op import (
-    WorkerLayerwiseTransferOp,
-    WorkerTransferOp,
-    WorkerTransferResult,
+from flexkv.transfer.geometry import (
+    ChunkStrides,
+    DiskSide,
+    EdgeGeometry,
+    HostSide,
 )
-from flexkv.transfer import trace
-from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
-from flexkv.external.mooncake_store_keys import PoolKind, build_key
-from flexkv.external.mooncake_fault_inject import inject_mooncake_fault, is_mooncake_fault_inject_enabled
-from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
-from flexkv.cache.redis_meta import RedisMeta
-from flexkv.transfer.utils import (
-    group_blocks_by_node_and_segment,
-    group_blocks_by_node,
-    split_contiguous_blocks,
-    RemoteSSD2HMetaInfo,
-    NodeMetaInfo,
-    RDMATaskInfo,
-)
-from flexkv.transfer.nixlutil import (
-    NIXL_CPU_FILE_BACKENDS,
-    NIXL_GPU_FILE_BACKENDS,
-    NixlAgentSession,
-    normalize_nixl_file_plugin_name,
-    file_path_for_ssd_block,
-    gpu_chunk_u8_view,
-    kv_chunk_byte_offset_in_block,
-    ssd_chunk_byte_offset_in_file,
-)
-try:
-    from flexkv.c_ext import (
-        transfer_kv_blocks_remote,
-        shared_transfer_kv_blocks_remote_read,
-    )
-except ImportError:
-    transfer_kv_blocks_remote = None
-    shared_transfer_kv_blocks_remote_read = None
-
-
+from flexkv.transfer.worker_op import WorkerTransferOp
 from flexkv.transfer.workers.runtime import TransferWorkerBase
 
 
@@ -109,7 +51,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  num_blocks_per_file: int,
                  cache_config: CacheConfig,
                  compressor: Optional[CompressionStrategy] = None,
-                 layer_groups: Optional[List[LayerGroupSpec]] = None):
+                 layer_groups: Optional[List[LayerGroupSpec]] = None,
+                 backend: Optional[StorageBackend] = None):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         self._pin_op_buffer()
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
@@ -134,6 +77,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
 
+        self.cpu_kv_layout = cpu_kv_layout
         if self.has_multi_group:
             self._init_multi_group_ssd(cpu_kv_layout, ssd_kv_layout, layer_groups)
         else:
@@ -145,18 +89,80 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
             self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
             self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
-            # Bytes per KV block (all layers); used by transfer tracing for bw.
-            self._bytes_per_block = self.chunk_size_in_bytes * self.num_layers * self.kv_dim
+            # Per-file block stride: unused by the io_uring kernel (which takes
+            # num_blocks_per_file and derives it), but a backend addressing the
+            # file directly needs it, and deriving it here keeps the two views
+            # of the same file from drifting.
+            self.ssd_block_stride_in_bytes = (
+                ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize)
 
-        try:
-            self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), GLOBAL_CONFIG_FROM_ENV.iouring_entries,
-                GLOBAL_CONFIG_FROM_ENV.iouring_flags)
-        except Exception as e:
-            flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
-            raise RuntimeError("SSD Worker init failed") from e
+        if backend is None:
+            # io_uring is this edge's native engine; a backend replaces it
+            # wholesale, so do not open descriptors it will never use.
+            try:
+                self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+                    GLOBAL_CONFIG_FROM_ENV.iouring_flags)
+            except Exception as e:
+                flexkv_logger.error(f"Error setting ssd ioctx: {e}\n")
+                raise RuntimeError("SSD Worker init failed") from e
 
         self._compressor = compressor or NullCompressionStrategy()
         self._compressor.attach(self)
+        self._attach_backend(backend, self._build_geometry())
+
+    def _build_geometry(self) -> EdgeGeometry:
+        """This edge, in the terms every CPU<->SSD engine reads it in.
+
+        Under a heterogeneous layout there is no uniform (layer, kv) chunk on
+        either side -- both blocks are opaque blobs of identical byte layout,
+        which is exactly what makes the native io_uring path able to move them
+        as one I/O -- so both ``strides`` are None and a chunk-addressing
+        engine is refused by name.
+        """
+        cpu_block_stride = self.block_stride_in_bytes
+        if self.has_multi_group:
+            cpu_strides = ssd_strides = None
+            # CPU and SSD share an identical per-block byte layout here.
+            ssd_block_stride = cpu_block_stride
+            bytes_per_block = cpu_block_stride
+        else:
+            cpu_strides = ChunkStrides(
+                chunk_bytes=self.chunk_size_in_bytes,
+                kv_stride=self.cpu_kv_stride_in_bytes,
+                layer_stride=self.cpu_layer_stride_in_bytes,
+                block_stride=cpu_block_stride,
+            )
+            ssd_block_stride = self.ssd_block_stride_in_bytes
+            ssd_strides = ChunkStrides(
+                # The two sides move the same bytes, so one chunk size covers
+                # both; the SSD layout differs only in how blocks are spread
+                # across files.
+                chunk_bytes=self.chunk_size_in_bytes,
+                kv_stride=self.ssd_kv_stride_in_bytes,
+                layer_stride=self.ssd_layer_stride_in_bytes,
+                block_stride=ssd_block_stride,
+            )
+            bytes_per_block = (
+                self.chunk_size_in_bytes * self.num_layers * self.kv_dim)
+        return EdgeGeometry(
+            num_layers=self.num_layers,
+            kv_dim=self.kv_dim,
+            num_kv_heads=self.num_kv_heads,
+            dtype=self.dtype,
+            has_multi_group=self.has_multi_group,
+            bytes_per_block=bytes_per_block,
+            cpu=HostSide(
+                layout=self.cpu_kv_layout,
+                blocks=self.cpu_blocks,
+                layer_ptrs=self.cpu_layer_ptrs,
+                block_stride=cpu_block_stride,
+                strides=cpu_strides,
+            ),
+            ssd=DiskSide(
+                block_stride=ssd_block_stride,
+                strides=ssd_strides,
+            ),
+        )
 
     def _init_multi_group_ssd(
         self,
@@ -258,6 +264,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        if self._backend is not None:
+            return self._run_backend(transfer_op)
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
         if self.has_multi_group:
             # Multi-group (heterogeneous KV) path — compression not supported here.
@@ -282,4 +290,3 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 self, src_block_ids=src_block_ids,
                 dst_block_ids=dst_block_ids, op=transfer_op)
         return True
-

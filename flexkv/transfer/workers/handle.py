@@ -1,9 +1,9 @@
-"""Parent-side handle to a worker process.
+"""Parent-side handle for one worker process.
 
-``WorkerHandle`` is what the engine holds: the pipe it submits ops on, the
-child's pid, and the shutdown path. It deliberately knows nothing about which
-edge the worker serves.
+Kept apart from ``runtime`` because it runs in the *parent*: it never touches
+CUDA, never imports a worker class, and is what ``TransferEngine`` holds.
 """
+
 import threading
 import time
 from multiprocessing.connection import Connection
@@ -15,8 +15,10 @@ from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import LayerwiseTransferOp, TransferOp
 from flexkv.transfer import trace
-from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp, WorkerTransferOp
-
+from flexkv.transfer.worker_op import (
+    WorkerLayerwiseTransferOp,
+    WorkerTransferOp,
+)
 
 
 class WorkerHandle:
@@ -113,4 +115,3 @@ class WorkerHandle:
                 self.shutdown()
         except Exception:
             pass
-

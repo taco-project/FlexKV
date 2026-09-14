@@ -2,106 +2,45 @@
 
 ``TransferWorkerBase`` owns the parts that are the same whatever edge a worker
 serves: the child-process entry point, the receive/batch/report loop, host
-pinning and its paired unregister, block-id fetch from the shared op buffer,
-the perf record, and control-message dispatch.
+pinning and its paired unregister, the bounded CUDA drain on shutdown, block-id
+fetch from the shared op buffer, backend attach/run, the perf record, and
+control-message dispatch.
 
-Concrete workers live in sibling modules and this module must not import them:
-``create_worker`` is a classmethod on the base, so the concrete class is always
-the one the caller already holds.
+Concrete workers live in sibling modules (``gpu_cpu``, ``cpu_ssd``, ``remote``,
+``gds``, ``peer``) and this module must not import them: ``create_worker`` is a
+classmethod on the base, so the concrete class is always the one the caller
+already holds.
 """
-import contextlib
-import logging
-import math
-import os
-import copy
-import signal
 
-import torch.multiprocessing as mp
+import gc
+import logging
+import os
+import signal
 import threading
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from torch.multiprocessing import Queue as MPQueue, Pipe as MPPipe
 from multiprocessing.connection import Connection
-from threading import Thread
-from typing import List, Any, Dict, Union, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import nvtx
 import torch
-import zmq
-import json
-
-from flexkv import c_ext
-
-from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, TPTransferThreadGroup
-
-# GDS imports are optional (only available when compiled with FLEXKV_ENABLE_GDS=1)
-try:
-    from flexkv.c_ext import transfer_kv_blocks_gds, TPGDSTransferThreadGroup
-except ImportError:
-    transfer_kv_blocks_gds = None
-    TPGDSTransferThreadGroup = None
+from torch.multiprocessing import Queue as MPQueue
 
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.memory_handle import TensorSharedHandle, release_vmm_tensor
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
-from flexkv.common.transfer import get_nvtx_range_color, LayerwiseTransferOp
-from flexkv.common.config import (
-    CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig, LayerGroupSpec,
+from flexkv.common.memory_handle import (
+    TensorSharedHandle,
+    close_all_cuda_ipc_handles,
 )
-from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
+from flexkv.common.transfer import TransferType, get_nvtx_range_color
+from flexkv.transfer import trace
+from flexkv.transfer.backends import StorageBackend
+from flexkv.transfer.geometry import EdgeGeometry
 from flexkv.transfer.host_buffer import (
-    allocate_host_buffer,
     cudaHostRegister,
     safe_cuda_host_unregister,
 )
-
-
-from flexkv.transfer.compression.common.strategy import (
-    CompressionStrategy,
-    NullCompressionStrategy,
-)
-from flexkv.transfer.worker_op import (
-    WorkerLayerwiseTransferOp,
-    WorkerTransferOp,
-    WorkerTransferResult,
-)
-from flexkv.transfer import trace
-from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
-from flexkv.external.mooncake_store_keys import PoolKind, build_key
-from flexkv.external.mooncake_fault_inject import inject_mooncake_fault, is_mooncake_fault_inject_enabled
-from flexkv.transfer.zmqHelper import NotifyMsg, NotifyStatus, SSDZMQServer, SSDZMQClient
-from flexkv.cache.redis_meta import RedisMeta
-from flexkv.transfer.utils import (
-    group_blocks_by_node_and_segment,
-    group_blocks_by_node,
-    split_contiguous_blocks,
-    RemoteSSD2HMetaInfo,
-    NodeMetaInfo,
-    RDMATaskInfo,
-)
-from flexkv.transfer.nixlutil import (
-    NIXL_CPU_FILE_BACKENDS,
-    NIXL_GPU_FILE_BACKENDS,
-    NixlAgentSession,
-    normalize_nixl_file_plugin_name,
-    file_path_for_ssd_block,
-    gpu_chunk_u8_view,
-    kv_chunk_byte_offset_in_block,
-    ssd_chunk_byte_offset_in_file,
-)
-try:
-    from flexkv.c_ext import (
-        transfer_kv_blocks_remote,
-        shared_transfer_kv_blocks_remote_read,
-    )
-except ImportError:
-    transfer_kv_blocks_remote = None
-    shared_transfer_kv_blocks_remote_read = None
-
-
+from flexkv.transfer.template import gpu_strides_from_tensor
+from flexkv.transfer.worker_op import WorkerTransferOp, WorkerTransferResult
 from flexkv.transfer.workers.handle import WorkerHandle
 
 
@@ -134,6 +73,13 @@ def import_tensor_handles(
     return [h.get_tensor() for h in handles]
 
 
+# Idle wait in the worker's receive loop. Connection.poll() wakes as soon as
+# the pipe is readable, so this does not add dispatch latency; it only bounds
+# how long a worker sleeps between interruptibility checks. The previous value
+# (0.1 ms) made every idle worker burn a full core.
+_WORKER_IDLE_POLL_S = float(os.getenv("FLEXKV_WORKER_IDLE_POLL_S", "0.05"))
+
+
 class TransferWorkerBase(ABC):
     _worker_id_counter = 0
     _worker_id_lock = threading.Lock()
@@ -154,6 +100,8 @@ class TransferWorkerBase(ABC):
                  op_buffer_tensor: torch.Tensor):
         self.worker_id = worker_id
         self.transfer_conn = transfer_conn  # receive end of pipe
+        # Not MPQueue[int]: a partial-capable worker reports a
+        # WorkerTransferResult in the op-id slot instead of a bare int.
         self.finished_ops_queue: MPQueue = finished_ops_queue
 
         self.op_buffer_tensor = op_buffer_tensor
@@ -161,6 +109,12 @@ class TransferWorkerBase(ABC):
         # (tensor, label) pairs registered via _register_host_tensor / _pin_op_buffer.
         self._host_registered: List[Tuple[torch.Tensor, str]] = []
         self._shutdown_done = False
+        # Pluggable I/O engine for this worker's edge; None = the worker's own
+        # native ``_transfer_impl``. See flexkv/transfer/backends.py.
+        self._backend: Optional[StorageBackend] = None
+        # What this worker publishes about its edge, built by the subclass and
+        # handed to ``attach``. See flexkv/transfer/geometry.py.
+        self._geometry: Optional[EdgeGeometry] = None
 
     def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
         """cudaHostRegister and track for paired unregister in shutdown()."""
@@ -191,6 +145,18 @@ class TransferWorkerBase(ABC):
         if getattr(self, "_shutdown_done", False):
             return
         self._shutdown_done = True
+        # Backends release first: mooncake unregisters the very buffer the
+        # loop below is about to cudaHostUnregister, and NIXL deregisters
+        # memory it handed to the agent.
+        backend = getattr(self, "_backend", None)
+        if backend is not None:
+            try:
+                backend.shutdown()
+            except Exception as e:  # noqa: BLE001
+                flexkv_logger.error(
+                    f"[worker {getattr(self, 'worker_id', -1)}] backend "
+                    f"{backend.name} shutdown failed: {e}"
+                )
         registered = getattr(self, "_host_registered", None) or []
         worker_id = getattr(self, "worker_id", "-1")
         msg = (
@@ -214,6 +180,34 @@ class TransferWorkerBase(ABC):
             safe_cuda_host_unregister(tensor, label=f"worker={worker_id} {label}")
         self._op_buffer_pinned = False
         self._host_registered = registered
+
+        # Drop every tensor that aliases an imported IPC mapping *before*
+        # closing the mappings — the tensors carry raw device pointers, so
+        # closing while they are still reachable leaves dangling pointers.
+        self._release_imported_gpu_tensors()
+        close_all_cuda_ipc_handles()
+
+    def _release_imported_gpu_tensors(self) -> None:
+        """Drop references to tensors backed by CUDA IPC mappings.
+
+        Subclasses store these under a few different names; clear whichever
+        exist. Called only from ``shutdown()``, after the CUDA drain.
+        """
+        for attr in ("gpu_blocks", "_multi_group_gpu_blocks_keepalive"):
+            if getattr(self, attr, None) is not None:
+                try:
+                    setattr(self, attr, [])
+                except Exception:  # noqa: BLE001
+                    pass
+        # GPUCPUTransferWorker keeps them per pool instead, in a registry keyed
+        # by PoolId, so one worker can hold several without a name per pool.
+        # getattr-guarded because the other worker classes have no ``_pools``.
+        for pool in getattr(self, "_pools", {}).values():
+            try:
+                pool.keepalive = []
+            except Exception:  # noqa: BLE001
+                pass
+        gc.collect()
 
     @staticmethod
     def _drain_cuda_bounded(worker_id: Any, timeout_s: float) -> None:
@@ -287,38 +281,15 @@ class TransferWorkerBase(ABC):
           flash_attn:        [2, num_blocks, block_size, num_kv_heads, head_size]
           triton/flashinfer: [num_blocks, 2, block_size, num_kv_heads, head_size]
 
-        Returns (gpu_kv_stride_bytes, gpu_block_stride_bytes, gpu_layer_stride_bytes).
+        Returns (gpu_kv_stride_bytes, gpu_block_stride_bytes, gpu_layer_stride_bytes),
+        or None when the dim order cannot be recovered and the caller should
+        fall back to the declared layout.
+
+        Kept as a method only so the single-group call sites below read the
+        same as before; the formula itself lives in transfer.template so the
+        multi-group compiler and these paths cannot drift apart.
         """
-        if kv_dim == 1 or tensor.ndim != 5:
-            return None  # caller should fall back to layout-based strides
-
-        # Last 2 dims are always (num_kv_heads, head_size).
-        # First 3 dims are a permutation of (num_blocks, kv_dim=2, block_size).
-        dim_sizes = [tensor.shape[i] for i in range(3)]
-        kv_dim_idx = None
-        block_size_idx = None
-        block_dim_idx = None
-
-        # Identify kv_dim (size 2) and block_size (size tokens_per_block)
-        for i in range(3):
-            if dim_sizes[i] == 2 and kv_dim_idx is None:
-                kv_dim_idx = i
-        for i in range(3):
-            if i != kv_dim_idx and dim_sizes[i] == tokens_per_block and block_size_idx is None:
-                block_size_idx = i
-        # Remaining dim is num_blocks
-        for i in range(3):
-            if i != kv_dim_idx and i != block_size_idx:
-                block_dim_idx = i
-                break
-
-        if kv_dim_idx is None or block_dim_idx is None:
-            return None  # ambiguous, fall back
-
-        kv_stride = tensor.stride(kv_dim_idx) * dtype_size
-        block_stride = tensor.stride(block_dim_idx) * dtype_size
-        layer_stride = tensor.numel() * dtype_size
-        return (kv_stride, block_stride, layer_stride)
+        return gpu_strides_from_tensor(tensor, tokens_per_block, dtype_size, kv_dim)
 
     @classmethod
     def create_worker(cls,
@@ -396,7 +367,6 @@ class TransferWorkerBase(ABC):
                 except Exception as e:
                     flexkv_logger.error(f"[worker {worker_id}] final shutdown error: {e}")
 
-    @abstractmethod
     def _transfer_impl(
         self,
         src_block_ids: torch.Tensor,
@@ -404,7 +374,115 @@ class TransferWorkerBase(ABC):
         transfer_type: TransferType,
         **kwargs: Any
     ) -> None:
-        pass
+        """The worker's *native* engine.
+
+        Not abstract: a worker whose edge is served entirely by a pluggable
+        ``StorageBackend`` (CPU<->Remote, whose engine is PCFS or
+        mooncake-store) has no native engine to implement, and an abstract
+        method would force it to write a stub that only raises.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no native transfer engine; it moves "
+            f"bytes through a StorageBackend (see backends.py)"
+        )
+
+    def _attach_backend(
+        self,
+        backend: Optional["StorageBackend"],
+        geometry: EdgeGeometry,
+    ) -> None:
+        """Bind a pluggable I/O engine, if this worker was given one.
+
+        Call at the *end* of ``__init__``: ``geometry`` describes the edge the
+        worker just derived, and ``attach`` may open sessions that assume the
+        CUDA device is already bound.
+
+        The geometry is recorded even when there is no backend, because it is
+        also this worker's own statement of what its edge is -- ``bytes_per_block``
+        for the transfer trace comes from it either way.
+        """
+        self._geometry = geometry
+        self._backend = backend
+        if backend is not None:
+            backend.attach(self, geometry)
+
+    def _trace_bytes_per_block(self) -> int:
+        """Whole-block bytes for the bandwidth figure in the transfer trace.
+
+        The engine that is actually moving the bytes gets the first say: PCFS
+        flattens a BLOCKFIRST block and mooncake-store writes one opaque value,
+        so what they move per block is not what this edge's native engine
+        would. A backend that has no separate answer leaves ``bytes_per_block``
+        at 0 and the edge's own number stands.
+
+        Backends used to write this back onto the worker, which meant a worker
+        attribute silently meant something different depending on which engine
+        had attached to it.
+        """
+        backend = getattr(self, "_backend", None)
+        if backend is not None and backend.bytes_per_block:
+            return backend.bytes_per_block
+        geometry = getattr(self, "_geometry", None)
+        if geometry is not None:
+            return geometry.bytes_per_block
+        # Workers that take no backend (GPU<->CPU, PEER2CPU) publish no
+        # geometry, because nothing would read it; they set the attribute
+        # directly and this is the only thing that reads it.
+        return int(getattr(self, "_bytes_per_block", 0))
+
+    def _run_backend(
+        self, transfer_op: WorkerTransferOp
+    ) -> Union[bool, WorkerTransferResult]:
+        """One timed backend transfer plus its perf record.
+
+        The backend returns the byte count, which is what removes the
+        per-engine ``transfer_size`` formula from every ``launch_transfer``.
+
+        A backend that ``reports_block_results`` returns per-block outcomes
+        alongside the byte count; those become a ``WorkerTransferResult`` so
+        the engine can keep the blocks that landed instead of failing the
+        whole op. Everything else stays on the plain bool path.
+        """
+        backend = self._backend
+        assert backend is not None
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(
+            transfer_op, pinned=backend.needs_pinned_block_ids)
+        start_time = time.time()
+        if backend.reports_block_results:
+            block_results, transfer_size = backend.transfer_blocks(
+                self, transfer_op, src_block_ids, dst_block_ids)
+        else:
+            block_results = None
+            transfer_size = backend.transfer(
+                self, transfer_op, src_block_ids, dst_block_ids)
+        end_time = time.time()
+        if block_results is None:
+            # Bool path: a throw here propagates, exactly as it did when every
+            # launch_transfer logged for itself. The run loop turns it into a
+            # failed completion.
+            self._log_transfer_performance(
+                transfer_op, transfer_size, start_time, end_time)
+            return True
+        # Block-results path: the op has already completed one way or another,
+        # so a logging fault must not be raised past here -- an op that never
+        # reports hangs its graph and leaks every cache block the plan holds.
+        # It does still fail the op closed, because a worker that cannot even
+        # record what it did is not one whose success we should believe.
+        try:
+            self._log_transfer_performance(
+                transfer_op, transfer_size, start_time, end_time)
+        except Exception:
+            flexkv_logger.error(
+                f"[worker {self.worker_id}] transfer performance logging "
+                "failed; reporting the operation unsuccessful for "
+                f"op_id={transfer_op.transfer_op_id}",
+                exc_info=True,
+            )
+            block_results = (False,) * len(block_results)
+        return WorkerTransferResult(
+            transfer_op_id=transfer_op.transfer_op_id,
+            block_results=block_results,
+        )
 
     def get_transfer_block_ids(self,
                                transfer_op: WorkerTransferOp,
@@ -538,7 +616,11 @@ class TransferWorkerBase(ABC):
         """
         while True:
             try:
-                if not self.transfer_conn.poll(timeout=0.0001):
+                # Blocking poll: it returns the instant the pipe becomes
+                # readable, so a long timeout costs no dispatch latency, it
+                # only stops this loop from spinning a full core while idle.
+                # The timeout exists solely so the loop stays interruptible.
+                if not self.transfer_conn.poll(timeout=_WORKER_IDLE_POLL_S):
                     continue
 
                 op = self.transfer_conn.recv()
@@ -547,20 +629,28 @@ class TransferWorkerBase(ABC):
                 if not isinstance(op, dict):
                     op._received_ns = time.perf_counter_ns()
 
-                # Drain any already-queued ops into one batch, then process.
-                # The for-loop MUST sit outside the drain while: a single-op
-                # submit leaves poll() False immediately, and a while-else
-                # continue would otherwise drop the first op forever (which
-                # stalls D2H → H2REMOTE and leaves mooncake PutStart=0).
                 batch_ops = [op]
                 stop_after_batch = False
+                drain_failed = False
                 while self.transfer_conn.poll(timeout=0):
+                    # A failure while draining must not discard the ops
+                    # already received: fall through and process the batch,
+                    # then let the outer handler deal with the pipe.
                     try:
                         op = self.transfer_conn.recv()
                     except EOFError:
-                        # A closed pipe is readable. Preserve the batch already
-                        # received, then exit after reporting its completions.
+                        # A closed pipe is readable, so poll() says yes and
+                        # recv() raises. That is the parent going away, not a
+                        # fault: preserve the batch already received and exit
+                        # after reporting its completions.
                         stop_after_batch = True
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        flexkv_logger.error(
+                            f"[worker {self.worker_id}] recv failed while "
+                            f"draining batch ({len(batch_ops)} op(s) pending): {e}"
+                        )
+                        drain_failed = True
                         break
                     if op is None:
                         stop_after_batch = True
@@ -607,42 +697,70 @@ class TransferWorkerBase(ABC):
                         if nvtx_pushed:
                             nvtx.pop_range()
                     launched_ns = time.perf_counter_ns()
-                    is_h2d = (op.transfer_type == TransferType.H2D
-                              or op.transfer_type == TransferType.LAYERWISE)
-                    metrics = trace.build_worker_metrics(
-                        op,
-                        getattr(op, "prof_submitted_ns", 0),
-                        getattr(op, "_received_ns", launched_ns),
-                        transfer_start_ns,
-                        launched_ns,
-                        self.worker_id,
-                        getattr(self, "_bytes_per_block", 0),
-                        getattr(self, "kv_dim", 2),
-                        is_h2d,
+                    # Metrics are diagnostics: they must never decide whether
+                    # a result is reported. Before this guard, a throw here
+                    # (or anywhere below) escaped to the outer handler and
+                    # dropped the results of *every remaining op in the
+                    # batch*, hanging their graphs forever.
+                    metrics = None
+                    try:
+                        is_h2d = (op.transfer_type == TransferType.H2D
+                                  or op.transfer_type == TransferType.LAYERWISE)
+                        metrics = trace.build_worker_metrics(
+                            op,
+                            getattr(op, "prof_submitted_ns", 0),
+                            getattr(op, "_received_ns", launched_ns),
+                            transfer_start_ns,
+                            launched_ns,
+                            self.worker_id,
+                            self._trace_bytes_per_block(),
+                            getattr(self, "kv_dim", 2),
+                            is_h2d,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        flexkv_logger.error(
+                            f"[worker {self.worker_id}] build_worker_metrics "
+                            f"failed for op {op.transfer_op_id}: {e}",
+                            exc_info=True,
+                        )
+                    # Report the outcome, success or failure: a dropped op
+                    # leaves its graph incomplete forever and leaks every
+                    # resource its plan holds. A bare int still means success,
+                    # so the queue format stays compatible.
+                    try:
+                        if isinstance(transfer_status, WorkerTransferResult):
+                            # Partial-capable backends report completion even
+                            # when zero blocks succeeded, so the graph can
+                            # clean up and the caller can fall back rather
+                            # than hang. Carry metrics so the trace still
+                            # sees the op.
+                            self.finished_ops_queue.put(
+                                (transfer_status, True, metrics))
+                        elif transfer_status:
+                            self.finished_ops_queue.put(
+                                (op.transfer_op_id, True, metrics))
+                        else:
+                            self.finished_ops_queue.put(
+                                (op.transfer_op_id, False, None))
+                    except Exception as e:  # noqa: BLE001
+                        # Queue put failing is unrecoverable for this op, but
+                        # must not take the rest of the batch down with it.
+                        flexkv_logger.error(
+                            f"[worker {self.worker_id}] failed to report result "
+                            f"for op {op.transfer_op_id}: {e}",
+                            exc_info=True,
+                        )
+                if drain_failed:
+                    flexkv_logger.error(
+                        f"[worker {self.worker_id}] transfer pipe unusable "
+                        f"after batch drain failure; exiting run loop"
                     )
-                    if isinstance(transfer_status, WorkerTransferResult):
-                        # Partial-capable backends report completion even when
-                        # zero blocks succeeded, so the graph can clean up and
-                        # the caller can fall back instead of hanging forever.
-                        # Carry metrics so FLEXKV_TRANSFER_TRACE still works.
-                        self.finished_ops_queue.put(
-                            (transfer_status, True, metrics))
-                    elif transfer_status:
-                        self.finished_ops_queue.put(
-                            (op.transfer_op_id, True, metrics))
-                    else:
-                        # Report the failure instead of dropping it: a
-                        # dropped op leaves its graph incomplete forever
-                        # and leaks every resource its plan holds. A bare
-                        # int still means success, so the queue format
-                        # stays compatible.
-                        self.finished_ops_queue.put(
-                            (op.transfer_op_id, False, None))
+                    return
                 if stop_after_batch:
-                    # _worker_process owns the single shutdown() call in its
-                    # finally block. Calling subclass shutdown here can repeat
-                    # external unregister work before super()'s idempotence
-                    # guard is reached.
+                    # No shutdown() here: ``_worker_process`` owns the single
+                    # call in its finally block. Calling it from the loop as
+                    # well repeats a subclass's external unregister work before
+                    # super()'s idempotence guard is reached.
                     return
             except EOFError:
                 flexkv_logger.warning(
@@ -650,5 +768,9 @@ class TransferWorkerBase(ABC):
                 )
                 return
             except Exception as e:
-                flexkv_logger.error(f"Error in worker run loop: {e}")
-
+                # Reaching here means the failure happened outside the
+                # per-op guards (i.e. in poll/recv of the first op), so no
+                # accepted op is silently dropped.
+                flexkv_logger.error(
+                    f"Error in worker run loop: {e}", exc_info=True
+                )

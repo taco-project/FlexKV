@@ -143,22 +143,22 @@ class _EngineHarness:
         self._child_to_parent_op_id = {}
         self._failed_graph_ids = set()
         self._failed_parent_op_ids = set()
-        # The registry is keyed by (pool, transfer type); ``_worker_map`` and
-        # ``_swa_worker_map`` are live views onto two of its pools, so seeding
-        # ``_workers`` is what makes all three consistent.
+        # The real engine's registry shape: pool -> transfer type -> handle.
+        # Empty here because this harness never dispatches; _worker_entry_for
+        # is only reached to answer "is this op's buffer registered with me".
         self._workers = {}
         self.pin_buffer = None
         self.completed_queue = Queue()
         self.scheduler = TransferScheduler()
 
-    _worker_map = TransferEngine._worker_map
-    _swa_worker_map = TransferEngine._swa_worker_map
-    _worker_entry_for = TransferEngine._worker_entry_for
     _handle_failed_op = TransferEngine._handle_failed_op
     _discard_failed_op = TransferEngine._discard_failed_op
     _finalize_or_discard = TransferEngine._finalize_or_discard
     _emit_drained_graph_failures = TransferEngine._emit_drained_graph_failures
     _op_buffer_registered_here = TransferEngine._op_buffer_registered_here
+    # _op_buffer_registered_here routes through the same worker lookup the
+    # dispatch path uses, so the harness needs it too.
+    _worker_entry_for = TransferEngine._worker_entry_for
 
 
 def test_dispatch_never_crosses_pools():

@@ -6,7 +6,7 @@ import torch
 from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
 from flexkv.common.pool import PoolId
 from flexkv.common.transfer import DeviceType
-from flexkv.storage.storage_engine import StorageEngine, _pool_from_kwargs
+from flexkv.storage.storage_engine import StorageEngine, _resolve_pool
 
 pytestmark = pytest.mark.unit
 
@@ -33,10 +33,10 @@ def _capture_allocations(monkeypatch):
             "device_type": device_type,
             "layout": layout,
             "dtype": dtype,
-            # Resolve the pool the way ``allocate`` itself does rather than
-            # reading one spelling: a call site may pass ``pool_id=`` or the
-            # ``is_swa=`` alias, and this fake must agree with both.
-            "pool_id": _pool_from_kwargs(dict(kwargs)),
+            # Resolved through the same helper the real allocate() uses, so
+            # this probe keeps working whichever selector the caller spells.
+            "pool_id": _resolve_pool(kwargs.get("pool_id"),
+                                     bool(kwargs.get("is_swa", False))),
         })
         return True
 
