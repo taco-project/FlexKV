@@ -41,11 +41,7 @@ from flexkv.transfer.region_batch import (
 )
 from flexkv.transfer.template import compile_gpu_regions, compile_host_regions
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp, WorkerTransferOp
-from flexkv.transfer.workers.runtime import (
-    TransferWorkerBase,
-    ensure_cuda_device,
-    import_tensor_handles,
-)
+from flexkv.transfer.workers.runtime import TransferWorkerBase
 
 # Stand-in for the block ids of a cached layerwise request, which are rebound
 # on every submit. Never read: a plan is only handed to cpp after every
@@ -225,12 +221,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         # Bind primary GPU + pin op buffer before any CUDA IPC import.
         if gpu_blocks and gpu_blocks[0]:
-            ensure_cuda_device(gpu_blocks[0][0].device)
+            self._ensure_cuda_device(gpu_blocks[0][0].device)
         self._pin_op_buffer()
         # Handle tensor import for multi-process case — set_device per GPU first.
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
-            imported_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
+            imported_gpu_blocks.append(self._import_tensor_handles(handles_in_one_gpu))
         self._gpu_block_counts = [len(handles) for handles in gpu_blocks]
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
@@ -346,7 +342,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                     cpu_tensor=swa_cpu_tensor, dtype=swa_dt,
                 )
             else:
-                imported_swa = [import_tensor_handles(h) for h in swa_gpu_blocks]
+                imported_swa = [self._import_tensor_handles(h) for h in swa_gpu_blocks]
                 swa_pool = self._init_uniform(
                     imported_swa, swa_cpu_tensor, swa_gpu_kv_layouts,
                     swa_cpu_kv_layout, swa_dt, pool_id=PoolId.SWA,
@@ -763,7 +759,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             # Import tensors from handles (bind CUDA device per GPU first)
             imported_group_blocks = []
             for handles_in_one_gpu in group_gpu_blocks_per_gpu:
-                imported_group_blocks.append(import_tensor_handles(handles_in_one_gpu))
+                imported_group_blocks.append(self._import_tensor_handles(handles_in_one_gpu))
             pool.keepalive.append(imported_group_blocks)
 
             # Build flat pointer list for this group
@@ -1040,7 +1036,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 f"Expected GPU block counts {self._gpu_block_counts}, got {counts}"
             )
         imported_gpu_blocks = [
-            import_tensor_handles(handles) for handles in gpu_blocks
+            self._import_tensor_handles(handles) for handles in gpu_blocks
         ]
         gpu_block_ptrs_flat = [
             tensor.data_ptr()
