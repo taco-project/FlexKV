@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Dict, Optional, List, Union, Tuple
+from typing import Dict, Optional, List, Union, Tuple, Sequence
 import threading
 from enum import Enum
 from dataclasses import dataclass, field, replace
@@ -11,7 +11,9 @@ from expiring_dict import ExpiringDict
 import nvtx
 import numpy as np
 
+from flexkv.prefetch.types import PrefetchCapabilities, PrefetchHandle, PrefetchOptions, PrefetchSnapshot
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.prefetch.runtime import on_runtime
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.block import hash_token
 from flexkv.common.transfer import (
@@ -456,6 +458,9 @@ class KVTaskManager:
         completed_ops = self._get_completed_ops(timeout)
         metrics_collector = get_global_collector()
         for completed_op in completed_ops:
+            coordinator = getattr(self, "_prefetch", None)
+            if coordinator is not None and coordinator.on_completion(completed_op):
+                continue
             if completed_op.graph_id not in self.graph_to_task:
                 continue
             task_id = self.graph_to_task[completed_op.graph_id]
@@ -734,6 +739,8 @@ class KVTaskManager:
         task.task_end_op_finished = True
         self.graph_to_task.pop(task.graph.graph_id, None)
         task.shed_heavy_resources()
+        if hasattr(self, "_terminal_tasks"):
+            self._terminal_tasks[task_id] = time.monotonic()
         if task.request_returned:
             self._release_task(task_id)
 
@@ -753,6 +760,9 @@ class KVTaskManager:
             # graph is in flight and completion callbacks will still fire).
             if task.status in (TaskStatus.UNREADY, TaskStatus.READY):
                 self._abort_task_plans(task)
+            if task.status == TaskStatus.RUNNING and getattr(self, "_runtime", None) is not None:
+                task.request_returned = True
+                return
             task.status = TaskStatus.CANCELLED
             self._log_task_terminal(task, TaskStatus.CANCELLED)
         self._release_task(task_id)
@@ -841,6 +851,17 @@ class KVTaskManager:
         if task.graph is not None:
             self.graph_to_task.pop(task.graph.graph_id, None)
         self.tasks.pop(task_id, None)
+        if hasattr(self, "_terminal_tasks"):
+            self._terminal_tasks.pop(task_id, None)
+
+    def _reap_completed_tasks(self):
+        terminal = getattr(self, "_terminal_tasks", {})
+        now = time.monotonic()
+        while terminal:
+            task_id, completed_at = next(iter(terminal.items()))
+            if len(terminal) <= 100000 and now - completed_at < 1800:
+                break
+            self._release_task(task_id)
 
     def _mark_completed(self, task_id: int) -> None:
         task = self.tasks[task_id]
@@ -871,6 +892,8 @@ class KVTaskManager:
         self._log_task_terminal(task, TaskStatus.COMPLETED)
         self.graph_to_task.pop(task.graph.graph_id, None)
         task.shed_heavy_resources()
+        if hasattr(self, "_terminal_tasks"):
+            self._terminal_tasks[task_id] = time.monotonic()
         if task.request_returned:
             self._release_task(task_id)
 
@@ -998,10 +1021,138 @@ class KVTaskEngine(KVTaskManager):
                  redis_meta: Optional[RedisMeta] = None,
                  event_collector: Optional[KVEventCollector] = None
                  ):
+        if cache_config.enable_chunked_prefetch:
+            if (not cache_config.use_mooncake_store_backend or cache_config.enable_ssd
+                    or cache_config.enable_kv_sharing or model_config.nnodes > 1
+                    or model_config.use_trtllm_subprocess):
+                raise ValueError(
+                    "chunked prefetch v1 requires node-local Mooncake + CPU, "
+                    "without SSD/P2P or TRT remote mode")
+            from flexkv.prefetch.types import PrefetchOptions
+            from flexkv.prefetch.coordinator import PrefetchCoordinator
+            from flexkv.prefetch.planner import MooncakeChunkPlanner
+            self._prefetch_options = PrefetchOptions(**(cache_config.prefetch_options or {}))
+            self._prefetch_options.validate()
+            for name in ("prefetch_max_sessions", "prefetch_max_reserved_bytes", "prefetch_max_pinned_bytes"):
+                value = getattr(cache_config, name)
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("prefetch runtime limits must be integers")
+            import math
+            for limit in (cache_config.prefetch_max_sessions, cache_config.prefetch_max_reserved_bytes,
+                          cache_config.prefetch_max_pinned_bytes, cache_config.prefetch_result_ttl_s):
+                if not math.isfinite(limit) or limit <= 0:
+                    raise ValueError("prefetch runtime limits must be finite and positive")
         super().__init__(model_config, cache_config, gpu_register_port, redis_meta, event_collector)
         self.tracer = FlexKVTracer()
         self.tracer.trace_config(model_config, cache_config, gpu_layout=None)
 
+        self._runtime = None
+        if cache_config.enable_chunked_prefetch:
+            self._prefetch_backend = MooncakeChunkPlanner(self, cache_config.prefetch_max_pinned_bytes)
+            self._prefetch = PrefetchCoordinator(
+                self._prefetch_backend,
+                max_sessions=cache_config.prefetch_max_sessions,
+                max_reserved_bytes=cache_config.prefetch_max_reserved_bytes,
+                result_ttl_s=cache_config.prefetch_result_ttl_s)
+            # Active graph/callback ownership must never be evicted by TTL.
+            self.tasks = {}
+            from collections import OrderedDict
+            self._terminal_tasks = OrderedDict()
+
+    def start(self) -> None:
+        super().start()
+        if hasattr(self, "_prefetch") and self._runtime is None:
+            from flexkv.prefetch.runtime import QueuedTransferHandle, TaskRuntime
+            self.transfer_handles = [QueuedTransferHandle(h) for h in self.transfer_handles]
+            self._runtime = TaskRuntime(self)
+            self._runtime.start()
+
+    def _next_runtime_wakeup(self, poll_s):
+        # Held GET plans have no submitted I/O. Only RUNNING graphs require
+        # completion polling, including async PUT tails after request return.
+        if any(self.tasks[tid].status == TaskStatus.RUNNING
+               for tid in self.graph_to_task.values()):
+            return poll_s
+        delay = self._prefetch.next_wakeup(poll_s)
+        if self._terminal_tasks:
+            completed_at = next(iter(self._terminal_tasks.values()))
+            expiry = max(0, completed_at + 1800 - time.monotonic())
+            delay = expiry if delay is None else min(delay, expiry)
+        return delay
+
+    @on_runtime
+    def prefetch_capabilities(self) -> PrefetchCapabilities:
+        if not hasattr(self, "_prefetch"):
+            raise RuntimeError("chunked prefetch is not enabled")
+        return PrefetchCapabilities(partial_swa_checkpoints=True)
+
+    @on_runtime
+    def start_prefetch(
+        self, token_ids: np.ndarray, options: Optional[PrefetchOptions] = None,
+        namespace: Optional[List[str]] = None, dp_client_id: int = 0,
+    ) -> PrefetchHandle:
+        self.prefetch_capabilities()
+        if self._runtime is None:
+            raise RuntimeError("start the task engine before submitting prefetch")
+        return self._prefetch.start(token_ids, options or self._prefetch_options, namespace, dp_client_id)
+
+    @on_runtime
+    def progress_prefetch(
+        self, handles: Sequence[PrefetchHandle], demand_handles: Sequence[PrefetchHandle] = (),
+    ) -> Dict[PrefetchHandle, PrefetchSnapshot]:
+        self.prefetch_capabilities()
+        self._prefetch.demand(demand_handles)
+        return {h: self._prefetch.snapshot(h) for h in handles}
+
+    @on_runtime
+    def stop_prefetch(self, handle: PrefetchHandle, reason: str = "request_abort") -> PrefetchSnapshot:
+        return self._prefetch.stop(handle, reason)
+
+    @on_runtime
+    def release_prefetch(self, handle: PrefetchHandle) -> None:
+        self._prefetch.release(handle)
+
+    def _runtime_wait(self, task_ids, timeout, completely=False):
+        deadline = time.monotonic() + max(0, timeout)
+        responses = {}
+        pending = list(task_ids)
+        while pending:
+            current = self._runtime.call(
+                self._wait_impl, pending, timeout=0,
+                completely=completely, only_return_finished=True)
+            responses.update(current)
+            pending = [tid for tid in pending if tid not in current]
+            if not pending:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                responses.update({tid: KVResponse(KVResponseStatus.TIMEOUT, tid, None) for tid in pending})
+                break
+            with self._runtime.changed:
+                self._runtime.changed.wait(min(remaining, 0.01))
+        return responses
+
+    def shutdown(self) -> None:
+        runtime = getattr(self, "_runtime", None)
+        if runtime is not None:
+            if runtime.error:
+                raise RuntimeError("runtime failed: registered buffers retained") from runtime.error
+            runtime.call(self._prefetch.stop_all, "shutdown")
+            deadline = time.monotonic() + 30
+            while not runtime.call(lambda: self._prefetch.drained and
+                                   all(t.status != TaskStatus.RUNNING for t in self.tasks.values())):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("shutdown drain timed out; inflight buffers retained")
+                with runtime.changed:
+                    runtime.changed.wait(0.01)
+            runtime.call(lambda: [self._cancel_task(tid) for tid in list(self.tasks)])
+            runtime.call(lambda: [self._prefetch.release(h) for h in list(self._prefetch.sessions)])
+            runtime.stop()
+            self._runtime = None
+            self._prefetch_backend.shutdown()
+        super().shutdown()
+
+    @on_runtime
     def get_async(self,
                   token_ids: np.ndarray,
                   slot_mapping: np.ndarray,
@@ -1029,6 +1180,7 @@ class KVTaskEngine(KVTaskManager):
         self._launch_task(task_id)
         return task_id, return_mask
 
+    @on_runtime
     def put_async(self,
                   token_ids: np.ndarray,
                   slot_mapping: np.ndarray,
@@ -1112,6 +1264,7 @@ class KVTaskEngine(KVTaskManager):
             nvtx.end_range(nvtx_range)
         return return_responses
 
+    @on_runtime
     def try_wait(self, task_ids: Union[int, List[int]]) -> Dict[int, KVResponse]:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
@@ -1134,6 +1287,9 @@ class KVTaskEngine(KVTaskManager):
              completely: bool = False) -> Dict[int, KVResponse]:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
+        runtime = getattr(self, "_runtime", None)
+        if runtime is not None and not runtime.is_owner:
+            return self._runtime_wait(task_ids, timeout, completely)
         nvtx.push_range(f"wait task_ids: {task_ids}", color=get_nvtx_default_color())
         # trace wait request
         self.tracer.trace_wait_request(
@@ -1154,6 +1310,7 @@ class KVTaskEngine(KVTaskManager):
             end_time = time.time()
             flexkv_logger.debug(f"sync prefetch task {prefetch_task_id} cost {(end_time - start_time) * 1000} ms")
 
+    @on_runtime
     def get_match(self,
                   token_ids: np.ndarray,
                   dp_client_id: int = 0,
@@ -1234,6 +1391,7 @@ class KVTaskEngine(KVTaskManager):
         nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
 
+    @on_runtime
     def put_match(self,
                   token_ids: np.ndarray,
                   dp_client_id: int = 0,
@@ -1284,6 +1442,7 @@ class KVTaskEngine(KVTaskManager):
         nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
 
+    @on_runtime
     def prefetch_async(self,
                        token_ids: np.ndarray,
                        dp_client_id: int = 0,
@@ -1305,7 +1464,9 @@ class KVTaskEngine(KVTaskManager):
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
-        self.create_prefetch_task(task_id, token_ids, dp_client_id=dp_client_id, namespace=namespace, swa_aware=swa_aware)
+        self.create_prefetch_task(
+            task_id, token_ids, dp_client_id=dp_client_id, namespace=namespace, swa_aware=swa_aware
+        )
         self._process_empty_graph(task_id)
         nvtx.pop_range()
         # trace prefetch async request
@@ -1389,6 +1550,7 @@ class KVTaskEngine(KVTaskManager):
             self.tasks.pop(task_id, None)
         return batch_task_graph
 
+    @on_runtime
     def launch_tasks(self,
                     task_ids: List[int],
                     slot_mappings: List[np.ndarray],
@@ -1439,6 +1601,7 @@ class KVTaskEngine(KVTaskManager):
         nvtx.end_range(nvtx_range)
         return task_ids
 
+    @on_runtime
     def cancel_tasks(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
@@ -1448,6 +1611,7 @@ class KVTaskEngine(KVTaskManager):
     def _clear_cpu_cache(self) -> None:
         self.cache_engine.cpu_cache_engine.reset()
 
+    @on_runtime
     def reset_cache(self) -> None:
         """Invalidate the cache across ALL tiers (CPU + SSD + remote): drop the
         whole prefix tree and return every block to the mempool.
@@ -1455,7 +1619,10 @@ class KVTaskEngine(KVTaskManager):
         Used after a weight update (e.g. verl RL rollout) so that KV computed
         against stale weights is never reused.
 
-        We do NOT drain or cancel in-flight transfers here. verl issues the
+        Chunked-prefetch mode seals admission and requires all transfers to
+        drain before clearing the tree; retry if the first call is still draining.
+
+        In legacy mode we do NOT drain or cancel in-flight transfers here. verl issues the
         reset at a rollout/weight-update boundary where no new generation
         requests are being served, so in practice no task is ongoing. If any
         task IS still in flight we only warn: resetting the radix tree +
@@ -1463,6 +1630,20 @@ class KVTaskEngine(KVTaskManager):
         on transfer completion. This mirrors vLLM's own reset_encoder_cache /
         reset_mm_cache, which likewise only warn on has_unfinished_requests().
         """
+        coordinator = getattr(self, "_prefetch", None)
+        if coordinator is not None:
+            coordinator.stop_all("reset")
+            if not coordinator.drained or any(t.status == TaskStatus.RUNNING for t in self.tasks.values()):
+                raise RuntimeError("cache reset is draining; retry after all inflight tasks finish")
+            for handle in list(coordinator.sessions):
+                coordinator.release(handle)
+            for task_id in list(self.tasks):
+                self._cancel_task(task_id)
+            coordinator.sessions.clear()
+            coordinator.expired.clear()
+            import uuid
+            coordinator.epoch = uuid.uuid4().hex
+            coordinator.accepting = True
         ongoing = sum(1 for t in list(self.tasks.values()) if not t.is_completed())
         if ongoing:
             flexkv_logger.warning(

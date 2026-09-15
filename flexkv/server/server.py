@@ -3,6 +3,7 @@ from dataclasses import fields
 from typing import Optional, Dict, List, Union
 
 import tempfile
+import re
 import zmq
 import torch
 import time
@@ -10,6 +11,7 @@ import threading
 from threading import Lock
 import multiprocessing as mp
 import socket
+from contextlib import suppress
 import os
 import subprocess
 import textwrap
@@ -40,6 +42,8 @@ from flexkv.server.request import (
     ResetRequest,
     CheckRunningRequest,
     PrefetchRequest,
+    PrefetchControlRequest,
+    PrefetchControlResponse,
 )
 import contextlib
 
@@ -126,10 +130,8 @@ class KVServerHandle:
     def _join(self, timeout: float = None) -> None:
         """Wait for the process to finish (compatible with both Process and Popen)."""
         if isinstance(self.process, subprocess.Popen):
-            try:
+            with suppress(subprocess.TimeoutExpired):
                 self.process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                pass
         else:
             self.process.join(timeout=timeout)
 
@@ -154,6 +156,8 @@ class KVServer:
     ):
 
         self.model_config = model_config
+        self._prefetch_clients = {}
+        self._pending_waits = []
         # Init inter-process communication
         self.context = zmq.Context(2)
         self.recv_from_client = get_zmq_socket(
@@ -182,7 +186,9 @@ class KVServer:
             # update distributed_node_id
             cache_config.distributed_node_id = self.redis_meta_client.get_node_id()
 
-        self.kv_task_engine = KVTaskEngine(model_config, cache_config, gpu_register_port, redis_meta=self.redis_meta_client)
+        self.kv_task_engine = KVTaskEngine(
+            model_config, cache_config, gpu_register_port, redis_meta=self.redis_meta_client
+        )
 
         self.req_counter = 0
         self._is_ready = False
@@ -313,8 +319,12 @@ class KVServer:
             raise TypeError(f"Received RequestType: {type(req)} from DP client "
                             f"dp_client_id={req.dp_client_id} before the start request")
         self._running = True
+        self.request_handlers[PrefetchControlRequest] = self._handle_prefetch_control
         while self._running:
             try:
+                self._drain_pending_waits()
+                if self._pending_waits and not self.recv_from_client.poll(2):
+                    continue
                 flexkv_logger.info("start waiting for req")
                 req = self.recv_from_client.recv_pyobj()
                 flexkv_logger.info(f"recv req: {type(req)} from DP client "
@@ -442,6 +452,54 @@ class KVServer:
             swa_aware=req.swa_aware,
         )
 
+    def _handle_prefetch_control(self, req):
+        # IPC protocol is local, just like existing KVServer RPC. Never connect
+        # to arbitrary network endpoints supplied as a reply address.
+        if not re.fullmatch(r"ipc:///tmp/flexkv-prefetch-[0-9a-f]{32}", req.reply_port):
+            flexkv_logger.error("Invalid prefetch control reply endpoint")
+            return
+        result = None
+        error = None
+        try:
+            if req.protocol_version != 1:
+                raise ValueError("unsupported prefetch protocol version")
+            if req.dp_client_id not in self.client_manager.client_dict:
+                raise ValueError("unregistered prefetch client")
+            # Retain ownership only while the bounded coordinator ledger does.
+            runtime = self.kv_task_engine._runtime
+            live = runtime.call(
+                lambda: set(self.kv_task_engine._prefetch.sessions)
+                | set(self.kv_task_engine._prefetch.expired)
+            ) if runtime else set()
+            self._prefetch_clients = {h: cid for h, cid in self._prefetch_clients.items() if h in live}
+            payload = dict(req.payload)
+            for handle in list(payload.get("handles", ())) + list(payload.get("demand_handles", ())):
+                if self._prefetch_clients.get(handle) != req.dp_client_id:
+                    raise ValueError("prefetch handle belongs to another client")
+            if "handle" in payload and self._prefetch_clients.get(payload["handle"]) != req.dp_client_id:
+                raise ValueError("unknown prefetch handle or client")
+            if req.action == "capabilities":
+                result = self.kv_task_engine.prefetch_capabilities()
+            elif req.action == "start":
+                result = self.kv_task_engine.start_prefetch(dp_client_id=req.dp_client_id, **payload)
+                self._prefetch_clients[result] = req.dp_client_id
+            elif req.action == "progress":
+                result = self.kv_task_engine.progress_prefetch(**payload)
+            elif req.action == "stop":
+                result = self.kv_task_engine.stop_prefetch(**payload)
+            elif req.action == "release":
+                result = self.kv_task_engine.release_prefetch(**payload)
+            else:
+                raise ValueError("unknown prefetch control action")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        reply = get_zmq_socket(self.context, zmq.SocketType.PUSH, req.reply_port, False)
+        try:
+            reply.setsockopt(zmq.SNDTIMEO, 100)
+            reply.send_pyobj(PrefetchControlResponse(result, error))
+        finally:
+            reply.close(linger=100)
+
     def _handle_launch_task_request(self, req: LaunchTaskRequest) -> None:
         """Handle LaunchTask request"""
         self.kv_task_engine.launch_tasks(
@@ -460,6 +518,9 @@ class KVServer:
 
     def _handle_wait_request(self, req: WaitRequest) -> None:
         """Handle Wait request"""
+        if getattr(self.kv_task_engine, "_runtime", None) is not None:
+            self._pending_waits.append((req, time.monotonic() + max(0, req.wait_timeout), {}))
+            return
         kv_responses = self.kv_task_engine.wait(
             req.wait_task_ids,
             timeout=req.wait_timeout,
@@ -468,6 +529,34 @@ class KVServer:
         response = Response(dp_client_id=req.dp_client_id, status=kv_responses)
         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
         result_zmq.send_pyobj(response)
+
+    def _drain_pending_waits(self):
+        from flexkv.common.request import KVResponse, KVResponseStatus
+        for entry in list(self._pending_waits):
+            req, deadline, results = entry
+            pending = [tid for tid in req.wait_task_ids if tid not in results]
+            try:
+                current = self.kv_task_engine._runtime.call(
+                    self.kv_task_engine._wait_impl, pending, timeout=0,
+                    completely=req.completely, only_return_finished=True)
+            except Exception as exc:
+                # A dead runtime must not trap the server before recv(), which
+                # would also prevent independent control RPCs returning errors.
+                self._pending_waits.remove(entry)
+                if req.dp_client_id in self.client_manager.client_dict:
+                    self.client_manager.get_zmq(req.dp_client_id).send_pyobj(Response(
+                        dp_client_id=req.dp_client_id,
+                        error_msg=str(exc),
+                        status={tid: KVResponse(KVResponseStatus.FAILED, tid, None) for tid in pending}))
+                continue
+            results.update(current)
+            pending = [tid for tid in pending if tid not in results]
+            if pending and time.monotonic() < deadline:
+                continue
+            results.update({tid: KVResponse(KVResponseStatus.TIMEOUT, tid, None) for tid in pending})
+            self.client_manager.get_zmq(req.dp_client_id).send_pyobj(
+                Response(dp_client_id=req.dp_client_id, status=results))
+            self._pending_waits.remove(entry)
 
     def _handle_try_wait_request(self, req: TryWaitRequest) -> None:
         """Handle TryWait request"""
@@ -488,6 +577,13 @@ class KVServer:
         """Detach one client while leaving the shared server running."""
         flexkv_logger.info(f"Received unregister request from DP client "
                            f"(dp_client_id={req.dp_client_id})")
+        if getattr(self.kv_task_engine, "_runtime", None) is not None:
+            for handle, client_id in list(self._prefetch_clients.items()):
+                if client_id == req.dp_client_id:
+                    self.kv_task_engine.release_prefetch(handle)
+                    self._prefetch_clients.pop(handle, None)
+        self._pending_waits = [entry for entry in self._pending_waits
+                               if entry[0].dp_client_id != req.dp_client_id]
         self.client_manager.delete_dp_client(req.dp_client_id)
 
     def _handle_reset_request(self, req: ResetRequest) -> None:
