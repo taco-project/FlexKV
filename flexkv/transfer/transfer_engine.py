@@ -49,6 +49,7 @@ from flexkv.transfer.backends import (
 )
 from flexkv.external.mooncake_store_keys import PoolKind
 from flexkv.transfer.compression import build_compressors, NullCompressionStrategy
+from flexkv.transfer.cuda_sync import synchronize_cuda_devices
 from flexkv.transfer.completion import CompletionContract
 from flexkv.transfer.layer_eventfd import build_layerwise_eventfd_socket_path
 from flexkv.transfer.worker_op import WorkerTransferResult
@@ -96,40 +97,14 @@ def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
         pin_buffer.free_slot(op.dst_slot_id)
 
 
-def _te_bounded_cuda_sync(timeout_s: float) -> None:
-    """torch.cuda.synchronize() with a wall-clock cap.
+def _te_bounded_cuda_sync(device_ids: List[int], timeout_s: float) -> bool:
+    """Bound the drain of this process's contexts on the registered GPUs.
 
-    Runs the sync in a daemon thread so a wedged GPU cannot prevent
-    TransferEngine.shutdown from returning. Failure / timeout is logged
-    but not raised — this is called from the shutdown finally.
+    A fresh daemon thread inherits the default device, so a bare
+    ``torch.cuda.synchronize()`` here would drain GPU 0 no matter which GPUs
+    this engine actually registered. Drain the registered devices instead.
     """
-    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
-        return
-    done = threading.Event()
-    err: List[BaseException] = []
-
-    def _run() -> None:
-        try:
-            torch.cuda.synchronize()
-        except BaseException as e:  # noqa: BLE001
-            err.append(e)
-        finally:
-            done.set()
-
-    t = threading.Thread(
-        target=_run, name="flexkv-te-cuda-drain", daemon=True,
-    )
-    t.start()
-    if not done.wait(timeout=timeout_s):
-        flexkv_logger.warning(
-            f"TransferEngine.shutdown: cuda synchronize did not finish in "
-            f"{timeout_s:.0f}s (GPU likely wedged); continuing"
-        )
-        return
-    if err:
-        flexkv_logger.warning(
-            f"TransferEngine.shutdown: cuda synchronize failed: {err[0]!r}"
-        )
+    return synchronize_cuda_devices(device_ids, timeout_s, name="flexkv-te")
 
 class TransferEngine:
     def __init__(self,
@@ -1554,4 +1529,16 @@ class TransferEngine:
             # Bounded sync: a wedged GPU here would keep the TM process alive
             # past shutdown, forcing the parent-side SIGTERM/SIGKILL. Workers
             # have already unpinned; TM does not itself hold CPU pin refs.
-            _te_bounded_cuda_sync(timeout_s=15.0) # hardcode for now
+            # Worker processes drain their own contexts; drain this process's
+            # contexts on the GPUs actually registered here, rather than on the
+            # default device a fresh daemon thread would otherwise pick up.
+            # getattr: shutdown also runs after a partially failed __init__.
+            device_ids = sorted({
+                handle.gpu_device_id
+                for groups in (getattr(self, "gpu_handle_groups", None) or {},
+                               getattr(self, "_swa_gpu_handles", None) or {})
+                for handles in groups.values()
+                for handle in handles
+                if handle.gpu_device_id is not None
+            })
+            _te_bounded_cuda_sync(device_ids, timeout_s=15.0)  # hardcode for now

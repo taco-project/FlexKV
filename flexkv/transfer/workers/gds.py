@@ -31,11 +31,7 @@ from flexkv.transfer.geometry import (
 )
 from flexkv.transfer.template import compile_gpu_regions, compile_host_regions
 from flexkv.transfer.worker_op import WorkerTransferOp
-from flexkv.transfer.workers.runtime import (
-    TransferWorkerBase,
-    ensure_cuda_device,
-    import_tensor_handles,
-)
+from flexkv.transfer.workers.runtime import TransferWorkerBase
 
 
 class GDSTransferWorker(TransferWorkerBase):
@@ -116,12 +112,12 @@ class GDSTransferWorker(TransferWorkerBase):
 
         assert len(gpu_blocks) == tp_group_size
         if gpu_blocks and gpu_blocks[0]:
-            ensure_cuda_device(gpu_blocks[0][0].device)
+            self._ensure_cuda_device(gpu_blocks[0][0].device)
         self._pin_op_buffer()
         # Handle tensor import for multi-process case — set_device per GPU first.
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
-            imported_gpu_blocks.append(import_tensor_handles(handles_in_one_gpu))
+            imported_gpu_blocks.append(self._import_tensor_handles(handles_in_one_gpu))
         self.gpu_blocks = imported_gpu_blocks
         self.num_blocks_per_file = num_blocks_per_file
         self.num_files = sum(len(file_list) for file_list in ssd_files.values())

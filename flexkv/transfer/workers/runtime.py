@@ -20,7 +20,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from multiprocessing.connection import Connection
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import nvtx
 import torch
@@ -34,6 +34,7 @@ from flexkv.common.memory_handle import (
 from flexkv.common.transfer import TransferType, get_nvtx_range_color
 from flexkv.transfer import trace
 from flexkv.transfer.backends import StorageBackend
+from flexkv.transfer.cuda_sync import synchronize_cuda_devices
 from flexkv.transfer.geometry import EdgeGeometry
 from flexkv.transfer.host_buffer import (
     cudaHostRegister,
@@ -44,12 +45,19 @@ from flexkv.transfer.worker_op import WorkerTransferOp, WorkerTransferResult
 from flexkv.transfer.workers.handle import WorkerHandle
 
 
-def ensure_cuda_device(device: Union[int, torch.device, None]) -> None:
-    """Bind this process's CUDA context before IPC import / host register / Stream.
+def ensure_cuda_device(
+    device: Union[int, torch.device, None], *, cuda_device_ids: Optional[Set[int]] = None
+) -> None:
+    """Bind this thread's CUDA context before IPC import / host register / Stream.
 
     Workers must call this *before* any CUDA API. Otherwise the default device
     (usually GPU 0) gets a context from every worker, which under DP exhausts
     GPU0 and makes ``torch.cuda.Stream()`` OOM while ``ready_event.wait()`` hangs.
+
+    ``cuda_device_ids`` collects every device this worker actually bound, so
+    shutdown can drain exactly those and not whatever device a fresh thread
+    happens to default to. Pass a worker's ``_cuda_device_ids``; the
+    ``_ensure_cuda_device`` method below does that for you.
     """
     if device is None:
         return
@@ -62,15 +70,24 @@ def ensure_cuda_device(device: Union[int, torch.device, None]) -> None:
         if idx < 0:
             return
     torch.cuda.set_device(idx)
+    if cuda_device_ids is not None:
+        cuda_device_ids.add(idx)
 
 
 def import_tensor_handles(
-    handles: List["TensorSharedHandle"],
+    handles: List["TensorSharedHandle"], *, cuda_device_ids: Optional[Set[int]] = None
 ) -> List[torch.Tensor]:
-    """Import CUDA IPC tensors after switching to their owning device."""
-    if handles:
-        ensure_cuda_device(handles[0].device)
-    return [h.get_tensor() for h in handles]
+    """Import CUDA IPC tensors after switching to their owning device.
+
+    Every handle's device is recorded, not just the first: ``get_tensor()``
+    binds each handle's own device internally, so a list that ever spans GPUs
+    would leave the extra contexts undrained at shutdown.
+    """
+    imported = []
+    for handle in handles:
+        ensure_cuda_device(handle.device, cuda_device_ids=cuda_device_ids)
+        imported.append(handle.get_tensor())
+    return imported
 
 
 # Idle wait in the worker's receive loop. Connection.poll() wakes as soon as
@@ -78,6 +95,12 @@ def import_tensor_handles(
 # how long a worker sleeps between interruptibility checks. The previous value
 # (0.1 ms) made every idle worker burn a full core.
 _WORKER_IDLE_POLL_S = float(os.getenv("FLEXKV_WORKER_IDLE_POLL_S", "0.05"))
+
+
+# Host regions whose CUDA drain did not complete at shutdown. Unregistering
+# them would hand the kernel back pages a live DMA may still write, so they are
+# parked here instead: these references live until this worker process exits.
+_undrained_host_regions: List[List[Tuple[torch.Tensor, str]]] = []
 
 
 class TransferWorkerBase(ABC):
@@ -89,6 +112,7 @@ class TransferWorkerBase(ABC):
         # call shutdown() even when ``__init__`` fails mid-way after some pins.
         obj = super().__new__(cls)
         obj._host_registered = []
+        obj._cuda_device_ids = set()
         obj._shutdown_done = False
         obj._op_buffer_pinned = False
         return obj
@@ -115,6 +139,13 @@ class TransferWorkerBase(ABC):
         # What this worker publishes about its edge, built by the subclass and
         # handed to ``attach``. See flexkv/transfer/geometry.py.
         self._geometry: Optional[EdgeGeometry] = None
+
+    def _ensure_cuda_device(self, device: Union[int, torch.device, None]) -> None:
+        ensure_cuda_device(device, cuda_device_ids=self._cuda_device_ids)
+
+    def _import_tensor_handles(self, handles: List[TensorSharedHandle]) -> List[torch.Tensor]:
+        # Record each owning device before IPC import, including partial init.
+        return import_tensor_handles(handles, cuda_device_ids=self._cuda_device_ids)
 
     def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
         """cudaHostRegister and track for paired unregister in shutdown()."""
@@ -169,11 +200,23 @@ class TransferWorkerBase(ABC):
         #
         # torch.cuda.synchronize() releases the GIL and blocks in the driver;
         # if the GPU is wedged (hung kernel, TDR, faulty NVLink) it can hang
-        # forever. We run it in a daemon thread with a bounded join so a
-        # wedged GPU cannot prevent cudaHostUnregister from firing — the
-        # kernel behind the DMA is already dead, so proceeding with unpin
-        # is the correct action; the sentinel thread dies with the process.
-        self._drain_cuda_bounded(worker_id, timeout_s=30.0)
+        # forever. Each owned device is drained in its own daemon thread under
+        # a shared wall-clock budget, so a wedged GPU cannot keep this process
+        # alive past shutdown; the sentinel threads die with the process.
+        if not self._drain_cuda_bounded(worker_id, timeout_s=30.0):
+            # A timeout does not prove that DMA has stopped. Unpinning now
+            # would hand the kernel back pages a live engine may still write,
+            # and closing an IPC mapping under a live DMA is the same fault.
+            # Retain both the host regions and the imported device mappings
+            # until this process exits; the OS reclaims them at exit.
+            if registered:
+                _undrained_host_regions.append(registered)
+            flexkv_logger.warning(
+                "[worker %s] CUDA drain incomplete; retaining %d host region(s) "
+                "and their imported GPU mappings until process exit",
+                worker_id, len(registered),
+            )
+            return
         # Unregister in reverse order of registration.
         while registered:
             tensor, label = registered.pop()
@@ -209,43 +252,16 @@ class TransferWorkerBase(ABC):
                 pass
         gc.collect()
 
-    @staticmethod
-    def _drain_cuda_bounded(worker_id: Any, timeout_s: float) -> None:
-        """Best-effort torch.cuda.synchronize() with a wall-clock cap.
+    def _drain_cuda_bounded(self, worker_id: Any, timeout_s: float) -> bool:
+        """Drain every device this worker bound, including TP and partial init.
 
-        Returns whether the sync actually completed. Failure / timeout is
-        logged but not raised — unpin must proceed either way.
+        Returns whether every owned device finished. False means the caller
+        must keep the pinned host memory and the imported GPU mappings alive:
+        a timeout does not prove the DMA stopped.
         """
-        if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
-            return
-        done = threading.Event()
-        err: List[BaseException] = []
-
-        def _run() -> None:
-            try:
-                torch.cuda.synchronize()
-            except BaseException as e:  # noqa: BLE001
-                err.append(e)
-            finally:
-                done.set()
-
-        t = threading.Thread(
-            target=_run,
-            name=f"flexkv-worker-{worker_id}-cuda-drain",
-            daemon=True,
+        return synchronize_cuda_devices(
+            self._cuda_device_ids, timeout_s, name=f"flexkv-worker-{worker_id}"
         )
-        t.start()
-        if not done.wait(timeout=timeout_s):
-            flexkv_logger.warning(
-                f"[worker {worker_id}] cuda synchronize did not finish in "
-                f"{timeout_s:.0f}s (GPU likely wedged); proceeding with unpin"
-            )
-            return
-        if err:
-            flexkv_logger.warning(
-                f"[worker {worker_id}] cuda synchronize before unpin failed: "
-                f"{err[0]!r}"
-            )
 
     @classmethod
     def _get_worker_id(cls) -> int:
