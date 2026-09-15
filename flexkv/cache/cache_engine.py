@@ -1137,7 +1137,12 @@ class GlobalCacheEngine:
         # swa) after matching, which can end before the aligned length. So the
         # invariant is <= (can never exceed the aligned length), not ==. Nothing
         # below uses aligned_length; all downstream sizing keys off block_end_idx.
-        assert block_end_idx <= aligned_length // self.tokens_per_block
+        assert block_end_idx <= aligned_length // self.tokens_per_block, (
+            f"block_end_idx={block_end_idx} exceeds aligned block count "
+            f"{aligned_length // self.tokens_per_block} "
+            f"(aligned_length={aligned_length}, tokens_per_block={self.tokens_per_block}, "
+            f"num_tokens={token_ids.shape[0]}, mask_sum={int(token_mask.sum())})"
+        )
         gpu_block_ids = self.slot_mapping_to_block_ids(slot_mapping,
                                                        self.tokens_per_block)[:block_end_idx-block_start_idx]
 
@@ -1740,8 +1745,12 @@ class GlobalCacheEngine:
         enable_cpu = self.cache_config.enable_cpu
         enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
         enable_gds = self.cache_config.enable_gds and not temp_cache_strategy.ignore_gds
-        assert enable_cpu
-        assert self.cpu_cache_engine is not None
+        assert enable_cpu, (
+            "_get_impl_local requires the CPU tier: cache_config.enable_cpu is False"
+        )
+        assert self.cpu_cache_engine is not None, (
+            "_get_impl_local: cpu_cache_engine is None while enable_cpu is True"
+        )
 
         if self.index_accel:
             cpu_matched_result, ssd_matched_result = self.match_local_accel(
@@ -1811,7 +1820,12 @@ class GlobalCacheEngine:
                     self._metrics_collector.record_cache_miss(total_query_blocks)
             nvtx.end_range(nvtx_range)
             return self._empty_get_return(request_id)
-        assert fragment12_num_blocks <= len(gpu_block_ids)
+        assert fragment12_num_blocks <= len(gpu_block_ids), (
+            f"fragment12_num_blocks={fragment12_num_blocks} > len(gpu_block_ids)="
+            f"{len(gpu_block_ids)} (cpu_matched={len(cpu_matched_blocks)}, "
+            f"ssd_matched={len(ssd_matched_blocks)}, "
+            f"block_mask=[{block_mask_start},{block_mask_end}))"
+        )
 
         finished_ops_ids = []
         op_node_to_ready = {}
@@ -3324,12 +3338,43 @@ class GlobalCacheEngine:
                       token_ids: np.ndarray,
                       token_mask: np.ndarray,
                       slot_mapping: np.ndarray) -> None:
-        assert token_ids.dtype == np.int64
-        # assert token_mask.dtype == np.bool_, f"token_mask.dtype={token_mask.dtype}"
-        assert slot_mapping.dtype == np.int64
-        assert token_ids.ndim == 1
-        assert token_mask.ndim == 1
-        assert slot_mapping.ndim == 1
+        # Every assertion here carries a message on purpose.  A bare ``assert``
+        # raises ``AssertionError('')``, and callers that log ``str(exc)`` (e.g.
+        # the SGLang connector's lookup path) then report ``error=""`` -- an
+        # empty string that is indistinguishable from "no error" and carries no
+        # line number.  That cost days of debugging on P800.
+        assert token_ids.dtype == np.int64, f"token_ids.dtype={token_ids.dtype}, expected int64"
+        # token_mask SHOULD be boolean.  numpy turns an *integer* array used as
+        # an index into fancy indexing, so ``token_ids[token_mask]`` would
+        # silently return len(mask) elements picked by value instead of the
+        # masked subset (e.g. 6784 instead of 64).
+        #
+        # It cannot be a hard bool-only requirement, though: FlexKV's own
+        # ``kvtask`` is shipped as a compiled extension (kvtask.so shadows
+        # kvtask.py) and its put / prefetch paths build the default mask with
+        # ``np.ones_like(token_ids)`` -- i.e. int64.  Those paths never index
+        # token_ids with the mask, so they are safe; only ``get_match`` does,
+        # and it already passes dtype=bool.
+        #
+        # So: accept bool, or an integer mask that is genuinely 0/1-valued
+        # (which is all the compiled code ever produces), and reject anything
+        # else -- a non-0/1 integer array is certainly not a mask.
+        if token_mask.dtype != np.bool_:
+            assert np.issubdtype(token_mask.dtype, np.integer), (
+                f"token_mask.dtype={token_mask.dtype}, expected bool_ "
+                f"(or a 0/1 integer array)"
+            )
+            assert bool(((token_mask == 0) | (token_mask == 1)).all()), (
+                f"token_mask.dtype={token_mask.dtype} and contains values other "
+                f"than 0/1 (min={token_mask.min()}, max={token_mask.max()}); "
+                f"an integer mask silently becomes fancy indexing when used to "
+                f"index token_ids"
+            )
+        assert slot_mapping.dtype == np.int64, \
+            f"slot_mapping.dtype={slot_mapping.dtype}, expected int64"
+        assert token_ids.ndim == 1, f"token_ids.ndim={token_ids.ndim}, expected 1"
+        assert token_mask.ndim == 1, f"token_mask.ndim={token_mask.ndim}, expected 1"
+        assert slot_mapping.ndim == 1, f"slot_mapping.ndim={slot_mapping.ndim}, expected 1"
         assert token_ids.size == token_mask.size, f"token_ids.size={token_ids.size}, token_mask.size={token_mask.size}"
         assert slot_mapping.size == token_mask.sum(), \
             f"slot_mapping.size={slot_mapping.size}, token_mask.sum()={token_mask.sum()}"

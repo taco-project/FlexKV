@@ -33,6 +33,7 @@ import signal
 import socket
 import struct
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -148,6 +149,10 @@ class FlexKVConnector:
         attn_cp_group: Any = None,
     ) -> None:
         self.page_size = int(page_size)
+        self._flexkv_debug_indices = (
+            os.environ.get("FLEXKV_DEBUG_SLOT_INDICES", "0").lower()
+            in ("1", "true", "yes")
+        )
 
         # 1. Resolve FlexKV config from env + sglang server args.
         self.flexkv_config = FlexKVConfig.from_env()
@@ -208,6 +213,19 @@ class FlexKVConnector:
         # MLA/MHA models keep the single-layout path.
         self._kvcache = kvcache
         self._swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
+        # Self-attestation for the store fast path. ``per_token_mask_bcast``
+        # must read False on a TP-only deployment -- that is the whole point of
+        # not serialising one Python bool per prompt token across ranks.
+        logger.info(
+            "[FlexKV] store fast path: per_token_mask_bcast=%s (cross_node_pp=%s), "
+            "swa_pool=%s pp_active=%s async_store_api_ok=%s",
+            bool(getattr(self._sync_ctx, "is_cross_node_pp", False)),
+            bool(getattr(self._sync_ctx, "is_cross_node_pp", False)),
+            self._swa_kv_pool is not None,
+            bool(getattr(self._sync_ctx, "is_pp_active", False)),
+            (not bool(getattr(self._sync_ctx, "is_pp_active", False)))
+            and self._swa_kv_pool is None,
+        )
         self._is_dsv4 = hasattr(kvcache, "c4_kv_pool")
         self._dsv4_layer_groups: List[Dict[str, Any]] = []
         self._dsv4_state_groups: List[Dict[str, Any]] = []
@@ -263,6 +281,9 @@ class FlexKVConnector:
         self.enable_layerwise = bool(
             int(os.environ.get("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "0"))
         )
+        self._profile_store_stages = os.getenv(
+            "FLEXKV_PROFILE_STORE_STAGES", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._layerwise_socket = build_layerwise_eventfd_socket_path(
             dp_client_id=self.rank_info.dp_client_id,
             pp_rank=self.rank_info.pp_rank,
@@ -501,6 +522,33 @@ class FlexKVConnector:
             except Exception as exc:  # noqa: BLE001
                 lookup_error = exc
                 res = None
+                # Never swallow this silently.  The structured log below only
+                # records ``error=str(exc)``, and a bare ``assert`` (of which
+                # the get path has several) stringifies to "" -- so the whole
+                # failure used to surface as
+                #     operation=lookup act=complete status=failed ... error=""
+                # with no stack, no line number and no way to tell a real
+                # exception from a plain cache miss.  On P800 that hid a
+                # permanently broken load path for days: every lookup raised,
+                # so ``load`` never ran, yet the request-level hit rate looked
+                # fine because SGLang's own device radix cache was serving it.
+                #
+                # Log the full traceback plus the inputs, once per failure.
+                logger.exception(
+                    "[FlexKV] lookup_kv: get_match raised %s (str=%r); "
+                    "treating as a miss. token_ids: shape=%s dtype=%s | "
+                    "token_mask: shape=%s dtype=%s sum=%s | "
+                    "swa_aware=%s page_size=%s",
+                    type(exc).__name__,
+                    str(exc),
+                    getattr(tids_np, "shape", None),
+                    getattr(tids_np, "dtype", None),
+                    getattr(mask_np, "shape", None),
+                    getattr(mask_np, "dtype", None),
+                    (int(mask_np.sum()) if mask_np is not None else None),
+                    self._swa_kv_pool is not None,
+                    self.page_size,
+                )
             if res is None:
                 fkv_task_id = -1
                 hit_length = 0
@@ -1008,6 +1056,35 @@ class FlexKVConnector:
     # Public API — store
     # ------------------------------------------------------------------
 
+    @property
+    def is_store_sync_leader(self) -> bool:
+        """Whether this rank owns the authoritative FlexKV store decision."""
+        return bool(self._sync_ctx.is_sync_leader)
+
+    @property
+    def supports_async_store_slot_mapping(self) -> bool:
+        """Whether a leader-only pinned slot copy is valid for this topology.
+
+        PP stages need their own stage-local mapping, and SWA needs a GPU-side
+        full-to-SWA translation. Keep those paths on the synchronous
+        implementation until they have an explicit sideband.
+        """
+        # TODO: add stage-local mapping sidebands for PP and carry
+        # the GPU full-to-SWA translation in the asynchronous store protocol.
+        return not bool(getattr(self._sync_ctx, "is_pp_active", False)) and (
+            self._swa_kv_pool is None
+        )
+
+    def sync_ready_store_rids(self, ready_rids: List[str]) -> List[str]:
+        """Fan out the leader's ready pinned-copy set to every cache rank."""
+        payload = list(ready_rids) if self._sync_ctx.is_sync_leader else []
+        if self._sync_ctx.needs_sync:
+            payload = self._sync_ctx.scatter(
+                payload,
+                channel=FlexKVScatterChannel.STORE_READY,
+            )
+        return list(payload)
+
     def store_kv(
         self,
         rid: str,
@@ -1034,6 +1111,26 @@ class FlexKVConnector:
                 f"has {len(kv_indices)} entries"
             )
 
+        # Move the slot-index vector to the host *before* any slicing or
+        # masking. On Kunlun XPU every device-side indexing op -- including a
+        # plain contiguous slice like ``kv_indices[:aligned_len]`` -- lowers to
+        # strided_slice / as_strided and raises kernel exception 714
+        # (strided_slice.cpp:548). That failure is doubly nasty: the result can
+        # come back silently all-zero, and the CUDA context is poisoned, so the
+        # damage only surfaces later as
+        # "tp_group_transfer failed: invalid program counter" /
+        # copy_kernel.cpp:413 in a completely different process.
+        #
+        # A single bulk D2H of the whole vector is one contiguous copy and is
+        # always safe, so do that once here and keep every subsequent slice and
+        # boolean mask on the host. ``kv_indices_device`` is retained only for
+        # diagnostics (scalar .min()/.max() use a different lowering and still
+        # work on XPU) and for the SWA translation, which expects full-pool
+        # indices on the pool's own device.
+        kv_indices_device = kv_indices
+        if isinstance(kv_indices, torch.Tensor) and kv_indices.is_cuda:
+            kv_indices = self._to_cpu_int64(kv_indices)
+
         # Page-align inputs *before* put_match so the FlexKV allocator
         # only reserves slots that line up with the slot_mapping we send.
         if self.page_size > 1:
@@ -1050,19 +1147,29 @@ class FlexKVConnector:
                 return -1
             if aligned_len < n:
                 token_ids_np = token_ids_np[:aligned_len]
+                # Safe: kv_indices is on the host by now (see above).
                 kv_indices = kv_indices[:aligned_len]
+                # Keep ``n`` in step with the truncation: it is broadcast as
+                # ``slot_count`` below and followers validate it against their
+                # own ``len(kv_indices)``.
+                n = aligned_len
 
         store_start = {
             "rid": rid,
             "task_id": -1,
             "active": False,
+            "slot_count": n,
+            "unmatched_count": 0,
             "unmatched_mask": [],
             "error": "",
         }
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             match_error: Optional[Exception] = None
             try:
-                res = self.kv_manager.put_match(token_ids=token_ids_np, token_mask=None)
+                with self._store_profile_scope("flexkv.connector.store.put_match"):
+                    res = self.kv_manager.put_match(
+                        token_ids=token_ids_np, token_mask=None
+                    )
             except Exception as exc:  # noqa: BLE001
                 match_error = exc
                 res = None
@@ -1078,33 +1185,136 @@ class FlexKVConnector:
                 )
             else:
                 fkv_task_id, unmatched_mask = res
+                # TP/CP followers only need the task id to retain their local
+                # radix-node ownership.  Broadcasting one Python bool per
+                # prompt token made the common TP-only write-through path
+                # serialize/deserialise tens of thousands of objects per
+                # request.  Only cross-node PP receivers need the mask to
+                # construct their stage-local slot mapping.
+                #
+                # Safety: ``should_send_slot_mapping_to_remote`` (the condition
+                # under which a follower *consumes* the mask) is defined as
+                # ``is_pp_receiver and is_cross_node_pp``, so it is strictly
+                # narrower than the ``is_cross_node_pp`` gate used here -- any
+                # rank that needs the mask is guaranteed to receive it.
+                #
+                # p800 divergence from upstream: the host-side masking further
+                # down reads ``unmatched_mask`` directly instead of
+                # ``mask_list``, so the leader stays correct even though the
+                # broadcast payload is now empty on the TP-only path.
+                needs_remote_mask = bool(
+                    getattr(self._sync_ctx, "is_cross_node_pp", False)
+                )
+                unmatched_count = int(np.count_nonzero(unmatched_mask))
                 mask_list = (
                     unmatched_mask.tolist()
-                    if hasattr(unmatched_mask, "tolist")
+                    if needs_remote_mask and hasattr(unmatched_mask, "tolist")
                     else list(unmatched_mask)
+                    if needs_remote_mask
+                    else []
                 )
                 store_start.update(
-                    task_id=int(fkv_task_id), unmatched_mask=mask_list
+                    task_id=int(fkv_task_id),
+                    unmatched_count=unmatched_count,
+                    unmatched_mask=mask_list,
                 )
                 context.task_id = int(fkv_task_id)
-                unmatched_count = int(sum(bool(item) for item in mask_list))
                 if unmatched_count > 0:
-                    filtered = kv_indices[unmatched_mask]
-                    slot_mapping_cpu = self._to_cpu_int64(filtered)
-                    swa_slot_mapping = self._build_swa_slot_mapping(filtered)
+                    # kv_indices is already on the host (moved once at the top
+                    # of store_kv, before any slicing) precisely so that this
+                    # boolean mask never runs on the accelerator: on Kunlun XPU
+                    # device-side masked indexing lowers to
+                    # as_strided/strided_slice and raises kernel exception 714,
+                    # which silently yields all zeros -- making every stored
+                    # block point at GPU page 0 -- and poisons the CUDA context
+                    # so the next tp_group_transfer dies with "invalid program
+                    # counter".
+                    with self._store_profile_scope(
+                        "flexkv.connector.store.filter_slot_mapping"
+                    ):
+                        # Read ``unmatched_mask`` (the raw put_match result),
+                        # NOT ``mask_list``: the latter is deliberately empty on
+                        # the TP-only path now that it is no longer broadcast
+                        # one Python bool per token.
+                        mask_np = np.asarray(unmatched_mask, dtype=bool)
+                        kv_indices_cpu = self._to_cpu_int64(kv_indices)
+                        slot_mapping_cpu = kv_indices_cpu[
+                            torch.from_numpy(mask_np)
+                        ].contiguous()
+                    # Verify the D2H actually carried the values across. On
+                    # Kunlun XPU a bulk D2H can come back silently all-zero
+                    # even though the device-side tensor is correct (scalar
+                    # .min()/.max() use a different path and still work), which
+                    # makes every stored block id collapse to GPU page 0.
+                    # Detect it here instead of letting the transfer worker die
+                    # with an opaque "invalid program counter" seconds later.
+                    # NOTE: this must read the *device* tensor -- comparing the
+                    # host copy against itself would always agree and defeat
+                    # the check.
+                    if slot_mapping_cpu.numel() > 1 and bool(
+                        (slot_mapping_cpu == 0).all()
+                    ):
+                        dev_max = int(kv_indices_device.max())
+                        if dev_max != 0:
+                            raise RuntimeError(
+                                "[FlexKV] slot index D2H returned all zeros "
+                                f"(device max={dev_max}, "
+                                f"numel={slot_mapping_cpu.numel()}, "
+                                f"dtype={kv_indices_device.dtype}, "
+                                f"device={kv_indices_device.device}). Refusing "
+                                "to launch a store that would corrupt GPU "
+                                "page 0."
+                            )
+                    if self._flexkv_debug_indices:
+                        logger.info(
+                            "[FlexKV-DEBUG-D2H] rid=%s dev(min=%d max=%d dtype=%s) "
+                            "-> host(numel=%d min=%d max=%d dtype=%s) "
+                            "unmatched=%d/%d",
+                            rid,
+                            int(kv_indices_device.min()),
+                            int(kv_indices_device.max()),
+                            kv_indices_device.dtype,
+                            slot_mapping_cpu.numel(),
+                            int(slot_mapping_cpu.min()),
+                            int(slot_mapping_cpu.max()),
+                            slot_mapping_cpu.dtype,
+                            unmatched_count,
+                            int(mask_np.size),
+                        )
+                    if self._swa_kv_pool is None:
+                        swa_slot_mapping = None
+                    else:
+                        # SWA path: feed the already-selected HOST slot vector.
+                        #
+                        # Do NOT reintroduce ``kv_indices[unmatched_mask]``
+                        # here. Two reasons: (1) if kv_indices were still the
+                        # device tensor, that masked index is exactly the XPU
+                        # strided_slice(714) trap described above; (2) kv_indices
+                        # has been page-aligned (truncated to aligned_len) while
+                        # unmatched_mask is sized from put_match, so indexing one
+                        # by the other can go out of range. slot_mapping_cpu is
+                        # the same selection, already materialised and
+                        # contiguous. translate_loc_from_full_to_swa() moves it
+                        # back to whatever device it needs.
+                        swa_slot_mapping = self._build_swa_slot_mapping(
+                            slot_mapping_cpu
+                        )
                     swa_slots = (
                         0
                         if swa_slot_mapping is None
                         else int(swa_slot_mapping.numel())
                     )
                     try:
-                        self.kv_manager.launch(
-                            task_ids=[fkv_task_id],
-                            slot_mappings=[slot_mapping_cpu],
-                            swa_slot_mappings=[swa_slot_mapping],
-                            as_batch=False,
-                            layerwise_transfer=False,
-                        )
+                        with self._store_profile_scope(
+                            "flexkv.connector.store.kvmanager_launch"
+                        ):
+                            self.kv_manager.launch(
+                                task_ids=[fkv_task_id],
+                                slot_mappings=[slot_mapping_cpu],
+                                swa_slot_mappings=[swa_slot_mapping],
+                                as_batch=False,
+                                layerwise_transfer=False,
+                            )
                     except Exception as exc:  # noqa: BLE001
                         store_start["error"] = str(exc)
                         self._log_cache_op(
@@ -1139,10 +1349,11 @@ class FlexKVConnector:
                     )
 
         if self._sync_ctx.needs_sync:
-            store_start = self._sync_ctx.scatter(
-                store_start,
-                channel=FlexKVScatterChannel.STORE_START,
-            )
+            with self._store_profile_scope("flexkv.connector.store.scatter_start"):
+                store_start = self._sync_ctx.scatter(
+                    store_start,
+                    channel=FlexKVScatterChannel.STORE_START,
+                )
         if store_start.get("rid") != rid:
             raise RuntimeError(
                 "[FlexKV] store-start rid mismatch: "
@@ -1156,23 +1367,31 @@ class FlexKVConnector:
             return -1
 
         fkv_task_id = int(store_start["task_id"])
+        slot_count = int(store_start.get("slot_count", -1))
         mask_list = store_start.get("unmatched_mask", [])
-        if fkv_task_id < 0 or len(mask_list) != len(kv_indices):
+        # Validate against ``slot_count`` rather than the mask length: the
+        # per-token mask is only broadcast on the cross-node PP path now.
+        if fkv_task_id < 0 or slot_count != len(kv_indices):
             raise RuntimeError(
                 "[FlexKV] invalid store-start payload: "
-                f"task_id={fkv_task_id}, mask_len={len(mask_list)}, "
+                f"task_id={fkv_task_id}, slot_count={slot_count}, "
                 f"slot_len={len(kv_indices)}"
             )
 
         # Cross-node PP needs the local PP stage's physical slot mapping.
         if self._sync_ctx.should_send_slot_mapping_to_remote:
-            unmatched_mask = torch.as_tensor(
-                mask_list, dtype=torch.bool, device=kv_indices.device
-            )
-            filtered = kv_indices[unmatched_mask]
-            self._send_slot_mapping_to_remote(
-                fkv_task_id, self._to_cpu_int64(filtered)
-            )
+            if len(mask_list) != len(kv_indices):
+                raise RuntimeError(
+                    "[FlexKV] invalid cross-node store mask: "
+                    f"mask_len={len(mask_list)}, slot_len={len(kv_indices)}"
+                )
+            # Same host-side selection as the leader path above: masking on the
+            # device faults on Kunlun XPU and silently returns zeros.
+            kv_indices_cpu = self._to_cpu_int64(kv_indices)
+            filtered = kv_indices_cpu[
+                torch.from_numpy(np.asarray(mask_list, dtype=bool))
+            ].contiguous()
+            self._send_slot_mapping_to_remote(fkv_task_id, filtered)
 
         # This is deliberately done on every rank. SGLang uses the returned
         # positive task id to keep radix-node locks (and GPU slots) alive.
@@ -1601,6 +1820,23 @@ class FlexKVConnector:
     ) -> Tuple[List[torch.Tensor], Optional[List[torch.Tensor]]]:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
+        if indexer_buffers is not None and os.environ.get(
+            "FLEXKV_DISABLE_INDEXER_GROUP", "0"
+        ).lower() in ("1", "true", "yes"):
+            # A/B switch (diagnostic): drop the DSA indexer sidecar so the
+            # whole path degenerates to the single-group layout used by the
+            # known-good older FlexKV build. If the XPU transfer fault
+            # disappears with this set, the fault is in the heterogeneous
+            # multi-group geometry rather than in the transfer itself.
+            # NOTE: this stores main KV only -- correctness of DSA reuse is
+            # not guaranteed; use it to bisect, not in production.
+            logger.warning(
+                "[FlexKV] FLEXKV_DISABLE_INDEXER_GROUP=1: ignoring %d DSA "
+                "indexer buffers, falling back to single-group layout "
+                "(DIAGNOSTIC ONLY)",
+                len(indexer_buffers),
+            )
+            indexer_buffers = None
         if not self._is_dsv4:
             if hasattr(kvcache, "kv_buffer"):
                 return list(kvcache.kv_buffer), indexer_buffers
@@ -1836,9 +2072,14 @@ class FlexKVConnector:
             LayerGroupSpec(
                 num_layers=len(indexer_buffers),
                 num_kv_heads=1,
+                # GLM DSA stores one flattened index+scale row per complete
+                # KV page: [num_pages, page_size * (head + scale)]. The
+                # physical GPU layout therefore has tokens_per_block=1.
+                # Describe that row as one page so the worker does not
+                # multiply it by page_size a second time.
                 head_size=indexer_buffers[0].shape[1],
                 layer_indices=list(range(len(indexer_buffers))),
-                compress_ratio=1,
+                compress_ratio=self.page_size,
                 dtype=indexer_buffers[0].dtype,
             ),
         ]
@@ -1918,9 +2159,72 @@ class FlexKVConnector:
 
     @staticmethod
     def _to_cpu_int64(tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.is_cuda:
-            tensor = tensor.cpu()
-        return tensor.to(torch.int64)
+        """Bring a slot-index vector to the host as int64, XPU-safely.
+
+        A slot-index tensor is usually a *view* into a much larger pool table
+        (sglang's ``req_to_token[i, :n]``, an allocator slice, ...): contiguous
+        but with a non-zero storage_offset.
+
+        On Kunlun XPU the rule is: do NOT run any shape- or dtype-changing op
+        on such a view while it is still on the device. ``clone()``,
+        ``contiguous()`` and ``.to(dtype)`` all lower to
+        as_strided / strided_slice, which raises kernel exception 714
+        (strided_slice.cpp:548 / copy_kernel.cpp:413). That failure is silent
+        in the worst way: the result can come back all-zero *and* the CUDA
+        context is poisoned, so the damage resurfaces much later as
+        "tp_group_transfer failed: invalid program counter" in the transfer
+        worker.
+
+        An earlier version of this function tried to "normalise" the view with
+        a device-side ``clone()`` before the D2H. That was the bug, not the
+        fix: the clone is exactly the unsupported strided read.
+
+        So: copy straight to the host with no device-side reshaping, and only
+        then touch the dtype. Scalar reductions (``.max()``) and ``.tolist()``
+        use a different lowering that does work on XPU, so they remain
+        available as a verification step and a fallback.
+        """
+        if not tensor.is_cuda:
+            return tensor.to(torch.int64)
+
+        host: Optional[torch.Tensor]
+        try:
+            # Plain D2H of the view as-is: no clone, no contiguous, no cast.
+            host = tensor.cpu()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[FlexKV] bulk D2H of slot indices failed (%s); "
+                "falling back to the element-wise scalar path",
+                exc,
+            )
+            host = None
+
+        # Verify the copy actually carried the values across; fall back to the
+        # scalar path if it came back all-zero while the device says otherwise.
+        if host is not None and host.numel() > 1 and bool((host == 0).all()):
+            if int(tensor.max()) != 0:
+                logger.warning(
+                    "[FlexKV] bulk D2H of slot indices returned all zeros "
+                    "(device max != 0); falling back to the element-wise "
+                    "scalar path"
+                )
+                host = None
+
+        if host is None:
+            host = torch.tensor(tensor.tolist(), dtype=torch.int64, device="cpu")
+
+        # Cast on the host, where dtype changes are always safe.
+        return host.to(torch.int64)
+
+    def _store_profile_scope(self, name: str):
+        """Optional per-stage store timing (FLEXKV_PROFILE_STORE_STAGES=1).
+
+        Returns a no-op context manager when disabled, so the store path pays
+        nothing in the default configuration.
+        """
+        if not getattr(self, "_profile_store_stages", False):
+            return nullcontext()
+        return torch.profiler.record_function(name)
 
     def _wait_kv_manager_ready(self, poll_interval: float = 10.0) -> None:
         assert self.kv_manager is not None
@@ -2052,13 +2356,107 @@ class FlexKVConnector:
                 num_kv_heads=1,
             )
 
+            # Geometry self-check, restored from the pre-multi-group connector.
+            # The indexer sidecar carries exactly one flattened row per full KV
+            # page, so its page count must match the main KV block count 1:1.
+            # If it does not, the two groups disagree on what a "block id"
+            # means and every indexer transfer addresses the wrong row -- which
+            # the transfer path cannot detect, because each group is described
+            # by its own layout. Checking it here costs nothing and turns a
+            # later out-of-range copy (on Kunlun P800: an unrecoverable XPU
+            # fault) into a clear registration-time error.
+            if indexer_tensor.shape[0] != num_blocks:
+                raise ValueError(
+                    f"[FlexKV] Indexer num_block mismatch: indexer has "
+                    f"{indexer_tensor.shape[0]} pages but main KV has "
+                    f"{num_blocks} blocks "
+                    f"(kv shape={tuple(kv_tensor.shape)}, "
+                    f"page_size={self.page_size}, "
+                    f"indexer shape={tuple(indexer_tensor.shape)}). "
+                    f"These must map 1:1 because a block id is shared across "
+                    f"both layer groups."
+                )
+
+            # csrc/gtensor_handler.cuh addresses GPU memory in int64_t units
+            # and truncates strides that are not 8-byte aligned (see
+            # _validate_gpu_stride_alignment in flexkv/transfer/worker.py).
+            # The indexer row stride is head_size * itemsize, so catch a
+            # misaligned page_stride_size at registration time.
+            _indexer_row_bytes = (
+                indexer_tensor.shape[1] * indexer_tensor.element_size()
+            )
+            if _indexer_row_bytes % 8 != 0:
+                raise ValueError(
+                    f"[FlexKV] Indexer row stride {_indexer_row_bytes} B "
+                    f"(page_stride_size={indexer_tensor.shape[1]} x "
+                    f"{indexer_tensor.element_size()} B/elem) is not a "
+                    f"multiple of 8. csrc divides GPU strides by "
+                    f"sizeof(int64_t) without a remainder check, so transfers "
+                    f"would drift by {_indexer_row_bytes % 8} B per block."
+                )
+
         if indexer_buffers and indexer_layout is not None:
+            _specs = self._build_indexer_layer_group_specs(
+                kv_caches, indexer_buffers
+            )
+            # One-shot startup dump of the heterogeneous layout. Enabled with
+            # FLEXKV_DEBUG_TRANSFER_GEOMETRY=1 so it can be turned on together
+            # with the per-transfer dump in worker.py.
+            if os.environ.get(
+                "FLEXKV_DEBUG_TRANSFER_GEOMETRY", "0"
+            ).lower() in ("1", "true", "yes"):
+                try:
+                    lines = [
+                        "",
+                        "======== [FlexKV-GEOM] register_to_server (indexer) ========",
+                        f"  page_size            : {self.page_size}",
+                        f"  model kv_dim         : {self.model_config.kv_dim}",
+                        f"  model num_kv_heads   : "
+                        f"{self.model_config.num_kv_heads}",
+                        f"  model head_size      : {self.model_config.head_size}",
+                        f"  model num_layers     : {self.model_config.num_layers}",
+                        "  --- main KV tensors ---",
+                        f"  count                : {len(kv_caches)}",
+                        f"  [0] shape            : {tuple(kv_caches[0].shape)}",
+                        f"  [0] stride           : {tuple(kv_caches[0].stride())}",
+                        f"  [0] dtype/bytes      : {kv_caches[0].dtype} / "
+                        f"{kv_caches[0].numel() * kv_caches[0].element_size()}",
+                        "  --- indexer tensors ---",
+                        f"  count                : {len(indexer_buffers)}",
+                        f"  [0] shape            : "
+                        f"{tuple(indexer_buffers[0].shape)}",
+                        f"  [0] stride           : "
+                        f"{tuple(indexer_buffers[0].stride())}",
+                        f"  [0] dtype/bytes      : {indexer_buffers[0].dtype} / "
+                        f"{indexer_buffers[0].numel() * indexer_buffers[0].element_size()}",
+                        "  --- gpu_layouts ---",
+                        f"  main   : {gpu_layout}",
+                        f"  indexer: {indexer_layout}",
+                        "  --- LayerGroupSpec list ---",
+                    ]
+                    for i, sp in enumerate(_specs):
+                        lines.append(
+                            f"  [{i}] num_layers={sp.num_layers} "
+                            f"num_kv_heads={sp.num_kv_heads} "
+                            f"head_size={sp.head_size} "
+                            f"compress_ratio={sp.compress_ratio} "
+                            f"dtype={sp.dtype}"
+                        )
+                    lines.append(
+                        "  NOTE: the native transfer receives ONE worker-level "
+                        "num_kv_heads/kv_dim (from gpu_layouts[0]); any group "
+                        "whose own geometry differs is a suspect."
+                    )
+                    lines.append(
+                        "============================================================"
+                    )
+                    logger.info("\n".join(lines))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[FlexKV-GEOM] register dump failed: %s", exc)
             self.tp_client.register_to_server(
                 kv_caches=list(kv_caches) + list(indexer_buffers),
                 kv_layout=gpu_layout,
-                layer_groups=self._build_indexer_layer_group_specs(
-                    kv_caches, indexer_buffers
-                ),
+                layer_groups=_specs,
                 gpu_layouts=[gpu_layout, indexer_layout],
                 handles_per_group=[list(kv_caches), list(indexer_buffers)],
             )

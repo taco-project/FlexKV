@@ -74,6 +74,260 @@ def import_tensor_handles(
     if handles:
         ensure_cuda_device(handles[0].device)
     return [h.get_tensor() for h in handles]
+
+
+def _validate_multi_group_chunk_layout(
+    group_chunk_size: int,
+    layout_chunk_size: int,
+    group_index: int,
+    group_tpb: int,
+    layout_tpb: int,
+    head_size: int,
+    compress_ratio: int,
+) -> None:
+    """Reject a transfer descriptor that disagrees with GPU storage."""
+    if group_chunk_size != layout_chunk_size:
+        raise ValueError(
+            "Multi-group chunk/layout mismatch for group "
+            f"{group_index}: group_chunk={group_chunk_size} B, "
+            f"layout_chunk={layout_chunk_size} B, "
+            f"group_tpb={group_tpb}, layout_tpb={layout_tpb}, "
+            f"head_size={head_size}, compress_ratio={compress_ratio}"
+        )
+
+
+# csrc/gtensor_handler.cuh builds every GPU address as an int64_t* offset:
+#
+#   GTensorHandler(...)
+#     : gpu_kv_stride   (gpu_kv_stride_in_bytes    / sizeof(int64_t)),
+#       gpu_block_stride(gpu_block_stride_in_bytes / sizeof(int64_t)),
+#       gpu_layer_stride(gpu_layer_stride_in_bytes / sizeof(int64_t))
+#
+# Those are *integer* divisions with no remainder check, and ptr_at() then does
+#   gpu_tensor_ptrs[...] + block_idx * gpu_block_stride
+# on an int64_t*. Any stride that is not a multiple of 8 bytes is therefore
+# silently truncated, and the resulting address drifts by
+# (stride % 8) * block_idx bytes -- i.e. the error grows with the block index
+# and only shows up as an out-of-range access deep inside the copy engine.
+# On Kunlun P800 that surfaces as an unrecoverable XPU fault
+# ("invalid program counter" / kl3ChannelCheckErrors) with no hint that the
+# real cause was a misaligned stride computed back in Python.
+#
+# Heterogeneous (multi-group) layouts are where this actually bites: the GLM
+# DSA indexer group has its own dtype (fp16) and its own head_size
+# (= page_stride_size), so its strides are computed from completely different
+# factors than the main KV group's. Fail closed here instead.
+_GPU_ADDR_UNIT_BYTES = 8  # sizeof(int64_t) in csrc/gtensor_handler.cuh
+
+
+def _validate_gpu_stride_alignment(
+    group_index: int,
+    gpu_index: int,
+    kv_stride: int,
+    block_stride: int,
+    layer_stride: int,
+    chunk_size: int,
+    *,
+    group_desc: str = "",
+) -> None:
+    """Reject GPU strides that csrc would silently truncate to int64 units."""
+    offenders = [
+        (name, value)
+        for name, value in (
+            ("gpu_kv_stride", kv_stride),
+            ("gpu_block_stride", block_stride),
+            ("gpu_layer_stride", layer_stride),
+            ("gpu_chunk_size", chunk_size),
+        )
+        if value % _GPU_ADDR_UNIT_BYTES != 0
+    ]
+    if not offenders:
+        return
+    detail = ", ".join(
+        f"{name}={value} B (remainder {value % _GPU_ADDR_UNIT_BYTES}, "
+        f"csrc would use {(value // _GPU_ADDR_UNIT_BYTES) * _GPU_ADDR_UNIT_BYTES} B)"
+        for name, value in offenders
+    )
+    raise ValueError(
+        f"GPU stride not {_GPU_ADDR_UNIT_BYTES}-byte aligned for group "
+        f"{group_index}{f' ({group_desc})' if group_desc else ''} "
+        f"gpu={gpu_index}: {detail}. "
+        f"csrc/gtensor_handler.cuh divides these by sizeof(int64_t) without a "
+        f"remainder check, so the transfer would read/write drifting addresses "
+        f"(on Kunlun P800: an unrecoverable XPU fault). Adjust head_size / "
+        f"tokens_per_block / dtype so every stride is a multiple of "
+        f"{_GPU_ADDR_UNIT_BYTES} bytes."
+    )
+
+
+_CE_CONFIG_LOGGED = False
+
+
+def _log_ce_config_once(where: str) -> None:
+    """Log the CE transfer switches exactly once per process.
+
+    These were previously invisible in logs, which made it impossible to tell
+    whether FLEXKV_ENABLE_CE_MEMCPY2D had actually taken effect. ``memcpy2d``
+    in particular MUST be off on Kunlun XPU (P800): cudaMemcpy2DAsync is not
+    implemented there and its failure is silent (return code ignored in
+    csrc/ce_transfer.cu), poisoning the CUDA context.
+    """
+    global _CE_CONFIG_LOGGED
+    if _CE_CONFIG_LOGGED:
+        return
+    _CE_CONFIG_LOGGED = True
+    memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
+    flexkv_logger.info(
+        "[FlexKV-CE-CONFIG] (%s) enable_ce_memcpy2d=%s "
+        "ce_path_opt=%s ce_segment_threshold=%s "
+        "use_ce_transfer_h2d=%s use_ce_transfer_d2h=%s "
+        "ce_gather_threads=%s ce_gather_nt=%s "
+        "[env FLEXKV_ENABLE_CE_MEMCPY2D=%s]",
+        where,
+        memcpy2d,
+        GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+        GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+        GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+        GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+        GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
+        GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
+        os.environ.get("FLEXKV_ENABLE_CE_MEMCPY2D", "<unset>"),
+    )
+    if memcpy2d:
+        flexkv_logger.warning(
+            "[FlexKV-CE-CONFIG] enable_ce_memcpy2d=True -> cudaMemcpy2DAsync "
+            "fast path is ACTIVE. This is correct on NVIDIA but UNSUPPORTED on "
+            "Kunlun XPU/P800, where it fails silently and corrupts the CUDA "
+            "context (XPU err 714 -> status=718 -> 'invalid program counter'). "
+            "Set FLEXKV_ENABLE_CE_MEMCPY2D=0 on Kunlun."
+        )
+
+
+_DEBUG_TRANSFER_GEOMETRY = os.environ.get(
+    "FLEXKV_DEBUG_TRANSFER_GEOMETRY", "0"
+).lower() in ("1", "true", "yes")
+
+
+def _dump_group_transfer_geometry(
+    worker: Any,
+    group_index: int,
+    gp: dict,
+    transfer_type: Any,
+    gpu_block_ids: Any,
+    cpu_block_ids: Any,
+    use_ce_transfer: bool,
+    transfer_num_cta: int,
+) -> None:
+    """Dump everything the native multi-group transfer is about to receive.
+
+    Only enabled via FLEXKV_DEBUG_TRANSFER_GEOMETRY=1. This exists because a
+    wrong stride/geometry scalar does not fail where it is computed -- on
+    Kunlun XPU it surfaces much later as an opaque
+    "tp_group_transfer failed: invalid program counter" preceded by
+    as_strided / strided_slice kernel faults, which is impossible to attribute
+    without seeing the actual numbers.
+
+    The critical cross-check is the last block: per-group geometry
+    (num_kv_heads / head_size / chunk_size) versus the *worker-level* scalars
+    (worker.num_kv_heads, worker.kv_dim) that are passed to the native call.
+    For a heterogeneous layout (e.g. GLM main-KV + DSA indexer sidecar) the
+    worker-level values only describe group 0, so any group whose own geometry
+    differs will be addressed with the wrong stride.
+    """
+    try:
+        def _fmt(v: Any) -> str:
+            return "None" if v is None else str(v)
+
+        n_ids = len(gpu_block_ids) if gpu_block_ids is not None else -1
+        gpu_min = gpu_max = cpu_min = cpu_max = -1
+        try:
+            if n_ids > 0:
+                gpu_min, gpu_max = int(gpu_block_ids.min()), int(gpu_block_ids.max())
+                cpu_min, cpu_max = int(cpu_block_ids.min()), int(cpu_block_ids.max())
+        except Exception:  # noqa: BLE001
+            pass
+
+        lines = [
+            "",
+            "================ [FlexKV-GEOM] multi-group transfer ================",
+            f"  group_index      : {group_index} / "
+            f"{len(worker.tp_group_transfer_groups)}",
+            f"  transfer_type    : {transfer_type}  "
+            f"use_ce={use_ce_transfer}  num_cta={transfer_num_cta}",
+            f"  block_ids        : n={n_ids} gpu[min={gpu_min},max={gpu_max}] "
+            f"cpu[min={cpu_min},max={cpu_max}]",
+            "  --- per-group geometry (LayerGroupSpec) ---",
+            f"  num_layers       : {_fmt(gp.get('num_layers'))}",
+            f"  num_kv_heads     : {_fmt(gp.get('dbg_group_num_kv_heads'))}",
+            f"  head_size        : {_fmt(gp.get('dbg_group_head_size'))}",
+            f"  compress_ratio   : {_fmt(gp.get('dbg_group_compress_ratio'))}",
+            f"  tokens_per_block : {_fmt(gp.get('dbg_group_tpb'))}",
+            f"  dtype            : {_fmt(gp.get('dbg_group_dtype'))}",
+            f"  chunk_size       : {_fmt(gp.get('chunk_size'))} B",
+            "  --- CPU strides passed to native (bytes) ---",
+            f"  cpu_kv_stride    : {_fmt(gp.get('cpu_kv_stride'))}",
+            f"  cpu_layer_stride : {_fmt(gp.get('cpu_layer_stride'))}",
+            f"  cpu_block_stride : {_fmt(gp.get('cpu_block_stride'))}",
+            f"  cpu_tp_stride    : {_fmt(gp.get('cpu_tp_stride'))}",
+            f"  cpu_offset_bytes : {_fmt(gp.get('cpu_offset_bytes'))}",
+            "  --- GPU strides given to TPTransferThreadGroup (bytes) ---",
+            f"  gpu_kv_strides   : {_fmt(gp.get('dbg_gpu_kv_strides'))}",
+            f"  gpu_block_strides: {_fmt(gp.get('dbg_gpu_block_strides'))}",
+            f"  gpu_layer_strides: {_fmt(gp.get('dbg_gpu_layer_strides'))}",
+            f"  gpu_chunk_sizes  : {_fmt(gp.get('dbg_gpu_chunk_sizes'))}",
+            "  --- actual GPU tensors (first 2 layers of gpu0) ---",
+            f"  num_tensors/gpu  : {_fmt(gp.get('dbg_num_tensors_per_gpu'))}",
+        ]
+        for i, meta in enumerate(gp.get("dbg_gpu_tensor_meta") or []):
+            shape, stride, nbytes, dt, soff = meta
+            lines.append(
+                f"    [{i}] shape={shape} stride={stride} bytes={nbytes} "
+                f"dtype={dt} storage_offset={soff}"
+            )
+        lines += [
+            "  --- WORKER-LEVEL scalars actually passed to native call ---",
+            f"  worker.kv_dim        : {_fmt(getattr(worker, 'kv_dim', None))}",
+            f"  worker.num_kv_heads  : {_fmt(getattr(worker, 'num_kv_heads', None))}"
+            "   <-- describes group 0 ONLY",
+            f"  worker.num_layers    : {_fmt(getattr(worker, 'num_layers', None))}",
+            f"  kv_shared_mode       : "
+            f"{_fmt(getattr(worker, 'kv_shared_across_ranks_mode', None))}",
+        ]
+
+        # Explicit consistency verdicts -- these are the numbers to look at.
+        w_heads = getattr(worker, "num_kv_heads", None)
+        g_heads = gp.get("dbg_group_num_kv_heads")
+        if w_heads is not None and g_heads is not None and w_heads != g_heads:
+            lines.append(
+                f"  ** MISMATCH ** worker.num_kv_heads={w_heads} but this "
+                f"group has num_kv_heads={g_heads}"
+            )
+        gpu_chunks = gp.get("dbg_gpu_chunk_sizes") or []
+        if gpu_chunks and gp.get("chunk_size") is not None:
+            if any(c != gp["chunk_size"] for c in gpu_chunks):
+                lines.append(
+                    f"  ** MISMATCH ** group chunk_size={gp['chunk_size']} vs "
+                    f"gpu_chunk_sizes={gpu_chunks}"
+                )
+        metas = gp.get("dbg_gpu_tensor_meta") or []
+        layer_strides = gp.get("dbg_gpu_layer_strides") or []
+        if metas and layer_strides:
+            real_bytes = metas[0][2]
+            if layer_strides[0] > real_bytes:
+                lines.append(
+                    f"  ** SUSPECT ** gpu_layer_stride={layer_strides[0]} exceeds "
+                    f"one tensor's total bytes={real_bytes}; if each layer is a "
+                    f"separate tensor the layer stride must not be used to hop "
+                    f"between layers"
+                )
+        lines.append(
+            "==================================================================="
+        )
+        flexkv_logger.info("\n".join(lines))
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never break the run
+        flexkv_logger.warning(f"[FlexKV-GEOM] dump failed: {exc}")
+
+
 from flexkv.transfer.compression.common.strategy import (
     CompressionStrategy,
     NullCompressionStrategy,
@@ -538,11 +792,20 @@ class TransferWorkerBase(ABC):
                 # continue would otherwise drop the first op forever (which
                 # stalls D2H → H2REMOTE and leaves mooncake PutStart=0).
                 batch_ops = [op]
-                shutdown_after_batch = False
+                stop_after_batch = False
                 while self.transfer_conn.poll(timeout=0):
-                    op = self.transfer_conn.recv()
+                    try:
+                        op = self.transfer_conn.recv()
+                    except EOFError:
+                        # A closed pipe is readable. Preserve the batch already
+                        # received, then exit after reporting its completions.
+                        # (upstream b64d82f) Without this, an EOF raised here
+                        # propagated to the outer handler and silently dropped
+                        # the whole batch we had just drained.
+                        stop_after_batch = True
+                        break
                     if op is None:
-                        shutdown_after_batch = True
+                        stop_after_batch = True
                         break
                     if not isinstance(op, dict):
                         op._received_ns = time.perf_counter_ns()
@@ -617,13 +880,16 @@ class TransferWorkerBase(ABC):
                         # stays compatible.
                         self.finished_ops_queue.put(
                             (op.transfer_op_id, False, None))
-                if shutdown_after_batch:
-                    if hasattr(self, "shutdown") and callable(self.shutdown):
-                        try:
-                            self.shutdown()
-                        except Exception as e:
-                            flexkv_logger.error(f"Error when shut down worker: {e}")
-                    break
+                if stop_after_batch:
+                    # (upstream b64d82f) _worker_process owns the single
+                    # shutdown() call in its finally block. Calling the subclass
+                    # shutdown here repeats the external unregister work before
+                    # super()'s idempotence guard is reached -- for a 256 GiB
+                    # pinned pool that means running cudaHostUnregister over the
+                    # whole pool twice, which is exactly the slow teardown seen
+                    # at 2026-09-02 21:05:34 right before the process was
+                    # SIGKILLed. Just return and let the finally block do it.
+                    return
             except EOFError:
                 flexkv_logger.warning(
                     f"[worker {self.worker_id}] transfer pipe EOF; exiting run loop"
@@ -874,6 +1140,20 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             # GPU strides: compute from actual tensor to handle different
             # attention backend layouts (flash_attn vs triton/flashinfer).
             gpu_chunk_size = chunk_elements * dtype_size_g
+            # Fail closed before submitting a native transfer if the
+            # declarative LayerGroupSpec disagrees with the actual tensor
+            # layout. This catches page-packed GLM DSA indexer buffers
+            # (tpb=1, one 8448-byte row) being described as tpb=64.
+            layout_chunk_size = gpu_layout.get_chunk_size() * dtype_size_g
+            _validate_multi_group_chunk_layout(
+                gpu_chunk_size,
+                layout_chunk_size,
+                gi,
+                tpb_g,
+                gpu_layout.tokens_per_block,
+                g.head_size,
+                g.compress_ratio,
+            )
             t0 = group_gpu_blocks[0]
             gpu_strides = self._get_gpu_strides_from_tensor(t0, tpb_g, dtype_size_g, self.kv_dim)
             if gpu_strides is not None:
@@ -882,6 +1162,22 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 gpu_kv_stride = gpu_layout.get_kv_stride() * dtype_size_g
                 gpu_block_stride = gpu_layout.get_block_stride() * dtype_size_g
                 gpu_layer_stride = gpu_layout.get_layer_stride() * dtype_size_g
+
+            # Same int64-unit alignment guard as the TP path: csrc truncates
+            # strides that are not 8-byte aligned, which silently drifts every
+            # GPU address it computes.
+            _validate_gpu_stride_alignment(
+                gi,
+                0,
+                gpu_kv_stride,
+                gpu_block_stride,
+                gpu_layer_stride,
+                gpu_chunk_size,
+                group_desc=(
+                    f"num_kv_heads={g.num_kv_heads} head_size={g.head_size} "
+                    f"tpb={tpb_g} dtype={g.dtype}"
+                ),
+            )
 
             # CPU strides: depend on layout type.  All values are in bytes; the
             # CPU buffer underlying self.cpu_tensor is uint8 for multi-group.
@@ -1215,6 +1511,16 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
             num_tensors_per_gpu = len(self.gpu_blocks[0])
 
+            _log_ce_config_once("tpGPUCPU single-group")
+            # NOTE (2026-09-01): these MUST be keyword arguments. The pybind11
+            # ctor inserts three nvcomp parameters (enable_nvcomp,
+            # nvcomp_batch_size, nvcomp_data_type) between ``gpu_device_ids``
+            # and ``ce_segment_threshold`` (csrc/bindings.cpp:772-774). Passing
+            # the CE switches positionally silently shifted every one of them by
+            # three slots -- ce_path_opt landed on nvcomp_batch_size and
+            # num_kv_heads landed on ce_path_opt, so ``FLEXKV_CE_PATH_OPT=0``
+            # never reached native and the transfer always took the optimized
+            # (ATen-based GATHER_SCATTER) path.
             self.tp_transfer_thread_group = TPTransferThreadGroup(
                 self.num_gpus,
                 gpu_block_ptrs_flat,
@@ -1226,11 +1532,11 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 self.gpu_layer_strides_in_bytes,
                 self.gpu_chunk_sizes_in_bytes,
                 gpu_device_ids,
-                GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
-                GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
-                GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
-                self.cpu_is_blockfirst,
-                self.num_kv_heads,
+                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+                ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+                is_blockfirst=self.cpu_is_blockfirst,
+                num_kv_heads=self.num_kv_heads,
                 ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
                 ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             )
@@ -1266,6 +1572,32 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         )
 
         self.tp_group_transfer_groups: list = []
+        # The native transfer receives ONE worker-level num_kv_heads (stored in
+        # CETransferConfig) and ONE worker-level kv_dim, both taken from
+        # gpu_kv_layouts[0] -- i.e. from the *main KV* group. num_kv_heads==1 is
+        # what gates the rank-shared / sharded-D2H CE branch
+        # (csrc/ce_transfer.cu: `!is_host_to_device && ce_config.num_kv_heads == 1`),
+        # so if the groups disagree on it, some group is silently transferred
+        # under the wrong sharding assumption and the assembled KV on CPU has
+        # holes -- a data-corruption bug with no error message. Refuse to build
+        # such a worker instead. (For GLM DSA both groups are num_kv_heads=1 /
+        # kv_dim=1, so this is a guard against future layouts, not a fix.)
+        _group_head_counts = {g.num_kv_heads for g in layer_groups}
+        if len(_group_head_counts) > 1:
+            raise ValueError(
+                f"Heterogeneous num_kv_heads across layer groups is not "
+                f"supported by the TP transfer path: {sorted(_group_head_counts)} "
+                f"(groups: "
+                + ", ".join(
+                    f"[{i}] num_kv_heads={g.num_kv_heads} head_size={g.head_size}"
+                    for i, g in enumerate(layer_groups)
+                )
+                + f"). The native transfer takes a single worker-level "
+                f"num_kv_heads={self.num_kv_heads} from the main KV group, "
+                f"which gates the rank-shared sharded-D2H branch for *every* "
+                f"group."
+            )
+
         # Keep imported CUDA-IPC tensors alive for the worker's lifetime:
         # TPTransferThreadGroup below stores only their raw data_ptr()s, so if
         # the tensors were dropped PyTorch would release the IPC mapping and the
@@ -1324,6 +1656,45 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
             chunk_elements = tpb_g * g.num_kv_heads * g.head_size
 
+            # Same fail-closed check as GPUCPUTransferWorker: reject a
+            # LayerGroupSpec whose geometry disagrees with the real tensor
+            # layout *before* handing pointers to the native transfer.
+            # This is the TP path (tp_group_transfer), which is what any
+            # tp_size > 1 deployment actually uses, so it needs the guard
+            # just as much as the non-TP path.  Without it a page-packed
+            # GLM DSA indexer buffer (one 8448 B row per page, tpb=1)
+            # described as tpb=64 makes the copy engine read 64x past the
+            # end of the buffer, which on Kunlun P800 surfaces as an
+            # unrecoverable XPU fault ("invalid program counter" /
+            # kl3ChannelCheckErrors status=718) instead of a clear error.
+            for gi_layout, layout in enumerate(group_gpu_layouts):
+                _validate_multi_group_chunk_layout(
+                    chunk_elements * dtype_size_g,
+                    gpu_chunk_sizes[gi_layout],
+                    gi,
+                    tpb_g,
+                    layout.tokens_per_block,
+                    g.head_size,
+                    g.compress_ratio,
+                )
+                # Second, independent guard: csrc addresses GPU memory in
+                # int64_t units, so a stride that is not 8-byte aligned is
+                # silently truncated and the address drifts per block. See
+                # _validate_gpu_stride_alignment for the full rationale.
+                _validate_gpu_stride_alignment(
+                    gi,
+                    gi_layout,
+                    gpu_kv_strides[gi_layout],
+                    gpu_block_strides[gi_layout],
+                    gpu_layer_strides[gi_layout],
+                    gpu_chunk_sizes[gi_layout],
+                    group_desc=(
+                        f"num_kv_heads={g.num_kv_heads} "
+                        f"head_size={g.head_size} "
+                        f"tpb={tpb_g} dtype={g.dtype}"
+                    ),
+                )
+
             # CPU strides for this group (all in bytes)
             if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST:
                 cpu_block_stride = total_block_bytes
@@ -1339,6 +1710,13 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             # CPU tensor offset for this group (cpu_tensor is uint8 in multi-group)
             cpu_blocks_ptr = self.cpu_tensor.view(-1)[cpu_offset_bytes:].data_ptr()
 
+            _log_ce_config_once("tpGPUCPU multi-group")
+            # NOTE (2026-09-01): keyword arguments are mandatory here -- see the
+            # matching comment in the single-group branch above. Positionally,
+            # slots 11-15 land on enable_nvcomp / nvcomp_batch_size /
+            # nvcomp_data_type / ce_segment_threshold / ce_path_opt, which made
+            # ce_path_opt permanently True (it received num_kv_heads=1) and
+            # is_blockfirst permanently False.
             tp_thread_group = TPTransferThreadGroup(
                 self.num_gpus,
                 gpu_block_ptrs_flat,
@@ -1350,11 +1728,13 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 gpu_layer_strides,
                 gpu_chunk_sizes,
                 gpu_device_ids,
-                GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
-                GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
-                GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
-                (cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
-                self.num_kv_heads,
+                ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+                ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+                ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+                is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
+                num_kv_heads=self.num_kv_heads,
+                ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
+                ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             )
 
             self.tp_group_transfer_groups.append({
@@ -1366,6 +1746,32 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 'cpu_offset_bytes': cpu_offset_bytes,
                 'num_layers': g.num_layers,
                 'chunk_size': chunk_elements * dtype_size_g,
+                # --- kept for diagnostics only ---
+                'dbg_group_num_kv_heads': g.num_kv_heads,
+                'dbg_group_head_size': g.head_size,
+                'dbg_group_compress_ratio': g.compress_ratio,
+                'dbg_group_dtype': str(g.dtype),
+                'dbg_group_tpb': tpb_g,
+                'dbg_gpu_kv_strides': list(gpu_kv_strides),
+                'dbg_gpu_block_strides': list(gpu_block_strides),
+                'dbg_gpu_layer_strides': list(gpu_layer_strides),
+                'dbg_gpu_chunk_sizes': list(gpu_chunk_sizes),
+                'dbg_gpu_tensor_meta': [
+                    (
+                        tuple(t.shape),
+                        tuple(t.stride()),
+                        t.numel() * t.element_size(),
+                        str(t.dtype),
+                        t.storage_offset(),
+                    )
+                    for t in (imported_group_blocks[0][:2]
+                              if imported_group_blocks and imported_group_blocks[0]
+                              else [])
+                ],
+                'dbg_num_tensors_per_gpu': (
+                    len(imported_group_blocks[0]) if imported_group_blocks
+                    and imported_group_blocks[0] else 0
+                ),
             })
 
             # Advance CPU byte offset for next group
@@ -1460,9 +1866,27 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         if self.tp_group_transfer_groups is not None:
             # Multi-group transfer: one call per group
-            for gp in self.tp_group_transfer_groups:
+            for gi, gp in enumerate(self.tp_group_transfer_groups):
                 g_gpu = gpu_block_id_list
                 g_cpu = cpu_block_id_list
+
+                # ------------------------------------------------------------
+                # DIAGNOSTIC (FLEXKV_DEBUG_TRANSFER_GEOMETRY=1)
+                # Dump every scalar handed to the native transfer plus the real
+                # tensor geometry, so a bad stride can be spotted directly
+                # instead of surfacing as an opaque XPU fault later.
+                # ------------------------------------------------------------
+                if _DEBUG_TRANSFER_GEOMETRY:
+                    _dump_group_transfer_geometry(
+                        worker=self,
+                        group_index=gi,
+                        gp=gp,
+                        transfer_type=transfer_type,
+                        gpu_block_ids=g_gpu,
+                        cpu_block_ids=g_cpu,
+                        use_ce_transfer=use_ce_transfer,
+                        transfer_num_cta=transfer_num_cta,
+                    )
 
                 gp['tp_thread_group'].tp_group_transfer(
                     g_gpu,
@@ -2094,6 +2518,17 @@ class GDSTransferWorker(TransferWorkerBase):
                     gpu_block_stride = gpu_layout.get_block_stride() * dtype_size_g
                     gpu_layer_stride = gpu_layout.get_layer_stride() * dtype_size_g
                 gpu_chunk_size = chunk_elements * dtype_size_g
+                # Fail closed on a spec/layout geometry disagreement (see
+                # GPUCPUTransferWorker for the rationale).
+                _validate_multi_group_chunk_layout(
+                    gpu_chunk_size,
+                    gpu_layout.get_chunk_size() * dtype_size_g,
+                    gi,
+                    tpb_g,
+                    gpu_layout.tokens_per_block,
+                    g.head_size,
+                    g.compress_ratio,
+                )
             else:
                 gpu_kv_stride = self.gpu_kv_stride_in_bytes
                 gpu_block_stride = self.gpu_block_stride_in_bytes
@@ -2443,6 +2878,17 @@ class tpGDSTransferWorker(TransferWorkerBase):
                     gpu_block_strides.append(blk_s)
                     gpu_layer_strides.append(layer_s)
                     gpu_chunk_sizes.append(chunk_elements * dtype_size_g)
+                    # Fail closed on a spec/layout geometry disagreement (see
+                    # GPUCPUTransferWorker for the rationale).
+                    _validate_multi_group_chunk_layout(
+                        chunk_elements * dtype_size_g,
+                        grp_layout.get_chunk_size() * dtype_size_g,
+                        gi,
+                        tpb_g,
+                        grp_layout.tokens_per_block,
+                        g.head_size,
+                        g.compress_ratio,
+                    )
 
                     for t in grp_tensors:
                         gpu_ptrs_flat.append(t.data_ptr())

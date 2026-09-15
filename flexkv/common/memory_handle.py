@@ -448,8 +448,25 @@ def _is_vmm_pointer(data_ptr: int) -> bool:
     If the attribute query itself fails we conservatively answer False so
     the caller falls back to the existing cudaIpc path (which then errors
     out cleanly on a truly non-shareable allocation).
+
+    ★ FLEXKV_DISABLE_VMM_PROBE=1 escape hatch (2026-08-27, Kunlun/P800):
+      ``legacy_ok == 0`` is ambiguous. It means either
+        (a) the buffer really is a VMM range (the case this probe was written
+            for: vLLM CuMemAllocator / sleep_mode), or
+        (b) the platform does not implement legacy CUDA IPC at all.
+      On Kunlun P800 the driver answers CUDA_SUCCESS with legacy_ok=0 for
+      ordinary cudaMalloc buffers, so every KV tensor is misclassified as VMM.
+      The VMM export path then calls ``cuMemRetainAllocationHandle``, which the
+      P800 driver does not support either -> CUresult=801 (NOT_SUPPORTED) and
+      GPU registration hangs forever at "0/8 registered".
+
+      The previously working FlexKV build on P800 had no VMM probe at all: it
+      went straight to reduce_tensor / cudaIpcGetMemHandle. Setting this flag
+      restores exactly that behaviour.
     """
     if libcuda is None:
+        return False
+    if os.environ.get("FLEXKV_DISABLE_VMM_PROBE", "0") == "1":
         return False
     legacy_ok = ctypes.c_uint(0)
     result = libcuda.cuPointerGetAttribute(
@@ -460,6 +477,10 @@ def _is_vmm_pointer(data_ptr: int) -> bool:
     if result != CUDA_SUCCESS:
         return False
     return legacy_ok.value == 0
+
+
+# Log the effective CUDA-IPC export mode exactly once per process.
+_IPC_MODE_LOGGED = False
 
 
 @dataclass
@@ -525,6 +546,46 @@ class TensorSharedHandle:
         self.vmm_granularity = 0
 
         if isinstance(data, torch.Tensor):
+            # FLEXKV_FORCE_DIRECT_IPC=1 -- escape hatch, NOT the default.
+            #
+            # History (do not repeat this mistake): this flag was added on
+            # 2026-08-31 because a Kunlun P800 crash trace pointed at
+            # as_strided (xpytorch as_strided.cpp:28 [ASSERT-FAIL],
+            # strided_slice.cpp:548 RUNTIME ERROR 714, then context poisoning
+            # with status=718 / "invalid program counter"), and as_strided is
+            # reached from the default 'torch_reduce' path via
+            # torch._utils._rebuild_cuda_tensor. The conclusion drawn at the
+            # time -- "XPU cannot do as_strided, force direct IPC instead" --
+            # turned out to be WRONG.
+            #
+            # Measured on 2026-09-01 (P800, GLM5.1, 78 layers, TP8, DSA
+            # indexer, FLEXKV_FORCE_DIRECT_IPC=0): torch_reduce runs clean --
+            # zero as_strided errors, zero XPU status codes, zero IPC
+            # failures. Meanwhile forcing this flag on made things strictly
+            # worse: cuda_ipc opens one cudaIpcOpenMemHandle per tensor with
+            # no dedup, so 78 layers x 8 GPUs x 2 layer groups = 1248 mappings
+            # blew past the per-process limit (~1024) and failed with
+            # "error code 999".
+            #
+            # torch_reduce avoids that by construction: reduce_tensor shares
+            # one handle per allocator segment (cached in
+            # reductions.shared_cache), so the mapping count tracks segments,
+            # not tensors.
+            #
+            # Keep this flag only for allocators that reduce_tensor cannot
+            # export. Prefer leaving it unset/0.
+            if not force_direct_ipc and os.environ.get(
+                "FLEXKV_FORCE_DIRECT_IPC", "0"
+            ).lower() in ("1", "true", "yes"):
+                force_direct_ipc = True
+                flexkv_logger.warning(
+                    "[FlexKV-IPC-MODE] FLEXKV_FORCE_DIRECT_IPC=1 is set. This "
+                    "bypasses torch_reduce and opens one CUDA IPC mapping per "
+                    "tensor; with many layers x GPUs x layer groups it can "
+                    "exhaust the per-process limit (~1024 on P800) and fail "
+                    "with 'cudaIpcOpenMemHandle ... error code 999'. Unset it "
+                    "unless reduce_tensor is known to fail for this allocator."
+                )
             self._init_from_tensor(data, device_id, force_direct_ipc)
             return
 
@@ -548,6 +609,7 @@ class TensorSharedHandle:
         device_id: int,
         force_direct_ipc: bool,
     ) -> None:
+        global _IPC_MODE_LOGGED
         if not tensor.is_cuda:
             raise ValueError("Only support CUDA tensor sharing")
 
@@ -577,10 +639,54 @@ class TensorSharedHandle:
                     tmp_list[6] = device_id
                     self.rebuild_args = tuple(tmp_list)
                 self.handle_type = "torch_reduce"
+                if not _IPC_MODE_LOGGED:
+                    _IPC_MODE_LOGGED = True
+                    flexkv_logger.info(
+                        "[FlexKV-IPC-MODE] handle_type=torch_reduce "
+                        "(PyTorch reduce_tensor; child rebuilds via "
+                        "_rebuild_cuda_tensor -> as_strided). This is the "
+                        "recommended path: reduce_tensor shares one IPC handle "
+                        "per allocator *segment* (torch caches them in "
+                        "reductions.shared_cache), so a model with many layers "
+                        "needs far fewer mappings than cuda_ipc, which opens "
+                        "one per tensor and can exhaust the per-process "
+                        "cudaIpcOpenMemHandle limit (~1024 on Kunlun P800 -- "
+                        "seen as 'error code 999'). Verified working on P800 "
+                        "with GLM5.1 / 78 layers / TP8 / DSA indexer. "
+                        "[env FLEXKV_FORCE_DIRECT_IPC=%s]",
+                        os.environ.get("FLEXKV_FORCE_DIRECT_IPC", "<unset>"),
+                    )
                 return
             except RuntimeError as e:
+                # This fallback is silent by design, but it makes the two IPC
+                # paths indistinguishable from the outside: a torch_reduce
+                # deployment that quietly degrades to cuda_ipc then hits a
+                # completely different failure mode (on Kunlun P800: the
+                # per-process cudaIpcOpenMemHandle limit, ~1024 mappings,
+                # surfacing as "error code 999"), and the real reason -- why
+                # reduce_tensor failed in the first place -- is buried in a
+                # single WARNING line. Set FLEXKV_STRICT_IPC_MODE=1 to fail
+                # loudly here instead, so the original export error is the one
+                # that reaches the user.
+                if os.environ.get("FLEXKV_STRICT_IPC_MODE", "0").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    raise RuntimeError(
+                        f"torch_reduce export failed and "
+                        f"FLEXKV_STRICT_IPC_MODE=1 forbids the silent fallback "
+                        f"to cuda_ipc: {e}"
+                    ) from e
                 flexkv_logger.warning(f"PyTorch CUDA IPC export failed: {e}")
-                flexkv_logger.info("Attempting direct CUDA IPC export...")
+                flexkv_logger.warning(
+                    "[FlexKV-IPC-MODE] FALLING BACK to direct CUDA IPC "
+                    "(handle_type=cuda_ipc). This changes the failure mode: "
+                    "cuda_ipc opens one mapping per tensor with no dedup, so "
+                    "large layer counts can exhaust the per-process limit. "
+                    "Set FLEXKV_STRICT_IPC_MODE=1 to surface the original "
+                    "torch_reduce error instead."
+                )
 
         try:
             ## Try direct CUDA IPC export
@@ -596,6 +702,15 @@ class TensorSharedHandle:
             self.rebuild_func = None
             self.rebuild_args = None
             self.offset = 0    ## only used when constructing from direct ipc handle
+            if not _IPC_MODE_LOGGED:
+                _IPC_MODE_LOGGED = True
+                flexkv_logger.info(
+                    "[FlexKV-IPC-MODE] handle_type=cuda_ipc "
+                    "(cudaIpcGetMemHandle; child rebuilds via "
+                    "_create_tensor_from_cuda_ptr with strides=None, no "
+                    "as_strided) [env FLEXKV_FORCE_DIRECT_IPC=%s]",
+                    os.environ.get("FLEXKV_FORCE_DIRECT_IPC", "<unset>"),
+                )
             flexkv_logger.info(
                 f"Tensor exported via direct CUDA IPC: tensor.device={tensor.device}, passed device_id={device_id}, final self.device={self.device}"
             )

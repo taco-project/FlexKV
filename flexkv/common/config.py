@@ -1,5 +1,7 @@
 import os
 import json
+import sys
+import importlib.util
 import yaml
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
@@ -745,6 +747,45 @@ class CacheConfig:
             f", num_ssd_blocks={self.num_ssd_blocks})"
         )
 
+
+def _default_enable_ce_memcpy2d() -> int:
+    """Default for FLEXKV_ENABLE_CE_MEMCPY2D, decided per platform.
+
+    The CE fast path uses ``cudaMemcpy2DAsync`` (see csrc/ce_transfer.cu --
+    "fast NVIDIA, slow/unsupported elsewhere"). Baidu Kunlun XPU (P800) does
+    NOT implement it: the call is lowered to an as_strided/strided_slice
+    kernel that raises XPU error 714, poisons the CUDA context
+    (``status=718``) and makes every subsequent transfer fail with
+    "invalid program counter". Its return code is not checked either, so the
+    failure only surfaces later at cudaStreamSynchronize.
+
+    Therefore default to OFF on non-NVIDIA accelerators and ON elsewhere, so
+    NVIDIA keeps the optimisation and Kunlun works out of the box. An explicit
+    FLEXKV_ENABLE_CE_MEMCPY2D always wins over this auto-detection.
+    """
+    # Cheap, import-safe probe: no CUDA context is created here.
+    try:
+        import torch
+
+        # Kunlun's torch build (torch_xmlir / xpytorch) is the marker we care
+        # about; it masquerades as CUDA, so torch.version.hip/cuda are not
+        # reliable on their own.
+        if getattr(torch, "version", None) is not None:
+            ver = str(getattr(torch.version, "__version__", "")) or str(
+                getattr(torch, "__version__", "")
+            )
+            if "xmlir" in ver.lower() or "xpu" in ver.lower():
+                return 0
+        for mod in ("torch_xmlir", "xpytorch"):
+            if mod in sys.modules:
+                return 0
+        if importlib.util.find_spec("torch_xmlir") is not None:
+            return 0
+    except Exception:  # noqa: BLE001 - never break import on a probe
+        pass
+    return 1
+
+
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
     instance_num=int(os.getenv('FLEXKV_INSTANCE_NUM', 1)),
@@ -783,7 +824,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     ce_path_opt=bool(int(os.getenv('FLEXKV_CE_PATH_OPT', 1))),
     ssd_io_opt=bool(int(os.getenv('FLEXKV_SSD_IO_OPT', 1))),
 
-    enable_ce_memcpy2d=bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', 1))),
+    enable_ce_memcpy2d=bool(int(os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D', _default_enable_ce_memcpy2d()))),
     ce_gather_threads=int(os.getenv('FLEXKV_CE_GATHER_THREADS', 4)),
     ce_gather_nt=bool(int(os.getenv('FLEXKV_CE_GATHER_NT', 1))),
 

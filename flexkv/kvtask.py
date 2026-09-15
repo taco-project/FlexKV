@@ -385,7 +385,12 @@ class KVTaskManager:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
         fake_slot_mapping = np.zeros_like(token_ids)
-        fake_token_mask = np.ones_like(token_ids)
+        # dtype=bool is mandatory: a mask is used as ``token_ids[token_mask]``
+        # downstream, and numpy turns an *integer* array into fancy indexing --
+        # silently returning len(mask) elements picked by value instead of the
+        # masked subset. ``get_match`` already does this correctly; the other
+        # call sites used to omit it.
+        fake_token_mask = np.ones_like(token_ids, dtype=bool)
         temp_cache_strategy = copy.deepcopy(DEFAULT_CACHE_STRATEGY)
         temp_cache_strategy.ignore_gpu = True  # upload to CPU only
         temp_cache_strategy.ignore_gds = True
@@ -1209,7 +1214,9 @@ class KVTaskEngine(KVTaskManager):
                   namespace: Optional[List[str]] = None,
                   swa_aware: bool = False) -> Tuple[int, np.ndarray]:
         if token_mask is None:
-            token_mask = np.ones_like(token_ids)
+            # dtype=bool: see the note in create_prefetch_task -- an integer
+            # mask silently degrades to fancy indexing.
+            token_mask = np.ones_like(token_ids, dtype=bool)
         if task_id == -1:
             task_id = self._gen_task_id()
         temp_cache_strategy = DEFAULT_CACHE_STRATEGY
@@ -1264,7 +1271,8 @@ class KVTaskEngine(KVTaskManager):
                         task_id: int = -1,
                         namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
         if token_mask is None:
-            token_mask = np.ones_like(token_ids)
+            # dtype=bool: see the note in create_prefetch_task.
+            token_mask = np.ones_like(token_ids, dtype=bool)
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"put match: task_id={task_id}", color=get_nvtx_default_color())
@@ -1309,7 +1317,7 @@ class KVTaskEngine(KVTaskManager):
             request_id=task_id,
             token_ids=token_ids,
             slot_mapping=np.zeros_like(token_ids),
-            token_mask=np.ones_like(token_ids),
+            token_mask=np.ones_like(token_ids, dtype=bool),
             dp_client_id=dp_client_id
         )
         self._launch_task(task_id)
