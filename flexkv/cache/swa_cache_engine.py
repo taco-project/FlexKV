@@ -54,6 +54,7 @@ from typing import List, Optional, Union
 
 import numpy as np
 
+from flexkv.common.pool import PoolId
 from flexkv.common.transfer import DeviceType, TransferOp, TransferOpGraph, TransferType
 
 
@@ -133,7 +134,7 @@ class SWAOpConstructor:
             src_block_ids=src,
             dst_block_ids=dst,
             dp_client_id=dp_client_id,
-            is_swa=True,
+            pool_id=PoolId.SWA,
             mooncake_store_swa_block_hashes=tail_hashes,
         )
         graph.add_transfer_op(op)

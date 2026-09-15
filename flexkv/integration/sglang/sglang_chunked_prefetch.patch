@@ -116,7 +116,7 @@ index 4d68b4c4d7..6d89c2f3dd 100644
                  # Budget and tile gates for this request already ran above,
                  # before init_load_back(), so only the commit remains here.
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 5c0d0dcc8d..efa53795ad 100644
+index 0e07ca0d42..c766b23c49 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -3117,7 +3117,7 @@ class Scheduler(
@@ -128,11 +128,8 @@ index 5c0d0dcc8d..efa53795ad 100644
              self.tree_cache.prefetch_request(req)
 
      def _retry_missed_storage_prefetches(self):
-@@ -3886,9 +3886,11 @@ class Scheduler(
-                 if res == AddReqResult.NO_TOKEN:
-                     if (
-                         self.enable_hierarchical_cache
-+                        or self.enable_flexkv
+@@ -3894,7 +3894,8 @@ class Scheduler(
+                         or get_memory().enable_flexkv
                          or self.enable_unified_cache_external_linker
                      ):
 -                        # Set batch_is_full after making sure there are requests that can be served
@@ -142,7 +139,7 @@ index 5c0d0dcc8d..efa53795ad 100644
                              not running_batch.is_empty()
                          )
 diff --git a/python/sglang/srt/mem_cache/storage/flexkv/README.md b/python/sglang/srt/mem_cache/storage/flexkv/README.md
-index beca6b6c99..3a4066c54e 100644
+index 080dc362f8..a27d9c3feb 100644
 --- a/python/sglang/srt/mem_cache/storage/flexkv/README.md
 +++ b/python/sglang/srt/mem_cache/storage/flexkv/README.md
 @@ -10,6 +10,26 @@ Remote offload). Same integration pattern as
@@ -173,10 +170,10 @@ index beca6b6c99..3a4066c54e 100644
 
  This walks through everything the verification on H20-GPU-11 actually
 diff --git a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_hybrid_radix_cache.py b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_hybrid_radix_cache.py
-index 427935a15e..65bfec6f44 100644
+index fc8c54b8c1..ff116a1092 100644
 --- a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_hybrid_radix_cache.py
 +++ b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_hybrid_radix_cache.py
-@@ -707,32 +707,51 @@ class FlexKVHybridRadixCache(BasePrefixCache):
+@@ -739,32 +739,51 @@ class FlexKVHybridRadixCache(BasePrefixCache):
          # flush, whose connector reset fences H2D before freeing them.
 
      def prefetch_request(self, req: Req) -> None:
@@ -238,7 +235,7 @@ index 427935a15e..65bfec6f44 100644
 
      def check_prefetch_progress(self, rid: str) -> bool:
          return self.flexkv_connector.check_prefetch_progress(rid)
-@@ -740,6 +759,11 @@ class FlexKVHybridRadixCache(BasePrefixCache):
+@@ -772,6 +791,11 @@ class FlexKVHybridRadixCache(BasePrefixCache):
      def terminate_prefetch(self, rid: str) -> None:
          self.flexkv_connector.cancel_prefetch(rid)
 
@@ -251,10 +248,10 @@ index 427935a15e..65bfec6f44 100644
          pop = getattr(self.flexkv_connector, "pop_prefetch_loaded_tokens", None)
          if callable(pop):
 diff --git a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
-index 11d792a245..95d530dfa2 100644
+index b5531497a7..fe85e9e0a4 100644
 --- a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
 +++ b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
-@@ -957,19 +957,21 @@ class FlexKVRadixCache(RadixCache):
+@@ -1020,19 +1020,21 @@ class FlexKVRadixCache(RadixCache):
          self.flexkv_connector.cancel_prefetch(rid)
 
      def prefetch_request(self, req: Req) -> None:
@@ -284,7 +281,7 @@ index 11d792a245..95d530dfa2 100644
 
      def prefetch_from_storage(
          self,
-@@ -978,25 +980,28 @@ class FlexKVRadixCache(RadixCache):
+@@ -1041,25 +1043,28 @@ class FlexKVRadixCache(RadixCache):
          token_ids=None,
          last_hash=None,
          prefix_keys=None,
@@ -327,7 +324,7 @@ index 11d792a245..95d530dfa2 100644
 
      def check_prefetch_progress(self, rid: str) -> bool:
          return self.flexkv_connector.check_prefetch_progress(rid)
-@@ -1004,6 +1009,11 @@ class FlexKVRadixCache(RadixCache):
+@@ -1067,6 +1072,11 @@ class FlexKVRadixCache(RadixCache):
      def terminate_prefetch(self, rid: str) -> None:
          self.flexkv_connector.cancel_prefetch(rid)
 

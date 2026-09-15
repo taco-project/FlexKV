@@ -10,11 +10,12 @@ import uuid
 
 import numpy as np
 import pytest
+import torch
 
 pytest.importorskip("flexkv.c_ext")
 import zmq
 
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import ModelConfig, CacheConfig, SWAPoolConfig
 from flexkv.integration.sglang.connector import FlexKVConnector
 from flexkv.kvtask import KVTaskEngine, KVTaskManager, TaskStatus
 from flexkv.prefetch.coordinator import PrefetchCoordinator
@@ -75,6 +76,56 @@ def test_connector_routes_policy_before_runtime_creation(
     assert cfg.enable_chunked_prefetch is expected
     if enabled:
         assert cfg.prefetch_options["policy"] == (explicit or server_policy)
+
+
+@pytest.mark.parametrize("dedup", [False, True])
+def test_connector_keeps_snapshot_budget_when_resolving_indexer_group(monkeypatch, dedup):
+    import flexkv.integration.sglang.connector as module
+
+    monkeypatch.setenv("FLEXKV_DEDUP_INDEXER_GROUP", "1" if dedup else "0")
+    cfg = CacheConfig(swa=SWAPoolConfig(enabled=True))
+    config = NS(
+        cache_config=cfg,
+        model_config=ModelConfig(),
+        post_init_from_sglang_config=Mock(return_value=NS()),
+    )
+    monkeypatch.setattr(module.FlexKVConfig, "from_env", lambda: config)
+    monkeypatch.setattr(
+        module, "FlexKVComm", lambda **kwargs: NS(all_reduce_min=lambda value: value)
+    )
+    kvcache = NS(
+        kv_buffer=[torch.empty((8, 1, 4))],
+        index_k_with_scale_buffer=[
+            torch.empty((8, 4), dtype=torch.uint8),
+            torch.empty((0, 4), dtype=torch.uint8),
+            torch.empty((8, 4), dtype=torch.uint8),
+        ],
+        skip_topk_layers=[False, True, False],
+        swa_kv_pool=NS(kv_buffer=[
+            torch.empty((8, 4, 3), dtype=torch.float16),
+            torch.empty((8, 4, 5), dtype=torch.uint8),
+        ]),
+    )
+
+    class GeometryResolved(Exception):
+        pass
+
+    # Both geometries must survive constructor setup before capacity sizing
+    # and KVManager creation; no GPU registration is needed for this check.
+    def check_geometry(self, buffers, indexer_group):
+        assert buffers[0] is kvcache.kv_buffer[0]
+        assert indexer_group.layer_indices == ((0, 2) if dedup else (0, 1, 2))
+        assert cfg.swa.snapshot_bytes == 44
+        raise GeometryResolved
+
+    monkeypatch.setattr(
+        FlexKVConnector, "_apply_layer_groups_for_cache_sizing", check_geometry
+    )
+    with pytest.raises(GeometryResolved):
+        FlexKVConnector(
+            sgl_model_config=NS(), server_args=NS(), page_size=64, kvcache=kvcache,
+            tp_rank=0, dp_rank=0, pp_rank=0, attn_cp_rank=0,
+        )
 
 
 @pytest.fixture

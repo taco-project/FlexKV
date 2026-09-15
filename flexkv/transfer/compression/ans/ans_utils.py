@@ -392,7 +392,13 @@ def optimal_batch_size(
     hs = 1
     dtype = torch.bfloat16 if data_type == 0 else torch.float8_e4m3fn
 
-    shape_per_layer = (2, num_blocks, tpb, nh, hs)
+    # The calibration buffer is built K+V, so every "2" below is this kv_dim.
+    # It must also be what the kernel is told: passing a bool here used to
+    # collapse to 0, and total_chunks = layers*kv_dim*blocks went to 0 too --
+    # the calibration then timed a kernel that transferred nothing and picked
+    # a batch size from that.
+    CALIBRATION_KV_DIM = 2
+    shape_per_layer = (CALIBRATION_KV_DIM, num_blocks, tpb, nh, hs)
     gpu_cache = torch.randn(
         (num_layers,) + shape_per_layer,
         dtype=torch.bfloat16,
@@ -400,7 +406,7 @@ def optimal_batch_size(
     if dtype != torch.bfloat16:
         gpu_cache = gpu_cache.to(dtype)
     gpu_blocks = [gpu_cache[i] for i in range(num_layers)]
-    cpu_shape = (num_blocks, num_layers, 2, tpb, nh, hs)
+    cpu_shape = (num_blocks, num_layers, CALIBRATION_KV_DIM, tpb, nh, hs)
     cpu_data = torch.zeros(cpu_shape, dtype=dtype, device="cpu").pin_memory()
     gpu_ptrs = torch.tensor(
         [block.data_ptr() for block in gpu_blocks],
@@ -409,17 +415,18 @@ def optimal_batch_size(
     chunk_size = chunk_size_bytes
     gpu_kv_stride = num_blocks * tpb * nh * hs * elem
     gpu_block_stride = chunk_size
-    gpu_layer_stride = 2 * gpu_kv_stride
+    gpu_layer_stride = CALIBRATION_KV_DIM * gpu_kv_stride
     cpu_kv_stride = chunk_size
-    cpu_layer_stride = 2 * chunk_size
-    cpu_block_stride = num_layers * 2 * chunk_size
+    cpu_layer_stride = CALIBRATION_KV_DIM * chunk_size
+    cpu_block_stride = num_layers * CALIBRATION_KV_DIM * chunk_size
 
     gpu_ids = torch.arange(num_blocks, dtype=torch.int64).pin_memory()
     cpu_ids = torch.arange(num_blocks, dtype=torch.int64).pin_memory()
     stream = torch.cuda.Stream(device=dev)
 
     size_table = torch.zeros(
-        (num_blocks, num_layers, 2), dtype=torch.uint32).pin_memory()
+        (num_blocks, num_layers, CALIBRATION_KV_DIM),
+        dtype=torch.uint32).pin_memory()
     size_table_ptr = size_table.data_ptr()
     size_table_block_stride = size_table.stride(0)
     size_table_layer_stride = size_table.stride(1)
@@ -441,7 +448,7 @@ def optimal_batch_size(
                     ctx, gpu_ids, gpu_ptrs, gpu_kv_stride, gpu_block_stride,
                     gpu_layer_stride, cpu_ids, cpu_data, cpu_kv_stride,
                     cpu_layer_stride, cpu_block_stride, chunk_size, 0,
-                    num_layers, False, 0, size_table_ptr,
+                    num_layers, CALIBRATION_KV_DIM, 0, size_table_ptr,
                     size_table_block_stride, size_table_layer_stride)
             stream.synchronize()
 
@@ -452,7 +459,7 @@ def optimal_batch_size(
                     ctx, gpu_ids, gpu_ptrs, gpu_kv_stride, gpu_block_stride,
                     gpu_layer_stride, cpu_ids, cpu_data, cpu_kv_stride,
                     cpu_layer_stride, cpu_block_stride, chunk_size, 0,
-                    num_layers, False, 0, size_table_ptr,
+                    num_layers, CALIBRATION_KV_DIM, 0, size_table_ptr,
                     size_table_block_stride, size_table_layer_stride)
         end_evt.record(stream)
         stream.synchronize()

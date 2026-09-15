@@ -1,19 +1,23 @@
-import sys
-import types
 from types import SimpleNamespace
 
+import pytest
+import torch
 import zmq
 
-from flexkv.common.config import ModelConfig, RankInfo
+from flexkv.common.config import LayerGroupSpec, ModelConfig, RankInfo
 from flexkv.server.request import RegisterTPClientRequest
-
-
-# Registration tests do not need the CUDA/liburing transfer workers.
-transfer_engine_module = types.ModuleType("flexkv.transfer.transfer_engine")
-transfer_engine_module.TransferEngine = object
-sys.modules["flexkv.transfer.transfer_engine"] = transfer_engine_module
-
 from flexkv.transfer_manager import TransferManager
+
+pytestmark = pytest.mark.unit
+
+# Imported plainly, on purpose. An earlier version of this file stubbed
+# flexkv.transfer.transfer_engine in sys.modules to skip the CUDA/liburing
+# import cost, then tried to unwind the stub afterwards. Either half breaks the
+# suite: leaving the stub in binds TransferEngine to `object` for every module
+# collected after this one, and popping flexkv.transfer_manager to undo it
+# makes a later import build a *second* module object, so pickling
+# TransferManagerInterProcessHandle fails its class-identity check in ~48
+# unrelated tests. The real import works and costs little.
 
 
 def _request(dp_client_id: int, intra_client_id: int, device_id: int):
@@ -137,6 +141,8 @@ def test_gpu_control_edge_drains_all_queued_requests():
 
 def test_intra_client_id_flattens_pp_and_effective_tp_rank():
     model_config = ModelConfig(tp_size=4, pp_size=2, attn_cp_size=2)
+    # Production adapters freeze after normalizing attn_cp_size <-> cp_size.
+    model_config.freeze()
     rank_info = RankInfo(
         model_config=model_config,
         pp_rank=1,
@@ -144,9 +150,9 @@ def test_intra_client_id_flattens_pp_and_effective_tp_rank():
         attn_cp_rank=1,
     )
 
-    assert model_config.effective_tp_size == 4
-    assert rank_info.effective_tp_rank == 3
-    assert rank_info.intra_client_id == 7
+    assert model_config.effective_tp_size == 8
+    assert rank_info.effective_tp_rank == 7
+    assert rank_info.intra_client_id == 15
 
 
 def test_registration_key_distinguishes_replicas_from_cuda_device_id():
@@ -171,3 +177,33 @@ def test_duplicate_registration_key_is_rejected():
 
     assert len(manager.all_gpu_blocks) == 1
     assert manager.gpu_device_id_mapping[(2, 3)] == 4
+
+
+def test_compact_layer_groups_must_match_across_cp_registrations():
+    manager = _empty_transfer_manager()
+    manager.model_config.layer_groups = [
+        LayerGroupSpec(
+            num_layers=2,
+            num_kv_heads=1,
+            head_size=8448,
+            layer_indices=[0, 2],
+            compress_ratio=64,
+            dtype=torch.uint8,
+        )
+    ]
+    mismatched = _request(dp_client_id=0, intra_client_id=1, device_id=1)
+    mismatched.layer_groups = [
+        LayerGroupSpec(
+            num_layers=1,
+            num_kv_heads=1,
+            head_size=8448,
+            layer_indices=[0],
+            compress_ratio=64,
+            dtype=torch.uint8,
+        )
+    ]
+
+    with pytest.raises(ValueError, match="differ across GPU registrations"):
+        manager._handle_gpu_blocks_registration(mismatched)
+
+    assert mismatched.registration_key not in manager.all_gpu_blocks

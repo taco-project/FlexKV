@@ -3,6 +3,7 @@
  * All rights reserved. SPDX-License-Identifier: Apache-2.0
  */
 #include "compression/ans/nvcomp_ans.cuh"
+#include "transfer_backend.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
@@ -32,7 +33,7 @@ static size_t transfer_kv_blocks_ans_binding(
     int64_t chunk_size_in_bytes,
     int start_layer_id,
     int num_layers,
-    bool kv_dim,
+    int kv_dim,
     int gpu_block_type,
     int64_t cpu_size_table_ptr,
     int64_t cpu_size_table_block_stride,
@@ -43,6 +44,13 @@ static size_t transfer_kv_blocks_ans_binding(
               "cpu_block_id_tensor must be int64");
   TORCH_CHECK(gpu_tensor_ptrs_tensor.dtype() == torch::kInt64,
               "gpu_tensor_ptrs_tensor must be int64");
+  // This parameter was declared ``bool`` here (and only here -- every other
+  // kv_dim in the tree is int), so pybind11 folded MHA's 2 down to true and
+  // the implicit widening handed the kernel a 1. Half of every MHA batch
+  // then silently did not exist. Fail loudly on anything unexpected rather
+  // than degrade again.
+  TORCH_CHECK(kv_dim == 1 || kv_dim == 2,
+              "kv_dim must be 1 (MLA) or 2 (MHA/GQA), got ", kv_dim);
 
   int num_blocks = gpu_block_id_tensor.numel();
   int64_t *gpu_block_ids = static_cast<int64_t*>(gpu_block_id_tensor.data_ptr());
@@ -78,31 +86,24 @@ static size_t transfer_kv_blocks_ans_binding(
 
   size_t compressed_bytes = 0;
 
-#define ANS_DISPATCH(func, Type)                                             \
-  compressed_bytes = flexkv::func<Type>(                                      \
-      &ctx, num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,   \
-      cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,                         \
-      cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,                   \
-      chunk_size_in_bytes, kv_dim, cpu_size_table,                            \
-      cpu_size_table_block_stride, cpu_size_table_layer_stride, stream)
-#define ANS_SWITCH(func)                                                     \
-  switch (bt) {                                                              \
-    case flexkv::BackendType::VLLM:                                          \
-      ANS_DISPATCH(func, flexkv::BackendType::VLLM);                         \
-      break;                                                                 \
-    case flexkv::BackendType::TRTLLM:                                        \
-      ANS_DISPATCH(func, flexkv::BackendType::TRTLLM);                       \
-      break;                                                                 \
-    case flexkv::BackendType::SGLANG:                                        \
-      ANS_DISPATCH(func, flexkv::BackendType::SGLANG);                       \
-      break;                                                                 \
-  }
+  // The only thing that varied between the two switches was the function
+  // name, and the only thing that varied between their arms was the layout.
+  // with_tensor_kind supplies the layout, so what is left is one macro that
+  // names the function.
+#define ANS_DISPATCH(func)                                                    \
+  flexkv::with_tensor_kind(bt, [&](auto tag) {                                \
+    compressed_bytes = flexkv::func<decltype(tag)::value>(                    \
+        &ctx, num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, \
+        cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,                       \
+        cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,                 \
+        chunk_size_in_bytes, kv_dim, cpu_size_table,                          \
+        cpu_size_table_block_stride, cpu_size_table_layer_stride, stream);    \
+  })
   if (is_d2h) {
-    ANS_SWITCH(transfer_kv_blocks_ans_comp);
+    ANS_DISPATCH(transfer_kv_blocks_ans_comp);
   } else {
-    ANS_SWITCH(transfer_kv_blocks_ans_decomp);
+    ANS_DISPATCH(transfer_kv_blocks_ans_decomp);
   }
-#undef ANS_SWITCH
 #undef ANS_DISPATCH
 
   cudaError_t err = cudaGetLastError();
@@ -127,7 +128,7 @@ static size_t transfer_kv_blocks_ans_comp_binding(
     int64_t chunk_size_in_bytes,
     int start_layer_id,
     int num_layers,
-    bool kv_dim,
+    int kv_dim,
     int gpu_block_type,
     int64_t cpu_size_table_ptr,
     int64_t cpu_size_table_block_stride,
@@ -157,7 +158,7 @@ static size_t transfer_kv_blocks_ans_decomp_binding(
     int64_t chunk_size_in_bytes,
     int start_layer_id,
     int num_layers,
-    bool kv_dim,
+    int kv_dim,
     int gpu_block_type,
     int64_t cpu_size_table_ptr,
     int64_t cpu_size_table_block_stride,

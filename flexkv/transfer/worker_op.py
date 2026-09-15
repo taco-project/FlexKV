@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from flexkv.common.pool import PoolId
 from flexkv.common.transfer import TransferOp, TransferType, LayerwiseTransferOp
 
 
@@ -27,7 +28,17 @@ class WorkerTransferOp:
     src_block_node_ids: Optional[np.ndarray]
     mooncake_store_block_hashes: Optional[np.ndarray] = None
     mooncake_store_swa_block_hashes: Optional[list] = None
+    # Which KV pool this op's block ids index. Not a different kind of
+    # transfer -- same direction, same layout -- so it travels with the op and
+    # selects the pool binding on the worker side, instead of being inferred
+    # from which worker the engine happened to pick.
+    pool_id: PoolId = PoolId.FULL_KV
     prof_submitted_ns: int = 0
+
+    @property
+    def is_swa(self) -> bool:
+        """Kept for the readers that predate ``pool_id``; see PoolId."""
+        return self.pool_id is PoolId.SWA
 
     def __init__(self, transfer_op: TransferOp):
         self.transfer_op_id = transfer_op.op_id
@@ -40,6 +51,7 @@ class WorkerTransferOp:
         self.src_block_node_ids = transfer_op.src_block_node_ids
         self.mooncake_store_block_hashes = transfer_op.mooncake_store_block_hashes
         self.mooncake_store_swa_block_hashes = transfer_op.mooncake_store_swa_block_hashes
+        self.pool_id = getattr(transfer_op, "pool_id", PoolId.FULL_KV)
 
         if self.src_slot_id == -1 or self.dst_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
@@ -61,14 +73,10 @@ class WorkerLayerwiseTransferOp:
     transfer_type: TransferType
     src_block_ids_h2d: np.ndarray
     dst_block_ids_h2d: np.ndarray
-    src_block_ids_disk2h: np.ndarray
-    dst_block_ids_disk2h: np.ndarray
     # Always non-None: LayerwiseTransferOp normalizes missing SWA ids to empty
     # np.int64 arrays. Empty arrays signal cpp that this transfer carries no SWA.
     swa_src_block_ids_h2d: np.ndarray
     swa_dst_block_ids_h2d: np.ndarray
-    swa_src_block_ids_disk2h: np.ndarray
-    swa_dst_block_ids_disk2h: np.ndarray
     counter_id: int  # Counter set index for triple buffering eventfd notification
     prof_submitted_ns: int = 0
 
@@ -79,10 +87,6 @@ class WorkerLayerwiseTransferOp:
         self.transfer_type = transfer_op.transfer_type
         self.src_block_ids_h2d = transfer_op.src_block_ids_h2d
         self.dst_block_ids_h2d = transfer_op.dst_block_ids_h2d
-        self.src_block_ids_disk2h = transfer_op.src_block_ids_disk2h
-        self.dst_block_ids_disk2h = transfer_op.dst_block_ids_disk2h
         self.swa_src_block_ids_h2d = transfer_op.swa_src_block_ids_h2d
         self.swa_dst_block_ids_h2d = transfer_op.swa_dst_block_ids_h2d
-        self.swa_src_block_ids_disk2h = transfer_op.swa_src_block_ids_disk2h
-        self.swa_dst_block_ids_disk2h = transfer_op.swa_dst_block_ids_disk2h
         self.counter_id = transfer_op.counter_id

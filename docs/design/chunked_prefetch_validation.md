@@ -1,5 +1,40 @@
 # Chunked prefetch validation
 
+## Target-branch integration: September 15, 2026
+
+FlexKV was merged with main `6960dfde09`; the companion SGLang review head
+`c6b51c1b5c` includes adaptation base `5166ce06aa`. The connector resolution
+preserves both physical indexer deduplication and SWA snapshot byte accounting.
+The scheduler retains idle admission retry, shared restore deferral, and the
+adaptation's new SWA snapshot grid behavior. The companion patch applies to
+that SGLang base and produces exactly the review head's source tree.
+
+- **487 FlexKV tests passed; 9 skipped.** Coverage includes prefetch policy and
+  threads, Python/C++ radix planning, native IPC, deferred publication,
+  cancellation, failure propagation, connector/store ownership, SWA, and indexer
+  geometry. Two new constructor cases exercise deduplication on/off while
+  preserving the snapshot budget. Skips are unsupported Python-radix SWA cases;
+  corresponding C++ cases executed.
+- **167 SGLang tests and 12 subtests passed** on the latest adaptation base,
+  covering prefetch, ordinary/hybrid restore, admission, ownership, eviction,
+  and PrefillAdder. Changed-file lint, formatting, and patch checks passed.
+- The current FlexKV C++/CUDA extension was rebuilt in an isolated Linux
+  container (Python 3.12.3, PyTorch 2.13.0+cu130, 4 CPUs, 16 GiB memory, no
+  network or GPU devices). This validates native imports and CPU control/data
+  paths; it is not a Cython release build, GPU/model test, or performance rerun.
+
+Compatibility with [FlexKV #266](https://github.com/taco-project/FlexKV/pull/266)
+was checked at `07496038d0`. Git can combine the changes without textual
+conflicts, but the APIs are incompatible: #266 removes
+`num_ready_matched_blocks` and `last_ready_node`, which the prefetch planner
+still reads. Executing the actual planner methods against the combined
+match-result schema raises `AttributeError`; the coordinator turns the resolve
+failure into a failed prefetch session. This is a focused API reproduction,
+not a full test of the combined branches. Integrating #266 must migrate the
+planner and its tests to `num_matched_blocks` / `last_node` together with its
+insert-after semantics. Those fields cannot replace the ready-prefix fields
+on the current main, which still permits unready radix nodes.
+
 ## SGLang whole-task policy routing: September 10, 2026
 
 Revision `837d3a4` routes SGLang's effective `wait_complete` policy to the
