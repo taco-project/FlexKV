@@ -363,7 +363,12 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
       }
     }
   }
-  
+
+  // The remote index is assembled through bulk subtree attachment/merge paths
+  // that intentionally bypass normal insert(). Re-establish the cached-offset
+  // invariant once after the rebuild; this is off the request hot path.
+  new_index->rebuild_block_offsets();
+
   return new_index;
 }
 
