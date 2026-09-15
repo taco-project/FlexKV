@@ -22,7 +22,10 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <cerrno>
+#include <limits>
 
+#include "logging.h"
 #include "monitoring/metrics_manager.h"
 
 // metrics no-op when monitoring disabled
@@ -103,6 +106,30 @@ CEPath choose_path(const CEAnalysis &ce_analysis, const CETransferConfig &ce_con
   return CEPath::GATHER_SCATTER;
 }
 
+const CEMemcpyStagingOptions &ce_memcpy_staging_options() {
+  static const CEMemcpyStagingOptions options = [] {
+    CEMemcpyStagingOptions result;
+    const char *backend = std::getenv("FLEXKV_CE_GATHER_BACKEND");
+    if (backend == nullptr || std::strcmp(backend, "aten") == 0) return result;
+    TORCH_CHECK(std::strcmp(backend, "memcpy") == 0,
+                "FLEXKV_CE_GATHER_BACKEND must be aten or memcpy");
+    result.enabled = true;
+    const char *tile = std::getenv("FLEXKV_CE_STAGING_TILE_MB");
+    if (tile != nullptr) {
+      TORCH_CHECK(*tile >= '0' && *tile <= '9',
+                  "FLEXKV_CE_STAGING_TILE_MB must be an integer in [1, 256]");
+      char *end = nullptr;
+      errno = 0;
+      const unsigned long mb = std::strtoul(tile, &end, 10);
+      TORCH_CHECK(errno == 0 && end != tile && *end == '\0' && mb >= 1 && mb <= 256,
+                  "FLEXKV_CE_STAGING_TILE_MB must be an integer in [1, 256]");
+      result.tile_bytes = static_cast<size_t>(mb) * 1024 * 1024;
+    }
+    return result;
+  }();
+  return options;
+}
+
 // Cached host staging buffer (per-device)
 
 struct HostStagingBuf {
@@ -132,37 +159,45 @@ struct DeviceStagingBuf {
 
 void *get_cached_host_buffer(size_t size) {
   int dev = 0;
-  cudaGetDevice(&dev);
+  ce_check_cuda(cudaGetDevice(&dev), "host staging get device");
   thread_local std::unordered_map<int, HostStagingBuf> cache;
   HostStagingBuf &b = cache[dev];
   if (size > b.size) {
     if (b.buf) {
-      cudaFreeHost(b.buf);
+      ce_check_cuda(cudaFreeHost(b.buf), "host staging free");
+      b.buf = nullptr;
+      b.size = 0;
     }
-    TORCH_CHECK(cudaSuccess == cudaMallocHost(&b.buf, size, cudaHostAllocDefault),
-                "cudaMallocHost failed for cached host buffer");
+    void *allocated = nullptr;
+    ce_check_cuda(cudaMallocHost(&allocated, size, cudaHostAllocDefault),
+                  "host staging allocation");
+    b.buf = allocated;
     b.size = size;
   }
   return b.buf;
 }
 
-// Cached device buffer (per-device, slot-keyed). null on cudaMalloc failure -> PER_BLOCK.
+// Only allocation exhaustion may fall back; a poisoned context must propagate.
 void *get_cached_device_buffer(size_t size, int slot) {
+  TORCH_CHECK(slot >= 0 && slot < 3, "invalid device staging slot: ", slot);
   int dev = 0;
-  cudaGetDevice(&dev);
+  ce_check_cuda(cudaGetDevice(&dev), "device staging get device");
   thread_local std::unordered_map<int, std::array<DeviceStagingBuf, 3>> cache;
   DeviceStagingBuf &b = cache[dev][slot];
   if (size > b.size) {
     if (b.buf) {
-      cudaFree(b.buf);
+      ce_check_cuda(cudaFree(b.buf), "device staging free");
       b.buf = nullptr;
       b.size = 0;
     }
-    // cudaMalloc failed -> PER_BLOCK
-    if (cudaSuccess != cudaMalloc(&b.buf, size)) {
+    void *allocated = nullptr;
+    const cudaError_t status = cudaMalloc(&allocated, size);
+    if (status == cudaErrorMemoryAllocation) {
       cudaGetLastError();
       return nullptr;
     }
+    ce_check_cuda(status, "device staging allocation");
+    b.buf = allocated;
     b.size = size;
   }
   return b.buf;
@@ -178,13 +213,13 @@ cudaEvent_t *get_cached_event_pair(bool need, bool &created) {
   if (!need) return nullptr;
   thread_local std::unordered_map<int, CachedEventPair> cache;
   int dev = 0;
-  cudaGetDevice(&dev);
+  ce_check_cuda(cudaGetDevice(&dev), "cached event get device");
   CachedEventPair &e = cache[dev];
   if (!e.created) {
-    TORCH_CHECK(cudaSuccess == cudaEventCreateWithFlags(&e.ev[0], cudaEventDisableTiming),
-                "cudaEventCreateWithFlags failed for cached event[0]");
-    TORCH_CHECK(cudaSuccess == cudaEventCreateWithFlags(&e.ev[1], cudaEventDisableTiming),
-                "cudaEventCreateWithFlags failed for cached event[1]");
+    ce_check_cuda(cudaEventCreateWithFlags(&e.ev[0], cudaEventDisableTiming),
+                  "cached event[0] create");
+    ce_check_cuda(cudaEventCreateWithFlags(&e.ev[1], cudaEventDisableTiming),
+                  "cached event[1] create");
     e.created = true;
   }
   created = true;
@@ -221,7 +256,8 @@ void ce_transfer_per_block(
             cpu_base + cpu_block_ids[b] * cpu_block_stride_int64;
         void *dst = is_host_to_device ? (void *)gpu_ptr_off : (void *)cpu_ptr_b;
         void *src = is_host_to_device ? (void *)cpu_ptr_b : (void *)gpu_ptr_off;
-        cudaMemcpyAsync(dst, src, chunk_size_in_bytes, kind, stream);
+        ce_check_cuda(cudaMemcpyAsync(dst, src, chunk_size_in_bytes, kind, stream),
+                      "PER_BLOCK copy");
         FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, chunk_size_in_bytes);
       }
     }
@@ -809,6 +845,150 @@ void ce_transfer_segment_scatter(
                    ce_config.gather_threads, ce_config.gather_nt);
   }
   // Events cached, not destroyed (all work already synced).
+}
+
+// ---- MEMCPY_STAGED: bounded, ATen-free gather/scatter ----
+template <BackendType Type>
+void ce_transfer_memcpy_staged(
+    int num_blocks, int start_layer_id, int num_layers, int kv_dim,
+    int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
+    int64_t gpu_startoff_inside_chunks_int64,
+    int64_t *cpu_block_ids, int64_t *cpu_ptr_int64,
+    int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
+    int64_t cpu_block_stride_int64,
+    int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
+    cudaStream_t stream, bool is_host_to_device,
+    const CEAnalysis &ce_analysis, const CETransferConfig &ce_config) {
+  if (num_blocks == 0 || num_layers == 0) return;
+  const auto &options = ce_memcpy_staging_options();
+  TORCH_CHECK(num_blocks > 0 && num_layers > 0 && kv_dim > 0 && start_layer_id >= 0,
+              "invalid memcpy-staged transfer dimensions");
+  TORCH_CHECK(chunk_size_in_bytes > 0 && chunk_size_in_bytes % sizeof(int64_t) == 0,
+              "memcpy-staged transfer requires a positive 8-byte aligned chunk");
+  const size_t chunk = static_cast<size_t>(chunk_size_in_bytes);
+  TORCH_CHECK(chunk <= options.tile_bytes,
+              "KV chunk exceeds FLEXKV_CE_STAGING_TILE_MB; increase the tile budget");
+  for (int b = 0; b < num_blocks; ++b) {
+    TORCH_CHECK(gpu_block_ids[b] >= 0 && cpu_block_ids[b] >= 0,
+                "negative block ID in memcpy-staged transfer at index ", b);
+  }
+  const int tile_blocks = static_cast<int>(std::min(
+      static_cast<size_t>(num_blocks), options.tile_bytes / chunk));
+  const size_t tile_bytes = static_cast<size_t>(tile_blocks) * chunk;
+  const int slots = is_host_to_device ? 1 : 2;
+  char *host = static_cast<char *>(get_cached_host_buffer(tile_bytes * slots));
+  // A shard has gaps between adjacent GPU blocks. Pack it with D2D copies
+  // before one large D2H (reverse for H2D); never merge across those gaps.
+  char *device = nullptr;
+  if (!ce_analysis.gpu_phys_contig) {
+    device = static_cast<char *>(get_cached_device_buffer(tile_bytes * slots, 2));
+    TORCH_CHECK(device != nullptr, "memcpy-staged device buffer allocation failed");
+  }
+  bool events_created = false;
+  cudaEvent_t *events = get_cached_event_pair(!is_host_to_device, events_created);
+  struct Pending {
+    bool valid = false;
+    int first = 0;
+    int count = 0;
+    int layer = 0;
+    int kv = 0;
+  } pending[2];
+  auto drain = [&](int slot) {
+    const Pending &p = pending[slot];
+    if (!p.valid) return;
+    ce_check_cuda(cudaEventSynchronize(events[slot]), "memcpy-staged D2H wait");
+    scatter_to_cpu(host + slot * tile_bytes, cpu_ptr_int64,
+                   cpu_block_ids + p.first, p.count, cpu_block_stride_int64,
+                   cpu_startoff_inside_chunks_int64, chunk_size_in_bytes,
+                   p.layer, p.kv, cpu_kv_stride_int64, cpu_layer_stride_int64,
+                   start_layer_id, ce_analysis.cpu_phys_contig,
+                   ce_config.gather_threads, ce_config.gather_nt);
+    pending[slot].valid = false;
+  };
+  thread_local unsigned logged_directions = 0;
+  const unsigned direction_bit = is_host_to_device ? 1u : 2u;
+  if (!(logged_directions & direction_bit)) {
+    int dev = 0;
+    ce_check_cuda(cudaGetDevice(&dev), "memcpy-staged get device");
+    FLEXKV_LOG_INFO(
+        "[FlexKV-CE-PATH] backend=memcpy direction=%s gpu=%d blocks=%d "
+        "tile_blocks=%d tile_bytes=%zu gpu_phys_contig=%d",
+        is_host_to_device ? "H2D" : "D2H", dev, num_blocks, tile_blocks,
+        tile_bytes, static_cast<int>(ce_analysis.gpu_phys_contig));
+    logged_directions |= direction_bit;
+  }
+  size_t iteration = 0;
+  try {
+    for (int first = 0; first < num_blocks;) {
+      const int count = std::min(tile_blocks, num_blocks - first);
+      const size_t bytes = static_cast<size_t>(count) * chunk;
+      std::vector<CESegment> runs;
+      for (int k = 0; k < count;) {
+        int length = 1;
+        if (ce_analysis.gpu_phys_contig) {
+          while (k + length < count &&
+                 gpu_block_ids[first + k + length - 1] < std::numeric_limits<int64_t>::max() &&
+                 gpu_block_ids[first + k + length] == gpu_block_ids[first + k + length - 1] + 1)
+            ++length;
+        }
+        runs.push_back({k, length});
+        k += length;
+      }
+      for (int layer = 0; layer < num_layers; ++layer) {
+        for (int kv = 0; kv < kv_dim; ++kv, ++iteration) {
+          const int slot = is_host_to_device ? 0 : static_cast<int>(iteration & 1);
+          drain(slot);
+          char *host_slot = host + slot * tile_bytes;
+          char *packed = device ? device + slot * tile_bytes : host_slot;
+          if (is_host_to_device) {
+            gather_from_cpu(host_slot, cpu_ptr_int64, cpu_block_ids + first, count,
+                            cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+                            chunk_size_in_bytes, layer, kv, cpu_kv_stride_int64,
+                            cpu_layer_stride_int64, start_layer_id,
+                            ce_analysis.cpu_phys_contig, ce_config.gather_threads,
+                            ce_config.gather_nt);
+            if (device)
+              ce_check_cuda(cudaMemcpyAsync(packed, host_slot, bytes,
+                                             cudaMemcpyHostToDevice, stream),
+                            "memcpy-staged H2D packed copy");
+          }
+          for (const auto &run : runs) {
+            int64_t *gpu = reinterpret_cast<int64_t *>(ptr_at<Type>(
+                gpu_tensor_handler, start_layer_id + layer, kv,
+                gpu_block_ids[first + run.start_k])) + gpu_startoff_inside_chunks_int64;
+            void *packed_run = packed + static_cast<size_t>(run.start_k) * chunk;
+            const cudaMemcpyKind kind = device ? cudaMemcpyDeviceToDevice
+                : (is_host_to_device ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost);
+            ce_check_cuda(cudaMemcpyAsync(is_host_to_device ? static_cast<void *>(gpu) : packed_run,
+                                          is_host_to_device ? packed_run : static_cast<void *>(gpu),
+                                          static_cast<size_t>(run.nr_blocks) * chunk, kind, stream),
+                          "memcpy-staged GPU gather/scatter copy");
+          }
+          if (is_host_to_device) {
+            ce_check_cuda(cudaStreamSynchronize(stream), "memcpy-staged H2D wait");
+          } else {
+            if (device)
+              ce_check_cuda(cudaMemcpyAsync(host_slot, packed, bytes,
+                                             cudaMemcpyDeviceToHost, stream),
+                            "memcpy-staged D2H packed copy");
+            ce_check_cuda(cudaEventRecord(events[slot], stream), "memcpy-staged D2H record");
+            pending[slot] = {true, first, count, layer, kv};
+            drain(slot ^ 1);
+          }
+          FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, bytes);
+        }
+      }
+      first += count;
+    }
+    drain(0);
+    drain(1);
+    ce_check_cuda(cudaStreamSynchronize(stream), "memcpy-staged final wait");
+  } catch (...) {
+    // Cached buffers survive this call. Drain before their next reuse, and do
+    // not scatter a slot whose completion could not be confirmed.
+    cudaStreamSynchronize(stream);
+    throw;
+  }
 }
 
 // ---- GATHER_SCATTER: GPU gather/scatter through staging (sharded D2H, many segs) ----
@@ -1426,6 +1606,7 @@ FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_NOSTG, ce_transfer_per_block)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_NOSTG, ce_transfer_contig_direct)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_segment_direct)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_segment_scatter)
+FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_memcpy_staged)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_gather_scatter)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_gather_direct)
 

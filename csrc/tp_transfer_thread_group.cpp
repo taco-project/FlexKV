@@ -211,6 +211,16 @@ void TPTransferThreadGroup::tp_group_transfer(
 
   std::atomic<bool> failed{false};
   std::string error_msg;
+  std::mutex error_mutex;
+  auto record_error = [&](int gpu_idx, const char *message) {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    if (!failed.load()) {
+      error_msg = "gpu=" + std::to_string(gpu_device_ids_[gpu_idx]) +
+                  " direction=" + (is_host_to_device ? "H2D" : "D2H") +
+                  " " + message;
+      failed.store(true);
+    }
+  };
   // threads_.clear();
   // threads_.reserve(num_gpus_);
 
@@ -361,12 +371,10 @@ void TPTransferThreadGroup::tp_group_transfer(
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-          failed = true;
-          error_msg = cudaGetErrorString(err);
+          record_error(i, cudaGetErrorString(err));
         }
       } catch (const std::exception &e) {
-        failed = true;
-        error_msg = e.what();
+        record_error(i, e.what());
       }
     }));
   }

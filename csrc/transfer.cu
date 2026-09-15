@@ -251,7 +251,17 @@ void transfer_kv_blocks(
                            is_host_to_device, is_full_block);
       }
 
-      switch (path) {
+      if (ce_memcpy_staging_options().enabled &&
+          path != CEPath::CONTIG_DIRECT && path != CEPath::SEGMENT_DIRECT) {
+        ce_transfer_memcpy_staged<Type>(
+            num_blocks, start_layer_id, num_layers, kv_dim,
+            gpu_block_ids, gpu_tensor_handler,
+            gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
+            cpu_kv_stride_int64, cpu_layer_stride_int64,
+            cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+            chunk_size_in_bytes, stream, is_host_to_device, analysis, ce_config);
+      } else {
+        switch (path) {
         case CEPath::CONTIG_DIRECT:
           ce_transfer_contig_direct<Type>(
               num_blocks, start_layer_id, num_layers, kv_dim,
@@ -301,6 +311,7 @@ void transfer_kv_blocks(
               chunk_size_in_bytes, stream, is_host_to_device, analysis,
               ce_config);
           break;
+        }
       }
     }  // end else (path_opt_enabled)
   } else {
@@ -343,7 +354,7 @@ void transfer_kv_blocks(
   }
   if (sync) {
     auto sync_t0 = std::chrono::steady_clock::now();
-    cudaStreamSynchronize(stream);
+    ce_check_cuda(cudaStreamSynchronize(stream), "transfer final stream synchronize");
     if (enable_trace) {
       auto sync_t1 = std::chrono::steady_clock::now();
       double sync_ms =
