@@ -7,7 +7,20 @@ from typing import NamedTuple
 
 
 from setuptools import find_packages, setup
-from torch.utils import cpp_extension
+
+try:
+    from torch.utils import cpp_extension
+except ImportError as exc:  # pragma: no cover - build-time diagnostic
+    raise RuntimeError(
+        "flexkv builds a C++/CUDA extension against your installed PyTorch, "
+        "so torch must be importable at build time.\n"
+        "  1. Install the torch build you intend to run with.\n"
+        "  2. Build with isolation disabled so that same torch is used:\n"
+        "       pip install --no-build-isolation flexkv\n"
+        "torch is deliberately not a build requirement: an isolated build "
+        "environment would link flexkv against a different libtorch than the "
+        "one loaded at runtime."
+    ) from exc
 
 
 class NvcompInfo(NamedTuple):
@@ -238,7 +251,10 @@ def _enable_nvcomp_build(cpp_sources, hpp_sources, include_dirs, library_dirs,
     extra_compile_args.append("-DFLEXKV_ENABLE_NVCOMP")
     nvcc_compile_args.append("-DFLEXKV_ENABLE_NVCOMP")
 
-def get_version():
+VERSION_FILE = Path(__file__).resolve().parent / "flexkv" / "_version.py"
+
+
+def _version_from_git():
     import subprocess
     try:
         # e.g. "v1.0.0-0-gabc1234" or "v1.0.0-3-gabc1234"
@@ -258,7 +274,43 @@ def get_version():
         else:
             return f"{tag}+git{git_hash[1:]}"  # dev build
     except Exception:
-        return "0.0.0+unknown"
+        return None
+
+
+def _version_from_file():
+    """Read the version baked into the tree by a previous sdist build."""
+    if not VERSION_FILE.is_file():
+        return None
+    namespace = {}
+    exec(VERSION_FILE.read_text(), namespace)  # noqa: S102
+    return namespace.get("__version__") or None
+
+
+def get_version():
+    """Resolve the version, in descending order of authority.
+
+    ``FLEXKV_VERSION`` wins so a release job can stamp an exact PEP 440
+    version. Otherwise fall back to git, and then to flexkv/_version.py --
+    the last one matters because an sdist unpacked by pip has no .git, and
+    without it every source install would report 0.0.0+unknown.
+
+    Note that a non-tagged git build yields a PEP 440 *local* version
+    (``1.2.1+gabc1234``). Local versions are valid for local installs but
+    PyPI rejects them, so publishing must happen from a clean tag or with
+    FLEXKV_VERSION set explicitly.
+    """
+    return (os.environ.get("FLEXKV_VERSION")
+            or _version_from_git()
+            or _version_from_file()
+            or "0.0.0+unknown")
+
+
+def write_version_file(version):
+    """Persist the resolved version so it survives into the sdist."""
+    VERSION_FILE.write_text(
+        '"""Generated at build time by setup.py -- do not edit."""\n'
+        f'__version__ = "{version}"\n'
+    )
 
 
 def get_git_commit():
@@ -285,6 +337,47 @@ build_git_commit = get_git_commit()
 build_dir = "build"
 os.makedirs(build_dir, exist_ok=True)
 
+
+def ensure_cmake_prerequisites():
+    """Build the CMake half of the tree if it has not been built already.
+
+    ``flexkv.c_ext`` links ``-lxxhash`` against ``build/lib`` and includes
+    ``build/include``, both of which are CMake outputs. build.sh runs CMake
+    before setup.py, so a developer build already has them. A user running
+    ``pip install flexkv`` invokes setup.py directly and would otherwise fail
+    at link time with ``cannot find -lxxhash``, so run CMake here when the
+    outputs are absent. An existing build/ is left alone: re-running CMake on
+    a developer tree would discard the configuration build.sh chose.
+    """
+    import subprocess
+
+    lib_dir = Path(build_dir) / "lib"
+    if lib_dir.is_dir() and any(lib_dir.glob("libxxhash.so*")):
+        return
+
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        raise RuntimeError(
+            "cmake is required to build flexkv from source but was not found "
+            "on PATH. Install it (e.g. `pip install cmake` or "
+            "`apt-get install cmake`) and retry."
+        )
+
+    cmake_args = [cmake, os.path.abspath(".")]
+    if not enable_metrics:
+        # Mirror build.sh: without metrics, prometheus-cpp is not needed, and
+        # the sdist deliberately does not ship it.
+        cmake_args.append("-DFLEXKV_ENABLE_MONITORING=OFF")
+    print(f"=== Running CMake configuration: {' '.join(cmake_args)}")
+    subprocess.check_call(cmake_args, cwd=build_dir)
+    build_cmd = [cmake, "--build", "."]
+    jobs = os.environ.get("MAX_JOBS")
+    if jobs:
+        build_cmd.extend(["-j", jobs])
+    print(f"=== Building third-party libraries: {' '.join(build_cmd)}")
+    subprocess.check_call(build_cmd, cwd=build_dir)
+
+
 spdlog_include_dir = os.path.abspath("third_party/spdlog/include")
 if not os.path.isdir(spdlog_include_dir):
     raise RuntimeError(
@@ -304,6 +397,8 @@ enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
 enable_nvcomp = os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") == "1"
 # FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
 enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
+
+ensure_cmake_prerequisites()
 
 # Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
@@ -450,7 +545,10 @@ if not debug:
                       "flexkv/**/test_*.py",
                       "flexkv/**/benchmark_*.py",
                       "flexkv/benchmark/**/*.py",
-                      "flexkv/benchmark/test_kvmanager.py"]
+                      "flexkv/benchmark/test_kvmanager.py",
+                      # A one-line version literal; compiling it just produces
+                      # a second copy of the same constant.
+                      "flexkv/_version.py"]
     # Import cython when debug is turned off.
     from Cython.Build import cythonize
     cythonized_modules = cythonize(
@@ -497,19 +595,72 @@ class CustomBuildExt(cpp_extension.BuildExtension):
                     shutil.copy2(source_file, dest_file)
                     print(f"Copied {source_file} to {dest_file}")
 
-with open("requirements.txt") as f:
-    install_requires = f.read().splitlines()
+# Runtime dependencies only. requirements.txt is the *development* environment
+# and additionally lists build tools (setuptools, Cython) and test tools
+# (pytest, pytest-benchmark); installing those into a user's environment as a
+# side effect of `pip install flexkv` would be wrong.
+#
+# torch is deliberately absent even though flexkv imports it. flexkv.c_ext is
+# linked against a specific libtorch ABI, so the torch that must be present is
+# the one this was compiled against -- not whichever version a resolver would
+# pick. Declaring it would also let pip silently replace the torch that the
+# host inference engine (sglang/vLLM) depends on. torch must be installed
+# first; setup.py imports it at build time and fails clearly if it is not.
+INSTALL_REQUIRES = [
+    "numpy>=1.20.0",
+    "pyzmq>=22.0.0",
+    "psutil>=5.8.0",
+    "nvtx>=0.2.8",
+    "pyyaml>=5.4.0",
+    "expiring-dict==1.1.2",
+    "redis>=4.0.0",
+    "requests>=2.0.0",
+]
+
+with open("README.md", encoding="utf-8") as f:
+    long_description = f.read()
+
+version = get_version()
+write_version_file(version)
 
 setup(
     name="flexkv",
     description="A global KV-Cache manager for LLM inference",
-    version=get_version(),
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    version=version,
+    license="Apache-2.0",
+    url="https://github.com/taco-project/FlexKV",
+    project_urls={
+        "Source": "https://github.com/taco-project/FlexKV",
+        "Issues": "https://github.com/taco-project/FlexKV/issues",
+        "Changelog": "https://github.com/taco-project/FlexKV/blob/main/CHANGELOG.md",
+    },
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Developers",
+        "License :: OSI Approved :: Apache Software License",
+        "Operating System :: POSIX :: Linux",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: C++",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    ],
     packages=find_packages(exclude=("benchmarks", "csrc", "examples", "tests")),
     package_data={
         "flexkv": ["*.so", "lib/*.so", "lib/*.so.*"],
     },
     include_package_data=True,
-    install_requires=install_requires,
+    install_requires=INSTALL_REQUIRES,
+    extras_require={
+        "dev": [
+            "pytest>=6.0.0",
+            "pytest-benchmark>=3.0.0",
+        ],
+    },
     ext_modules=ext_modules,  # Now contains both C++ and Cython modules as needed
     cmdclass={
         "build_ext": CustomBuildExt.with_options(
@@ -518,7 +669,10 @@ setup(
             build_temp=os.path.join(build_dir, "temp"),  # Temporary build files
         )
     },
-    #python_requires=">=3.8",
-    python_requires=">=3.6",
+    # CI builds and tests on 3.10. The codebase uses syntax and typing features
+    # that predate nothing older than 3.9, but 3.6/3.7 are long EOL and were
+    # never tested; claiming them only converts a clean resolver error into a
+    # SyntaxError after download.
+    python_requires=">=3.9",
     entry_points={"console_scripts": ["flexkv=flexkv.cli.main:main"]},
 )

@@ -1,9 +1,14 @@
 [build-system]
+# torch is intentionally NOT listed. setup.py imports torch to build the
+# extension, but the build must link against the torch already installed in
+# the target environment -- if pip provisioned its own copy in an isolated
+# build env, flexkv.c_ext would be linked against a libtorch that is not the
+# one present at runtime. Users therefore install torch first and build with
+# --no-build-isolation, which is what build.sh and install.sh do.
 requires = [
-    #"setuptools>=61",
-    #"torch==2.3.0"
-    "setuptools>=40.0.0",
-    "torch>=1.10.0"
+    "setuptools>=61",
+    "wheel",
+    "Cython>=3.0.10",
 ]
 build-backend = "setuptools.build_meta"
 
