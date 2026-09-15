@@ -106,7 +106,7 @@ public:
   // Override insert to attach a LeaseMeta from the pool to new nodes
   CRadixNode *insert(torch::Tensor &physical_block_ids,
     torch::Tensor &block_hashes, int num_blocks, int num_insert_blocks,
-    bool ready = true, CRadixNode *node = nullptr, int num_matched_blocks = -1,
+    CRadixNode *node = nullptr, int num_matched_blocks = -1,
     int last_node_matched_length = -1) override;
 
   // Override evict: prefer evicting expired leases; otherwise mark as ABOUT_TO_EVICT
@@ -116,8 +116,6 @@ public:
   // Wrappers that mirror CRadixTreeIndex APIs
   std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,
     int num_blocks, bool update_cache_info = true) override;
-  int total_unready_blocks();
-  int total_ready_blocks();
   int total_cached_blocks();
   int total_node_num();
   void reset();
@@ -131,7 +129,6 @@ public:
   bool is_empty();
   void inc_node_count();
   void dec_node_count();
-  void set_ready(CRadixNode *node, bool ready = true, int ready_length = -1);
 
   size_t lease_pool_capacity() const;
   size_t lease_pool_free_size() const;
