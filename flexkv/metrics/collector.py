@@ -16,12 +16,20 @@ from typing import Dict, Optional
 
 # Optional import for prometheus_client
 try:
-    from prometheus_client import Counter, Gauge
+    from prometheus_client import Counter, Gauge, Histogram
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
     Counter = None
     Gauge = None
+    Histogram = None
+
+# Transfer duration buckets, in seconds: 0.5ms (small H2D/D2H hit) up to 30s
+# (a cold SSD read of a long prefix). Wide because the same op type spans both.
+TRANSFER_DURATION_BUCKETS = (
+    0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
+    0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0,
+)
 
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
@@ -186,6 +194,32 @@ class FlexKVMetricsCollector:
             documentation="Total number of bytes transferred by transfer type and operation",
             labelnames=["transfer_type", "operation"],
         )
+
+        # Transfer durations. Measured on the worker and carried back on the
+        # CompletedOp, so they cost nothing to record at the task layer.
+        duration_kwargs = {
+            "labelnames": ["transfer_type"],
+            "buckets": TRANSFER_DURATION_BUCKETS,
+        }
+        self.transfer_wait_duration_seconds = Histogram(
+            name="flexkv_py_transfer_wait_duration_seconds",
+            documentation="Time a transfer op waited on the worker before launch, by transfer type",
+            **duration_kwargs,
+        )
+        self.transfer_xfer_duration_seconds = Histogram(
+            name="flexkv_py_transfer_xfer_duration_seconds",
+            documentation="Time spent in the transfer itself (launch start to launch return), by transfer type",
+            **duration_kwargs,
+        )
+        self.transfer_e2e_duration_seconds = Histogram(
+            name="flexkv_py_transfer_e2e_duration_seconds",
+            documentation="Time from op submit to completion being observed, by transfer type",
+            **duration_kwargs,
+        )
+        # transfer_type -> (wait, xfer, e2e) children. Resolving a label set
+        # costs more than the observation itself, and transfer types are a
+        # small fixed set, so resolve once and reuse.
+        self._duration_children: Dict[str, tuple] = {}
         
         # Memory pool gauges by device
         mempool_gauge_kwargs = {
@@ -261,9 +295,11 @@ class FlexKVMetricsCollector:
                 pass
             def set(self, *args, **kwargs):
                 pass
-        
+            def observe(self, *args, **kwargs):
+                pass
+
         dummy = DummyMetric()
-        
+
         # Cache engine dummy metrics
         self.cache_hit_blocks_total = dummy
         self.cache_miss_blocks_total = dummy
@@ -271,6 +307,9 @@ class FlexKVMetricsCollector:
         self.transfer_blocks_total = dummy
         self.transfer_ops_total = dummy
         self.transfer_bytes_total = dummy
+        self.transfer_wait_duration_seconds = dummy
+        self.transfer_xfer_duration_seconds = dummy
+        self.transfer_e2e_duration_seconds = dummy
         self.mempool_total_blocks = dummy
         self.mempool_free_blocks = dummy
         self.evicted_blocks_total = dummy
@@ -337,6 +376,28 @@ class FlexKVMetricsCollector:
             self.transfer_blocks_total.labels(transfer_type=transfer_type, operation=operation).inc(num_blocks)
         if num_bytes > 0:
             self.transfer_bytes_total.labels(transfer_type=transfer_type, operation=operation).inc(num_bytes)
+
+    def record_transfer_duration(self, transfer_type: str, wait_ms: float, xfer_ms: float, e2e_ms: float):
+        """
+        Record the lifecycle durations of one completed transfer op, in seconds.
+
+        Durations are measured on the worker and carried back on the op, so
+        this only converts and observes. ``e2e_ms <= 0`` means the op was never
+        timed (it never reached a worker, or metrics were off when the transfer
+        worker started) and is skipped rather than recorded as a real zero.
+        """
+        if not self.enabled or e2e_ms <= 0:
+            return
+        children = self._duration_children.get(transfer_type)
+        if children is None:
+            children = self._duration_children[transfer_type] = (
+                self.transfer_wait_duration_seconds.labels(transfer_type=transfer_type),
+                self.transfer_xfer_duration_seconds.labels(transfer_type=transfer_type),
+                self.transfer_e2e_duration_seconds.labels(transfer_type=transfer_type),
+            )
+        children[0].observe(wait_ms / 1000.0)
+        children[1].observe(xfer_ms / 1000.0)
+        children[2].observe(e2e_ms / 1000.0)
     
     def update_mempool_stats(self, device: str, total_blocks: int, free_blocks: int):
         """

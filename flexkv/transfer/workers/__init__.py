@@ -27,6 +27,9 @@ from flexkv.transfer import trace
 # through ``runtime``, so the package -- which every import path executes first
 # -- is the only place that covers both.
 trace.configure(GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace)
+# Metrics export reads the same durations the trace prints, so turn collection
+# on for it too -- without turning on the per-op log lines.
+trace.configure_timing(GLOBAL_CONFIG_FROM_ENV.enable_metrics)
 
 from flexkv.transfer.workers.cpu_ssd import CPUSSDDiskTransferWorker  # noqa: E402
 from flexkv.transfer.workers.gds import GDSTransferWorker  # noqa: E402

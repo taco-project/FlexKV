@@ -1026,10 +1026,15 @@ class TransferEngine:
                                     free_op_from_buffer(child_op, self.pin_buffer)
                                     if op_id in self.op_id_to_nvtx_range:
                                         nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
-                                    self._emit_xfer_trace(op_id, metrics)
+                                    timing = self._emit_xfer_trace(op_id, metrics)
                                     parent_op = self.op_id_to_op[parent_op_id]
                                     self._merge_block_results(
                                         parent_op, child_op.block_results)
+                                    if timing is not None:
+                                        # The parent is finalized when its last
+                                        # replica lands, so that replica owns
+                                        # the duration the parent reports.
+                                        parent_op._timing_ms = timing
                                     parent_op.pending_count -= 1
                                     if parent_op.pending_count == 0:
                                         self._finalize_or_discard(parent_op, finished_ops)
@@ -1039,8 +1044,10 @@ class TransferEngine:
                                 else:
                                     op = self.op_id_to_op[op_id]
                                     self._merge_block_results(op, block_results)
+                                    timing = self._emit_xfer_trace(op_id, metrics)
+                                    if timing is not None:
+                                        op._timing_ms = timing
                                     op.pending_count -= 1
-                                    self._emit_xfer_trace(op_id, metrics)
                                     if op.pending_count == 0:
                                         self._finalize_or_discard(op, finished_ops)
                             except queue.Empty:
@@ -1123,17 +1130,22 @@ class TransferEngine:
         else:
             self._finalize_op(op, finished_ops)
 
-    def _emit_xfer_trace(self, op_id: int, metrics) -> None:
+    def _emit_xfer_trace(self, op_id: int, metrics):
         """Print one ``[XFER]`` line for a completed op (transfer tracing).
 
         Combines the worker-computed timing metrics with the scheduler-side
-        e2e (submit -> detect) and current backlog. All trace.* calls no-op
-        when ``FLEXKV_TRANSFER_TRACE`` is unset, so this is safe to call
-        unconditionally on every finished op.
+        e2e (submit -> detect) and current backlog. Safe to call
+        unconditionally on every finished op: trace.* gates itself, so nothing
+        happens when both ``FLEXKV_TRANSFER_TRACE`` and metrics export are off.
+
+        Returns ``(wait_ms, xfer_ms, e2e_ms)`` when timing is on, else None.
         """
         e2e_ms = trace.consume_submit_ns(op_id)
         trace.dec_inflight()
         trace.record_xfer(op_id, metrics, e2e_ms)
+        if metrics is None:
+            return None
+        return (metrics["wait_ms"], metrics["xfer_ms"], e2e_ms)
 
     def _handle_failed_op(self, op_id: int) -> None:
         """A worker reported a failed transfer for ``op_id``.
@@ -1217,6 +1229,9 @@ class TransferEngine:
         token_size_in_bytes_per_pp_stage = self._num_layers_for_local_pp_stage * avg_bytes_per_layer
         num_bytes = num_blocks * self.cache_config.tokens_per_block * token_size_in_bytes_per_pp_stage
         transfer_type_str = op.transfer_type.value if op.transfer_type != TransferType.VIRTUAL else None
+        # Set by _emit_xfer_trace from the worker's timestamps; absent for ops
+        # that never reached a worker (VIRTUAL) and when timing is off.
+        timing = getattr(op, "_timing_ms", None)
         self.completed_queue.put(CompletedOp(
             graph_id=op.graph_id,
             op_id=op.op_id,
@@ -1224,6 +1239,9 @@ class TransferEngine:
             num_blocks=num_blocks,
             num_bytes=num_bytes,
             block_results=op.block_results,
+            wait_ms=timing[0] if timing is not None else 0.0,
+            xfer_ms=timing[1] if timing is not None else 0.0,
+            e2e_ms=timing[2] if timing is not None else 0.0,
         ))
         finished_ops.append(op)
         del self.op_id_to_op[op.op_id]
