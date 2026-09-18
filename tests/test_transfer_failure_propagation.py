@@ -322,9 +322,9 @@ def test_failed_graph_rolls_back_task_and_reports_failed(global_engine):
     assert task.status == TaskStatus.FAILED
     assert task.is_completed()
     assert convert_to_response_status(task.status) == KVResponseStatus.FAILED
-    # every plan resource returned: pool restored, no unready or locked residue
+    # every plan resource returned: pool restored, nothing published, no locks
     assert cpu.mempool.num_free_blocks == free_before
-    assert cpu.index.total_unready_blocks() == 0
+    assert cpu.index.total_cached_blocks() == 0
     # the same prefix is usable again afterwards
     mask = np.ones_like(tokens, dtype=bool)
     slot_mapping = np.arange(tokens.size, dtype=np.int64)
@@ -354,17 +354,19 @@ def test_failed_task_with_partial_completion_keeps_completed_tier(global_engine)
     task.status = TaskStatus.RUNNING
 
     # the D2H op completed (its callback ran); the H2DISK op then failed
-    d2h_callbacks = [cb for op_id, cb in task.op_callback_dict.items()]
-    assert d2h_callbacks
-    d2h_callbacks[0]()  # CPU tier published
+    d2h_op_ids = [op.op_id for op in task.graph._op_map.values()
+                  if op.transfer_type == TransferType.D2H and not op.is_swa]
+    assert len(d2h_op_ids) == 1
+    task.op_callback_dict[d2h_op_ids[0]]()  # CPU tier published
 
     manager._fail_task(1)
 
-    assert cpu.index.total_ready_blocks() > 0, \
+    assert cpu.index.total_cached_blocks() > 0, \
         "tier whose transfer completed must keep its data"
-    assert cpu.index.total_unready_blocks() == 0
-    assert ssd.index.total_unready_blocks() == 0, \
+    assert ssd.index.total_cached_blocks() == 0, \
         "tier whose transfer never ran must be rolled back"
+    assert ssd.mempool.num_used_blocks == 0, \
+        "its staging blocks must go back to the pool"
 
 
 def test_update_tasks_routes_failed_message_to_fail_task(global_engine):

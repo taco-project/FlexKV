@@ -716,13 +716,13 @@ class KVTaskManager:
 
     def _fail_task(self, task_id: int) -> None:
         """A transfer op of this task's graph failed and the graph has fully
-        drained. Roll the plan back instead of completing it. Under
-        insert-after nothing this plan staged is on any radix tree yet -- the
-        graph-completion callback is the only publisher -- so the abort is
-        fail-closed: every staged block is recycled and every SWA slot
-        returned, even on tiers whose own ops did succeed. The task terminates
-        as FAILED so wait() reports the failure instead of a misleading
-        TIMEOUT."""
+        drained. Roll the plan back instead of completing it: the abort is
+        fail-closed, recycling every staged block and SWA slot that is still
+        detached. A tier whose *own* writers all completed has already been
+        published by its per-writer commit -- PUT reports success at its D2H,
+        so the CPU copy is legitimately readable -- and is kept; only its pin
+        is dropped. The task terminates as FAILED so wait() reports the
+        failure instead of a misleading TIMEOUT."""
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]

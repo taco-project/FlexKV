@@ -30,7 +30,7 @@ from flexkv.cache.redis_meta import RedisMeta, dist_available
 
 from flexkv.cache.mempool import Mempool
 from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
-from flexkv.cache.swa_cache_engine import SWAOpConstructor
+from flexkv.cache.swa_cache_engine import SWAOpConstructor, SWAPutChainOpIds
 from flexkv.common.block import SequenceMeta, format_block_hash
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig
 from flexkv.common.transfer import (
@@ -149,6 +149,81 @@ class DeferredCacheInsert:
 
 
 @dataclass
+class DeferredRelease:
+    """Block recycles and SWA-slot decisions postponed to graph completion.
+
+    A tier that commits early (see :class:`DeferredTierCommit`) may decide to
+    throw staging away -- the rematch went stale, the tree already covers the
+    prefix, a concurrent writer moved the boundary. Those blocks are still
+    addressed by the graph's remaining ops (H2DISK / H2REMOTE read the CPU
+    staging, the SWA write-through chain reads the CPU SWA slot), so returning
+    them to the mempool at commit time would hand live source buffers to the
+    next allocation. They are parked here and released once the graph drains.
+    """
+
+    blocks: List[Tuple[object, np.ndarray]] = field(default_factory=list)
+    swa_slots: List[Tuple[object, int]] = field(default_factory=list)
+    swa_mounts: List[Tuple[object, "DeferredCacheInsert", object]] = field(
+        default_factory=list)
+
+    def recycle(self, engine: object, block_ids: np.ndarray) -> None:
+        self.blocks.append((engine, np.asarray(block_ids, dtype=np.int64)))
+
+    def free_swa_slot(self, engine: object, slot: int) -> None:
+        self.swa_slots.append((engine, int(slot)))
+
+    def publish_swa_slot(self, engine: object,
+                         pending: "DeferredCacheInsert", node: object) -> None:
+        self.swa_mounts.append((engine, pending, node))
+
+    def flush(self, publish_swa: Callable) -> None:
+        """Mount the parked SWA slots, then return every parked resource."""
+        for engine, pending, node in self.swa_mounts:
+            publish_swa(engine, pending, node)
+        self.swa_mounts.clear()
+        for engine, slot in self.swa_slots:
+            engine._free_swa_slot(slot)
+        self.swa_slots.clear()
+        for engine, block_ids in self.blocks:
+            if len(block_ids) > 0:
+                engine.recycle(block_ids)
+        self.blocks.clear()
+
+
+@dataclass
+class DeferredTierCommit:
+    """One tier's staging, published by *that tier's own* transfer completion.
+
+    PUT reports success at its task-end op (the D2H), so publishing every tier
+    only at graph completion would make a CPU hit depend on SSD/REMOTE latency,
+    and a later H2DISK failure would abort the plan and throw away a CPU copy
+    that was written correctly. Each tier therefore commits as soon as the ops
+    that write it have all completed.
+
+    ``remaining`` counts those writer ops (full-KV plus the tier's SWA op, when
+    one was planned); the commit runs on the last one. The published node stays
+    pinned in ``pinned_node`` until the graph drains, because in-graph consumers
+    still address those blocks -- H2DISK and H2REMOTE read the CPU staging. The
+    graph-completion / abort callback releases the pin.
+
+    The SWA slot is *not* mounted at tier-commit time: the SWA write-through
+    chain still reads it, and a mounted slot is evictable even under a Full
+    lock (``evict_swa`` drops SWA from locked leaves). It is parked in the
+    plan's :class:`DeferredRelease` and mounted onto ``pinned_node`` when the
+    graph drains -- i.e. exactly where this PR already mounted it.
+    """
+
+    pending: DeferredCacheInsert
+    remaining: int
+    committed: bool = False
+    # A writer op reported per-block failures: the staging is incomplete and is
+    # never published. Kept distinct from ``committed`` so the graph-completion
+    # / abort path still discards it.
+    failed: bool = False
+    pinned_node: Optional[object] = None
+
+
+@dataclass
 class GetTransferPlan:
     transfer_graph: TransferOpGraph
     finished_ops_ids: List[int]
@@ -183,6 +258,11 @@ class PutTransferPlan:
     num_gpu_blocks_to_transfer: int
     skipped_gpu_blocks: int
     deferred_inserts: List[DeferredCacheInsert] = field(default_factory=list)
+    # Tiers that publish on their own writers' completion instead of waiting
+    # for the whole graph. Entries here are NOT repeated in deferred_inserts.
+    tier_commits: List[DeferredTierCommit] = field(default_factory=list)
+    # Resources an early tier commit gave up but the graph still reads.
+    deferred_release: Optional[DeferredRelease] = None
 
     @classmethod
     def empty(cls) -> "PutTransferPlan":
@@ -2025,11 +2105,15 @@ class GlobalCacheEngine:
             complete=partial(self._transfer_callback,
                              node_to_unlock=plan.node_to_unlock,
                              buffer_to_free=plan.buffer_to_free,
-                             deferred_inserts=plan.deferred_inserts),
+                             deferred_inserts=plan.deferred_inserts,
+                             tier_commits=plan.tier_commits,
+                             deferred_release=plan.deferred_release),
             abort=partial(self._abort_transfer_plan,
                           node_to_unlock=plan.node_to_unlock,
                           buffer_to_free=plan.buffer_to_free,
-                          deferred_inserts=plan.deferred_inserts),
+                          deferred_inserts=plan.deferred_inserts,
+                          tier_commits=plan.tier_commits,
+                          deferred_release=plan.deferred_release),
         )
 
         op_callback_dict = plan.op_callback_dict
@@ -2273,6 +2357,7 @@ class GlobalCacheEngine:
             if op_h2remote is not None:
                 finished_ops_ids.append(op_h2remote.op_id)
 
+        swa_ops = SWAPutChainOpIds()
         if cpu_swa_slot >= 0:
             empty = np.array([], dtype=np.int64)
             put_remote_via_mooncake = (
@@ -2302,48 +2387,70 @@ class GlobalCacheEngine:
                 assert swa_ops.h2remote_id is not None
             finished_ops_ids.append(swa_ops.d2h_id)
 
-        # Insert-after: nothing is mounted on any radix tree at plan time. The
-        # staged blocks (and their SWA slots) stay detached until the graph
-        # completes, then _commit_deferred_insert fresh-rematches each tier and
-        # publishes only the prefix this request actually wrote.
+        # Insert-after: nothing is mounted on any radix tree at plan time. Each
+        # tier's staging (and its SWA slot) stays detached until the ops that
+        # write *that tier* have completed, then _commit_deferred_insert
+        # fresh-rematches it and publishes only the prefix actually written.
+        # PUT reports success at its D2H (see KVTaskManager.check_completed),
+        # so making the CPU tier wait for H2DISK/H2REMOTE would put CPU reuse
+        # behind SSD/REMOTE latency, and an H2DISK failure would abort the plan
+        # and discard a CPU copy that was written correctly.
         deferred_inserts: List[DeferredCacheInsert] = []
+        tier_commits: List[DeferredTierCommit] = []
+        deferred_release = DeferredRelease()
+        op_callback_dict: Dict[int, Callable] = {}
         node_to_unlock = {}
         requested_end = block_mask_start + len(gpu_block_ids)
         if fragment12_num_blocks > 0 or cpu_swa_slot >= 0:
-            deferred_inserts.append(DeferredCacheInsert(
-                device_type=DeviceType.CPU,
-                sequence_meta=sequence_meta,
-                physical_blocks=fragment12_cpu_blocks,
-                staged_start_block=block_mask_start + num_skipped_blocks,
-                remote_start_block=block_mask_start + num_skipped_blocks,
-                requested_end_block=requested_end,
-                swa_slot=cpu_swa_slot,
-                publish_to_peer=self.cache_config.enable_p2p_cpu,
-            ))
+            self._schedule_tier_commit(
+                DeferredCacheInsert(
+                    device_type=DeviceType.CPU,
+                    sequence_meta=sequence_meta,
+                    physical_blocks=fragment12_cpu_blocks,
+                    staged_start_block=block_mask_start + num_skipped_blocks,
+                    remote_start_block=block_mask_start + num_skipped_blocks,
+                    requested_end_block=requested_end,
+                    swa_slot=cpu_swa_slot,
+                    publish_to_peer=self.cache_config.enable_p2p_cpu,
+                ),
+                [op_d2h.op_id if op_d2h is not None else None,
+                 swa_ops.d2h_id if cpu_swa_slot >= 0 else None],
+                tier_commits, deferred_inserts, deferred_release,
+                op_callback_dict, self._commit_tier_on_write)
         if put_to_ssd:
-            deferred_inserts.append(DeferredCacheInsert(
-                device_type=DeviceType.SSD,
-                sequence_meta=sequence_meta,
-                physical_blocks=fragment2_ssd_blocks,
-                staged_start_block=block_mask_start + len(ssd_matched_blocks),
-                remote_start_block=block_mask_start + len(ssd_matched_blocks),
-                requested_end_block=requested_end,
-                swa_slot=ssd_swa_slot,
-                publish_to_peer=self.cache_config.enable_p2p_ssd,
-            ))
+            self._schedule_tier_commit(
+                DeferredCacheInsert(
+                    device_type=DeviceType.SSD,
+                    sequence_meta=sequence_meta,
+                    physical_blocks=fragment2_ssd_blocks,
+                    staged_start_block=block_mask_start + len(ssd_matched_blocks),
+                    remote_start_block=block_mask_start + len(ssd_matched_blocks),
+                    requested_end_block=requested_end,
+                    swa_slot=ssd_swa_slot,
+                    publish_to_peer=self.cache_config.enable_p2p_ssd,
+                ),
+                [op_h2disk.op_id if op_h2disk is not None else None,
+                 swa_ops.h2disk_id if ssd_swa_slot >= 0 else None],
+                tier_commits, deferred_inserts, deferred_release,
+                op_callback_dict, self._commit_tier_on_write)
         if put_to_remote and not self.use_mooncake_store_backend:
             # Mooncake-store is key-addressed: the worker writes the keys and
             # there is no local remote index to mount.
-            deferred_inserts.append(DeferredCacheInsert(
-                device_type=DeviceType.REMOTE,
-                sequence_meta=sequence_meta,
-                physical_blocks=fragment3_remote_blocks,
-                staged_start_block=block_mask_start + remote_put_hit_blocks,
-                remote_start_block=block_mask_start + remote_put_hit_blocks,
-                requested_end_block=requested_end,
-                swa_slot=remote_swa_slot,
-                publish_to_peer=self.enable_kv_sharing,
-            ))
+            self._schedule_tier_commit(
+                DeferredCacheInsert(
+                    device_type=DeviceType.REMOTE,
+                    sequence_meta=sequence_meta,
+                    physical_blocks=fragment3_remote_blocks,
+                    staged_start_block=block_mask_start + remote_put_hit_blocks,
+                    remote_start_block=block_mask_start + remote_put_hit_blocks,
+                    requested_end_block=requested_end,
+                    swa_slot=remote_swa_slot,
+                    publish_to_peer=self.enable_kv_sharing,
+                ),
+                [op_h2remote.op_id if op_h2remote is not None else None,
+                 swa_ops.h2remote_id if remote_swa_slot >= 0 else None],
+                tier_commits, deferred_inserts, deferred_release,
+                op_callback_dict, self._commit_tier_on_write)
         elif remote_swa_slot >= 0:
             self.remote_cache_engine._free_swa_slot(remote_swa_slot)
             remote_swa_slot = -1
@@ -2357,16 +2464,32 @@ class GlobalCacheEngine:
         if (put_to_ssd and len(ssd_matched_blocks) > 0
                 and ssd_anchor is not None):
             node_to_unlock[DeviceType.SSD] = ssd_anchor
+        # The remote staging is published *after* it starts, at
+        # ``staged_start_block == block_mask_start + remote_put_hit_blocks``.
+        # ``take(protected_node=...)`` only guards that prefix while this plan
+        # allocates; once planning returns, a concurrent allocation can evict
+        # the matched remote prefix and _commit_deferred_insert would then see
+        # ``current_blocks < staged_start_block`` and throw away a suffix this
+        # graph successfully wrote. Pin the anchor for the plan's lifetime,
+        # exactly like CPU and SSD. (Mooncake-store is key-addressed: no local
+        # index node exists and lock_node/unlock are no-ops there.)
+        remote_anchor = remote_matched_result.last_node
+        if (put_to_remote and not self.use_mooncake_store_backend
+                and len(remote_matched_blocks) > 0
+                and remote_anchor is not None):
+            node_to_unlock[DeviceType.REMOTE] = remote_anchor
         skipped_gpu_blocks = len(cpu_matched_blocks)
         return PutTransferPlan(
             transfer_graph=transfer_graph,
             finished_ops_ids=finished_ops_ids,
             node_to_unlock=node_to_unlock,
-            op_callback_dict={},
+            op_callback_dict=op_callback_dict,
             buffer_to_free={},
             num_gpu_blocks_to_transfer=len(fragment12_gpu_blocks),
             skipped_gpu_blocks=skipped_gpu_blocks,
             deferred_inserts=deferred_inserts,
+            tier_commits=tier_commits,
+            deferred_release=deferred_release,
         )
 
     def _put_impl_local(self,
@@ -2491,6 +2614,7 @@ class GlobalCacheEngine:
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)
 
+        op_h2disk = None
         if fragment2_num_blocks > 0:
             if len(fragment12_cpu_blocks) < fragment2_num_blocks:
                 flexkv_logger.warning(f"fragment12_cpu_blocks: {len(fragment12_cpu_blocks)}, "
@@ -2513,6 +2637,7 @@ class GlobalCacheEngine:
 
             transfer_graph.add_dependency(op_h2disk.op_id, op_d2h.op_id)
 
+        swa_ops = SWAPutChainOpIds()
         if cpu_swa_slot >= 0:
             empty = np.array([], dtype=np.int64)
             swa_ops = self.swa_op_constructor.build_put_chain(
@@ -2531,32 +2656,47 @@ class GlobalCacheEngine:
             finished_ops_ids.append(swa_ops.d2h_id)
 
         """stage for insert-after publication"""
-        # Nothing is mounted on the radix tree yet: the staged blocks (and their
-        # SWA slots) are published by _commit_deferred_insert once the graph has
-        # written them.
+        # Nothing is mounted on the radix tree yet: each tier's staged blocks
+        # (and its SWA slot) are published by _commit_deferred_insert once the
+        # ops writing *that tier* have completed. CPU therefore becomes readable
+        # at the D2H -- the op PUT already reports success on -- instead of
+        # waiting on H2DISK, and survives an H2DISK failure.
         deferred_inserts: List[DeferredCacheInsert] = []
+        tier_commits: List[DeferredTierCommit] = []
+        deferred_release = DeferredRelease()
+        op_callback_dict: Dict[int, Callable] = {}
         requested_end = block_mask_start + len(gpu_block_ids)
-        deferred_inserts.append(DeferredCacheInsert(
-            device_type=DeviceType.CPU,
-            sequence_meta=sequence_meta,
-            physical_blocks=fragment12_cpu_blocks,
-            staged_start_block=block_mask_start + num_skipped_blocks,
-            remote_start_block=block_mask_start + num_skipped_blocks,
-            requested_end_block=requested_end,
-            swa_slot=cpu_swa_slot,
-            publish_to_peer=self.cache_config.enable_p2p_cpu,
-        ))
-        if len(fragment2_ssd_blocks) > 0:
-            deferred_inserts.append(DeferredCacheInsert(
-                device_type=DeviceType.SSD,
+        self._schedule_tier_commit(
+            DeferredCacheInsert(
+                device_type=DeviceType.CPU,
                 sequence_meta=sequence_meta,
-                physical_blocks=fragment2_ssd_blocks,
-                staged_start_block=block_mask_start + len(ssd_matched_blocks),
-                remote_start_block=block_mask_start + len(ssd_matched_blocks),
+                physical_blocks=fragment12_cpu_blocks,
+                staged_start_block=block_mask_start + num_skipped_blocks,
+                remote_start_block=block_mask_start + num_skipped_blocks,
                 requested_end_block=requested_end,
-                swa_slot=ssd_swa_slot,
-                publish_to_peer=self.cache_config.enable_p2p_ssd,
-            ))
+                swa_slot=cpu_swa_slot,
+                publish_to_peer=self.cache_config.enable_p2p_cpu,
+            ),
+            [op_d2h.op_id,
+             swa_ops.d2h_id if cpu_swa_slot >= 0 else None],
+            tier_commits, deferred_inserts, deferred_release,
+            op_callback_dict, self._commit_tier_on_write)
+        if len(fragment2_ssd_blocks) > 0:
+            self._schedule_tier_commit(
+                DeferredCacheInsert(
+                    device_type=DeviceType.SSD,
+                    sequence_meta=sequence_meta,
+                    physical_blocks=fragment2_ssd_blocks,
+                    staged_start_block=block_mask_start + len(ssd_matched_blocks),
+                    remote_start_block=block_mask_start + len(ssd_matched_blocks),
+                    requested_end_block=requested_end,
+                    swa_slot=ssd_swa_slot,
+                    publish_to_peer=self.cache_config.enable_p2p_ssd,
+                ),
+                [op_h2disk.op_id if op_h2disk is not None else None,
+                 swa_ops.h2disk_id if ssd_swa_slot >= 0 else None],
+                tier_commits, deferred_inserts, deferred_release,
+                op_callback_dict, self._commit_tier_on_write)
         elif ssd_swa_slot >= 0:
             self.ssd_cache_engine._free_swa_slot(ssd_swa_slot)
             ssd_swa_slot = -1
@@ -2574,11 +2714,13 @@ class GlobalCacheEngine:
             transfer_graph=transfer_graph,
             finished_ops_ids=finished_ops_ids,
             node_to_unlock=node_to_unlock,
-            op_callback_dict={},
+            op_callback_dict=op_callback_dict,
             buffer_to_free={},
             num_gpu_blocks_to_transfer=len(fragment12_gpu_blocks),
             skipped_gpu_blocks=skipped_gpu_blocks,
             deferred_inserts=deferred_inserts,
+            tier_commits=tier_commits,
+            deferred_release=deferred_release,
         )
 
     @staticmethod
@@ -2594,16 +2736,31 @@ class GlobalCacheEngine:
         return node
 
     @staticmethod
-    def _release_pending_swa_slot(engine, pending: DeferredCacheInsert) -> None:
-        if pending.swa_slot >= 0:
-            engine._free_swa_slot(pending.swa_slot)
+    def _release_pending_swa_slot(
+            engine, pending: DeferredCacheInsert,
+            release: Optional["DeferredRelease"] = None) -> None:
+        if pending.swa_slot < 0:
+            return
+        if release is not None:
+            # The SWA write-through chain may still be reading this slot.
+            release.free_swa_slot(engine, pending.swa_slot)
+            return
+        engine._free_swa_slot(pending.swa_slot)
 
     def _discard_deferred_insert(
             self, engine, pending: DeferredCacheInsert,
-            physical_blocks: np.ndarray) -> None:
-        """Release staging that is still wholly owned by this request."""
-        engine.recycle(physical_blocks)
-        self._release_pending_swa_slot(engine, pending)
+            physical_blocks: np.ndarray,
+            release: Optional["DeferredRelease"] = None) -> None:
+        """Release staging that is still wholly owned by this request.
+
+        ``release`` defers the recycle to graph completion: on an early tier
+        commit the blocks are still the source of this graph's remaining ops.
+        """
+        if release is not None:
+            release.recycle(engine, physical_blocks)
+        else:
+            engine.recycle(physical_blocks)
+        self._release_pending_swa_slot(engine, pending, release)
 
     @staticmethod
     def _publish_pending_swa_slot(
@@ -2631,13 +2788,21 @@ class GlobalCacheEngine:
         publish_result.record(
             published_remote, reason=reason, failed=failed)
 
-    def _commit_deferred_insert(self, pending: DeferredCacheInsert):
+    def _commit_deferred_insert(
+            self, pending: DeferredCacheInsert,
+            release: Optional["DeferredRelease"] = None):
         """Fresh-rematch and atomically publish one valid staging prefix.
 
         When ``pending.publish_result`` is set (CPU Mooncake loads), every
         normal return path records the published remote-block count so
         prefetch finalize can clamp ``return_mask`` to what the radix tree
         actually mounts — not only what REMOTE2H transferred.
+
+        ``release`` is set when this commit runs *before* the graph drains (a
+        per-tier PUT commit, so the tier is readable at its own completion).
+        Every block this call gives up, and every SWA slot it frees or mounts,
+        is parked there instead of being applied immediately: the graph's
+        remaining ops still read those buffers.
         """
         engine = self.cache_engines[pending.device_type]
         physical_blocks = np.asarray(pending.physical_blocks, dtype=np.int64)
@@ -2646,7 +2811,8 @@ class GlobalCacheEngine:
         if (staged_blocks != len(physical_blocks)
                 or pending.staged_start_block > pending.remote_start_block
                 or remote_blocks < 0):
-            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._discard_deferred_insert(
+                engine, pending, physical_blocks, release)
             flexkv_logger.error(
                 "Invalid deferred cache insert range: "
                 f"staged=[{pending.staged_start_block}, "
@@ -2678,7 +2844,7 @@ class GlobalCacheEngine:
                 and all(pending.swa_load_result.block_results)
             )
             if not (swa_covered and swa_ok):
-                engine._free_swa_slot(pending.swa_slot)
+                self._release_pending_swa_slot(engine, pending, release)
                 pending = replace(pending, swa_slot=-1)
 
         # Hierarchical engines must rematch their local tree. match() may choose
@@ -2692,7 +2858,8 @@ class GlobalCacheEngine:
             )
         except Exception:
             # No radix mutation has started, so all staging is still ours.
-            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._discard_deferred_insert(
+                engine, pending, physical_blocks, release)
             self._record_deferred_publish(
                 pending, pending.remote_start_block, "rematch_error", failed=True)
             raise
@@ -2702,18 +2869,24 @@ class GlobalCacheEngine:
         # this staging starts at, leaving a hole we cannot bridge. The staged
         # allocation is still ours and is safe to recycle.
         if current_blocks < pending.staged_start_block:
-            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._discard_deferred_insert(
+                engine, pending, physical_blocks, release)
             self._record_deferred_publish(
                 pending, pending.remote_start_block, "rematch_stale")
             return None
 
         if current_blocks >= publish_end:
-            engine.recycle(physical_blocks)
+            if release is not None:
+                release.recycle(engine, physical_blocks)
+            else:
+                engine.recycle(physical_blocks)
             boundary_node = self._matched_boundary_node(
                 current_match, pending.requested_end_block)
             if pending.swa_slot >= 0:
                 if boundary_node is None or publish_end != pending.requested_end_block:
-                    self._release_pending_swa_slot(engine, pending)
+                    self._release_pending_swa_slot(engine, pending, release)
+                elif release is not None:
+                    release.publish_swa_slot(engine, pending, boundary_node)
                 else:
                     self._publish_pending_swa_slot(
                         engine, pending, boundary_node)
@@ -2724,7 +2897,8 @@ class GlobalCacheEngine:
 
         successful_staged_blocks = publish_end - pending.staged_start_block
         if successful_staged_blocks <= 0:
-            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._discard_deferred_insert(
+                engine, pending, physical_blocks, release)
             self._record_deferred_publish(
                 pending, pending.remote_start_block, "zero_prefix")
             return None
@@ -2745,21 +2919,23 @@ class GlobalCacheEngine:
             # block ownership with the caller. Other insert failures may happen
             # after mutation, so keep those fail-closed.
             if not str(error).startswith("radix insert conflict:"):
-                self._release_pending_swa_slot(engine, pending)
+                self._release_pending_swa_slot(engine, pending, release)
                 self._record_deferred_publish(
                     pending, pending.remote_start_block, "insert_error", failed=True)
                 raise
-            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._discard_deferred_insert(
+                engine, pending, physical_blocks, release)
             self._record_deferred_publish(
                 pending, pending.remote_start_block, "insert_conflict")
             return None
         except Exception:
-            self._release_pending_swa_slot(engine, pending)
+            self._release_pending_swa_slot(engine, pending, release)
             self._record_deferred_publish(
                 pending, pending.remote_start_block, "insert_error", failed=True)
             raise
         if node is None:
-            self._discard_deferred_insert(engine, pending, physical_blocks)
+            self._discard_deferred_insert(
+                engine, pending, physical_blocks, release)
             self._record_deferred_publish(
                 pending, pending.remote_start_block, "insert_none")
             return None
@@ -2769,13 +2945,18 @@ class GlobalCacheEngine:
             physical_blocks[successful_staged_blocks:],
         ))
         if len(unused_blocks) > 0:
-            engine.recycle(unused_blocks)
+            if release is not None:
+                release.recycle(engine, unused_blocks)
+            else:
+                engine.recycle(unused_blocks)
 
         if pending.swa_slot >= 0:
-            if publish_end == pending.requested_end_block:
-                self._publish_pending_swa_slot(engine, pending, node)
+            if publish_end != pending.requested_end_block:
+                self._release_pending_swa_slot(engine, pending, release)
+            elif release is not None:
+                release.publish_swa_slot(engine, pending, node)
             else:
-                self._release_pending_swa_slot(engine, pending)
+                self._publish_pending_swa_slot(engine, pending, node)
 
         if pending.publish_to_peer:
             engine.local_index.insert_and_publish(node)
@@ -2783,18 +2964,139 @@ class GlobalCacheEngine:
         return node
 
     @_synchronized_cache_tree
+    def _commit_tier_on_write(
+            self,
+            tier: DeferredTierCommit,
+            release: "DeferredRelease",
+            completed_op: Optional[CompletedOp] = None) -> None:
+        """Publish one tier as soon as its own writers have all completed.
+
+        Registered on every op that writes this tier. The last one runs the
+        commit, so the tier is matchable from that moment on -- a PUT that
+        reports success at its D2H makes the CPU copy readable there, instead
+        of making it wait on H2DISK/H2REMOTE (and instead of losing it entirely
+        when a lower tier later fails and aborts the plan).
+
+        A failed writer leaves the staging unpublished: ``block_results`` that
+        are not all-True mean part of this tier was never written, and
+        insert-after must not mount a block whose KV is missing. The plan's
+        graph-completion / abort path then discards it as before.
+        """
+        if tier.committed or tier.failed:
+            return
+        if (completed_op is not None
+                and (completed_op.failed
+                     or (completed_op.block_results is not None
+                         and not all(completed_op.block_results)))):
+            # Fail closed: leave ``committed`` False so the graph-completion /
+            # abort path still discards the staging.
+            tier.remaining = 0
+            tier.failed = True
+            return
+        tier.remaining -= 1
+        if tier.remaining > 0:
+            return
+        tier.committed = True
+        pending = tier.pending
+        engine = self.cache_engines[pending.device_type]
+        try:
+            node = self._commit_deferred_insert(pending, release=release)
+        except Exception:
+            publish_result = getattr(pending, "publish_result", None)
+            if (publish_result is not None
+                    and publish_result.published_remote_blocks is None):
+                publish_result.record_failure("callback_error")
+            flexkv_logger.error(
+                "Deferred tier publication failed: "
+                f"device={pending.device_type.name}",
+                exc_info=True,
+            )
+            return
+        if node is None:
+            return
+        # Hold the freshly published prefix until the graph drains: the
+        # remaining ops still read these blocks, and nothing else pins them.
+        engine.lock_node(node)
+        tier.pinned_node = node
+
+    @staticmethod
+    def _schedule_tier_commit(
+            pending: DeferredCacheInsert,
+            writer_op_ids: List[Optional[int]],
+            tier_commits: List[DeferredTierCommit],
+            deferred_inserts: List[DeferredCacheInsert],
+            release: DeferredRelease,
+            op_callback_dict: Dict[int, Callable],
+            commit: Callable) -> None:
+        """Route one tier to per-writer publication, or leave it whole-graph.
+
+        ``writer_op_ids`` are the ops that write this tier (full-KV plus its SWA
+        op when one was planned); ``None`` entries mean the op was not planned.
+        With at least one writer the tier commits on the last of them, so it is
+        matchable from that moment instead of waiting on lower tiers. With none
+        -- which happens only on paths that plan no writer for the tier at all
+        -- it stays on the whole-graph ``deferred_inserts`` path.
+        """
+        writers = [op_id for op_id in writer_op_ids if op_id is not None]
+        if not writers:
+            deferred_inserts.append(pending)
+            return
+        tier = DeferredTierCommit(pending=pending, remaining=len(writers))
+        tier_commits.append(tier)
+        for op_id in writers:
+            # One writer op writes exactly one tier, so a collision would be a
+            # planning bug -- but silently dropping someone else's callback is
+            # not an acceptable way to find out.
+            assert op_id not in op_callback_dict, (
+                f"op {op_id} already carries a callback")
+            op_callback_dict[op_id] = CompletionAwareCallback(
+                partial(commit, tier, release))
+
+    def _release_tier_pins(
+            self,
+            tier_commits: Optional[List[DeferredTierCommit]]) -> None:
+        """Drop the pins early tier commits took on their published nodes."""
+        for tier in tier_commits or []:
+            if tier.pinned_node is None:
+                continue
+            self.cache_engines[tier.pending.device_type].unlock(
+                tier.pinned_node)
+            tier.pinned_node = None
+
+    @_synchronized_cache_tree
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, RadixNode],
                            buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
-                           deferred_inserts: Optional[List[DeferredCacheInsert]] = None) -> None:
+                           deferred_inserts: Optional[List[DeferredCacheInsert]] = None,
+                           tier_commits: Optional[List[DeferredTierCommit]] = None,
+                           deferred_release: Optional["DeferredRelease"] = None) -> None:
         """Publish this plan's staging, then release everything it pinned.
 
         Insert-after: no radix node exists for the transferred data until this
         callback mounts it, so the tree never exposes a block whose KV has not
         been written. ``node_to_unlock`` only holds pre-existing nodes this plan
         read from and pinned.
+
+        ``tier_commits`` are tiers that already published on their own writers'
+        completion; here they only give up the pin they took. A tier that never
+        reached its commit (a writer failed) is discarded, exactly like the
+        whole-graph path always did.
         """
         try:
+            for tier in tier_commits or []:
+                if tier.committed:
+                    # Either it mounted a node (pinned below until the release
+                    # flush has run) or it gave everything up into
+                    # deferred_release. Nothing to do here.
+                    continue
+                # A writer of this tier failed, or the graph died before its
+                # commit ran: nothing was published, so the staging is still
+                # wholly ours.
+                pending = tier.pending
+                engine = self.cache_engines[pending.device_type]
+                self._discard_deferred_insert(
+                    engine, pending,
+                    np.asarray(pending.physical_blocks, dtype=np.int64))
             for pending in deferred_inserts or []:
                 try:
                     self._commit_deferred_insert(pending)
@@ -2815,6 +3117,12 @@ class GlobalCacheEngine:
                         exc_info=True,
                     )
         finally:
+            if deferred_release is not None:
+                # Blocks and SWA slots an early tier commit gave up, held back
+                # while the graph still read them. Runs before the tier pins are
+                # dropped: a parked SWA mount targets a node this plan pinned.
+                deferred_release.flush(self._publish_pending_swa_slot)
+            self._release_tier_pins(tier_commits)
             for device_type, node in node_to_unlock.items():
                 engine = self.cache_engines[device_type]
                 assert engine is not None
@@ -2835,15 +3143,22 @@ class GlobalCacheEngine:
                              node_to_unlock: Dict[DeviceType, RadixNode],
                              buffer_to_free: Optional[Dict[DeviceType, np.ndarray]] = None,
                              deferred_inserts: Optional[List[DeferredCacheInsert]] = None,
-                             swa_reservation: Optional[SWAReadReservation] = None) -> None:
-        """Roll back a planned get/put whose graph was never launched.
+                             swa_reservation: Optional[SWAReadReservation] = None,
+                             tier_commits: Optional[List[DeferredTierCommit]] = None,
+                             deferred_release: Optional["DeferredRelease"] = None) -> None:
+        """Roll back a planned get/put whose graph was never launched, or whose
+        graph failed.
 
         The completion path (:meth:`_transfer_callback`) publishes staging and
-        unlocks. On a cancelled plan no transfer ever ran, so publishing would
-        expose unfilled blocks as valid cache — instead every pinned node is
-        unlocked and all staging is discarded (blocks recycled, SWA slots
-        returned). Since insert-after never mounts anything at plan time, there
-        is no partially-published node to unwind.
+        unlocks. Here, staging that was never written must not be published:
+        every pinned node is unlocked and all staging is discarded (blocks
+        recycled, SWA slots returned). Since insert-after never mounts anything
+        at plan time, there is no partially-published node to unwind.
+
+        A tier that already published on its own writers' completion is the one
+        exception -- its data *was* written, and the reviewer's point is exactly
+        that a later H2DISK failure must not take a valid CPU copy with it. Such
+        a tier keeps its node; only the pin is released.
         """
         for device_type, node in node_to_unlock.items():
             self.cache_engines[device_type].unlock(node)
@@ -2851,6 +3166,16 @@ class GlobalCacheEngine:
             for device_type, blocks in buffer_to_free.items():
                 if blocks is not None and len(blocks) > 0:
                     self.cache_engines[device_type].recycle(blocks)
+        for tier in tier_commits or []:
+            if tier.committed:
+                continue
+            pending = tier.pending
+            self._discard_deferred_insert(
+                self.cache_engines[pending.device_type], pending,
+                np.asarray(pending.physical_blocks, dtype=np.int64))
+        if deferred_release is not None:
+            deferred_release.flush(self._publish_pending_swa_slot)
+        self._release_tier_pins(tier_commits)
         for pending in deferred_inserts or []:
             engine = self.cache_engines[pending.device_type]
             physical_blocks = np.asarray(
