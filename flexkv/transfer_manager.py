@@ -354,22 +354,38 @@ class TransferManager:
                                f"(instance_num={self.instance_num}, gpus_per_node={self.model_config.gpus_per_node}, "
                                f"total_gpus={self.model_config.total_gpus}, nnodes={self.model_config.nnodes})")
             last_log_time = time.time()
+            timeout_s = float(GLOBAL_CONFIG_FROM_ENV.gpu_register_timeout_s)
+            deadline = time.time() + timeout_s
             while len(self.all_gpu_blocks) < self.expected_gpus:
+                now = time.time()
+                if now > deadline:
+                    raise RuntimeError(
+                        f"GPU registration timed out after "
+                        f"{timeout_s:.0f}s: "
+                        f"{len(self.all_gpu_blocks)}/{self.expected_gpus} registered "
+                        f"(registered_keys={sorted(self.all_gpu_blocks.keys())}, "
+                        f"port={self.gpu_register_port}). A stale process still owning "
+                        f"this ipc endpoint silently absorbs the registration messages; "
+                        f"kill leftover vLLM/FlexKV processes and set "
+                        f"FLEXKV_SERVER_RECV_PORT to a per-run unique path. "
+                        f"Raise FLEXKV_GPU_REGISTER_TIMEOUT_S if startup is "
+                        f"legitimately slower than this.")
                 try:
                     # Recv from: flexkv.server.client.KVTPClient.register_to_server
                     req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
                 except zmq.Again:
                     # Periodically log waiting status for debugging
-                    now = time.time()
                     if now - last_log_time >= 5.0:
                         registered_keys = sorted(self.all_gpu_blocks.keys())
+                        remaining = deadline - now
                         flexkv_logger.info(
                             f"Still waiting for GPU registrations: "
                             f"{len(self.all_gpu_blocks)}/{self.expected_gpus} registered "
                             f"(registered_keys={registered_keys}, "
-                            f"port={self.gpu_register_port})")
+                            f"port={self.gpu_register_port}, "
+                            f"giving up in {remaining:.0f}s)")
                         last_log_time = now
-                    time.sleep(0.001)
+                    time.sleep(0.05)
                     continue
 
                 if isinstance(req, RegisterTPClientRequest):
@@ -556,7 +572,10 @@ class TransferManager:
         self.transfer_engine.start()
 
     def shutdown(self) -> None:
-        if hasattr(self, 'transfer_engine'):
+        # transfer_engine stays None when initialize_transfer_engine() never
+        # completed (e.g. the GPU registration wait timed out), so a partially
+        # initialized manager must be safe to shut down.
+        if getattr(self, 'transfer_engine', None) is not None:
             self.transfer_engine.shutdown()
 
 class TransferManagerOnRemote(TransferManager):
@@ -1061,23 +1080,29 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     break
         signal.signal(signal.SIGCHLD, _reap_children)
 
-        # Ignore Ctrl+C (SIGINT): process-group SIGINT would race with parent
-        # kill_process_tree(SIGKILL). Only SIGTERM / {'type':'shutdown'} should
-        # trigger paired worker unregister. SIGKILL cannot be handled.
-        def _on_sigterm(signum, frame):
+        def _on_exit_signal(signum, frame):
             flexkv_logger.warning(
                 f"TransferManager process received signal {signum}; exiting for graceful cleanup"
             )
             raise SystemExit(0)
 
+        # SIGINT is handled for the whole life of this process, not just during
+        # startup. A hang (typically the GPU registration wait) leaves an orphan
+        # the user can only reach with Ctrl+C, and this is a non-daemon child:
+        # if we ignored SIGINT, the parent would die and block forever in
+        # multiprocessing's atexit join() waiting for us.
         try:
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-            signal.signal(signal.SIGTERM, _on_sigterm)
+            signal.signal(signal.SIGINT, _on_exit_signal)
+            signal.signal(signal.SIGTERM, _on_exit_signal)
         except Exception as e:
             flexkv_logger.warning(
                 f"Failed to install TransferManager shutdown signal handlers: {e}"
             )
 
+        # Startup failures must leave a non-zero exitcode: is_ready() reports it
+        # to the parent as the reason the subprocess is gone, and exiting 0 would
+        # make a crashed startup look like a clean shutdown.
+        init_failed = False
         try:
             flexkv_logger.debug(f"_process_worker started, pid={os.getpid()}, "
                                f"gpu_register_port={gpu_register_port}")
@@ -1185,7 +1210,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     flexkv_logger.error(f"Error in transfer manager process: {e}")
 
         except Exception as e:
-            flexkv_logger.error(f"Failed to initialize transfer manager process: {e}")
+            flexkv_logger.error(f"Failed to initialize transfer manager process: {e}", exc_info=True)
+            init_failed = True
         finally:
             # Cleanup selector (only if it was created)
             if 'sel' in locals():
@@ -1211,6 +1237,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             except Exception:
                 pass
             flexkv_logger.info("TransferManager process cleanup complete")
+            if init_failed:
+                sys.exit(1)
 
     def start(self) -> None:
         os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
@@ -1219,7 +1247,17 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         os.environ['MPI4PY_RC_INITIALIZE'] = 'true'
 
     def is_ready(self) -> bool:
-        return self.ready_event.is_set()
+        if self.ready_event.is_set():
+            return True
+        # The subprocess can give up during startup (GPU registration timeout).
+        # Surface that instead of leaving callers spinning on a dead process.
+        if self.process is not None and not self.process.is_alive():
+            raise RuntimeError(
+                f"TransferManager subprocess (pid={self.process.pid}, "
+                f"exitcode={self.process.exitcode}) exited before becoming ready; "
+                f"see the [FLEXKV] log above for the startup failure."
+            )
+        return False
 
     def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
         nvtx_range = nvtx.start_range(message="TransferManagerInterProcessHandle.submit", color="green")

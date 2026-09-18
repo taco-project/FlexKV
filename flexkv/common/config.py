@@ -905,6 +905,16 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_manager_shutdown_timeout_s=float(
         os.getenv('FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S', 900)
     ),
+
+    # Upper bound on the TransferManager's wait for every GPU worker to
+    # register. Without it a lost registration (e.g. a stale process still
+    # owning the ipc endpoint) makes startup spin forever instead of failing.
+    # Must stay above the adapter-side registration retry window, otherwise a
+    # slow multi-node start is killed while its ranks are still retrying:
+    #   sglang connector _register_with_retry = 360 attempts x 1s = 360s
+    gpu_register_timeout_s=float(
+        os.getenv('FLEXKV_GPU_REGISTER_TIMEOUT_S', 600)
+    ),
 )
 
 @dataclass

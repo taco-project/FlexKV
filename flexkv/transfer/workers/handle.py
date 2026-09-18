@@ -40,10 +40,11 @@ class WorkerHandle:
             worker_op = WorkerLayerwiseTransferOp(op)
         else:
             worker_op = WorkerTransferOp(op)
-        if trace._TRACE_ON:
+        if trace.timing_enabled():
             submitted_ns = time.perf_counter_ns()
             worker_op.prof_submitted_ns = submitted_ns
             trace.set_submit_ns(op.op_id, submitted_ns)
+        if trace._TRACE_ON:
             trace.inc_inflight()
         self.transfer_conn.send(worker_op)
 

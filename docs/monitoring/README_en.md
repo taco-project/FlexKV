@@ -13,6 +13,7 @@ FlexKV integrates a [Prometheus](https://prometheus.io/)-based runtime metrics m
 | `FLEXKV_ENABLE_METRICS` | `0` | Enable metrics collection (set to `1` to enable, disabled by default) |
 | `FLEXKV_PY_METRICS_PORT` | `8080` | Python metrics HTTP server port |
 | `FLEXKV_CPP_METRICS_PORT` | `8081` | C++ metrics HTTP server port |
+| `FLEXKV_TRANSFER_TRACE` | `0` | Log per-transfer timing (`[XFER]` lines). Logs only; does not affect metrics |
 
 ### 1.2 Configuration
 
@@ -45,6 +46,13 @@ Python metrics are recorded by `GlobalCacheEngine` in `cache_engine.py` and coll
 | `flexkv_py_evicted_blocks_total` | Counter | `device` | Total number of evicted blocks |
 | `flexkv_py_allocated_blocks_total` | Counter | `device` | Total number of allocated blocks |
 | `flexkv_py_allocation_failures_total` | Counter | `mode` | Number of allocation failures |
+| `flexkv_py_transfer_wait_duration_seconds` | Histogram | `transfer_type` | Time the op waited on the worker before the transfer (received → started) |
+| `flexkv_py_transfer_xfer_duration_seconds` | Histogram | `transfer_type` | Time in the transfer itself (started → returned) |
+| `flexkv_py_transfer_e2e_duration_seconds` | Histogram | `transfer_type` | End-to-end time (submit → completion observed), including both |
+
+> The three duration metrics are bucketed 0.5ms – 30s and labelled by
+> `transfer_type`. Timing follows `FLEXKV_ENABLE_METRICS` and covers successful
+> transfers only.
 
 ---
 

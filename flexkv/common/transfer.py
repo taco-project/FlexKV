@@ -40,6 +40,16 @@ class CompletedOp:
     # Per-block completion status for backends that can partially succeed.
     # ``None`` preserves the all-or-nothing contract of existing workers.
     block_results: Optional[Tuple[bool, ...]] = None
+    # Lifecycle durations in milliseconds, 0.0 when timing is off. Measured on
+    # the worker that ran the op and carried back through the completion queue,
+    # so the task layer can export them without touching the transfer process.
+    #   wait_ms: worker received -> launch started (queued behind other ops)
+    #   xfer_ms: launch started  -> launch returned (the transfer itself)
+    #   e2e_ms:  submitted       -> completion observed (includes both, plus
+    #            hand-off to the worker and completion reporting)
+    wait_ms: float = 0.0
+    xfer_ms: float = 0.0
+    e2e_ms: float = 0.0
     # True on the graph-level message that reports the graph terminated because
     # one of its ops failed. Defaults False so the message stays pickle- and
     # constructor-compatible with existing producers/consumers.
@@ -183,6 +193,12 @@ class TransferOp:
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
     pending_count: int = 0
+    # (wait_ms, xfer_ms, e2e_ms) from the worker that ran this op, filled in by
+    # the engine as completions arrive. None until then, and for ops that never
+    # reach a worker (VIRTUAL) or when timing is off. Under PP fan-out every
+    # replica reports its own, and the parent keeps the slowest: the parent is
+    # not done until its last replica lands.
+    timing_ms: Optional[Tuple[float, float, float]] = None
     # ---- which pool this op's block ids index --------------------------------
     # A pool is one slot-id space. It is the *pool* that differs, not the
     # transfer: the op reuses the standard transfer_type (D2H/H2D/DISK2H/
