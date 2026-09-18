@@ -193,6 +193,12 @@ class TransferOp:
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
     pending_count: int = 0
+    # (wait_ms, xfer_ms, e2e_ms) from the worker that ran this op, filled in by
+    # the engine as completions arrive. None until then, and for ops that never
+    # reach a worker (VIRTUAL) or when timing is off. Under PP fan-out every
+    # replica reports its own, and the parent keeps the slowest: the parent is
+    # not done until its last replica lands.
+    timing_ms: Optional[Tuple[float, float, float]] = None
     # ---- which pool this op's block ids index --------------------------------
     # A pool is one slot-id space. It is the *pool* that differs, not the
     # transfer: the op reuses the standard transfer_type (D2H/H2D/DISK2H/

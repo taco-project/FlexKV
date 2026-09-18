@@ -1030,11 +1030,11 @@ class TransferEngine:
                                     parent_op = self.op_id_to_op[parent_op_id]
                                     self._merge_block_results(
                                         parent_op, child_op.block_results)
-                                    if timing is not None:
-                                        # The parent is finalized when its last
-                                        # replica lands, so that replica owns
-                                        # the duration the parent reports.
-                                        parent_op._timing_ms = timing
+                                    # Slowest replica wins: the parent is not
+                                    # complete until every PP sibling lands, so
+                                    # its duration is the max, not whichever
+                                    # replica happened to be dequeued last.
+                                    self._accumulate_timing(parent_op, timing)
                                     parent_op.pending_count -= 1
                                     if parent_op.pending_count == 0:
                                         self._finalize_or_discard(parent_op, finished_ops)
@@ -1045,8 +1045,7 @@ class TransferEngine:
                                     op = self.op_id_to_op[op_id]
                                     self._merge_block_results(op, block_results)
                                     timing = self._emit_xfer_trace(op_id, metrics)
-                                    if timing is not None:
-                                        op._timing_ms = timing
+                                    self._accumulate_timing(op, timing)
                                     op.pending_count -= 1
                                     if op.pending_count == 0:
                                         self._finalize_or_discard(op, finished_ops)
@@ -1130,7 +1129,9 @@ class TransferEngine:
         else:
             self._finalize_op(op, finished_ops)
 
-    def _emit_xfer_trace(self, op_id: int, metrics):
+    def _emit_xfer_trace(
+        self, op_id: int, metrics: Optional[dict]
+    ) -> Optional[Tuple[float, float, float]]:
         """Print one ``[XFER]`` line for a completed op (transfer tracing).
 
         Combines the worker-computed timing metrics with the scheduler-side
@@ -1146,6 +1147,26 @@ class TransferEngine:
         if metrics is None:
             return None
         return (metrics["wait_ms"], metrics["xfer_ms"], e2e_ms)
+
+    @staticmethod
+    def _accumulate_timing(
+        op: TransferOp, timing: Optional[Tuple[float, float, float]]
+    ) -> None:
+        """Fold one worker's durations into ``op.timing_ms``, keeping the max.
+
+        An op with no fan-out sees exactly one call, so this is an assignment.
+        A PP-fan-out parent sees one call per replica, and the parent's own
+        duration is the slowest of them -- it is not complete until the last
+        one lands.
+        """
+        if timing is None:
+            return
+        current = op.timing_ms
+        op.timing_ms = timing if current is None else (
+            max(current[0], timing[0]),
+            max(current[1], timing[1]),
+            max(current[2], timing[2]),
+        )
 
     def _handle_failed_op(self, op_id: int) -> None:
         """A worker reported a failed transfer for ``op_id``.
@@ -1229,9 +1250,9 @@ class TransferEngine:
         token_size_in_bytes_per_pp_stage = self._num_layers_for_local_pp_stage * avg_bytes_per_layer
         num_bytes = num_blocks * self.cache_config.tokens_per_block * token_size_in_bytes_per_pp_stage
         transfer_type_str = op.transfer_type.value if op.transfer_type != TransferType.VIRTUAL else None
-        # Set by _emit_xfer_trace from the worker's timestamps; absent for ops
-        # that never reached a worker (VIRTUAL) and when timing is off.
-        timing = getattr(op, "_timing_ms", None)
+        # Filled in by _accumulate_timing from the worker's timestamps; absent
+        # for ops that never reached a worker (VIRTUAL) and when timing is off.
+        timing = op.timing_ms
         self.completed_queue.put(CompletedOp(
             graph_id=op.graph_id,
             op_id=op.op_id,

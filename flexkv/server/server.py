@@ -374,9 +374,22 @@ class KVServer:
         )
 
     def _handle_is_ready_request(self, req: IsReadyRequest) -> None:
-        """Handle ready state check request"""
-        is_ready = self.kv_task_engine.is_ready()
-        response = Response(dp_client_id=req.dp_client_id, is_ready=is_ready)
+        """Handle ready state check request.
+
+        ``is_ready()`` raises when the TransferManager subprocess died during
+        startup. The client is blocked in a synchronous recv, and the run
+        loop's ``except Exception`` would swallow the error without replying,
+        so a failure that has a clear cause would surface as an unexplained
+        hang. Report it as a response instead.
+        """
+        try:
+            is_ready = self.kv_task_engine.is_ready()
+            error_msg = None
+        except Exception as e:  # noqa: BLE001
+            flexkv_logger.error(f"is_ready check failed: {e}", exc_info=True)
+            is_ready = False
+            error_msg = str(e)
+        response = Response(dp_client_id=req.dp_client_id, is_ready=is_ready, error_msg=error_msg)
         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
         result_zmq.send_pyobj(response)
 

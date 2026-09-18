@@ -36,13 +36,6 @@ from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import RegistrationKey, RegisterTPClientRequest, Response
 
 
-# Upper bound on the GPU registration wait. Without it a lost registration
-# (e.g. a stale process still owning the ipc endpoint) makes the TransferManager
-# spin forever instead of failing. 300s covers the slowest realistic startup
-# (a large TP group initializing CUDA contexts) with a wide margin.
-GPU_REGISTER_TIMEOUT_S = 300.0
-
-
 class TransferManager:
     def __init__(self,
                  model_config: ModelConfig,
@@ -361,19 +354,22 @@ class TransferManager:
                                f"(instance_num={self.instance_num}, gpus_per_node={self.model_config.gpus_per_node}, "
                                f"total_gpus={self.model_config.total_gpus}, nnodes={self.model_config.nnodes})")
             last_log_time = time.time()
-            deadline = time.time() + GPU_REGISTER_TIMEOUT_S
+            timeout_s = float(GLOBAL_CONFIG_FROM_ENV.gpu_register_timeout_s)
+            deadline = time.time() + timeout_s
             while len(self.all_gpu_blocks) < self.expected_gpus:
                 now = time.time()
                 if now > deadline:
                     raise RuntimeError(
                         f"GPU registration timed out after "
-                        f"{GPU_REGISTER_TIMEOUT_S:.0f}s: "
+                        f"{timeout_s:.0f}s: "
                         f"{len(self.all_gpu_blocks)}/{self.expected_gpus} registered "
                         f"(registered_keys={sorted(self.all_gpu_blocks.keys())}, "
                         f"port={self.gpu_register_port}). A stale process still owning "
                         f"this ipc endpoint silently absorbs the registration messages; "
                         f"kill leftover vLLM/FlexKV processes and set "
-                        f"FLEXKV_SERVER_RECV_PORT to a per-run unique path.")
+                        f"FLEXKV_SERVER_RECV_PORT to a per-run unique path. "
+                        f"Raise FLEXKV_GPU_REGISTER_TIMEOUT_S if startup is "
+                        f"legitimately slower than this.")
                 try:
                     # Recv from: flexkv.server.client.KVTPClient.register_to_server
                     req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
@@ -1103,6 +1099,10 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                 f"Failed to install TransferManager shutdown signal handlers: {e}"
             )
 
+        # Startup failures must leave a non-zero exitcode: is_ready() reports it
+        # to the parent as the reason the subprocess is gone, and exiting 0 would
+        # make a crashed startup look like a clean shutdown.
+        init_failed = False
         try:
             flexkv_logger.debug(f"_process_worker started, pid={os.getpid()}, "
                                f"gpu_register_port={gpu_register_port}")
@@ -1210,7 +1210,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     flexkv_logger.error(f"Error in transfer manager process: {e}")
 
         except Exception as e:
-            flexkv_logger.error(f"Failed to initialize transfer manager process: {e}")
+            flexkv_logger.error(f"Failed to initialize transfer manager process: {e}", exc_info=True)
+            init_failed = True
         finally:
             # Cleanup selector (only if it was created)
             if 'sel' in locals():
@@ -1236,6 +1237,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             except Exception:
                 pass
             flexkv_logger.info("TransferManager process cleanup complete")
+            if init_failed:
+                sys.exit(1)
 
     def start(self) -> None:
         os.environ['MPI4PY_RC_INITIALIZE'] = 'false'

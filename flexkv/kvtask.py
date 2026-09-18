@@ -994,6 +994,12 @@ class KVTaskManager:
             ),
             num_bytes=max(current.num_bytes, incoming.num_bytes),
             block_results=block_results,
+            # The op is only done once its slowest handle is done, so the
+            # merged durations are the max. Without this the histogram would
+            # silently keep whichever handle happened to arrive first.
+            wait_ms=max(current.wait_ms, incoming.wait_ms),
+            xfer_ms=max(current.xfer_ms, incoming.xfer_ms),
+            e2e_ms=max(current.e2e_ms, incoming.e2e_ms),
         )
 
 class KVTaskEngine(KVTaskManager):

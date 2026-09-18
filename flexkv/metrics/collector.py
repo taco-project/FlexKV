@@ -24,17 +24,17 @@ except ImportError:
     Gauge = None
     Histogram = None
 
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.debug import flexkv_logger
+
+logger = flexkv_logger
+
 # Transfer duration buckets, in seconds: 0.5ms (small H2D/D2H hit) up to 30s
 # (a cold SSD read of a long prefix). Wide because the same op type spans both.
 TRANSFER_DURATION_BUCKETS = (
     0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
     0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0,
 )
-
-from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
-from flexkv.common.debug import flexkv_logger
-
-logger = flexkv_logger
 
 # Flag to track if metrics server auto-start has been attempted
 _metrics_server_auto_started = False
