@@ -192,9 +192,9 @@ def _seed_long_ssd_short_cpu_hit(eng, tok):
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
     cpu_match = eng.cpu_cache_engine.match(seq)
     ssd_match = eng.ssd_cache_engine.match(seq)
-    assert cpu_match.num_ready_matched_blocks == 2
+    assert cpu_match.num_matched_blocks == 2
     assert cpu_match.swa_hit_blocks == 2
-    assert ssd_match.num_ready_matched_blocks == 4
+    assert ssd_match.num_matched_blocks == 4
     assert ssd_match.swa_hit_blocks == 4
     return cpu_match, ssd_match
 
@@ -223,7 +223,7 @@ def test_put_builds_full_plus_swa_store_chain():
     assert eng.cpu_cache_engine.swa_pool.num_used == 1  # one slot allocated
     sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
     pending = eng.cpu_cache_engine.match(sm)
-    assert pending.num_ready_matched_blocks == 0
+    assert pending.num_matched_blocks == 0
     assert pending.last_node.swa_host_slot == -1
     assert pending.swa_hit_blocks == 0
 
@@ -237,7 +237,7 @@ def test_put_builds_full_plus_swa_store_chain():
     # miss until its independent sibling D2H completes.
     op_cb[full_d2h.op_id]()
     full_only = eng.cpu_cache_engine.match(sm)
-    assert full_only.num_ready_matched_blocks == 4
+    assert full_only.num_matched_blocks == 4
     assert full_only.swa_hit_blocks == 0
     assert full_only.last_node.swa_host_slot == -1
 
@@ -272,14 +272,14 @@ def test_put_swa_first_stays_hidden_until_full_kv_is_ready():
     # match_prefix still requires the owning Full-KV node to be ready.
     op_cb[swa_d2h.op_id]()
     swa_only = eng.cpu_cache_engine.match(seq)
-    assert swa_only.num_ready_matched_blocks == 0
+    assert swa_only.num_matched_blocks == 0
     assert swa_only.swa_hit_blocks == 0
     assert swa_only.last_node.swa_host_slot >= 0
 
     op_cb[full_d2h.op_id]()
     cb()
     ready = eng.cpu_cache_engine.match(seq)
-    assert ready.num_ready_matched_blocks == 4
+    assert ready.num_matched_blocks == 4
     assert ready.swa_hit_blocks == 4
 
 
@@ -308,7 +308,7 @@ def test_put_full_swa_pool_keeps_match_node_alive_until_insert():
 
     seq = SequenceMeta(token_ids=extended, tokens_per_block=TPB)
     ready = eng.cpu_cache_engine.match(seq)
-    assert ready.num_ready_matched_blocks == 4
+    assert ready.num_matched_blocks == 4
     assert ready.swa_hit_blocks == 4
     assert eng.cpu_cache_engine.swa_pool.num_used == 1
 
@@ -532,14 +532,14 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
     assert eng.ssd_cache_engine.swa_pool.num_used == 1
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
     pending = eng.ssd_cache_engine.match(seq)
-    assert pending.num_ready_matched_blocks == 0
+    assert pending.num_matched_blocks == 0
     assert pending.last_node.swa_host_slot == -1
     assert pending.swa_hit_blocks == 0
 
     op_cb[full_d2h.op_id]()
     op_cb[full_h2disk.op_id]()
     full_only = eng.ssd_cache_engine.match(seq)
-    assert full_only.num_ready_matched_blocks == 4
+    assert full_only.num_matched_blocks == 4
     assert full_only.swa_hit_blocks == 0
 
     op_cb[swa_d2h.op_id]()
@@ -622,7 +622,7 @@ def test_get_ssd_staging_failure_does_not_report_fullkv_hit(monkeypatch):
     assert ssd_swa_node.swa_lock_ref == 0, "failed source pin leaked"
     cpu_after = eng.cpu_cache_engine.match(
         SequenceMeta(token_ids=tok, tokens_per_block=TPB))
-    assert cpu_after.num_ready_matched_blocks == 2
+    assert cpu_after.num_matched_blocks == 2
     assert cpu_after.swa_hit_blocks == 2
     assert np.array_equal(cpu_after.physical_blocks[:2], cpu_blocks)
     cb()
@@ -671,7 +671,7 @@ def test_get_ssd_staging_protects_referenced_cpu_fullkv(monkeypatch):
     # and its Full-KV blocks must still exist until the GET finishes.
     cpu_during_get = eng.cpu_cache_engine.match(
         SequenceMeta(token_ids=tok, tokens_per_block=TPB))
-    assert cpu_during_get.num_ready_matched_blocks == 2
+    assert cpu_during_get.num_matched_blocks == 2
     assert np.array_equal(cpu_during_get.physical_blocks[:2], cpu_blocks)
     _complete(op_cb, cb)
 

@@ -34,7 +34,6 @@ class _MooncakeRemoteStub:
     def match(self, sequence_meta):
         hit = min(self.kv_hit, sequence_meta.num_blocks)
         return MatchResultAccel(
-            num_ready_matched_blocks=hit,
             num_matched_blocks=hit,
             kv_matched_blocks=hit,
             physical_blocks=np.arange(hit, dtype=np.int64),
@@ -128,9 +127,25 @@ def _find_op(plan_or_graph, transfer_type):
     )
 
 
+def _pending_for(plan, device_type=DeviceType.CPU):
+    """The plan's staging for one tier, wherever it was routed.
+
+    A tier with its own writer ops publishes from ``tier_commits`` (on the last
+    of those ops); one without stays on the whole-graph ``deferred_inserts``
+    path. Tests that exercise the commit itself do not care which.
+    """
+    for pending in plan.deferred_inserts:
+        if pending.device_type == device_type:
+            return pending
+    for tier in plan.tier_commits:
+        if tier.pending.device_type == device_type:
+            return tier.pending
+    raise AssertionError(f"plan stages nothing for {device_type.name}")
+
+
 def _seed_ready(engine, sequence):
     blocks = engine.take(sequence.num_blocks)
-    node = engine.insert(sequence, blocks, is_ready=True)
+    node = engine.insert(sequence, blocks)
     assert node is not None
     return blocks, node
 
@@ -142,14 +157,27 @@ def _start_put(manager, request_id, sequence, gpu_block_start):
         gpu_block_start + sequence.num_blocks,
         dtype=np.int64,
     )
-    graph, _, callback, _, _ = manager.put(
+    graph, _, callback, op_callbacks, _ = manager.put(
         request_id=request_id,
         token_ids=sequence.token_ids.copy(),
         token_mask=token_mask,
         slot_mapping=slot_mapping,
         dp_client_id=0,
     )
-    return graph, callback
+
+    def finish():
+        """Drain this plan the way the transfer engine does.
+
+        Each tier publishes when its own writer ops report in, so the op
+        callbacks come first; the plan handle then releases the pins and
+        whatever the early commits parked.
+        """
+        for op_callback in op_callbacks.values():
+            op_callback()
+        callback()
+
+    finish.keywords = callback.keywords
+    return graph, finish
 
 
 def test_cpu_ssd_duplicate_put_fresh_rematch_recycles_loser_after_split():
@@ -174,15 +202,15 @@ def test_cpu_ssd_duplicate_put_fresh_rematch_recycles_loser_after_split():
 
     for callback in (first_callback, second_callback):
         locked = callback.keywords["node_to_unlock"]
-        assert locked[DeviceType.CPU][0] is cpu_anchor
-        assert locked[DeviceType.CPU][1] == 0
-        assert locked[DeviceType.SSD][0] is ssd_anchor
-        assert locked[DeviceType.SSD][1] == 0
+        assert locked[DeviceType.CPU] is cpu_anchor
+        assert locked[DeviceType.SSD] is ssd_anchor
+        # Both tiers publish on their own writers' completion.
         pending_tiers = {
-            pending.device_type
-            for pending in callback.keywords["deferred_inserts"]
+            tier.pending.device_type
+            for tier in callback.keywords["tier_commits"]
         }
         assert pending_tiers == {DeviceType.CPU, DeviceType.SSD}
+        assert callback.keywords["deferred_inserts"] == []
     assert cpu_anchor.lock_cnt == initial_cpu_locks + 2
     assert ssd_anchor.lock_cnt == initial_ssd_locks + 2
 
@@ -211,12 +239,11 @@ def test_cpu_ssd_duplicate_put_fresh_rematch_recycles_loser_after_split():
             np.concatenate((seed[:2], winner)),
         )
         np.testing.assert_array_equal(branch_match.physical_blocks, seed)
-        assert target_match.num_ready_matched_blocks == target.num_blocks
-        assert branch_match.num_ready_matched_blocks == existing_branch.num_blocks
+        assert target_match.num_matched_blocks == target.num_blocks
+        assert branch_match.num_matched_blocks == existing_branch.num_blocks
         assert engine.mempool._free_mask[loser].all()
         assert not engine.mempool._free_mask[winner].any()
         assert engine.mempool.num_used_blocks == engine.index.total_cached_blocks()
-        assert engine.index.total_unready_blocks() == 0
 
 
 @pytest.mark.parametrize("finish_second_first", [False, True])
@@ -227,22 +254,22 @@ def test_duplicate_puts_publish_one_owner_and_recycle_the_loser(
     sequence = _sequence([1, 2, 3])
     first = _plan(manager, 1, sequence)
     second = _plan(manager, 2, sequence)
-    first_blocks = first.deferred_inserts[0].physical_blocks.copy()
-    second_blocks = second.deferred_inserts[0].physical_blocks.copy()
+    first_blocks = _pending_for(first).physical_blocks.copy()
+    second_blocks = _pending_for(second).physical_blocks.copy()
 
     assert manager.cpu_cache_engine.index.total_cached_blocks() == 0
     assert manager.cpu_cache_engine.mempool.num_used_blocks == 6
 
     winner, loser = ((second, first) if finish_second_first
                      else (first, second))
-    manager._commit_deferred_insert(winner.deferred_inserts[0])
-    manager._commit_deferred_insert(loser.deferred_inserts[0])
+    manager._commit_deferred_insert(_pending_for(winner))
+    manager._commit_deferred_insert(_pending_for(loser))
 
     expected = second_blocks if finish_second_first else first_blocks
     duplicate = first_blocks if finish_second_first else second_blocks
     match = manager.cpu_cache_engine.match(sequence)
     np.testing.assert_array_equal(match.physical_blocks, expected)
-    assert match.num_ready_matched_blocks == 3
+    assert match.num_matched_blocks == 3
     assert manager.cpu_cache_engine.mempool.num_used_blocks == 3
     assert manager.cpu_cache_engine.mempool._free_mask[duplicate].all()
     assert not manager.cpu_cache_engine.mempool._free_mask[expected].any()
@@ -257,12 +284,12 @@ def test_overlapping_puts_fresh_rematch_and_split_without_leaking(
     second_sequence = _sequence([1, 3])
     first = _plan(manager, 1, first_sequence)
     second = _plan(manager, 2, second_sequence)
-    first_blocks = first.deferred_inserts[0].physical_blocks.copy()
-    second_blocks = second.deferred_inserts[0].physical_blocks.copy()
+    first_blocks = _pending_for(first).physical_blocks.copy()
+    second_blocks = _pending_for(second).physical_blocks.copy()
 
     ordered = (second, first) if finish_second_first else (first, second)
     for plan in ordered:
-        manager._commit_deferred_insert(plan.deferred_inserts[0])
+        manager._commit_deferred_insert(_pending_for(plan))
 
     first_match = manager.cpu_cache_engine.match(first_sequence)
     second_match = manager.cpu_cache_engine.match(second_sequence)
@@ -272,34 +299,37 @@ def test_overlapping_puts_fresh_rematch_and_split_without_leaking(
     assert second_match.physical_blocks.tolist() == [
         expected_shared, second_blocks[1]]
     assert manager.cpu_cache_engine.index.total_cached_blocks() == 3
-    assert manager.cpu_cache_engine.index.total_unready_blocks() == 0
     assert manager.cpu_cache_engine.mempool.num_used_blocks == 3
 
 
-def test_put_never_uses_an_unready_local_prefix_as_mooncake_source():
+def test_put_never_uses_detached_staging_as_the_mooncake_source():
+    """Insert-after has no unready node; staging is simply not on the tree.
+
+    The invariant the removed readiness flag protected still has to hold: a
+    concurrent PUT that has allocated CPU staging but has not completed its
+    D2H must not have those blocks picked up as someone else's upload source.
+    """
     manager = _manager()
     sequence = _sequence([1, 2, 3])
-    unready = manager.cpu_cache_engine.take(1)
-    manager.cpu_cache_engine.insert(
-        sequence, unready, num_insert_blocks=1, is_ready=False)
+    inflight = _plan(manager, 1, sequence)
+    staged = _find_op(inflight, TransferType.D2H).dst_block_ids.copy()
+    assert manager.cpu_cache_engine.index.total_cached_blocks() == 0
 
-    plan = _plan(manager, 1, sequence)
+    plan = _plan(manager, 2, sequence)
     d2h = _find_op(plan, TransferType.D2H)
     h2remote = _find_op(plan, TransferType.H2REMOTE)
 
-    # All three blocks come from this request's GPU data. The pre-existing
-    # unready block must not appear in the upload source.
+    # All three blocks come from this request's own GPU data.
     assert len(d2h.dst_block_ids) == 3
     np.testing.assert_array_equal(h2remote.src_block_ids, d2h.dst_block_ids)
-    assert int(unready[0]) not in set(h2remote.src_block_ids.tolist())
-    assert manager.cpu_cache_engine.index.total_cached_blocks() == 1
+    assert not set(staged.tolist()) & set(h2remote.src_block_ids.tolist())
 
 
 def test_ready_cpu_hit_retries_a_missing_mooncake_upload_without_d2h():
     manager = _manager(remote_hit=0)
     sequence = _sequence([1, 2, 3])
     initial = _plan(manager, 1, sequence)
-    manager._commit_deferred_insert(initial.deferred_inserts[0])
+    manager._commit_deferred_insert(_pending_for(initial))
     cached = manager.cpu_cache_engine.match(sequence).physical_blocks.copy()
 
     retry = _plan(manager, 2, sequence)
@@ -313,7 +343,11 @@ def test_ready_cpu_hit_retries_a_missing_mooncake_upload_without_d2h():
         cached,
     )
     assert retry.deferred_inserts == []
-    assert retry.node_to_unlock[DeviceType.CPU][1] == 0
+    # The mooncake REMOTE tier is key-addressed, so nothing is staged locally;
+    # the CPU source it uploads from is the pre-existing node, pinned for the
+    # graph's lifetime.
+    assert retry.tier_commits == []
+    assert retry.node_to_unlock[DeviceType.CPU] is not None
 
 
 def test_duplicate_put_recycles_its_swa_slot_without_replacing_the_winner():
@@ -324,8 +358,8 @@ def test_duplicate_put_recycles_its_swa_slot_without_replacing_the_winner():
     engine.swa_pool = SimpleNamespace(
         free=lambda slot: freed_slots.append(int(slot)))
 
-    first = _plan(manager, 1, sequence).deferred_inserts[0]
-    second = _plan(manager, 2, sequence).deferred_inserts[0]
+    first = _pending_for(_plan(manager, 1, sequence))
+    second = _pending_for(_plan(manager, 2, sequence))
     first = replace(first, swa_slot=7)
     second = replace(second, swa_slot=8)
 
@@ -343,8 +377,8 @@ def test_p2p_publication_happens_once_for_the_inserted_ready_node():
     engine = manager.cpu_cache_engine
     engine.local_index = SimpleNamespace(insert_and_publish=Mock())
 
-    first = _plan(manager, 1, sequence).deferred_inserts[0]
-    second = _plan(manager, 2, sequence).deferred_inserts[0]
+    first = _pending_for(_plan(manager, 1, sequence))
+    second = _pending_for(_plan(manager, 2, sequence))
     first = replace(first, publish_to_peer=True)
     second = replace(second, publish_to_peer=True)
 
@@ -352,4 +386,4 @@ def test_p2p_publication_happens_once_for_the_inserted_ready_node():
     manager._commit_deferred_insert(second)
 
     engine.local_index.insert_and_publish.assert_called_once_with(inserted)
-    assert engine.match(sequence).num_ready_matched_blocks == 2
+    assert engine.match(sequence).num_matched_blocks == 2
