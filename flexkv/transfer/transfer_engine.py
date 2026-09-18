@@ -34,6 +34,7 @@ from flexkv.transfer.scheduler import TransferScheduler
 from flexkv.transfer import trace
 from flexkv.transfer.workers import (
     WorkerHandle,
+    CPUCXLTransferWorker,
     CPUSSDDiskTransferWorker,
     CPURemoteTransferWorker,
     GPUCPUTransferWorker,
@@ -83,6 +84,10 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
         TransferType.H2PEERH: (2, 5),  # CPU -> PEER_CPU
         TransferType.PEERSSD2H: (6, 2),# PEER_SSD -> CPU
         TransferType.H2PEERSSD: (2, 6),# CPU -> PEER_SSD
+        TransferType.H2CXL: (2, 7),    # CPU -> CXL
+        TransferType.CXL2H: (7, 2),    # CXL -> CPU
+        TransferType.CXL2DISK: (7, 3), # CXL -> SSD
+        TransferType.DISK2CXL: (3, 7), # SSD -> CXL
     }
 
     src_device, dst_device = transfer_type_to_devices.get(op.transfer_type, (0, 0))
@@ -112,6 +117,7 @@ class TransferEngine:
         model_config: ModelConfig,
         cache_config: CacheConfig,
         cpu_handle: Optional[StorageHandle] = None,
+        cxl_handle: Optional[StorageHandle] = None,
         ssd_handle: Optional[StorageHandle] = None,
         remote_handle: Optional[StorageHandle] = None,
         gpu_blocks_per_group: Optional[Dict[WorkerKey, List]] = None,
@@ -159,6 +165,7 @@ class TransferEngine:
         self.shutdown_read_fd, self.shutdown_write_fd = os.pipe()
         self.gpu_handle_groups = gpu_handles  # WorkerKey -> list of GPU handles for that TP group
         self._cpu_handle = cpu_handle
+        self._cxl_handle = cxl_handle
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
         self._gpu_blocks_per_group = gpu_blocks_per_group
@@ -491,6 +498,20 @@ class TransferEngine:
                 layer_groups=ssd_layer_groups,
             )
             self._register_worker(PoolId.FULL_KV, TransferType.H2DISK, self.cpussd_write_worker)
+        if self._cxl_handle is not None and self._cpu_handle is not None:
+            self.cpucxl_worker: WorkerHandle = CPUCXLTransferWorker.create_worker(
+                mp_ctx=self.mp_ctx,
+                finished_ops_queue=self.finished_ops_queue,
+                op_buffer_tensor=self.pin_buffer.get_buffer(),
+                cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                cxl_blocks=self._cxl_handle.get_tensor(),
+                cpu_kv_layout=self._cpu_handle.kv_layout,
+                cxl_kv_layout=self._cxl_handle.kv_layout,
+                dtype=self._cpu_handle.dtype,
+            )
+            self._register_worker(PoolId.FULL_KV, TransferType.H2CXL, self.cpucxl_worker)
+            self._register_worker(PoolId.FULL_KV, TransferType.CXL2H, self.cpucxl_worker)
+            flexkv_logger.info("CXL transfer workers initialized")
         if self._remote_handle is not None and self._cpu_handle is not None:
             self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
