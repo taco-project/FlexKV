@@ -81,6 +81,13 @@ class RadixNode:
     hit_count: int = 0
     creation_time: float = 0.0
     last_access_time: float = 0.0
+    # Cached sum of ancestor sizes (blocks preceding this node). Maintained
+    # incrementally in split() and RadixTreeIndex.insert so StreamingLLM sink
+    # checks are O(1) instead of an O(depth) walk to root. split()/merge_child
+    # preserve the block count along every root->descendant path, so only the
+    # split node itself and freshly-inserted nodes ever need updating (no
+    # subtree refresh). Root and freshly-created nodes start at 0.
+    block_offset: int = 0
 
     parent: Optional['RadixNode'] = None
     children: Dict[Optional[HashType], 'RadixNode'] = field(default_factory=dict)
@@ -180,6 +187,11 @@ class RadixNode:
         new_node.parent = self.parent
         self.parent = new_node
         new_node.children[self.head_hash()] = self
+        # Offset maintenance (O(1)): new_node is the PREFIX half and keeps this
+        # node's original offset; self is the SUFFIX half and now starts
+        # new_node.size() blocks later. Read the old offset before overwriting.
+        new_node.block_offset = self.block_offset
+        self.block_offset = new_node.block_offset + new_node.size()
         # self keeps its SWA and its SWA-LRU membership unchanged (its last page
         # is unchanged), so no SWA-LRU surgery is needed here.
         return new_node
@@ -212,7 +224,7 @@ class RadixNode:
 class RadixTreeIndex:
     def __init__(self, tokens_per_block: int, max_num_blocks: int = 1000000,
                  hit_reward_seconds: int = 0, eviction_policy: str = "lru",
-                 protected_threshold: int = 2):
+                 protected_threshold: int = 2, sink_block_count: int = 0):
         self.root_node: RadixNode = RadixNode(block_hashes=np.array([], dtype=np.int64),
                                               physical_blocks=np.array([], dtype=np.int64),
                                               is_ready=True,
@@ -228,6 +240,9 @@ class RadixTreeIndex:
         self.hit_reward_seconds = hit_reward_seconds
         self.eviction_policy = eviction_policy
         self.protected_threshold = protected_threshold
+        # StreamingLLM: protect the first N blocks (attention sinks) from eviction.
+        # Sink tokens always receive high attention scores and should never be evicted.
+        self.sink_block_count = sink_block_count
 
         # ===== SWA-only LRU (intrusive doubly-linked list w/ sentinels) =====
         # head side = MRU, tail side = LRU. Nodes carrying a live SWA slot are on
@@ -531,6 +546,10 @@ class RadixTreeIndex:
         new_node.parent = last_node
         last_node.children[new_node.head_hash()] = new_node
         self.leaf_nodes[new_node.head_hash()] = new_node
+        # O(1) offset: blocks preceding new_node == offset+size of its parent.
+        # (last_node may be the root, whose offset and size are both 0.)
+        new_node.block_offset = (0 if last_node.is_root()
+                                 else last_node.block_offset + last_node.size())
 
         return new_node
 
@@ -590,15 +609,31 @@ class RadixTreeIndex:
 
     def evict(self, num_evicted: int) -> Tuple[np.ndarray, np.ndarray]:
         candidates = []
+        sink_candidates = []
         for node in self.leaf_nodes.values():
-            if node.evictable():
-                priority = self._get_eviction_priority(node)
-                candidates.append((priority, node))
+            if not node.evictable():
+                continue
+            # StreamingLLM: protect attention-sink blocks (first sink_block_count
+            # blocks from the root). They are always attended to and should be
+            # evicted only as a last resort when no non-sink block is available.
+            is_sink = (self.sink_block_count > 0 and
+                       self._get_block_offset_from_root(node) < self.sink_block_count)
+            if is_sink:
+                sink_candidates.append(
+                    (self._get_raw_eviction_priority(node), node))
+            else:
+                candidates.append((self._get_eviction_priority(node), node))
         heapq.heapify(candidates)
+        heapq.heapify(sink_candidates)
         evicted_blocks = np.array([], dtype=np.int64)
         evicted_block_hashes = np.array([], dtype=np.int64)
-        while len(evicted_blocks) < num_evicted and candidates:
-            priority, node = heapq.heappop(candidates)
+        while (len(evicted_blocks) < num_evicted
+               and (candidates or sink_candidates)):
+            # Re-evaluate fallback after every structural mutation: a child
+            # eviction may expose a sink parent while non-sink work remains.
+            use_sink_fallback = not candidates
+            heap = sink_candidates if use_sink_fallback else candidates
+            priority, node = heapq.heappop(heap)
             if node.size() > num_evicted - len(evicted_blocks):
                 physical_blocks, _block_hashes = node.shrink(num_evicted - len(evicted_blocks))
                 # SWA: node survives but its trailing page changed, so its old
@@ -626,8 +661,21 @@ class RadixTreeIndex:
                         physical_blocks = np.concatenate([physical_blocks, cascade_blocks])
                         _block_hashes = np.concatenate([_block_hashes, cascade_hashes])
                 if parent is not None and parent.evictable():
-                    priority = self._get_eviction_priority(parent)
-                    heapq.heappush(candidates, (priority, parent))
+                    is_sink_parent = (
+                        self.sink_block_count > 0
+                        and self._get_block_offset_from_root(parent)
+                        < self.sink_block_count
+                    )
+                    if is_sink_parent:
+                        heapq.heappush(
+                            sink_candidates,
+                            (self._get_raw_eviction_priority(parent), parent),
+                        )
+                    else:
+                        heapq.heappush(
+                            candidates,
+                            (self._get_eviction_priority(parent), parent),
+                        )
 
             evicted_blocks = np.concatenate([evicted_blocks, physical_blocks])
             evicted_block_hashes = np.concatenate([evicted_block_hashes, _block_hashes])
@@ -812,11 +860,46 @@ class RadixTreeIndex:
             self.record_freed_swa_slot(cur)
 
 
+
+    def _get_block_offset_from_root(self, node: RadixNode) -> int:
+        """Total number of blocks preceding *node* (the sum of sizes of all
+        ancestors).  Nodes whose offset is below ``sink_block_count`` are
+        treated as attention sinks and protected from eviction (StreamingLLM).
+
+        O(1): the value is maintained incrementally in ``RadixNode.split`` and
+        ``RadixTreeIndex.insert``.  It used to be an O(depth) walk to root,
+        called per candidate on every eviction; see ``_walk_block_offset`` for
+        the reference computation used by tests/asserts."""
+        return node.block_offset
+
+    def _walk_block_offset(self, node: RadixNode) -> int:
+        """Reference O(depth) offset used to validate the cached value in
+        tests/debug asserts.  Not used on the hot path."""
+        offset = 0
+        cur = node.parent
+        while cur is not None and not cur.is_root():
+            offset += cur.size()
+            cur = cur.parent
+        return offset
+
     def _get_eviction_priority(self, node: RadixNode):
-        """Get the eviction priority for a node based on the configured policy.
+        """Get eviction priority including attention-sink protection.
 
         Lower priority values are evicted first (min-heap).
+
+        Nodes within the first ``sink_block_count`` blocks from the root are
+        treated as attention sinks (StreamingLLM) and given maximum priority so
+        they are never evicted except in the explicit all-sink fallback.
         """
+        # StreamingLLM: protect attention sinks (first N blocks) from eviction.
+        if self.sink_block_count > 0:
+            offset = self._get_block_offset_from_root(node)
+            if offset < self.sink_block_count:
+                return float('inf')
+        return self._get_raw_eviction_priority(node)
+
+    def _get_raw_eviction_priority(self, node: RadixNode):
+        """Get policy priority without attention-sink protection."""
         if self.eviction_policy == "lru":
             return node.grace_time
         elif self.eviction_policy == "lfu":
