@@ -94,7 +94,7 @@ def wait_for_op(te, op_ids, timeout_s=30.0):
 def _run_graph(te, engine, graph, op_cb, cb, full_gpu_blocks, swa_gpu_slot,
                reported_op_ids):
     """Late-bind GPU slots (full-KV + SWA), submit to the TransferEngine, wait,
-    then run the engine's op/transfer callbacks (set_ready/unlock/lock-release),
+    then run the engine's op/transfer callbacks (publish/unlock/lock-release),
     exactly as KVTaskEngine.launch + _update_tasks would."""
     graph.set_gpu_blocks(np.asarray(full_gpu_blocks, dtype=np.int64))
     if graph._swa_gpu_transfer_op_id:

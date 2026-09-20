@@ -8,7 +8,7 @@ import pytest
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.cache.radixtree import MatchResult
 from flexkv.common.block import SequenceMeta
-from flexkv.common.transfer import TransferType
+from flexkv.common.transfer import DeviceType, TransferType
 
 
 pytestmark = pytest.mark.unit
@@ -17,9 +17,7 @@ pytestmark = pytest.mark.unit
 def _match(blocks=(), *, last_node=None):
     physical_blocks = np.asarray(blocks, dtype=np.int64)
     return MatchResult(
-        num_ready_matched_blocks=len(physical_blocks),
         num_matched_blocks=len(physical_blocks),
-        last_ready_node=last_node,
         last_node=last_node,
         physical_blocks=physical_blocks,
     )
@@ -32,6 +30,8 @@ def _prefetch_engine(*, use_mooncake: bool):
         enable_ssd=False,
         enable_remote=True,
         enable_kv_sharing=False,
+        enable_p2p_cpu=False,
+        enable_p2p_ssd=False,
     )
     engine.index_accel = False
     engine.use_mooncake_store_backend = use_mooncake
@@ -74,8 +74,8 @@ def _plan_remote_prefetch(engine):
     )
 
 
-def test_remote_prefetch_publishes_cpu_node_and_waits_for_remote2h():
-    engine, cpu_node = _prefetch_engine(use_mooncake=False)
+def test_remote_prefetch_defers_cpu_publication_until_remote2h_lands():
+    engine, _cpu_node = _prefetch_engine(use_mooncake=False)
     plan = _plan_remote_prefetch(engine)
 
     remote2h = [
@@ -85,11 +85,16 @@ def test_remote_prefetch_publishes_cpu_node_and_waits_for_remote2h():
     ]
     assert len(remote2h) == 1
     assert plan.finished_ops_ids == [remote2h[0].op_id]
-    assert remote2h[0].op_id in plan.op_callback_dict
-    assert not plan.deferred_inserts
-
-    plan.op_callback_dict[remote2h[0].op_id]()
-    engine.cpu_cache_engine.set_ready.assert_called_once_with(cpu_node, True, 2)
+    # Insert-after: nothing is mounted while REMOTE2H is still in flight, so
+    # there is no unready node to flip and no per-op readiness callback.
+    engine.cpu_cache_engine.insert.assert_not_called()
+    assert remote2h[0].op_id not in plan.op_callback_dict
+    assert len(plan.deferred_inserts) == 1
+    pending = plan.deferred_inserts[0]
+    assert pending.device_type == DeviceType.CPU
+    # Only the mooncake path reports a per-block success mask; the ordinary
+    # remote tier publishes the whole staged prefix on completion.
+    assert pending.load_result is None
 
 
 def test_mooncake_remote_prefetch_defers_cpu_insert():
