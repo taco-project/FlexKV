@@ -103,7 +103,7 @@ DEFAULT_SLOT_SIZE = DEFAULT_SUBMIT_SLOT_SIZE  # back-compat alias for `slot_size
 
 # Result ring holds one fixed-width CompletedOp record per slot (64 B × 65536 = 4 MB).
 DEFAULT_RESULT_SLOTS = 65536        # power of 2
-DEFAULT_RESULT_SLOT_SIZE = 64       # cache line; one 29 B CompletedOp record
+DEFAULT_RESULT_SLOT_SIZE = 64       # cache line; one 54 B CompletedOp record
 
 _PAGE = 4096
 
@@ -120,12 +120,14 @@ _FRAG_HDR_SIZE = _FRAG_HDR.size  # 5
 
 
 # CompletedOp result-ring record: graph_id/op_id (i64), transfer_type (u8 index),
-# num_blocks (u32), num_bytes (u64), flags (u8: bit0 = failed).
+# num_blocks (u32), num_bytes (u64), flags (u8: bit0 = failed), then the
+# worker-measured wait_ms / xfer_ms / e2e_ms (f64 each) so the CE side can
+# export the same transfer-duration histograms as the in-process path.
 # block_results does NOT cross the ring: a failed graph degrades to whole-task
 # failure on the client side, which is the correct conservative reading for
 # every backend the shm path serves (mooncake's partial success never runs
 # through this channel).
-_COMPLETED_OP = struct.Struct("<qqBIQB")
+_COMPLETED_OP = struct.Struct("<qqBIQBddd")
 COMPLETED_OP_WIRE_SIZE = _COMPLETED_OP.size
 
 # transfer_type frozen as a byte index; 0xFF = None (VIRTUAL ops).
@@ -145,13 +147,16 @@ def encode_completed_op(op: Any) -> bytes:
     flags = 1 if getattr(op, "failed", False) else 0
     return _COMPLETED_OP.pack(
         op.graph_id, op.op_id, tt_idx, op.num_blocks, op.num_bytes, flags,
+        float(getattr(op, "wait_ms", 0.0)),
+        float(getattr(op, "xfer_ms", 0.0)),
+        float(getattr(op, "e2e_ms", 0.0)),
     )
 
 
 def decode_completed_op(buf: Any, off: int) -> Any:
     """Unpack a CompletedOp record from `buf` at byte offset `off`."""
     from flexkv.common.transfer import CompletedOp
-    graph_id, op_id, tt_idx, num_blocks, num_bytes, flags = \
+    graph_id, op_id, tt_idx, num_blocks, num_bytes, flags, wait_ms, xfer_ms, e2e_ms = \
         _COMPLETED_OP.unpack_from(buf, off)
     tt = None if tt_idx == _TT_NONE else _TT_NAMES[tt_idx]
     return CompletedOp(
@@ -160,6 +165,9 @@ def decode_completed_op(buf: Any, off: int) -> Any:
         transfer_type=tt,
         num_blocks=num_blocks,
         num_bytes=num_bytes,
+        wait_ms=wait_ms,
+        xfer_ms=xfer_ms,
+        e2e_ms=e2e_ms,
         failed=bool(flags & 1),
     )
 
