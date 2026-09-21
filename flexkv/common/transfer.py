@@ -172,6 +172,21 @@ class TransferOp:
     # the cost. Kept as a ClassVar so ids stay global across all graphs, which
     # merge_to_batch_graph relies on when it mixes ops from many tasks.
     _op_id_counter: ClassVar["itertools.count"] = itertools.count()
+    # Per-process disjoint range, set by `set_op_id_range()`. Default is the
+    # full int64 positive range, preserving single-CE behavior. The radix-shmem
+    # multi-DP path partitions this so 8 CE procs sharing one TE never collide.
+    # An id is ``start + counter % size``: still lock-free, and it wraps inside
+    # the range instead of running into a neighbour's.
+    _op_id_range_start: ClassVar[int] = 0
+    _op_id_range_size: ClassVar[int] = 1 << 62
+
+    @classmethod
+    def set_op_id_range(cls, start: int, end: int) -> None:
+        """Restrict generated op_ids to [start, end). Call before any op is
+        created in this process; it restarts the counter."""
+        cls._op_id_range_start = start
+        cls._op_id_range_size = end - start
+        cls._op_id_counter = itertools.count()
 
     op_id: int = field(init=False)
     graph_id: int
@@ -259,7 +274,8 @@ class TransferOp:
             raise ValueError(f"src_block_ids and dst_block_ids must have the same number of physical blocks, but got "
                              f"src_block_ids.size={src.size}, "
                              f"dst_block_ids.size={dst.size}")
-        self.op_id = next(TransferOp._op_id_counter)
+        self.op_id = (TransferOp._op_id_range_start
+                      + next(TransferOp._op_id_counter) % TransferOp._op_id_range_size)
         assert src.dtype == _INT64
         assert dst.dtype == _INT64
         self.valid_block_num = src.size
@@ -329,9 +345,18 @@ class TransferOpGraph:
     # Lock-free for the same reason as TransferOp._op_id_counter: a C-level
     # __next__ that cannot be interrupted mid-increment.
     _graph_id_counter = itertools.count()
+    # Per-process DP-aware range, set via set_graph_id_range(start, end). Used
+    # so multiple CE processes that share a single TE don't collide on
+    # graph_id. Default range is the original (0, 2**62), preserving behavior
+    # in the single-CE path. Same ``start + counter % size`` scheme as
+    # TransferOp.
+    _graph_id_range_start = 0
+    _graph_id_range_size = 1 << 62
 
     def __init__(self) -> None:
-        self.graph_id = next(TransferOpGraph._graph_id_counter)
+        self.graph_id = (TransferOpGraph._graph_id_range_start
+                         + next(TransferOpGraph._graph_id_counter)
+                         % TransferOpGraph._graph_id_range_size)
         self._op_map: Dict[int, TransferOp] = {}
         self._ready_ops: Set[int] = set()
         self._trigger_ops: Set[int] = set()
@@ -346,7 +371,18 @@ class TransferOpGraph:
     @classmethod
     def _get_graph_id(cls) -> int:
         """Kept as the named entry point; __init__ inlines the same counter."""
-        return next(cls._graph_id_counter)
+        return (cls._graph_id_range_start
+                + next(cls._graph_id_counter) % cls._graph_id_range_size)
+
+    @classmethod
+    def set_graph_id_range(cls, start: int, end: int) -> None:
+        """Restrict generated graph_ids to [start, end). Used by the
+        radix-shmem multi-DP path to give each CE process a disjoint range.
+        Call before any graph is created in this process; it restarts the
+        counter."""
+        cls._graph_id_range_start = start
+        cls._graph_id_range_size = end - start
+        cls._graph_id_counter = itertools.count()
 
     def set_graph_id(self, graph_id: int) -> None:
         self.graph_id = graph_id
@@ -1241,7 +1277,7 @@ def merge_to_batch_graph(batch_id: int,
             put_sinks.append(merged_swa_d2h_op.op_id)
         if not put_sinks:
             # No D2H sink: wait for every independent full-KV / SWA leaf
-            # (H2DISK and/or H2REMOTE). 
+            # (H2DISK and/or H2REMOTE).
             for op in (merged_h2disk_op, merged_swa_h2disk_op,
                        merged_h2remote_op, merged_swa_h2remote_op):
                 if op is not None:
