@@ -1,0 +1,17 @@
+# FlexKV radixshmem mode, one node (no etcd, no RDMA).
+#
+#   export FLEXKV_ENABLE_RADIXSHMEM=1
+#   export FLEXKV_RADIXSHMEM_CONFIG_PATH=$PWD/examples/radixshmem_configs/radixshmem_single_node.yaml
+#   export FLEXKV_CPU_LAYOUT=BLOCKFIRST
+#
+# Every key below is at its default; the file is equivalent to setting no
+# FLEXKV_RADIXSHMEM_CONFIG_PATH at all. It is here to show what is tunable on a
+# single node. Slot counts / slot bytes / shm names are derived from the FlexKV
+# cache configuration and must not appear here. Reference: docs/radixshmem/config_zh.md
+
+cluster:
+  cluster_id: flexkv
+  expected_min_nodes: 0
+  
+index:
+  background_evict_ratio: 0.05
