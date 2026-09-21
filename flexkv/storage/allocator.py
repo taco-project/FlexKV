@@ -315,10 +315,59 @@ def _materialize_shareable_hugepage_tensor(path: str,
     return _wrap_mmap_tensor(mm, aligned, num_elements, dtype, cleanup_path=None)
 
 
-def materialize_worker_tensor(data: Union[torch.Tensor, HugePageTensorHandle]) -> torch.Tensor:
+@dataclass(frozen=True)
+class SlotStoreTensorHandle:
+    """Worker-side handle for one pool of a radixshmem SlotStore.
+
+    The pool is a POSIX shm (or hugetlbfs) mapping owned by the radix-server;
+    a transfer worker attaches it by name in its own process and views it as a
+    tensor, the same way ``HugePageTensorHandle`` re-maps a hugetlbfs file. A
+    tensor built over the mapping cannot be pickled to the worker (that would
+    copy the bytes), hence the handle.
+    """
+    data_name: str
+    hugepage_path: str
+    kind: int              # shmradix.ComponentType value (0 = FULL, 1 = SWA)
+    num_elements: int
+    dtype: torch.dtype
+
+    def get_tensor(self) -> torch.Tensor:
+        from shmradix import _data
+        store = _data.SlotStore.attach(self.data_name, self.hugepage_path, 60000)
+        return slot_store_pool_tensor(store, self.kind, self.dtype, self.num_elements)
+
+
+def slot_store_pool_tensor(store: Any, kind: Any, dtype: torch.dtype,
+                           num_elements: int) -> torch.Tensor:
+    """A 1-D tensor over one whole SlotStore pool (``num_slots x stride`` bytes).
+
+    The stride must equal FlexKV's block bytes (the bootstrap picks
+    ``slot_align`` so), so the view has the layout of a plain CPU buffer. The
+    store object is pinned on the tensor: dropping the mapping while the
+    tensor is in use would leave dangling addresses.
+    """
+    view = store.pool_view(kind)
+    tensor = torch.frombuffer(view, dtype=torch.uint8)
+    if dtype != torch.uint8:
+        if tensor.numel() % dtype.itemsize:
+            raise ValueError(
+                f"SlotStore pool of {tensor.numel()} bytes is not a multiple of "
+                f"{dtype} ({dtype.itemsize} bytes)")
+        tensor = tensor.view(dtype)
+    if tensor.numel() < num_elements:
+        raise ValueError(
+            f"SlotStore pool holds {tensor.numel()} elements of {dtype}, the CPU "
+            f"layout needs {num_elements}")
+    tensor = tensor[:num_elements]
+    tensor._flexkv_slot_store = store  # keep the mapping alive with the view
+    return tensor
+
+
+def materialize_worker_tensor(
+        data: Union[torch.Tensor, HugePageTensorHandle, SlotStoreTensorHandle]) -> torch.Tensor:
     if isinstance(data, torch.Tensor):
         return data
-    if isinstance(data, HugePageTensorHandle):
+    if isinstance(data, (HugePageTensorHandle, SlotStoreTensorHandle)):
         return data.get_tensor()
     raise TypeError(f"Unsupported worker tensor type: {type(data)}")
 
