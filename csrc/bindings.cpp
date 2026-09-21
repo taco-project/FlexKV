@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <nvtx3/nvToolsExt.h>
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <sys/mman.h>
@@ -481,6 +482,24 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
         py::arg("hasher"), py::arg("token_ids"), py::arg("tokens_per_block"),
         py::arg("block_hashes"));
+  m.def(
+      "gen_hashes_numpy",
+      [](flexkv::Hasher &hasher, py::array token_ids, int tokens_per_block,
+         py::array block_hashes) {
+        // numpy-buffer variant of gen_hashes; bypasses torch.from_numpy.
+        py::buffer_info tok = token_ids.request();
+        py::buffer_info bh = block_hashes.request(true);
+        const int64_t *tok_ptr = static_cast<const int64_t *>(tok.ptr);
+        flexkv::HashType *bh_ptr = static_cast<flexkv::HashType *>(bh.ptr);
+        for (py::ssize_t i = 0; i < bh.size; i++) {
+          hasher.update(tok_ptr + i * tokens_per_block,
+                        tokens_per_block * sizeof(int64_t));
+          bh_ptr[i] = hasher.digest();
+        }
+      },
+      "Generate block hashes directly from numpy buffers", py::arg("hasher"),
+      py::arg("token_ids"), py::arg("tokens_per_block"),
+      py::arg("block_hashes"));
 
   py::class_<flexkv::SSDIOCTX>(m, "SSDIOCTX")
       .def(
@@ -766,6 +785,17 @@ PYBIND11_MODULE(c_ext, m) {
            py::overload_cast<const void *, size_t>(&flexkv::Hasher::update),
            "Update the hasher with pointer and size", py::arg("input"),
            py::arg("size"))
+      .def(
+          "update_numpy",
+          [](flexkv::Hasher &self, py::array arr) {
+            // Hash the numpy buffer directly, bypassing torch.from_numpy
+            // (whose tensor conversion is not concurrency-safe).
+            py::buffer_info info = arr.request();
+            self.update(info.ptr,
+                        static_cast<size_t>(info.size * info.itemsize));
+          },
+          "Update the hasher directly from a numpy array buffer",
+          py::arg("input"))
       .def("digest", &flexkv::Hasher::digest, "Return the hash value");
 #ifdef FLEXKV_ENABLE_CFS
   py::class_<flexkv::Pcfs>(m, "Pcfs")
