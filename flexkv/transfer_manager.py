@@ -1551,6 +1551,26 @@ class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
         flexkv_logger.info("TransferManagerMultiNodeHandle shutdown complete")
 
 
+def shm_te_clears_cuda_visible_devices(cvd: Optional[str], gpus_needed: int) -> bool:
+    """Whether TransferManagerShmTEProcess drops CUDA_VISIBLE_DEVICES for the TE.
+
+    The TE opens every registered GPU buffer with cudaIpcOpenMemHandle, so it
+    must number the devices exactly as the workers did when they registered:
+
+    * one CUDA_VISIBLE_DEVICES for the whole engine (sglang, single-GPU vLLM):
+      the workers register logical ids inside that namespace, so the TE has to
+      INHERIT it. Clearing it renumbers the devices and puts the TE on the wrong
+      physical GPUs (or, on one GPU, fails with "device >= 0 && device < num_gpus").
+    * one CUDA_VISIBLE_DEVICES per DP rank (vLLM DP, each rank pinned to its own
+      device): the parent sees fewer GPUs than this node's TE has to reach, and
+      the ids the workers registered are physical. Only then is it cleared.
+    """
+    if cvd is None:
+        return False
+    visible = len([d for d in cvd.split(",") if d.strip()])
+    return visible < gpus_needed
+
+
 class TransferManagerShmTEProcess:
     """Spawns the single TE subprocess for the multi-DP shm path.
 
@@ -1581,21 +1601,20 @@ class TransferManagerShmTEProcess:
         if self.process is not None and self.process.is_alive():
             return
         from flexkv.transfer.shm_channel_handle import te_shm_main
-        # CRITICAL: clear CUDA_VISIBLE_DEVICES in the TE subprocess so it can
-        # cudaIpcOpenMemHandle from ALL DPs' GPUs (the parent scheduler may have
-        # it restricted to its own DP rank's device). mp.Process(spawn) inherits
-        # env from parent unless we override. Save+restore around .start().
-        #
-        # BUT: only do this when there is genuinely more than one GPU to span
-        # (multi-DP/TP/CP/PP). For a single-GPU deployment (total_gpus == 1,
-        # e.g. vLLM serve on one restricted GPU), clearing CVD renumbers devices
-        # in the TE subprocess so it no longer matches the device ordinal the
-        # worker recorded in its TensorSharedHandle — cudaIpcOpenMemHandle then
-        # fails with "device >= 0 && device < num_gpus". Leave CVD untouched so
-        # the TE and the registering worker agree on device numbering.
-        clear_cvd = self.model_config.total_gpus > 1
-        _saved_cuda = (os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-                       if clear_cvd else None)
+        # mp.Process(spawn) inherits the parent's env. The TE keeps the parent's
+        # CUDA_VISIBLE_DEVICES whenever that namespace covers the GPUs it serves
+        # (the workers registered ids inside it); it is cleared only when the
+        # parent is pinned to fewer GPUs than the node's TE must reach. See
+        # shm_te_clears_cuda_visible_devices. Pop / restore around .start().
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        gpus_needed = self.model_config.instance_num * self.model_config.gpus_per_node
+        clear_cvd = shm_te_clears_cuda_visible_devices(cvd, gpus_needed)
+        if cvd is not None:
+            flexkv_logger.info(
+                f"TransferManagerShmTEProcess: parent CUDA_VISIBLE_DEVICES={cvd!r}, "
+                f"TE serves {gpus_needed} GPU(s) on this node -> "
+                f"{'clearing it for the TE (per-rank pinned layout)' if clear_cvd else 'the TE inherits it'}")
+        _saved_cuda = os.environ.pop("CUDA_VISIBLE_DEVICES", None) if clear_cvd else None
         try:
             self.process = self.mp_ctx.Process(
                 target=te_shm_main,
