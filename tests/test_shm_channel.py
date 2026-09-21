@@ -133,21 +133,41 @@ def test_single_round_trip_local():
         assert msgs == ["hello", {"k": 42}]
 
         # Result ring carries fixed-width CompletedOp records; all fields must
-        # round-trip, including the transfer_type string and the -1 sentinel.
+        # round-trip, including the transfer_type string, the worker-measured
+        # durations and the -1 sentinel.
         sent = [
             CompletedOp(graph_id=7, op_id=3, transfer_type="H2D",
-                        num_blocks=12, num_bytes=98304),
+                        num_blocks=12, num_bytes=98304,
+                        wait_ms=0.25, xfer_ms=1.5, e2e_ms=2.125),
             CompletedOp(graph_id=7, op_id=-1),  # graph-completed sentinel
         ]
         ch.result_send(sent)
         out = ch.result_recv(timeout_s=0.0)
         assert out == sent
+        assert (out[0].wait_ms, out[0].xfer_ms, out[0].e2e_ms) == (0.25, 1.5, 2.125)
         assert out[1].is_graph_completed()
     finally:
         ch.close()
         ch.unlink()
         ctrl.close()
         ctrl.unlink()
+
+
+def test_result_record_carries_durations_and_fits_a_slot():
+    """The fixed-width record must hold the #297 durations (f64) and still fit
+    the default 64 B result slot; a failed op keeps its flag alongside them."""
+    from flexkv.transfer.shm_channel import (
+        COMPLETED_OP_WIRE_SIZE, DEFAULT_RESULT_SLOT_SIZE,
+        decode_completed_op, encode_completed_op)
+    assert COMPLETED_OP_WIRE_SIZE <= DEFAULT_RESULT_SLOT_SIZE
+    op = CompletedOp(graph_id=1 << 40, op_id=(1 << 40) + 5, transfer_type="D2H",
+                     num_blocks=3, num_bytes=3 * 4096,
+                     wait_ms=12.75, xfer_ms=0.001, e2e_ms=1e6, failed=True)
+    rec = encode_completed_op(op)
+    assert len(rec) == COMPLETED_OP_WIRE_SIZE
+    back = decode_completed_op(memoryview(rec), 0)
+    assert back == op
+    assert back.is_graph_failed() is False and back.failed
 
 
 def test_submit_fragmentation():
