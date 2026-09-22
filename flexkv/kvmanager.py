@@ -253,9 +253,12 @@ class KVManager:
             raise
 
     def _shutdown_radix_shmem_children(self) -> None:
-        if self._shm_te_process is not None:
-            self._shm_te_process.shutdown()
+        # getattr: shutdown() must work on a KVManager whose __init__ did not
+        # get this far (or was bypassed, as the unit tests do).
+        te = getattr(self, "_shm_te_process", None)
+        if te is not None:
             self._shm_te_process = None
+            te.shutdown()
 
     def _spawn_shm_te(self) -> None:
         """Bootstrap proc (local dp 0) only: spawn the TE subprocess every DP

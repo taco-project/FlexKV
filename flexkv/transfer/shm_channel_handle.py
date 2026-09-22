@@ -235,7 +235,13 @@ class _TEShmDispatcher:
                     graph = m.graph
                     with self._owner_lock:
                         self._graph_owner[graph.graph_id] = ch.channel_id
-                    self._tm.submit(graph)
+                    try:
+                        self._tm.submit(graph)
+                    except Exception as e:  # noqa: BLE001 - one bad graph must not stop the node
+                        flexkv_logger.error(
+                            f"TE could not submit graph {graph.graph_id} from channel "
+                            f"{ch.channel_id}: {e!r}; failing it", exc_info=True)
+                        self._fail_graph(ch, graph.graph_id)
             if had_work:
                 idle_spins = 0
                 continue
@@ -282,8 +288,30 @@ class _TEShmDispatcher:
                     continue
                 by_channel.setdefault(owner, []).append(op)
             for ch_id, ops in by_channel.items():
-                if 0 <= ch_id < len(self._channels):
+                if not (0 <= ch_id < len(self._channels)):
+                    continue
+                try:
                     self._channels[ch_id].result_send(ops)
+                except Exception as e:  # noqa: BLE001 - keep serving the other channels
+                    flexkv_logger.error(
+                        f"TE could not deliver {len(ops)} completion(s) to channel "
+                        f"{ch_id} (graphs {sorted({op.graph_id for op in ops})}): {e!r}",
+                        exc_info=True)
+
+    def _fail_graph(self, ch, graph_id: int) -> None:
+        """Tell the owning CE that `graph_id` is over and failed when the TE could
+        not run it, so its task errors out instead of waiting forever."""
+        from flexkv.common.transfer import CompletedOp
+        with self._owner_lock:
+            self._graph_owner.pop(graph_id, None)
+        try:
+            ch.result_send([CompletedOp(graph_id=graph_id, op_id=-1, transfer_type=None,
+                                        num_blocks=0, num_bytes=0, wait_ms=0.0,
+                                        xfer_ms=0.0, e2e_ms=0.0, failed=True)])
+        except Exception as e:  # noqa: BLE001
+            flexkv_logger.error(
+                f"TE could not report the failure of graph {graph_id} to channel "
+                f"{ch.channel_id}: {e!r}")
 
 
 def te_shm_main(model_config: ModelConfig,

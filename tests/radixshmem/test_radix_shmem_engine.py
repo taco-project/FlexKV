@@ -267,6 +267,24 @@ def test_engine_adopts_the_servers_register_chunk(env):
     assert engine2.register_chunk_tokens == 64 and engine2.register_chunk_blocks == 16
 
 
+def test_take_clamps_to_the_pool(env):
+    """radixshmem refuses an allocation larger than the pool (allocate_slots
+    raises ValueError); the engine clamps instead, so a planner asking for more
+    than exists gets what exists and nothing it took before leaks."""
+    engine, _server = env.make(f"/cers_clamp{os.getpid()}", blocks=64)
+    slots = engine.take(num_required_blocks=64 + 7)
+    assert 0 < len(slots) <= 64
+    engine.recycle(slots)
+    assert engine.take(num_required_blocks=0).size == 0
+    # the SWA pool is all-or-none: an oversize window comes back short and the
+    # planner stores Full KV only
+    swa_engine, _ = _make_swa_engine(env, f"/cers_clamp_swa{os.getpid()}", blocks=64,
+                                     swa_slots=SWA_W, window_blocks=SWA_W)
+    got = swa_engine.take(num_required_blocks=SWA_W + 3, component=_SWA)
+    assert len(got) <= SWA_W
+    swa_engine.recycle(got, component=_SWA)
+
+
 def test_insert_publishes_immediately(env):
     """There is no ready bit: being in the tree IS being servable.
 
@@ -1243,6 +1261,37 @@ def test_get_abort_drops_the_pin():
     engine.get_callback()                           # type: ignore[attr-defined]
     assert released == [1]
     assert engine.inserted_pools == []              # type: ignore[attr-defined]
+
+
+def test_put_planning_failure_returns_the_taken_slots_and_drops_the_pin():
+    """An exception after the FULL slots were taken (here the SWA take blows up)
+    must not leak them or the match pin: the planner recycles, releases and
+    re-raises. Before this, a server planning fewer SWA slots than the window
+    leaked FULL slots on every PUT."""
+    engine = _global_cache_engine()
+    released = []
+    _force_radixshmem(engine, _local_match(np.arange(20, 22),
+                                           finalize=lambda: released.append(1)))
+    tier = engine.cpu_cache_engine
+    free_before = tier.mempool.num_free_blocks
+    real_take = tier.take
+
+    def _take(num_required_blocks, component=None, **kwargs):
+        if component is not None:
+            raise RuntimeError("SWA pool exploded")
+        return real_take(num_required_blocks=num_required_blocks, **kwargs)
+
+    tier.take = _take                                            # type: ignore[method-assign]
+    engine.swa_op_constructor = SimpleNamespace(enabled=True)    # type: ignore[assignment]
+    engine.cache_config.swa = SimpleNamespace(window_blocks=2)
+    token_ids, token_mask, slot_mapping = _fake_request(5)
+    with pytest.raises(RuntimeError, match="SWA pool exploded"):
+        engine.put(request_id=3, token_ids=token_ids, token_mask=token_mask,
+                   slot_mapping=slot_mapping, dp_client_id=0)
+    assert tier.mempool.num_free_blocks == free_before          # the 3 FULL slots came back
+    assert [len(s) for s in engine.aborted_slots] == [3]         # type: ignore[attr-defined]
+    assert released == [1]                                       # pin dropped
+    assert engine.inserted_pools == []                           # type: ignore[attr-defined]
 
 
 def test_put_abort_returns_the_staged_slots_and_drops_the_pin():

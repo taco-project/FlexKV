@@ -153,6 +153,60 @@ def test_single_round_trip_local():
         ctrl.unlink()
 
 
+def _explode():
+    raise ValueError("poisoned record")
+
+
+class _Poison:
+    """Pickles fine, fails to unpickle: what a corrupted submit slot looks like."""
+
+    def __reduce__(self):
+        return (_explode, ())
+
+
+def test_undecodable_submit_record_is_dropped_not_fatal():
+    """A record the TE cannot decode is dropped with an error and the ring keeps
+    moving; re-raising on every poll would stall every channel on the node."""
+    server_id = f"{SERVER_ID}_poison{os.getpid()}"
+    _cleanup_shm(server_id, 1)
+    ctrl = ShmControlBlock(server_id, create=True)
+    ch = ShmChannel(server_id, 0, create=True)
+    try:
+        ch.submit_send(_Poison())
+        ch.submit_send("after the poison")
+        assert ch.submit_recv() == ["after the poison"]
+        assert ch.submit_recv() == []                   # the ring advanced past both
+    finally:
+        ch.close()
+        ch.unlink()
+        ctrl.close()
+        ctrl.unlink()
+
+
+def test_every_transfer_type_has_a_wire_index():
+    """The TE sends `op.transfer_type.value` for every non-VIRTUAL op, so each
+    TransferType member must round-trip. LAYERWISE was missing: its KeyError in
+    the TE's result thread stopped every completion on the node."""
+    from flexkv.common.transfer import TransferType
+    from flexkv.transfer.shm_channel import decode_completed_op, encode_completed_op
+    for tt in TransferType:
+        name = None if tt == TransferType.VIRTUAL else tt.value
+        op = CompletedOp(graph_id=1, op_id=2, transfer_type=name, num_blocks=1, num_bytes=8)
+        back = decode_completed_op(memoryview(encode_completed_op(op)), 0)
+        assert back == op, tt
+    # the member itself is accepted too
+    op = CompletedOp(graph_id=1, op_id=2, transfer_type=TransferType.LAYERWISE, num_blocks=1)
+    assert decode_completed_op(memoryview(encode_completed_op(op)), 0).transfer_type == "LAYERWISE"
+
+
+def test_unknown_transfer_type_is_sent_as_none():
+    """A name outside the table degrades to None instead of raising."""
+    from flexkv.transfer.shm_channel import decode_completed_op, encode_completed_op
+    op = CompletedOp(graph_id=1, op_id=2, transfer_type="NOT_A_TRANSFER_TYPE", num_blocks=1)
+    back = decode_completed_op(memoryview(encode_completed_op(op)), 0)
+    assert back.transfer_type is None and (back.graph_id, back.op_id, back.num_blocks) == (1, 2, 1)
+
+
 def test_result_record_carries_durations_and_fits_a_slot():
     """The fixed-width record must hold the #297 durations (f64) and still fit
     the default 64 B result slot; a failed op keeps its flag alongside them."""
