@@ -122,9 +122,18 @@ class KVDPClient:
     def is_ready(
         self,
     ) -> bool:
+        """Whether the server's transfer engines are up.
+
+        Raises when the server reports a startup failure (e.g. its
+        TransferManager subprocess died waiting for GPU registrations):
+        callers poll this in a ``while not is_ready()`` loop, so returning
+        False for a terminal failure would spin forever.
+        """
         req = IsReadyRequest(self.dp_client_id)
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
+        if response.error_msg:
+            raise RuntimeError(f"flexkv server failed to become ready: {response.error_msg}")
         return response.is_ready
 
     def reset(self) -> None:

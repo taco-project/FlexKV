@@ -1,5 +1,47 @@
 # Chunked prefetch validation
 
+## Insert-after integration: September 22, 2026
+
+The prefetch branch now includes main `738ddc141a`, including the merged
+insert-after change (#266). The planner uses `num_matched_blocks` and
+`last_node`: staging stays outside the radix tree until transfer completion,
+so a resident match is already valid. The planner tests use the same contract
+and retain checks for invisible staging, out-of-order completion, partial
+failure, concurrent publication, prefix pins, and SWA checkpoints.
+
+The previous schema probe reproduces the removed-field `AttributeError` with
+the old planner and passes with the migrated `resolve()` and `_pin_prefix()`.
+The internal branch's nonnegative span/checkpoint indexing is also included
+so release Cython builds with `wraparound=False` preserve Python behavior.
+The GPU fixture explicitly sets its 32 MiB staging limit; it no longer relies
+on the removed experimental per-chunk byte target.
+
+The companion SGLang head remains `c6b51c1b5c`, which already contains its
+current adaptation target `5166ce06aa`. No additional SGLang conflict edit is
+needed; the bundled patch still reproduces that head exactly.
+
+Validation on an isolated H20 container (Python 3.12, PyTorch 2.13.0+cu130,
+CUDA 13.0), after rebuilding the current C++/CUDA extension:
+
+- **520 FlexKV tests passed, 9 skipped**, both with Python prefetch modules
+  and with all five prefetch modules compiled by Cython 3.2.5 using the release
+  compiler directives. Skips are unsupported Python-radix SWA combinations.
+- **167 SGLang tests and 12 subtests passed** against each control-plane build.
+- **25 real GPU/Mooncake tests passed** against each build: three policies,
+  window/chunk limits, timeout/demand/abort drain, overlapping sessions,
+  foreground GET, reset, and a key disappearing after metadata matching.
+  Returned KV contents, untouched suffixes, and released pin/staging budgets
+  were checked. The isolated node-local Mooncake pool uses RDMA.
+- Three existing main-branch SWA tests assumed the pre-insert publication
+  order. Their assertions now check that Full KV stays invisible until both
+  tier writers finish, becomes readable before downstream tiers finish, and
+  the SWA slot remains unmounted until graph drain. The cache implementation
+  itself is unchanged from main.
+
+These compiled-module checks are not a complete release-wheel validation.
+The GPU tests retain the previously observed CUDA IPC producer-exit warning;
+they do not establish warning-free shutdown or performance acceptance.
+
 ## Target-branch integration: September 15, 2026
 
 FlexKV was merged with main `6960dfde09`; the companion SGLang review head
@@ -25,15 +67,15 @@ that SGLang base and produces exactly the review head's source tree.
 
 Compatibility with [FlexKV #266](https://github.com/taco-project/FlexKV/pull/266)
 was checked at `07496038d0`. Git can combine the changes without textual
-conflicts, but the APIs are incompatible: #266 removes
+conflicts, but the APIs were incompatible at that revision: #266 removes
 `num_ready_matched_blocks` and `last_ready_node`, which the prefetch planner
-still reads. Executing the actual planner methods against the combined
+still read. Executing the actual planner methods against the combined
 match-result schema raises `AttributeError`; the coordinator turns the resolve
 failure into a failed prefetch session. This is a focused API reproduction,
-not a full test of the combined branches. Integrating #266 must migrate the
-planner and its tests to `num_matched_blocks` / `last_node` together with its
-insert-after semantics. Those fields cannot replace the ready-prefix fields
-on the current main, which still permits unready radix nodes.
+not a full test of the combined branches. The September 22 integration above
+migrates the planner and tests together with insert-after. This migration
+must not be backported alone to the September 15 main, which still permits
+unready radix nodes.
 
 ## SGLang whole-task policy routing: September 10, 2026
 

@@ -248,10 +248,10 @@ class HierarchyLRCacheEngine:
         mr_remote = self.remote_index.match_prefix(block_hashes_t, int(num_blocks), True)
         t2 = time.perf_counter()
         print(f"[match_prefix timing] local: {(t1-t0)*1000:.3f}ms, remote: {(t2-t1)*1000:.3f}ms")
-        # For simplicy, we choose the one with the larger matched length; tie-break on ready length
+        # For simplicy, we choose the one with the larger matched length.
         # We should allow to combine the two results in the future.
-        local_key = (int(mr_local.num_matched_blocks), int(mr_local.num_ready_matched_blocks))
-        remote_key = (int(mr_remote.num_matched_blocks), int(mr_remote.num_ready_matched_blocks))
+        local_key = int(mr_local.num_matched_blocks)
+        remote_key = int(mr_remote.num_matched_blocks)
         matched_pos = "local" if local_key >= remote_key else "remote"
         chosen = mr_local if local_key >= remote_key else mr_remote
 
@@ -321,9 +321,7 @@ class HierarchyLRCacheEngine:
             insert_to_local_cpu_index = True
         #TODO A big question is how to get the node id for peer_cpu and peer_ssd?
         return MatchResultAccel(
-            num_ready_matched_blocks=int(chosen.num_ready_matched_blocks),
             num_matched_blocks=int(chosen.num_matched_blocks),
-            last_ready_node=chosen.last_ready_node,
             last_node=chosen.last_node,
             last_node_matched_length=int(chosen.last_node_matched_length),
             physical_blocks=phys_np,
@@ -386,9 +384,7 @@ class HierarchyLRCacheEngine:
         phys_np = mr_local.physical_blocks.cpu().numpy()
 
         return MatchResultAccel(
-            num_ready_matched_blocks=int(mr_local.num_ready_matched_blocks),
             num_matched_blocks=int(mr_local.num_matched_blocks),
-            last_ready_node=mr_local.last_ready_node,
             last_node=mr_local.last_node,
             last_node_matched_length=int(mr_local.last_node_matched_length),
             physical_blocks=phys_np,
@@ -400,7 +396,6 @@ class HierarchyLRCacheEngine:
                sequence_meta: SequenceMeta,
                physical_block_ids: torch.Tensor,
                num_insert_blocks: int = -1,
-               is_ready: bool = True,
                match_result: Optional[MatchResultAccel] = None,
                swa_store: bool = False) -> Optional[CRadixNode]:
         sequence_meta.gen_hashes()
@@ -409,11 +404,11 @@ class HierarchyLRCacheEngine:
 
         if match_result is None:
             node = self.local_index.insert(
-                phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks), bool(is_ready)
+                phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks)
             )
         else:
             node = self.local_index.insert(
-                phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks), bool(is_ready),
+                phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks),
                 match_result.last_node, int(match_result.num_matched_blocks), int(match_result.last_node_matched_length)
             )
         # NOTE: Do NOT lock the node here, because the caller (put() method) will lock it
@@ -448,39 +443,6 @@ class HierarchyLRCacheEngine:
             self.remote_index.unlock(node)
         else:
             self.local_index.unlock(node)
-
-    def cleanup(self, node: CRadixNode, cleanup_length: int) -> None:
-        if node is None:
-            return
-        try:
-            is_remote_node = bool(node.has_block_node_ids())
-        except Exception:
-            is_remote_node = False
-        if is_remote_node:
-            self.remote_index.unlock(node)
-            #self.remote_index.set_ready(node, True, cleanup_length)
-        else:
-            self.local_index.unlock(node)
-            #self.local_index.set_ready(node, True, cleanup_length)
-
-    def set_ready(self, node: CRadixNode, ready: bool = True, ready_length: int = -1) -> None:
-        """Set the ready state of a node in the appropriate index (local or remote).
-
-        Args:
-            node: The radix node to set ready state
-            ready: Whether the node is ready (default: True)
-            ready_length: The ready length (default: -1, meaning use node's current length)
-        """
-        if node is None:
-            return
-        try:
-            is_remote_node = bool(node.has_block_node_ids())
-        except Exception:
-            is_remote_node = False
-        if is_remote_node:
-            self.remote_index.set_ready(node, ready, ready_length)
-        else:
-            self.local_index.set_ready(node, ready, ready_length)
 
     def take(self,
              num_required_blocks: int,

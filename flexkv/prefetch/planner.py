@@ -164,7 +164,7 @@ class MooncakeChunkPlanner:
                 break
         context.checkpoints = tuple(checkpoints)
         if context.swa_aware:
-            matched = checkpoints[-1] // self.block_size if checkpoints else 0
+            matched = checkpoints[len(checkpoints) - 1] // self.block_size if checkpoints else 0
         return sequence, matched
 
     def resolve(self, context: PrefetchContext) -> Optional[Tuple[int, int]]:
@@ -175,7 +175,9 @@ class MooncakeChunkPlanner:
             return 0, 0
         with self.cache._cache_tree_lock:
             local = self.cache.cpu_cache_engine.match(context.sequence)
-            ready = int(local.num_ready_matched_blocks)
+            # Insert-after keeps inflight staging outside the tree: every
+            # matched block has completed its transfer and is safe to reuse.
+            ready = int(local.num_matched_blocks)
             start = (
                 min(ready, int(local.swa_hit_blocks)) if context.swa_aware else ready
             )
@@ -194,10 +196,10 @@ class MooncakeChunkPlanner:
         prefix.token_ids = prefix.token_ids[:end]
         prefix.block_hashes = prefix.block_hashes[: end // self.block_size]
         local = cpu.match(prefix)
-        if int(local.num_ready_matched_blocks) * self.block_size != end:
+        if int(local.num_matched_blocks) * self.block_size != end:
             raise RuntimeError("prefetch published prefix is not resident")
-        node = local.last_ready_node
-        # Locks protect whole nodes/ancestors, including a ready suffix beyond
+        node = local.last_node
+        # Locks protect whole nodes/ancestors, including a resident suffix beyond
         # our requested boundary. Charge that actual span, without splitting
         # existing nodes just for accounting.
         blocks, ancestor = 0, node
@@ -254,7 +256,7 @@ class MooncakeChunkPlanner:
         end = begin + blocks * self.block_size
         checkpoints = [point for point in context.checkpoints if begin < point <= end]
         if checkpoints:
-            end = checkpoints[-1]
+            end = checkpoints[len(checkpoints) - 1]
             blocks = (end - begin) // self.block_size
         needs_snapshot = context.swa_aware and end in context.checkpoints
         with self.cache._cache_tree_lock:

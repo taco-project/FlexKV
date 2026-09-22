@@ -268,8 +268,9 @@ class PrefetchCoordinator:
 
     @staticmethod
     def _add_span(session, begin, end):
-        if session.spans and session.spans[-1][1] == begin:
-            session.spans[-1] = (session.spans[-1][0], end)
+        last = len(session.spans) - 1
+        if last >= 0 and session.spans[last][1] == begin:
+            session.spans[last] = (session.spans[last][0], end)
         else:
             session.spans.append((begin, end))
 

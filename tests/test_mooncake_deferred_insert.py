@@ -78,8 +78,6 @@ def test_deferred_insert_publishes_all_successful_blocks():
 
     match = engine.match(sequence)
     assert match.num_matched_blocks == 4
-    assert match.num_ready_matched_blocks == 4
-    assert engine.index.total_unready_blocks() == 0
     assert engine.mempool.num_used_blocks == 4
 
 
@@ -92,8 +90,6 @@ def test_deferred_insert_stops_at_first_failed_block():
 
     match = engine.match(sequence)
     assert match.num_matched_blocks == 1
-    assert match.num_ready_matched_blocks == 1
-    assert engine.index.total_unready_blocks() == 0
     assert engine.mempool.num_used_blocks == 1
 
 
@@ -110,7 +106,7 @@ def test_deferred_insert_keeps_local_staging_before_remote_failure(
     sequence = _sequence([1, 2, 3, 4])
     first_block = engine.take(1)
     engine.insert(
-        sequence, first_block, num_insert_blocks=1, is_ready=True)
+        sequence, first_block, num_insert_blocks=1)
     pending = _pending(
         engine,
         sequence,
@@ -123,8 +119,7 @@ def test_deferred_insert_keeps_local_staging_before_remote_failure(
     _manager(engine)._commit_deferred_insert(pending)
 
     match = engine.match(sequence)
-    assert match.num_ready_matched_blocks == expected_ready
-    assert engine.index.total_unready_blocks() == 0
+    assert match.num_matched_blocks == expected_ready
     assert engine.mempool.num_used_blocks == expected_ready
 
 
@@ -136,7 +131,7 @@ def test_deferred_insert_rematches_after_concurrent_save_split():
     loading = _sequence([1, 2, 30, 40])
     concurrent_save = _sequence([1, 2, 30, 50])
 
-    engine.insert(cached, engine.take(4), is_ready=True)
+    engine.insert(cached, engine.take(4))
     pending = _pending(engine, loading, (True, True), 2, 4)
 
     # The save splits the old [1,2,3,4] node and adds [30,50]. The GET's fresh
@@ -146,7 +141,6 @@ def test_deferred_insert_rematches_after_concurrent_save_split():
     engine.insert(
         concurrent_save,
         engine.take(2),
-        is_ready=True,
         match_result=save_match,
     )
 
@@ -155,13 +149,12 @@ def test_deferred_insert_rematches_after_concurrent_save_split():
     cached_match = engine.match(cached)
     loading_match = engine.match(loading)
     save_match = engine.match(concurrent_save)
-    assert cached_match.num_ready_matched_blocks == 4
-    assert loading_match.num_ready_matched_blocks == 4
-    assert save_match.num_ready_matched_blocks == 4
+    assert cached_match.num_matched_blocks == 4
+    assert loading_match.num_matched_blocks == 4
+    assert save_match.num_matched_blocks == 4
     assert loading_match.physical_blocks[2] == save_match.physical_blocks[2]
     assert loading_match.physical_blocks[3] == pending.physical_blocks[1]
     assert engine.index.total_cached_blocks() == 7
-    assert engine.index.total_unready_blocks() == 0
     assert engine.mempool.num_used_blocks == 7
 
 
@@ -222,9 +215,9 @@ def test_callback_records_publish_failure_when_commit_raises():
         side_effect=RuntimeError("injected commit failure"))
     manager.cpu_cache_engine = SimpleNamespace(
         unlock=Mock(),
-        set_ready=Mock(),
         recycle=Mock(),
     )
+    manager.cache_engines = {DeviceType.CPU: manager.cpu_cache_engine}
     publish_result = DeferredPublishResult()
     pending = SimpleNamespace(
         device_type=DeviceType.CPU,
@@ -232,7 +225,7 @@ def test_callback_records_publish_failure_when_commit_raises():
     )
 
     manager._transfer_callback(
-        node_to_unlock={DeviceType.CPU: (object(), 0)},
+        node_to_unlock={DeviceType.CPU: object()},
         buffer_to_free=None,
         deferred_inserts=[pending],
     )
@@ -249,22 +242,21 @@ def test_callback_cleans_up_old_anchor_when_deferred_commit_fails():
         side_effect=RuntimeError("injected commit failure"))
     manager.cpu_cache_engine = SimpleNamespace(
         unlock=Mock(),
-        set_ready=Mock(),
         recycle=Mock(),
     )
+    manager.cache_engines = {DeviceType.CPU: manager.cpu_cache_engine}
     anchor = object()
     buffer = np.asarray([7, 8], dtype=np.int64)
     pending = SimpleNamespace(device_type=DeviceType.CPU)
 
     manager._transfer_callback(
-        node_to_unlock={DeviceType.CPU: (anchor, 2)},
+        node_to_unlock={DeviceType.CPU: anchor},
         buffer_to_free={DeviceType.CPU: buffer},
         deferred_inserts=[pending],
     )
 
     manager._commit_deferred_insert.assert_called_once_with(pending)
     manager.cpu_cache_engine.unlock.assert_called_once_with(anchor)
-    manager.cpu_cache_engine.set_ready.assert_called_once_with(anchor, True, 2)
     assert manager.cpu_cache_engine.recycle.call_count == 1
     recycled = manager.cpu_cache_engine.recycle.call_args.args[0]
     np.testing.assert_array_equal(recycled, buffer)

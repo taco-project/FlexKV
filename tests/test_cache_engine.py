@@ -224,7 +224,6 @@ def test_match_and_insert(cache_engine: CacheEngineType, num_insert: int, seq_le
     cache_engine.insert(
         SequenceMeta(token_ids=base_token_ids, tokens_per_block=cache_engine.tokens_per_block),
         np.arange(base_num_blocks, dtype=np.int64),
-        is_ready=True,
     )
     cur_cached_blocks = base_num_blocks
     for i in range(num_insert):
@@ -245,9 +244,7 @@ def test_match_and_insert(cache_engine: CacheEngineType, num_insert: int, seq_le
             tokens_per_block=cache_engine.tokens_per_block,
         )
         match_result = cache_engine.match(insert_sequence_meta)
-        assert match_result.num_ready_matched_blocks == num_prefix_blocks
         assert match_result.num_matched_blocks == num_prefix_blocks
-        assert match_result.last_ready_node is not None
         assert match_result.last_node is not None
         assert match_result.physical_blocks.shape == (num_prefix_blocks,)
         assert match_result.physical_blocks.dtype == np.int64
@@ -256,7 +253,6 @@ def test_match_and_insert(cache_engine: CacheEngineType, num_insert: int, seq_le
         cache_engine.insert(
             insert_sequence_meta,
             np.arange(num_insert_blocks, dtype=np.int64),
-            is_ready=True,
             match_result=match_result,
         )
         cur_cached_blocks += num_insert_blocks
@@ -264,7 +260,6 @@ def test_match_and_insert(cache_engine: CacheEngineType, num_insert: int, seq_le
 
         match_result = cache_engine.match(insert_sequence_meta)
         assert match_result.num_matched_blocks == insert_sequence_meta.num_blocks
-        assert match_result.num_ready_matched_blocks == insert_sequence_meta.num_blocks
 
 
 @pytest.mark.parametrize(
@@ -272,8 +267,15 @@ def test_match_and_insert(cache_engine: CacheEngineType, num_insert: int, seq_le
     [{'num_total_blocks': 16, 'tokens_per_block': 1}],
     indirect=True,
 )
-def test_ready_match_is_a_contiguous_prefix(cache_engine: CacheEngineType):
-    """A ready child below an unready split parent is not a readable prefix."""
+def test_every_matched_block_is_readable(cache_engine: CacheEngineType):
+    """Insert-after publishes only written data, so a match is always readable.
+
+    Under the old readiness API a node was mounted before its transfer ran and
+    a match could straddle an unready split parent, which is why
+    ``num_ready_matched_blocks`` existed. Inserting after the write removes the
+    state entirely: whatever is on the tree was written, and a branch inserted
+    below a shared prefix is readable from block 0.
+    """
     first = SequenceMeta(
         token_ids=np.array([1, 2, 3, 4], dtype=np.int64),
         tokens_per_block=1,
@@ -283,30 +285,23 @@ def test_ready_match_is_a_contiguous_prefix(cache_engine: CacheEngineType):
         tokens_per_block=1,
     )
 
-    first_node = cache_engine.insert(
-        first, cache_engine.take(4), is_ready=False)
+    first_blocks = cache_engine.take(4)
+    cache_engine.insert(first, first_blocks)
     branch_match = cache_engine.match(branch)
     assert branch_match.num_matched_blocks == 2
-    branch_node = cache_engine.insert(
+    cache_engine.insert(
         branch,
         cache_engine.take(2),
-        is_ready=False,
         match_result=branch_match,
     )
 
-    # This is the dangerous completion order: the new suffix finishes before
-    # the writer that owns the shared prefix.
-    cache_engine.set_ready(branch_node, True, 2)
-    pending_prefix = cache_engine.match(branch)
-    assert pending_prefix.num_matched_blocks == 4
-    assert pending_prefix.num_ready_matched_blocks == 0
-
-    # The original node pointer is now the split suffix. The saved insertion
-    # length walks through its parent and makes the whole path readable.
-    cache_engine.set_ready(first_node, True, 4)
+    # Both paths are fully matchable, and the shared prefix is the same blocks.
     completed = cache_engine.match(branch)
     assert completed.num_matched_blocks == 4
-    assert completed.num_ready_matched_blocks == 4
+    np.testing.assert_array_equal(completed.physical_blocks[:2],
+                                  first_blocks[:2])
+    assert cache_engine.match(first).num_matched_blocks == 4
+    assert cache_engine.index.total_cached_blocks() == 6
 
 
 @pytest.mark.parametrize(
@@ -342,12 +337,11 @@ def test_stale_insert_rejects_existing_child_without_taking_block_ownership(
     second_blocks_before = second_blocks.copy()
 
     cache_engine.insert(
-        first, first_blocks, is_ready=True, match_result=first_match)
+        first, first_blocks, match_result=first_match)
     with pytest.raises(RuntimeError, match="radix insert conflict"):
         cache_engine.insert(
             second,
             second_blocks,
-            is_ready=True,
             match_result=stale_second_match,
         )
 
@@ -383,7 +377,7 @@ def test_stale_partial_match_is_rejected_after_concurrent_split(
         token_ids=np.array([1, 2, 30, 50], dtype=np.int64),
         tokens_per_block=1,
     )
-    cache_engine.insert(cached, cache_engine.take(4), is_ready=True)
+    cache_engine.insert(cached, cache_engine.take(4))
     stale_match = cache_engine.match(stale_sequence)
     concurrent_match = cache_engine.match(concurrent_sequence)
     assert stale_match.num_matched_blocks == 2
@@ -391,7 +385,6 @@ def test_stale_partial_match_is_rejected_after_concurrent_split(
     cache_engine.insert(
         concurrent_sequence,
         cache_engine.take(2),
-        is_ready=True,
         match_result=concurrent_match,
     )
     rejected_blocks = cache_engine.take(2)
@@ -399,7 +392,6 @@ def test_stale_partial_match_is_rejected_after_concurrent_split(
         cache_engine.insert(
             stale_sequence,
             rejected_blocks,
-            is_ready=True,
             match_result=stale_match,
         )
 
@@ -428,7 +420,7 @@ def test_take_and_recycle(cache_engine: CacheEngineType):
     token_ids = np.random.randint(0, 10000, (seq_blocks * tokens_per_block,), dtype=np.int64)
     sequence_meta = SequenceMeta(token_ids=token_ids, tokens_per_block=tokens_per_block)
     physical_blocks = cache_engine.take(seq_blocks)
-    radixnode = cache_engine.insert(sequence_meta, physical_blocks, is_ready=True)
+    radixnode = cache_engine.insert(sequence_meta, physical_blocks)
     assert cache_engine.index.total_cached_blocks() == seq_blocks
 
     # take(0) should return an empty array
@@ -458,7 +450,6 @@ def test_take_and_recycle(cache_engine: CacheEngineType):
     with pytest.raises(RuntimeError):
         cache_engine.take(num_total_blocks, protected_node=radixnode, strict=True)
     cache_engine.unlock(radixnode)
-    cache_engine.set_ready(radixnode, True, radixnode.size())
 
     # After unlock, strict take of all blocks succeeds (evicts the node)
     physical_blocks = cache_engine.take(num_total_blocks, protected_node=None, strict=True)
@@ -468,7 +459,7 @@ def test_take_and_recycle(cache_engine: CacheEngineType):
 
 
 # ---------------------------------------------------------------------------
-# Tests – CacheEngine cleanup (lock / unlock / set_ready)
+# Tests – CacheEngine cleanup (lock / unlock)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "cache_engine",
@@ -491,57 +482,57 @@ def test_cleanup(cache_engine: CacheEngineType):
         for token_ids in token_ids_list
     ]
 
-    # Insert first sequence (all unready)
+    # Insert first sequence. Insert-after publishes it immediately: everything
+    # on the tree has been written, so it is matchable from this point on.
     num_insert_blocks0 = sequence_meta_list[0].num_blocks
     radixnode0 = cache_engine.insert(
         sequence_meta_list[0],
-        np.arange(num_insert_blocks0, dtype=np.int64),
-        is_ready=False,
+        cache_engine.take(num_insert_blocks0),
     )
     cache_engine.lock_node(radixnode0)
-    radixnode0_size = radixnode0.size()
 
     # Insert second sequence (shares prefix with first)
     match_result = cache_engine.match(sequence_meta_list[1])
     num_insert_blocks1 = sequence_meta_list[1].num_blocks - match_result.num_matched_blocks
     radixnode1 = cache_engine.insert(
         sequence_meta_list[1],
-        np.arange(num_insert_blocks1, dtype=np.int64),
+        cache_engine.take(num_insert_blocks1),
         match_result=match_result,
-        is_ready=False,
     )
     cache_engine.lock_node(radixnode1)
-    radixnode1_size = radixnode1.size()
 
     # Insert third sequence (shares prefix with first)
     match_result = cache_engine.match(sequence_meta_list[2])
     num_insert_blocks2 = sequence_meta_list[2].num_blocks - match_result.num_matched_blocks
     radixnode2 = cache_engine.insert(
         sequence_meta_list[2],
-        np.arange(num_insert_blocks2, dtype=np.int64),
+        cache_engine.take(num_insert_blocks2),
         match_result=match_result,
-        is_ready=False,
     )
     cache_engine.lock_node(radixnode2)
-    radixnode2_size = radixnode2.size()
 
     total_insert_blocks = num_insert_blocks0 + num_insert_blocks1 + num_insert_blocks2
     assert cache_engine.index.total_cached_blocks() == total_insert_blocks
-    assert cache_engine.index.total_unready_blocks() == total_insert_blocks
-    assert cache_engine.index.total_ready_blocks() == 0
+    for sequence_meta in sequence_meta_list:
+        assert (cache_engine.match(sequence_meta).num_matched_blocks
+                == sequence_meta.num_blocks)
 
-    # Unlock & set ready in reverse order, verify incremental ready counts
+    # Every node is locked, so nothing may be evicted to satisfy a strict take.
+    with pytest.raises(RuntimeError):
+        cache_engine.take(cache_engine.num_total_blocks, strict=True)
+    assert cache_engine.index.total_cached_blocks() == total_insert_blocks
+
+    # Unlock in reverse insertion order; only after the last unlock can the
+    # whole tree be evicted.
     cache_engine.unlock(radixnode2)
-    cache_engine.set_ready(radixnode2, True, radixnode2_size)
-    assert cache_engine.index.total_ready_blocks() == num_insert_blocks2
-
     cache_engine.unlock(radixnode1)
-    cache_engine.set_ready(radixnode1, True, radixnode1_size)
-    assert cache_engine.index.total_ready_blocks() == num_insert_blocks1 + num_insert_blocks2
+    with pytest.raises(RuntimeError):
+        cache_engine.take(cache_engine.num_total_blocks, strict=True)
 
     cache_engine.unlock(radixnode0)
-    cache_engine.set_ready(radixnode0, True, radixnode0_size)
-    assert cache_engine.index.total_ready_blocks() == total_insert_blocks
+    drained = cache_engine.take(cache_engine.num_total_blocks, strict=True)
+    assert drained.shape == (cache_engine.num_total_blocks,)
+    assert cache_engine.index.total_cached_blocks() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +587,7 @@ def _insert_and_access(engine, seqs, access_pattern):
 
     # 1. Insert A, B, C, D in order (with small delays for distinct timestamps)
     for seq in seqs[:4]:
-        engine.insert(seq, engine.take(1), is_ready=True)
+        engine.insert(seq, engine.take(1))
         time.sleep(0.002)
 
     # 2. Apply access pattern
@@ -606,7 +597,7 @@ def _insert_and_access(engine, seqs, access_pattern):
         time.sleep(0.002)
 
     # 3. Insert E → triggers eviction of 1 block
-    engine.insert(seqs[4], engine.take(1), is_ready=True)
+    engine.insert(seqs[4], engine.take(1))
 
     # 4. Check which sequences survived
     return {
@@ -703,7 +694,7 @@ def test_eviction_policy_valid_creation(engine_cls, policy: str):
     """All six policies should be accepted and produce a working engine."""
     engine = _create_engine(engine_cls, policy)
     seqs = _make_seqs(2)
-    engine.insert(seqs[0], engine.take(1), is_ready=True)
+    engine.insert(seqs[0], engine.take(1))
     mr = engine.match(seqs[0])
     assert mr.num_matched_blocks == 1
 
@@ -761,7 +752,7 @@ def test_eviction_policy_consecutive(engine_cls):
         )
 
         for seq in seqs[:4]:
-            engine.insert(seq, engine.take(1), is_ready=True)
+            engine.insert(seq, engine.take(1))
             time.sleep(0.002)
 
         for idx, count in access_pattern:
@@ -770,7 +761,7 @@ def test_eviction_policy_consecutive(engine_cls):
             time.sleep(0.002)
 
         # Insert E → triggers eviction
-        engine.insert(seqs[4], engine.take(1), is_ready=True)
+        engine.insert(seqs[4], engine.take(1))
 
         evicted = set()
         for i, label in enumerate(labels):
@@ -844,7 +835,7 @@ def test_eviction_policy_batch(engine_cls):
 
         # Insert A, B, C, D
         for seq in seqs[:4]:
-            engine.insert(seq, engine.take(1), is_ready=True)
+            engine.insert(seq, engine.take(1))
             time.sleep(0.002)
 
         # Apply access pattern
@@ -854,7 +845,7 @@ def test_eviction_policy_batch(engine_cls):
             time.sleep(0.002)
 
         # Insert E → triggers eviction of 2 blocks
-        engine.insert(seqs[4], engine.take(1), is_ready=True)
+        engine.insert(seqs[4], engine.take(1))
 
         result = {
             labels[i]: engine.match(seqs[i]).num_matched_blocks
@@ -887,7 +878,7 @@ def test_eviction_policy_reinsert_after_eviction(engine_cls):
 
     # Insert A, B, C, D
     for seq in seqs[:4]:
-        engine.insert(seq, engine.take(1), is_ready=True)
+        engine.insert(seq, engine.take(1))
         time.sleep(0.002)
 
     # Access pattern: make B the oldest accessed
@@ -897,7 +888,7 @@ def test_eviction_policy_reinsert_after_eviction(engine_cls):
         time.sleep(0.002)
 
     # Insert E → evicts B (LRU)
-    engine.insert(seqs[4], engine.take(1), is_ready=True)
+    engine.insert(seqs[4], engine.take(1))
     assert engine.match(seqs[1]).num_matched_blocks == 0, "B should be evicted"
 
     # Now evict another to make room, then re-insert B
@@ -908,7 +899,7 @@ def test_eviction_policy_reinsert_after_eviction(engine_cls):
     time.sleep(0.002)
 
     # Re-insert B (this triggers eviction of C, the current LRU)
-    engine.insert(seqs[1], engine.take(1), is_ready=True)
+    engine.insert(seqs[1], engine.take(1))
 
     # B should now be matchable
     assert engine.match(seqs[1]).num_matched_blocks == 1, (
@@ -956,7 +947,7 @@ def test_slru_protected_node_retained(engine_cls):
 
     # Insert A, B, C, D
     for seq in seqs[:4]:
-        engine.insert(seq, engine.take(1), is_ready=True)
+        engine.insert(seq, engine.take(1))
         time.sleep(0.002)
 
     # Access A 10 times → hit_count >= 5 → Protected
@@ -974,7 +965,7 @@ def test_slru_protected_node_retained(engine_cls):
     time.sleep(0.002)
 
     # Insert E → triggers eviction of 1 block
-    engine.insert(seqs[4], engine.take(1), is_ready=True)
+    engine.insert(seqs[4], engine.take(1))
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
@@ -1010,7 +1001,7 @@ def test_slru_same_segment_lru_order(engine_cls):
 
     # Insert A, B, C, D
     for seq in seqs[:4]:
-        engine.insert(seq, engine.take(1), is_ready=True)
+        engine.insert(seq, engine.take(1))
         time.sleep(0.002)
 
     # Access in order: A, B, C, D
@@ -1019,7 +1010,7 @@ def test_slru_same_segment_lru_order(engine_cls):
         time.sleep(0.002)
 
     # Insert E → triggers eviction
-    engine.insert(seqs[4], engine.take(1), is_ready=True)
+    engine.insert(seqs[4], engine.take(1))
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
@@ -1049,7 +1040,7 @@ def test_slru_custom_protected_threshold(engine_cls):
 
     # Insert A, B, C, D
     for seq in seqs[:4]:
-        engine.insert(seq, engine.take(1), is_ready=True)
+        engine.insert(seq, engine.take(1))
         time.sleep(0.002)
 
     # Access pattern: A×5, B×3 → both Protected (hit >= 3).
@@ -1068,7 +1059,7 @@ def test_slru_custom_protected_threshold(engine_cls):
     time.sleep(0.002)
 
     # Insert E → triggers eviction
-    engine.insert(seqs[4], engine.take(1), is_ready=True)
+    engine.insert(seqs[4], engine.take(1))
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
@@ -1108,7 +1099,7 @@ def test_slru_batch_eviction_cross_segment(engine_cls):
 
     # Insert A, B, C, D
     for seq in seqs[:4]:
-        engine.insert(seq, engine.take(1), is_ready=True)
+        engine.insert(seq, engine.take(1))
         time.sleep(0.002)
 
     # Access A×5, B×5 → Protected; C×1, D×1 → Probationary
@@ -1122,7 +1113,7 @@ def test_slru_batch_eviction_cross_segment(engine_cls):
     time.sleep(0.002)
 
     # Insert E → triggers eviction of 2 blocks
-    engine.insert(seqs[4], engine.take(1), is_ready=True)
+    engine.insert(seqs[4], engine.take(1))
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
@@ -1155,7 +1146,7 @@ def test_slru_threshold_one_promotes_on_first_hit(engine_cls):
 
     # Insert A, B, C, D — fills cache (4/4)
     for seq in seqs[:4]:
-        engine.insert(seq, engine.take(1), is_ready=True)
+        engine.insert(seq, engine.take(1))
         time.sleep(0.002)
 
     # Match A, B, C once → their hit_count becomes 1 → Protected segment.
@@ -1168,7 +1159,7 @@ def test_slru_threshold_one_promotes_on_first_hit(engine_cls):
     time.sleep(0.002)
 
     # Insert E → triggers eviction of 1 block; D (only Probationary) must go.
-    engine.insert(seqs[4], engine.take(1), is_ready=True)
+    engine.insert(seqs[4], engine.take(1))
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {
@@ -1202,7 +1193,7 @@ def test_slru_all_protected_falls_back_to_lru(engine_cls):
 
     # Insert A, B, C, D
     for seq in seqs[:4]:
-        engine.insert(seq, engine.take(1), is_ready=True)
+        engine.insert(seq, engine.take(1))
         time.sleep(0.002)
 
     # First-round match → all promote to Protected (hit_count >= 1)
@@ -1220,7 +1211,7 @@ def test_slru_all_protected_falls_back_to_lru(engine_cls):
     time.sleep(0.002)
 
     # Insert E → evicts the LRU-within-Protected node, which is B.
-    engine.insert(seqs[4], engine.take(1), is_ready=True)
+    engine.insert(seqs[4], engine.take(1))
 
     labels = ['A', 'B', 'C', 'D', 'E']
     result = {

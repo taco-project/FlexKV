@@ -44,8 +44,8 @@ class _FakeCPUCacheEngine:
         self.recycled.append(physical_blocks.copy())
 
     def insert(self, sequence_meta, physical_blocks, num_insert_blocks=None,
-               is_ready=False, match_result=None):
-        del sequence_meta, is_ready, match_result
+               match_result=None):
+        del sequence_meta, match_result
         self.inserted.append(physical_blocks.copy())
         size = len(physical_blocks) if num_insert_blocks is None else num_insert_blocks
         return _FakeNode(size)
@@ -55,9 +55,7 @@ def _match(block_ids):
     blocks = np.asarray(block_ids, dtype=np.int64)
     node = _FakeNode(len(blocks)) if len(blocks) > 0 else None
     return MatchResultAccel(
-        num_ready_matched_blocks=len(blocks),
         num_matched_blocks=len(blocks),
-        last_ready_node=node,
         last_node=node,
         physical_blocks=blocks,
         matched_pos="local",

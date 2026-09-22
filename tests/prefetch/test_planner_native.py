@@ -77,7 +77,7 @@ def finish(env, graph, bitmap=None, failed=False, missing=False):
     bitmap = bitmap if bitmap is not None else (True,) * len(op.dst_block_ids)
     # Remote values keyed by the full prefix hash; place in actual allocated slots.
     for hash_value, dst, ok in zip(
-        op.mooncake_store_block_hashes, op.dst_block_ids, bitmap
+        op.mooncake_store_block_hashes, op.dst_block_ids, bitmap, strict=False
     ):
         if ok:
             env.data[dst] = int(hash_value) & 255
@@ -124,14 +124,14 @@ def test_real_data_chunk_hash_offsets_and_invisible_staging(env):
     env.c.tick()
     assert len(env.sent) == 2
     seq = SequenceMeta(env.tokens, 4)
-    assert env.cpu.match(seq).num_ready_matched_blocks == 0
+    assert env.cpu.match(seq).num_matched_blocks == 0
     np.testing.assert_array_equal(
         next(iter(env.sent[1]._op_map.values())).mooncake_store_block_hashes,
         seq.block_hashes[2:4],
     )
     finish(env, env.sent[1])
     env.c.tick()
-    assert env.cpu.match(seq).num_ready_matched_blocks == 0
+    assert env.cpu.match(seq).num_matched_blocks == 0
     finish(env, env.sent[0])
     for _ in range(20):
         env.c.tick()
@@ -146,7 +146,7 @@ def test_real_data_chunk_hash_offsets_and_invisible_staging(env):
     snapshot = env.c.snapshot(h)
     assert snapshot.terminal and snapshot.loaded_tokens == 40
     match = env.cpu.match(seq)
-    assert match.num_ready_matched_blocks == 10
+    assert match.num_matched_blocks == 10
     expected = np.repeat(
         (seq.block_hashes.astype(np.uint64) & 255)[:, None], 16, axis=1
     )
@@ -176,7 +176,7 @@ def test_partial_result_and_out_of_order_tail_recycle(
     assert s.terminal and s.loaded_tokens == expected
     assert env.cpu.mempool.num_used_blocks == expected // 4
     assert (
-        env.cpu.match(SequenceMeta(env.tokens, 4)).num_ready_matched_blocks
+        env.cpu.match(SequenceMeta(env.tokens, 4)).num_matched_blocks
         == expected // 4
     )
 
@@ -305,7 +305,7 @@ def _cpu_pipe_worker(command, result, shared, allow):
         for graph in message["transfer_graphs"]:
             assert allow.wait(10)
             op = next(iter(graph._op_map.values()))
-            for h, dst in zip(op.mooncake_store_block_hashes, op.dst_block_ids):
+            for h, dst in zip(op.mooncake_store_block_hashes, op.dst_block_ids, strict=True):
                 data[dst] = int(h) & 255
             result.send(
                 [

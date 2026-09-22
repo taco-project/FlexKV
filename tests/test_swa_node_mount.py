@@ -56,7 +56,7 @@ def _phys(*xs):
 
 def test_py_match_returns_last_swa_node():
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3))
     assert n1 is not None and n1.size() == 4
     idx.set_swa(n1, slot=100)
     assert n1.has_swa() and n1.swa_host_slot == 100 and n1.on_swa_lru
@@ -70,12 +70,12 @@ def test_py_match_returns_last_swa_node():
 def test_py_split_preserves_swa_on_suffix_half():
     """I0/I4: split keeps the SWA on the half that owns the original last page."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3))
     idx.set_swa(n1, slot=200)
 
     s2 = _seq([1, 2, 3, 4, 55, 66, 77, 88])
     assert idx.match_prefix(s2).num_matched_blocks == 2
-    idx.insert(s2, _phys(8, 9), is_ready=True, match_result=idx.match_prefix(s2))
+    idx.insert(s2, _phys(8, 9), match_result=idx.match_prefix(s2))
 
     # original n1 is now the suffix half (last 2 pages) and KEEPS its SWA.
     assert n1.has_swa() and n1.swa_host_slot == 200 and n1.size() == 2
@@ -91,7 +91,7 @@ def test_py_split_preserves_swa_on_suffix_half():
 def test_py_full_evict_frees_swa_slot():
     """I1: evicting a node's Full KV frees its SWA slot (drained to pool)."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    na = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    na = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1))
     idx.set_swa(na, slot=300)
     ev_blocks, _ = idx.evict(2)
     assert len(ev_blocks) == 2
@@ -103,10 +103,10 @@ def test_py_full_evict_frees_swa_slot():
 def test_py_evict_swa_prefers_internal_node():
     """Multi-turn: SWA-only eviction drops interior-prefix SWA first, keeps Full."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    nfull = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    nfull = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3))
     idx.set_swa(nfull, slot=400)
     sd = _seq([1, 2, 3, 4, 99, 98, 97, 96])
-    idx.insert(sd, _phys(8, 9), is_ready=True, match_result=idx.match_prefix(sd))
+    idx.insert(sd, _phys(8, 9), match_result=idx.match_prefix(sd))
     A = nfull.parent
     assert A is not None and not A.is_leaf()
     idx.set_swa(A, slot=401)
@@ -125,7 +125,7 @@ def test_py_evict_swa_prefers_internal_node():
 def test_py_evict_swa_leaf_without_lock_deletes_node():
     """I2: a leaf that would lose its SWA and has no full lock is deleted whole."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    nl = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    nl = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1))
     idx.set_swa(nl, slot=500)
     evf, nfreed = idx.evict_swa(1)
     assert nfreed == 1
@@ -136,7 +136,7 @@ def test_py_evict_swa_leaf_without_lock_deletes_node():
 
 def test_py_evict_swa_leaf_with_full_lock_keeps_full():
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    nl = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    nl = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1))
     idx.set_swa(nl, slot=600)
     nl.lock_cnt = 1
     evf, nfreed = idx.evict_swa(1)
@@ -152,9 +152,9 @@ def test_py_match_probe_does_not_promote_swa_lru():
     pollute eviction. Passes today; must keep passing after the reuse-promotion
     fix (which should gate on update_cache_info=True only)."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    a = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    a = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1))
     idx.set_swa(a, slot=10)
-    b = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3), is_ready=True)
+    b = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3))
     idx.set_swa(b, slot=11)
     # SWA-LRU order (LRU tail -> MRU head): A, B. Probe A without cache-info update.
     idx.match_prefix(_seq([1, 2, 3, 4]), update_cache_info=False)
@@ -173,9 +173,9 @@ def test_py_reuse_promotes_swa_over_never_reused():
     true LRU victim. On the next single-slot SWA eviction, B must go and A must
     survive."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    a = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    a = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1))
     idx.set_swa(a, slot=10)
-    b = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3), is_ready=True)
+    b = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3))
     idx.set_swa(b, slot=11)
     # Reuse A (real match, not a probe).
     mr = idx.match_prefix(_seq([1, 2, 3, 4]), update_cache_info=True)
@@ -189,7 +189,7 @@ def test_py_reuse_promotes_swa_over_never_reused():
 def test_py_dual_lock_invariant():
     """I3: full_lock_ref (lock_cnt) >= swa_lock_ref, with paired inc/dec."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1))
     idx.set_swa(n1, slot=700)
     b = idx.inc_lock_ref(n1)
     assert n1.lock_cnt == 1 and n1.swa_lock_ref == 1 and b is n1
@@ -200,7 +200,7 @@ def test_py_dual_lock_invariant():
 
 def test_py_dec_swa_lock_only_early_release():
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1))
     idx.set_swa(n1, slot=701)
     b = idx.inc_lock_ref(n1)
     idx.dec_swa_lock_only(b)
@@ -215,10 +215,10 @@ def test_py_dual_lock_only_deepest_swa_node_locked():
     """I3 + scope: inc_lock_ref locks full on [node,root) but SWA only on the
     single deepest node with SWA; dec is symmetric (no underflow)."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    a = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    a = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3))
     idx.set_swa(a, slot=10)
     sd = _seq([1, 2, 3, 4, 55, 66, 77, 88])
-    idx.insert(sd, _phys(8, 9), is_ready=True, match_result=idx.match_prefix(sd))
+    idx.insert(sd, _phys(8, 9), match_result=idx.match_prefix(sd))
     A = a.parent
     idx.set_swa(A, slot=11)  # both internal A and leaf a carry SWA
     b = idx.inc_lock_ref(a)
@@ -233,7 +233,7 @@ def test_py_dual_lock_only_deepest_swa_node_locked():
 def test_py_swa_locked_node_not_full_evictable():
     """in_use() includes swa_lock_ref: a SWA-locked node is not full-evictable."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    n = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    n = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1))
     idx.set_swa(n, slot=5)
     n.swa_lock_ref = 1
     assert n.in_use()
@@ -269,7 +269,7 @@ def test_py_reset_rearms_swa_pool_via_host_pool():
 def test_py_partial_node_match_does_not_report_swa():
     """§5.2: a partially-matched node does not expose its trailing-page SWA."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3))
     idx.set_swa(n1, slot=800)
     # query shares only the first 3 blocks (partial match of the 4-block node)
     mr = idx.match_prefix(_seq([1, 2, 3, 4, 5, 6, 99, 98]))
@@ -283,10 +283,10 @@ def test_py_merge_child_moves_swa_to_merged_node():
     freeing the parent's stale SWA."""
     # Fresh 2-level chain we can merge: root -> A(2blk,SWA) -> B(2blk,SWA), A has 1 child.
     idx2 = RadixTreeIndex(tokens_per_block=TPB)
-    a = idx2.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    a = idx2.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3))
     idx2.set_swa(a, slot=901)
     sd2 = _seq([1, 2, 3, 4, 55, 66, 77, 88])
-    idx2.insert(sd2, _phys(8, 9), is_ready=True, match_result=idx2.match_prefix(sd2))
+    idx2.insert(sd2, _phys(8, 9), match_result=idx2.match_prefix(sd2))
     A = a.parent
     idx2.set_swa(A, slot=900)  # stale SWA on the internal prefix node
     # Remove the divergent sibling so A has exactly one child (a), enabling merge.
@@ -308,9 +308,9 @@ def _three_swa_leaves():
     """root -> {n1, n2, n3} sibling leaves, each with a live SWA. set_swa order
     n1,n2,n3 leaves n3 at MRU and n1 at the LRU tail."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
-    n2 = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3), is_ready=True)
-    n3 = idx.insert(_seq([9, 10, 11, 12]), _phys(4, 5), is_ready=True)
+    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1))
+    n2 = idx.insert(_seq([5, 6, 7, 8]), _phys(2, 3))
+    n3 = idx.insert(_seq([9, 10, 11, 12]), _phys(4, 5))
     idx.set_swa(n1, slot=100)
     idx.set_swa(n2, slot=200)
     idx.set_swa(n3, slot=300)
@@ -352,7 +352,7 @@ def test_promote_swa_ignores_dead_node():
     """promote_swa on a tombstone (SWA already freed) node is a no-op — it must
     not re-thread a dead node onto the SWA-LRU (would corrupt evict_swa)."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1), is_ready=True)
+    n1 = idx.insert(_seq([1, 2, 3, 4]), _phys(0, 1))
     idx.set_swa(n1, slot=100)
     idx.record_freed_swa_slot(n1)                        # tombstone it
     assert n1.swa_tombstone and not n1.on_swa_lru
@@ -393,13 +393,13 @@ def _tree():
     return c_ext.CRadixTreeIndex(TPB, 4096, 0, "lru")
 
 
-def _insert(tree, ids, base, ready=True, match=None):
+def _insert(tree, ids, base, match=None):
     n = len(ids) // TPB
     bh = _hashes(ids)
     phys = torch.arange(base, base + n, dtype=torch.int64)
     if match is None:
-        return tree.insert(phys, bh, n, -1, ready)
-    return tree.insert(phys, bh, n, -1, ready,
+        return tree.insert(phys, bh, n, -1)
+    return tree.insert(phys, bh, n, -1,
                        match.last_node, match.num_matched_blocks,
                        match.last_node_matched_length)
 
@@ -732,7 +732,7 @@ class _SWAWorkloadDriver:
         if nblocks == 0:
             return
         mr = self.engine.match(sm)
-        full_hit = int(mr.num_ready_matched_blocks)
+        full_hit = int(mr.num_matched_blocks)
         if full_hit > 0:
             swa_hit = int(mr.swa_hit_blocks)
             node = mr.last_swa_node
@@ -751,7 +751,7 @@ class _SWAWorkloadDriver:
                 self.engine.recycle(phys_new)
                 return
             node = self.engine.insert(sm, phys_new, num_insert_blocks=num_new,
-                                      is_ready=True, match_result=mr)
+                                      match_result=mr)
         else:
             node = mr.last_node
         if node is None:
@@ -824,10 +824,10 @@ def _build_prefix_chain():
     SWA and is the leaf we will evict; b is a sibling keeping A internal.
     """
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    a = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    a = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3))
     idx.set_swa(a, slot=901)
     sd = _seq([1, 2, 3, 4, 55, 66, 77, 88])
-    idx.insert(sd, _phys(8, 9), is_ready=True, match_result=idx.match_prefix(sd))
+    idx.insert(sd, _phys(8, 9), match_result=idx.match_prefix(sd))
     A = a.parent
     b = [c for c in A.children.values() if c is not a][0]
     return idx, A, a, b
@@ -875,9 +875,9 @@ def test_full_evict_no_cascade_when_swa_disabled():
     True on every node, but the I2 cascade must NOT fire — evict() frees EXACTLY
     the requested blocks and leaves valid ancestors intact."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    a = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    a = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3))
     sd = _seq([1, 2, 3, 4, 55, 66, 77, 88])
-    idx.insert(sd, _phys(8, 9), is_ready=True, match_result=idx.match_prefix(sd))
+    idx.insert(sd, _phys(8, 9), match_result=idx.match_prefix(sd))
     A = a.parent
     assert not idx._swa_enabled  # never armed
     total_before = idx.total_cached_blocks()  # 6
@@ -895,7 +895,7 @@ def test_full_evict_no_cascade_when_swa_disabled():
 def test_match_result_exposes_swa_source_within_bound():
     """match_prefix exposes the SWA source without a second read-source probe."""
     idx = RadixTreeIndex(tokens_per_block=TPB)
-    n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3), is_ready=True)
+    n1 = idx.insert(_seq([1, 2, 3, 4, 5, 6, 7, 8]), _phys(0, 1, 2, 3))
     idx.set_swa(n1, slot=100)
     mr = idx.match_prefix(_seq([1, 2, 3, 4, 5, 6, 7, 8]))
     assert mr.swa_hit_blocks == 4 and mr.last_swa_node is n1

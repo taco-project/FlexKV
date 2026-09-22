@@ -763,6 +763,9 @@ class _RecordingCollector:
     def record_transfer_completed(self, *_a, **_kw) -> None:
         pass
 
+    def record_transfer_duration(self, *_a, **_kw) -> None:
+        pass
+
     def record_cache_hit(self, *_a, **_kw) -> None:
         pass
 

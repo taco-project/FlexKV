@@ -192,9 +192,9 @@ def _seed_long_ssd_short_cpu_hit(eng, tok):
     seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
     cpu_match = eng.cpu_cache_engine.match(seq)
     ssd_match = eng.ssd_cache_engine.match(seq)
-    assert cpu_match.num_ready_matched_blocks == 2
+    assert cpu_match.num_matched_blocks == 2
     assert cpu_match.swa_hit_blocks == 2
-    assert ssd_match.num_ready_matched_blocks == 4
+    assert ssd_match.num_matched_blocks == 4
     assert ssd_match.swa_hit_blocks == 4
     return cpu_match, ssd_match
 
@@ -221,9 +221,10 @@ def test_put_builds_full_plus_swa_store_chain():
     # size-1 placeholder (bound late via set_swa_gpu_blocks).
     assert swa[0].op_id in graph._swa_gpu_transfer_op_id
     assert eng.cpu_cache_engine.swa_pool.num_used == 1  # one slot allocated
-    sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
+    sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
+    sm.gen_hashes()
     pending = eng.cpu_cache_engine.match(sm)
-    assert pending.num_ready_matched_blocks == 0
+    assert pending.num_matched_blocks == 0
     assert pending.last_node.swa_host_slot == -1
     assert pending.swa_hit_blocks == 0
 
@@ -233,17 +234,20 @@ def test_put_builds_full_plus_swa_store_chain():
     assert barrier.transfer_type == TransferType.VIRTUAL
     assert barrier.predecessors == {full_d2h.op_id, swa_d2h.op_id}
 
-    # Full-KV may become readable first, but the reserved SWA slot must remain a
-    # miss until its independent sibling D2H completes.
+    # Insert-after publishes the tier only after both sibling writers finish.
     op_cb[full_d2h.op_id]()
     full_only = eng.cpu_cache_engine.match(sm)
-    assert full_only.num_ready_matched_blocks == 4
+    assert full_only.num_matched_blocks == 0
     assert full_only.swa_hit_blocks == 0
     assert full_only.last_node.swa_host_slot == -1
 
     op_cb[swa_d2h.op_id]()
+    written = eng.cpu_cache_engine.match(sm)
+    assert written.num_matched_blocks == 4
+    assert written.swa_hit_blocks == 0
+    assert written.last_node.swa_host_slot == -1
     cb()
-    # SWA completion publishes the reserved slot independently.
+    # SWA stays reserved until all graph consumers drain.
     ready = eng.cpu_cache_engine.match(sm)
     assert ready.swa_hit_blocks == 4
     assert ready.last_swa_node is not None
@@ -266,20 +270,24 @@ def test_put_swa_first_stays_hidden_until_full_kv_is_ready():
                     if o.transfer_type == TransferType.D2H)
     swa_d2h = next(o for o in _swa_ops(graph)
                    if o.transfer_type == TransferType.D2H)
-    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
+    seq.gen_hashes()
 
-    # The SWA bytes may land first.  Mounting the completed slot is safe because
-    # match_prefix still requires the owning Full-KV node to be ready.
+    # SWA may land first, but neither staging allocation is published yet.
     op_cb[swa_d2h.op_id]()
     swa_only = eng.cpu_cache_engine.match(seq)
-    assert swa_only.num_ready_matched_blocks == 0
+    assert swa_only.num_matched_blocks == 0
     assert swa_only.swa_hit_blocks == 0
-    assert swa_only.last_node.swa_host_slot >= 0
+    assert swa_only.last_node.swa_host_slot == -1
 
     op_cb[full_d2h.op_id]()
+    written = eng.cpu_cache_engine.match(seq)
+    assert written.num_matched_blocks == 4
+    assert written.swa_hit_blocks == 0
+    assert written.last_node.swa_host_slot == -1
     cb()
     ready = eng.cpu_cache_engine.match(seq)
-    assert ready.num_ready_matched_blocks == 4
+    assert ready.num_matched_blocks == 4
     assert ready.swa_hit_blocks == 4
 
 
@@ -308,7 +316,7 @@ def test_put_full_swa_pool_keeps_match_node_alive_until_insert():
 
     seq = SequenceMeta(token_ids=extended, tokens_per_block=TPB)
     ready = eng.cpu_cache_engine.match(seq)
-    assert ready.num_ready_matched_blocks == 4
+    assert ready.num_matched_blocks == 4
     assert ready.swa_hit_blocks == 4
     assert eng.cpu_cache_engine.swa_pool.num_used == 1
 
@@ -333,7 +341,8 @@ def test_get_builds_full_plus_swa_load_chain():
     assert swa[0].op_id in barrier.predecessors, "SWA H2D not joined into barrier"
     # the matched CPU SWA node was pinned for load; releasing via the H2D callback
     # must drop the pin (no leak).
-    sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB); sm.gen_hashes()
+    sm = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
+    sm.gen_hashes()
     _complete(gop_cb, gcb)
     # after release, the node's SWA is unlocked (a fresh match can lock again).
     ready = eng.cpu_cache_engine.match(sm)
@@ -530,20 +539,29 @@ def test_put_writethrough_ssd_builds_swa_h2disk():
 
     # SSD SWA is allocated but is not mounted while write-through is in flight.
     assert eng.ssd_cache_engine.swa_pool.num_used == 1
-    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
+    seq.gen_hashes()
     pending = eng.ssd_cache_engine.match(seq)
-    assert pending.num_ready_matched_blocks == 0
+    assert pending.num_matched_blocks == 0
     assert pending.last_node.swa_host_slot == -1
     assert pending.swa_hit_blocks == 0
 
     op_cb[full_d2h.op_id]()
     op_cb[full_h2disk.op_id]()
     full_only = eng.ssd_cache_engine.match(seq)
-    assert full_only.num_ready_matched_blocks == 4
+    assert full_only.num_matched_blocks == 0
     assert full_only.swa_hit_blocks == 0
 
     op_cb[swa_d2h.op_id]()
+    # CPU Full is already reusable while the SSD sibling writer is pending.
+    cpu_written = eng.cpu_cache_engine.match(seq)
+    assert cpu_written.num_matched_blocks == 4
+    assert cpu_written.swa_hit_blocks == 0
     op_cb[swa_h2disk.op_id]()
+    ssd_written = eng.ssd_cache_engine.match(seq)
+    assert ssd_written.num_matched_blocks == 4
+    assert ssd_written.swa_hit_blocks == 0
+    assert ssd_written.last_node.swa_host_slot == -1
     for op_id, callback in op_cb.items():
         if op_id not in {
             full_d2h.op_id,
@@ -572,7 +590,8 @@ def test_get_ssd_staging_when_only_ssd_has_swa():
     # evict the CPU SWA (SWA-only eviction) so the CPU tier no longer matches it
     eng.cpu_cache_engine._evict_swa_slots(eng.cpu_cache_engine.swa_pool.num_used)
 
-    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB); seq.gen_hashes()
+    seq = SequenceMeta(token_ids=tok, tokens_per_block=TPB)
+    seq.gen_hashes()
     cpu_hit = eng.cpu_cache_engine.match(seq).swa_hit_blocks
     assert cpu_hit == 0, "precondition: CPU SWA must be gone"
     ssd_hit = eng.ssd_cache_engine.match(seq).swa_hit_blocks
@@ -622,7 +641,7 @@ def test_get_ssd_staging_failure_does_not_report_fullkv_hit(monkeypatch):
     assert ssd_swa_node.swa_lock_ref == 0, "failed source pin leaked"
     cpu_after = eng.cpu_cache_engine.match(
         SequenceMeta(token_ids=tok, tokens_per_block=TPB))
-    assert cpu_after.num_ready_matched_blocks == 2
+    assert cpu_after.num_matched_blocks == 2
     assert cpu_after.swa_hit_blocks == 2
     assert np.array_equal(cpu_after.physical_blocks[:2], cpu_blocks)
     cb()
@@ -671,7 +690,7 @@ def test_get_ssd_staging_protects_referenced_cpu_fullkv(monkeypatch):
     # and its Full-KV blocks must still exist until the GET finishes.
     cpu_during_get = eng.cpu_cache_engine.match(
         SequenceMeta(token_ids=tok, tokens_per_block=TPB))
-    assert cpu_during_get.num_ready_matched_blocks == 2
+    assert cpu_during_get.num_matched_blocks == 2
     assert np.array_equal(cpu_during_get.physical_blocks[:2], cpu_blocks)
     _complete(op_cb, cb)
 
@@ -783,7 +802,8 @@ def test_multitier_match_promotes_swa_in_each_tier():
         _complete(pop, pcb)
 
     # A real match of A on each tier (match() -> match_prefix(update_cache_info=True)).
-    seq_a = SequenceMeta(token_ids=tok_a, tokens_per_block=TPB); seq_a.gen_hashes()
+    seq_a = SequenceMeta(token_ids=tok_a, tokens_per_block=TPB)
+    seq_a.gen_hashes()
     eng.cpu_cache_engine.match(seq_a)
     eng.ssd_cache_engine.match(seq_a)
 
@@ -791,7 +811,8 @@ def test_multitier_match_promotes_swa_in_each_tier():
     eng.cpu_cache_engine._evict_swa_slots(1)
     eng.ssd_cache_engine._evict_swa_slots(1)
 
-    seq_b = SequenceMeta(token_ids=tok_b, tokens_per_block=TPB); seq_b.gen_hashes()
+    seq_b = SequenceMeta(token_ids=tok_b, tokens_per_block=TPB)
+    seq_b.gen_hashes()
     for name, engine in (("cpu", eng.cpu_cache_engine), ("ssd", eng.ssd_cache_engine)):
         a_hit = engine.match(seq_a).swa_hit_blocks
         b_hit = engine.match(seq_b).swa_hit_blocks

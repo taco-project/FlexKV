@@ -243,7 +243,6 @@ def test_match_kv_only_full_hit(mooncake_client, buffer_and_keys):
     assert result.num_matched_blocks == num_blocks, (
         f"expected match={num_blocks}, got {result.num_matched_blocks}"
     )
-    assert result.num_ready_matched_blocks == result.num_matched_blocks
 
     mooncake_client.unregister_buffer(buffer)
 

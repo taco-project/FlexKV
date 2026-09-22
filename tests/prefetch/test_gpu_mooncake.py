@@ -67,6 +67,7 @@ def cluster():
         use_mooncake_store_backend=True,
         mooncake_store_config_path=os.environ["FLEXKV_MOONCAKE_STORE_CONFIG_PATH"],
         enable_chunked_prefetch=True,
+        prefetch_max_reserved_bytes=32 * 1024**2,
     )
     manager = KVManager(
         model, cfg, server_recv_port="ipc:///tmp/prefetch-real-" + uuid.uuid4().hex
@@ -88,7 +89,7 @@ def cluster():
     expected = [
         ((pattern + i * 13) % 251 + 1).to(model.dtype) for i in range(len(tensors))
     ]
-    for target, source in zip(tensors, expected):
+    for target, source in zip(tensors, expected, strict=True):
         target.copy_(source)
     torch.cuda.synchronize()
     tokens = np.arange(512 * 16, dtype=np.int64)
@@ -180,7 +181,7 @@ def verify_load(c, h, snap):
         c.manager.cancel(task)
     torch.cuda.synchronize()
     blocks = end // 16
-    for actual, expected in zip(c.tensors, c.expected):
+    for actual, expected in zip(c.tensors, c.expected, strict=True):
         assert torch.equal(
             actual[:blocks], expected[:blocks]
         ), "GPU KV content mismatch"
@@ -286,7 +287,7 @@ def test_real_foreground_get_during_prefetch(clean):
         == KVResponseStatus.SUCCESS
     )
     torch.cuda.synchronize()
-    for actual, expected in zip(c.tensors, c.expected):
+    for actual, expected in zip(c.tensors, c.expected, strict=True):
         assert torch.equal(actual[: end // 16], expected[: end // 16])
     snap = c.manager.wait_prefetch(h, 60)
     record("foreground_overlap", snap, foreground_tokens=end)

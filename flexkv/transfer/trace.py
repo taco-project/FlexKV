@@ -1,9 +1,13 @@
-"""Transfer diagnosis tracing (single switch, raw-data only).
+"""Transfer op timing and diagnosis tracing (raw data only).
 
-One switch: FLEXKV_TRANSFER_TRACE. When on, every transfer prints one
-[XFER] line (lifecycle timing + backlog) plus a periodic [XFER-SUMMARY].
-No verdict; raw data for the operator to grep. Uses flexkv_logger.info,
-so it also obeys FLEXKV_LOG_LEVEL (default INFO => on).
+Two things live here and they have separate switches:
+
+- timing: stamping op lifecycle timestamps (submit / received / launch /
+  launched). On when either switch below is set, because Prometheus exports
+  the same durations that the trace prints.
+- tracing: printing one [XFER] line per transfer plus a periodic
+  [XFER-SUMMARY]. No verdict; raw data for the operator to grep. Uses
+  flexkv_logger.info, so it also obeys FLEXKV_LOG_LEVEL (default INFO => on).
 """
 import time
 import threading
@@ -12,8 +16,12 @@ from typing import Dict, List, Optional
 
 from flexkv.common.debug import flexkv_logger
 
-# Set by configure(); caller reads GLOBAL_CONFIG_FROM_ENV.
+# Set by configure()/configure_timing(); caller reads GLOBAL_CONFIG_FROM_ENV.
 _TRACE_ON = False
+
+# Timing is a superset of tracing: the durations are exported as histograms,
+# so they have to be collected whenever either consumer wants them.
+_TIMING_ON = False
 
 # Summary window in seconds (hardcoded).
 _SUMMARY_INTERVAL_S = 10.0
@@ -36,13 +44,31 @@ _type_counts: Dict[str, int] = defaultdict(int)
 
 def configure(enabled: bool) -> None:
     """Enable/disable tracing. Call once at startup from GLOBAL_CONFIG_FROM_ENV."""
-    global _TRACE_ON
+    global _TRACE_ON, _TIMING_ON
     _TRACE_ON = bool(enabled)
+    if _TRACE_ON:
+        _TIMING_ON = True
+
+
+def configure_timing(enabled: bool) -> None:
+    """Enable/disable timestamp collection without turning on the log lines.
+
+    Prometheus exports the same durations, so metrics export turns collection
+    on while leaving the per-op logging off.
+    """
+    global _TIMING_ON
+    if enabled:
+        _TIMING_ON = True
+
+
+def timing_enabled() -> bool:
+    """Whether op lifecycle timestamps are being collected."""
+    return _TIMING_ON
 
 
 def set_submit_ns(op_id: int, submitted_ns: int) -> None:
     """Record submit time (scheduler side)."""
-    if not _TRACE_ON:
+    if not _TIMING_ON:
         return
     with _submit_lock:
         _submit_ns[op_id] = submitted_ns
@@ -50,7 +76,7 @@ def set_submit_ns(op_id: int, submitted_ns: int) -> None:
 
 def consume_submit_ns(op_id: int) -> float:
     """e2e ms from submit to now; 0.0 if unknown."""
-    if not _TRACE_ON:
+    if not _TIMING_ON:
         return 0.0
     with _submit_lock:
         t = _submit_ns.pop(op_id, None)
@@ -103,7 +129,7 @@ def build_worker_metrics(
     bytes = bytes_per_block * num_blocks; backends without a block byte
     size pass 0 (bytes=0, bandwidth omitted).
     """
-    if not _TRACE_ON:
+    if not _TIMING_ON:
         return None
     transfer_type = getattr(op, "transfer_type", None)
     type_name = transfer_type.name if transfer_type is not None else "UNKNOWN"
