@@ -159,11 +159,17 @@ def slot_align_for(*sizes: int) -> int:
 @dataclasses.dataclass(frozen=True)
 class RadixGeometry:
     """FlexKV's side of the geometry: what one slot of each pool must hold. The
-    slot counts are not here; the server plans them from its byte budget."""
+    slot counts are not here; the server plans them from its byte budget. Nor
+    is the RHT registration chunk unless pinned: ``register_chunk_tokens`` 0
+    leaves it to the server's ``--register-chunk-tokens`` (radixshmem's default,
+    4096 tokens) and FlexKV adopts the published value (:func:`adopt_geometry`,
+    :func:`register_chunk_blocks`)."""
     tokens_per_block: int
     full_slot_bytes: int
     swa_slot_bytes: int = 0
     swa_window_blocks: int = 0
+    # RHT registration granularity in tokens; 0 = the server's --register-chunk-tokens.
+    register_chunk_tokens: int = 0
 
     @property
     def has_swa(self) -> bool:
@@ -183,13 +189,27 @@ class RadixGeometry:
             swa_slot_bytes=int(self.swa_slot_bytes),
             swa_window_blocks=int(self.swa_window_blocks) if self.has_swa else 0,
             slot_align=int(self.slot_align),
+            register_chunk_tokens=int(self.register_chunk_tokens),
         )
 
     def describe(self) -> str:
         s = f"tokens_per_block={self.tokens_per_block}, FULL slot {self.full_slot_bytes} B"
         if self.has_swa:
             s += f", SWA slot {self.swa_slot_bytes} B (window {self.swa_window_blocks})"
-        return s + f", slot_align={self.slot_align}"
+        s += f", slot_align={self.slot_align}"
+        if self.register_chunk_tokens:
+            s += f", register_chunk_tokens={self.register_chunk_tokens}"
+        return s
+
+
+def register_chunk_blocks(register_chunk_tokens: int, tokens_per_block: int) -> int:
+    """The RHT registration chunk in blocks, by radixshmem's rule
+    (``ShmConfig::effective_register_chunk_size``): ``register_chunk_tokens //
+    block_size``, at least 1. 0 tokens = no chunk alignment."""
+    tokens = int(register_chunk_tokens)
+    if tokens <= 0:
+        return 0
+    return max(1, tokens // max(1, int(tokens_per_block)))
 
 
 def expected_geometry(model_config: ModelConfig, cache_config: CacheConfig) -> RadixGeometry:
@@ -301,7 +321,8 @@ def attach_radix_client(name: Optional[str] = None,
 def _describe_published(g: Optional[Dict[str, Any]]) -> str:
     if not g:
         return "(none)"
-    parts = [f"block_size={g.get('block_size')}"]
+    parts = [f"block_size={g.get('block_size')}",
+             f"register_chunk_tokens={g.get('register_chunk_tokens', 0)}"]
     for kind, pool in (g.get("pools") or {}).items():
         s = f"{kind.upper()} {pool.get('num_slots')} x {pool.get('slot_bytes')} B"
         if kind == "swa":
@@ -334,6 +355,15 @@ def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
     diffs: List[str] = []
     if int(g["block_size"]) != expected.tokens_per_block:
         diffs.append(f"tokens_per_block server={g['block_size']} flexkv={expected.tokens_per_block}")
+    chunk_tokens = int(g.get("register_chunk_tokens", 0))
+    if expected.register_chunk_tokens and chunk_tokens != expected.register_chunk_tokens:
+        diffs.append(f"register_chunk_tokens server={chunk_tokens} "
+                     f"flexkv={expected.register_chunk_tokens}")
+    elif chunk_tokens % max(1, expected.tokens_per_block):
+        flexkv_logger.warning(
+            f"{label}: radix-server {client.name}'s register_chunk_tokens={chunk_tokens} is not a "
+            f"multiple of tokens_per_block={expected.tokens_per_block}; the RHT registration "
+            f"chunk is {register_chunk_blocks(chunk_tokens, expected.tokens_per_block)} blocks")
     full = pools["full"]
     if int(full["slot_bytes"]) != expected.full_slot_bytes:
         diffs.append(f"FULL slot_bytes server={full['slot_bytes']} flexkv={expected.full_slot_bytes}")
@@ -371,12 +401,16 @@ def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
 
 def adopt_geometry(cache_config: CacheConfig, client: "shmradix.RadixClient",
                    label: str = "radixshmem") -> Dict[str, int]:
-    """Take the slot counts the server planned from its budget over into
-    ``cache_config``: ``num_cpu_blocks`` = the FULL pool, ``swa.num_slots`` =
-    the SWA pool. Whatever ``cpu_cache_gb`` had produced was a placeholder in
-    this mode. Run it after any ``recompute_cache_block_counts`` in the same
-    process (that recompute sizes from ``cpu_cache_gb`` and would undo this).
-    Returns ``{"full": n, "swa": m}``."""
+    """Take over what the server planned and published: the slot counts into
+    ``cache_config`` (``num_cpu_blocks`` = the FULL pool, ``swa.num_slots`` =
+    the SWA pool; whatever ``cpu_cache_gb`` had produced was a placeholder in
+    this mode) and the RHT registration chunk, which FlexKV does not bring
+    itself: ``register_chunk_tokens`` is the server's ``--register-chunk-tokens``
+    and ``register_chunk_blocks`` that in FlexKV blocks. Run it after any
+    ``recompute_cache_block_counts`` in the same process (that recompute sizes
+    from ``cpu_cache_gb`` and would undo this). Returns ``{"full": n, "swa": m,
+    "register_chunk_tokens": t, "register_chunk_blocks": b}`` ("swa" only with
+    an SWA tier)."""
     g = _published_geometry(client, label)
     pools = g["pools"]
     counts: Dict[str, int] = {"full": int(pools["full"]["num_slots"])}
@@ -394,7 +428,12 @@ def adopt_geometry(cache_config: CacheConfig, client: "shmradix.RadixClient",
         swa_before = int(swa.num_slots)
         swa.num_slots = counts["swa"]
         note += f", SWA {counts['swa']} slots (had {swa_before})"
-    flexkv_logger.info(f"{label}: adopted radix-server {client.name}'s slot counts: {note}")
+    counts["register_chunk_tokens"] = int(g.get("register_chunk_tokens", 0))
+    counts["register_chunk_blocks"] = register_chunk_blocks(counts["register_chunk_tokens"],
+                                                            int(g["block_size"]))
+    note += (f"; RHT registration chunk {counts['register_chunk_tokens']} tokens = "
+             f"{counts['register_chunk_blocks']} blocks")
+    flexkv_logger.info(f"{label}: adopted radix-server {client.name}'s geometry: {note}")
     return counts
 
 

@@ -164,7 +164,7 @@ class CacheEngineRadixShmem:
         the server is part of a cluster; False switches it off.
         `num_total_blocks` is FlexKV's expectation; the region's capacity is
         authoritative."""
-        from flexkv.server.shm_radix_bootstrap import attach_radix_client
+        from flexkv.server.shm_radix_bootstrap import attach_radix_client, register_chunk_blocks
 
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
@@ -190,6 +190,12 @@ class CacheEngineRadixShmem:
                 f"radix-server {self.shm_name} has tokens_per_block={region_tpb}, "
                 f"FlexKV is configured with {tokens_per_block}")
         self.tokens_per_block = int(tokens_per_block)
+        # The RHT registration chunk is the server's (--register-chunk-tokens);
+        # FlexKV adopts it rather than bringing one of its own.
+        self.register_chunk_tokens = int(
+            (self._client.geometry or {}).get("register_chunk_tokens", 0))
+        self.register_chunk_blocks = register_chunk_blocks(self.register_chunk_tokens,
+                                                           self.tokens_per_block)
         capacity = int(self._client.mempool_total())
         if num_total_blocks > 0 and capacity != int(num_total_blocks):
             flexkv_logger.warning(

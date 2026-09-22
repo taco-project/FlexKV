@@ -253,6 +253,20 @@ def test_take_insert_match_recycle(env):
     engine.recycle(free_slots)
 
 
+def test_engine_adopts_the_servers_register_chunk(env):
+    """The RHT registration chunk is whatever the radix-server was started
+    with (--register-chunk-tokens); the engine carries it in tokens and in
+    FlexKV blocks, converted the way radixshmem does."""
+    engine, _server = env.make("/cers_chunk")           # radixshmem's default: 4096 tokens
+    assert engine.register_chunk_tokens == 4096
+    assert engine.register_chunk_blocks == 4096 // 4    # tokens_per_block 4
+    name = f"/cers_chunk{os.getpid()}"
+    cfg, geo = _server_config(name, blocks=64, tokens_per_block=4)
+    env.server(dataclasses.replace(cfg, register_chunk_tokens=64))
+    engine2 = env.engine(name, geometry=geo, num_total_blocks=64, tokens_per_block=4)
+    assert engine2.register_chunk_tokens == 64 and engine2.register_chunk_blocks == 16
+
+
 def test_insert_publishes_immediately(env):
     """There is no ready bit: being in the tree IS being servable.
 
@@ -605,6 +619,25 @@ def test_expected_geometry_mirrors_the_storage_engine_layout():
     assert set(spec["pools"]) == {"full"}
 
 
+def test_register_chunk_is_the_servers_unless_pinned():
+    """FlexKV brings no RHT registration chunk of its own: the geometry carries
+    0 and the server's --register-chunk-tokens decides. A pinned value travels
+    verbatim. Tokens become blocks by radixshmem's rule: tokens // block_size,
+    at least 1, 0 = unaligned."""
+    model_config, cache_config = _configs(num_cpu_blocks=64)
+    geo = bootstrap.expected_geometry(model_config, cache_config)
+    assert geo.register_chunk_tokens == 0
+    assert geo.to_shmradix().to_dict()["register_chunk_tokens"] == 0
+    assert "register_chunk" not in geo.describe()
+    pinned = dataclasses.replace(geo, register_chunk_tokens=2048)
+    assert pinned.to_shmradix().to_dict()["register_chunk_tokens"] == 2048
+    assert "register_chunk_tokens=2048" in pinned.describe()
+    assert bootstrap.register_chunk_blocks(4096, 16) == 256
+    assert bootstrap.register_chunk_blocks(4096, 4) == 1024
+    assert bootstrap.register_chunk_blocks(100, 64) == 1
+    assert bootstrap.register_chunk_blocks(0, 16) == 0
+
+
 def test_client_brings_the_geometry_and_adopts_the_counts(env):
     """The operator's server knows only its budget; FlexKV's first client hands
     it the slot shape, the server plans the counts, `check_geometry` verifies
@@ -616,6 +649,7 @@ def test_client_brings_the_geometry_and_adopts_the_counts(env):
     data_bytes = 64 * geo.full_slot_bytes + 16 * geo.swa_slot_bytes
     env.server(shmradix.ServerConfig(name=name, data_bytes=data_bytes,
                                      swa_ratio=16 * geo.swa_slot_bytes / data_bytes,
+                                     register_chunk_tokens=2048,  # the operator's, not FlexKV's
                                      prefault=False))       # slot_align comes with the geometry
     client = bootstrap.attach_radix_client(name, geometry=geo, timeout_s=60)
     try:
@@ -624,10 +658,17 @@ def test_client_brings_the_geometry_and_adopts_the_counts(env):
         assert pools["full"]["num_slots"] == 64 and pools["swa"]["num_slots"] == 16
         assert int(client.store.pool(FULL).slot_bytes) == geo.full_slot_bytes    # exact stride
         assert int(client.store.pool(_SWA).slot_bytes) == geo.swa_slot_bytes
-        # cpu_cache_gb's placeholders give way to the server's counts
+        # cpu_cache_gb's placeholders give way to the server's counts; the RHT
+        # registration chunk comes along: 2048 tokens = 128 blocks of 16
+        assert client.geometry["register_chunk_tokens"] == 2048
         cache_config.num_cpu_blocks, cache_config.swa.num_slots = 7, 3
-        assert bootstrap.adopt_geometry(cache_config, client, "test") == {"full": 64, "swa": 16}
+        assert bootstrap.adopt_geometry(cache_config, client, "test") == {
+            "full": 64, "swa": 16, "register_chunk_tokens": 2048, "register_chunk_blocks": 128}
         assert cache_config.num_cpu_blocks == 64 and cache_config.swa.num_slots == 16
+        # a chunk FlexKV pinned differently from the server's fails closed too
+        with pytest.raises(ValueError, match="register_chunk_tokens"):
+            bootstrap.check_geometry(
+                client, dataclasses.replace(geo, register_chunk_tokens=4096), "test")
         assert bootstrap.radix_cluster_rank(client) == 0 and client.info.world_size == 1
         # the connectors' prefetch gate asks the server the same question
         assert bootstrap.radix_server_is_distributed(_radix_config(name=name), timeout_s=30) is False
@@ -637,9 +678,10 @@ def test_client_brings_the_geometry_and_adopts_the_counts(env):
             bootstrap.check_geometry(
                 client, bootstrap.expected_geometry(model_config, cache_config), "test")
         # ...and a second client bringing another geometry is refused by the server
-        other = dataclasses.replace(geo, tokens_per_block=32)
-        with pytest.raises(ValueError, match="another geometry"):
-            bootstrap.attach_radix_client(name, geometry=other, timeout_s=60)
+        for other in (dataclasses.replace(geo, tokens_per_block=32),
+                      dataclasses.replace(geo, register_chunk_tokens=4096)):
+            with pytest.raises(ValueError, match="another geometry"):
+                bootstrap.attach_radix_client(name, geometry=other, timeout_s=60)
     finally:
         client.close()
 
