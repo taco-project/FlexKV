@@ -310,9 +310,15 @@ def attach_radix_client(name: Optional[str] = None,
                         geometry: Any = None,
                         timeout_s: Optional[float] = None,
                         max_outstanding: Optional[int] = None,
+                        attach_index: bool = False,
                         label: str = "radixshmem") -> "shmradix.RadixClient":
     """A ready ``shmradix.RadixClient`` on the radix-server ``name`` (default:
     :func:`radix_server_name`), at the socket radixshmem derives from the name.
+
+    ``attach_index=True`` also brings the index client up before returning
+    (RDMA queue pairs to every peer's RHT shard on a cluster) and retries a
+    peer that does not accept yet; callers that only read ``info`` (adopting
+    counts, asking about the cluster) leave it off and open no RDMA state.
 
     With ``geometry`` (a :class:`RadixGeometry` or a ``shmradix.Geometry``) the
     client hands the server FlexKV's slot shape on the way; the server plans
@@ -382,11 +388,37 @@ def attach_radix_client(name: Optional[str] = None,
     except RuntimeError as e:
         client.close()
         raise RuntimeError(f"{label}: radix-server {name} failed to configure: {e}") from e
+    if attach_index:
+        _attach_index(client, name, deadline, label)
     flexkv_logger.info(
         f"{label}: attached radix-server {name} ({where}): index={info.index_name}, "
         f"rank={info.rank}/{info.world_size}, data_plane={info.data_plane}, "
         f"geometry={_describe_published(info.geometry)}")
     return client
+
+
+def _attach_index(client: "shmradix.RadixClient", name: str, deadline: float, label: str) -> None:
+    """Bring the index client up now (``client.index``) instead of on first use.
+    On a cluster this opens the RDMA queue pairs to every peer's RHT shard;
+    right after the rendezvous a peer's holder may not accept yet, and
+    radixshmem gives up on such a connect with ``RhtConsumer: failed to
+    connect RHT holder``. That is retried until ``deadline``; any other error
+    is raised at once."""
+    attempt = 0
+    while True:
+        try:
+            client.index
+            return
+        except RuntimeError as e:
+            transient = "RHT" in str(e) or "RhtConsumer" in str(e)
+            if not transient or time.monotonic() >= deadline:
+                client.close()
+                raise RuntimeError(f"{label}: radix-server {name}: attaching the index failed: {e}") from e
+            attempt += 1
+            flexkv_logger.warning(
+                f"{label}: radix-server {name}: RHT peer not reachable yet ({e}); retry {attempt} "
+                f"in 5s")
+            time.sleep(5.0)
 
 
 def _describe_published(g: Optional[Dict[str, Any]]) -> str:

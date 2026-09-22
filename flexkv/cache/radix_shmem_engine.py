@@ -171,7 +171,7 @@ class CacheEngineRadixShmem:
         cpu_swa = swa_config.for_cache_tier(DeviceType.CPU) if swa_config is not None else None
         self.swa_enabled = cpu_swa is not None and cpu_swa.num_slots > 0
 
-        self._client = attach_radix_client(server_name, geometry=geometry,
+        self._client = attach_radix_client(server_name, geometry=geometry, attach_index=True,
                                            label="CacheEngineRadixShmem")
         self._tree = self._client  # index ops pass through the client
         self.shm_name = self._client.info.index_name  # node-suffixed when distributed
