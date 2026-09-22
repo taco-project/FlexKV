@@ -2,26 +2,31 @@
 # cython: boundscheck=True, wraparound=True
 """The radixshmem-mode configuration file (``FLEXKV_RADIXSHMEM_CONFIG_PATH``).
 
-One YAML, identical on every node of a cluster, with five sections:
+In radixshmem mode the CPU tier is a ``radix-server`` process the operator
+starts on every node (``radix-server --name /flexkv --data-bytes 64G ...``):
+the index shm, the SlotStore, the transfer engine and the cluster membership
+all belong to that process and are set on its command line. FlexKV never
+creates a server; it attaches a ``shmradix.RadixClient``. So this file holds
+the two things FlexKV has to know, and nothing else:
 
-  cluster / data / index / server
-      Passed through by key to ``shmradix.ClusterConfig`` /
-      ``DataPlaneConfig`` / ``IndexConfig`` / ``RadixServerConfig``. Keys are
-      validated against the dataclass fields of the installed shmradix, so a
-      new radixshmem field is configurable without a FlexKV change and a typo
-      fails at startup. Geometry fields (slot counts, slot bytes, alignment,
-      shm names) are derived from ``CacheConfig`` and rejected here.
+  server
+      Which radix-server to attach to: its ``--name`` (which also derives the
+      default gRPC socket ``unix:///dev/shm/<name>.sock`` and the prefix of
+      FlexKV's own TE channels), an ``endpoint`` override, and how long a
+      FlexKV process waits for the server to exist and become ready.
   client
-      FlexKV's own RadixClient / prefetch settings.
+      FlexKV's RadixClient / prefetch settings.
 
-Per-node values do not belong in a global file: ``cluster.node_name`` and
-``cluster.rpc_address`` are rejected. A node derives its identity from the IP
-``cluster.rpc_interface`` resolves to; the two environment variables
-``FLEXKV_RADIX_NODE_NAME`` / ``FLEXKV_RADIX_RPC_ADDRESS`` override that for
-several nodes on one host (tests).
+The slot geometry (tokens per block, bytes of one CPU block and one SWA page,
+the SWA window) is derived from ``ModelConfig`` / ``CacheConfig`` and handed to
+the server by FlexKV's clients (``flexkv.server.shm_radix_bootstrap``); the
+slot COUNTS come back from the server, which plans them from its byte budget.
+None of that is in this file. A file that still carries the former ``cluster``
+/ ``data`` / ``index`` sections is rejected with a pointer to the
+``radix-server`` flags they moved to.
 
-``cluster.cluster_id`` is the only namespace: the etcd key prefix and, through
-:meth:`RadixShmemConfig.local_id`, every shm / socket / IPC name on this host.
+No YAML at all is a valid configuration: it attaches to ``radix-server --name
+/flexkv`` on the local socket.
 
 Reference: ``docs/radixshmem/config_zh.md``.
 """
@@ -29,52 +34,36 @@ from __future__ import annotations
 
 import dataclasses
 import threading
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 
-SECTIONS = ("cluster", "data", "index", "server", "client")
+SECTIONS = ("server", "client")
+# Sections of the previous file format. Their keys are radix-server flags now.
+RETIRED_SECTIONS = ("cluster", "data", "index")
 
-# Values FlexKV sets differently from radixshmem's own defaults; anything not
-# listed takes the shmradix dataclass default. One more default depends on the
-# geometry and is resolved in shm_radix_bootstrap.build_radix_server_config:
-# index.register_chunk_size = REGISTER_CHUNK_TOKENS // tokens_per_block, so an
-# RHT registration chunk covers REGISTER_CHUNK_TOKENS tokens whatever the block
-# size (radixshmem's own default is 128 blocks).
-REGISTER_CHUNK_TOKENS = 4096
-
-FLEXKV_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "cluster": {
-        "cluster_id": "flexkv",
-        "bootstrap_timeout_sec": 120,
-        # 1 is a blind overwrite that loses routing entries.
-        "rht_slots_per_bucket": 4,
-    },
-    "data": {},
-    "index": {"data_pool_ratio": 8.0},
-    "server": {},
-}
-
-# Derived from CacheConfig / ModelConfig (shm_radix_bootstrap.expected_geometry)
-# or per node; rejected in the file.
-FORBIDDEN_KEYS: Dict[str, Set[str]] = {
-    "cluster": {"node_name", "rpc_address"},
-    "data": {"data_bytes", "full_slot_bytes", "swa_slot_bytes", "mamba_slot_bytes",
-             "slot_align", "data_name"},
-    "index": {"name", "tokens_per_block", "full_slots", "swa_slots", "swa_window_blocks",
-              "mamba_slots", "evict_policy"},
-    "server": set(),
-}
-
-_RDMA_TRANSPORTS = {"xrc", "dc"}
-_REMOTE_OP_TRANSPORTS = {"zmq", "dc"}
-_RHT_SLOTS = {1, 2, 4, 8}
+DEFAULT_SERVER_NAME = "/flexkv"
 
 
 class RadixShmemConfigError(ValueError):
     """The file is not a valid radixshmem-mode configuration."""
+
+
+@dataclasses.dataclass(frozen=True)
+class RadixServerSettings:
+    """Which radix-server this node's FlexKV attaches to."""
+    # ``radix-server --name``: the index shm name. Also the default socket
+    # (``unix:///dev/shm/<name>.sock``) and, sanitized, the prefix of FlexKV's
+    # TE shm channels on this host (``RadixShmemConfig.te_server_id``).
+    name: str = DEFAULT_SERVER_NAME
+    # gRPC endpoint; "" = the default socket derived from ``name``.
+    endpoint: str = ""
+    # How long a FlexKV process waits for the server to be reachable AND ready.
+    # Covers the operator starting it late, the SlotStore prefault and, on a
+    # cluster, the rendezvous (the server's --bootstrap-timeout).
+    ready_timeout_s: float = 600.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -93,107 +82,46 @@ class RadixClientSettings:
 @dataclasses.dataclass(frozen=True)
 class RadixShmemConfig:
     path: Optional[str]
-    cluster: Dict[str, Any]
-    data: Dict[str, Any]
-    index: Dict[str, Any]
-    server: Dict[str, Any]
+    server: RadixServerSettings = RadixServerSettings()
     client: RadixClientSettings = RadixClientSettings()
-
-    # ----------------------------------------------------------- cluster
-    @property
-    def cluster_id(self) -> str:
-        return str(self.cluster["cluster_id"])
-
-    @property
-    def node_name(self) -> str:
-        return str(self.cluster.get("node_name", ""))
-
-    @property
-    def rpc_address(self) -> str:
-        return str(self.cluster.get("rpc_address", ""))
-
-    @property
-    def expected_min_nodes(self) -> int:
-        return int(self.cluster.get("expected_min_nodes", 0))
-
-    @property
-    def num_rht_shards(self) -> int:
-        return int(self.cluster.get("num_rht_shards", 0))
-
-    @property
-    def distributed(self) -> bool:
-        """radixshmem's own criterion (ClusterConfig.distributed)."""
-        return self.expected_min_nodes > 1 or self.num_rht_shards > 1
-
-    @property
-    def bootstrap_timeout_sec(self) -> float:
-        return float(self.cluster.get("bootstrap_timeout_sec", 60))
-
-    @property
-    def attach_timeout_s(self) -> float:
-        """How long a FlexKV process waits for the radix-server: the cluster
-        rendezvous plus a margin for SlotStore creation / prefault."""
-        return self.bootstrap_timeout_sec + 60.0
-
-    @property
-    def local_id(self) -> str:
-        """Prefix of every name on this host: the index / SlotStore shm, the
-        gRPC socket, FlexKV's TE channels and GPU registration port. The
-        cluster id, suffixed with the node name when one was given so that
-        co-located nodes do not share regions."""
-        return f"{self.cluster_id}_{self.node_name}" if self.node_name else self.cluster_id
 
     # ------------------------------------------------------------ server
     @property
-    def endpoint(self) -> str:
-        """gRPC endpoint; "" = radixshmem's unix:///dev/shm/<index>.sock."""
-        return str(self.server.get("endpoint", ""))
+    def server_name(self) -> str:
+        return self.server.name
 
     @property
-    def hugepage_path(self) -> str:
-        return str(self.server.get("hugepage_path", ""))
+    def endpoint(self) -> str:
+        """gRPC endpoint; "" = radixshmem's ``unix:///dev/shm/<name>.sock``."""
+        return self.server.endpoint
+
+    @property
+    def ready_timeout_s(self) -> float:
+        return float(self.server.ready_timeout_s)
+
+    @property
+    def te_server_id(self) -> str:
+        """Prefix of FlexKV's own IPC objects on this host (the TE control
+        block and channels): the server name without its leading slash, so
+        two FlexKV deployments on one host that attach to different servers
+        never share a channel."""
+        return self.server.name.lstrip("/").replace("/", "_")
 
     # ------------------------------------------------------------- tests
-    def replace_cluster(self, **changes: Any) -> "RadixShmemConfig":
-        """A copy with ``cluster`` keys changed (test helper; bypasses the
-        forbidden-key check so node_name / rpc_address can be set)."""
-        return dataclasses.replace(self, cluster={**self.cluster, **changes})
-
     def replace_server(self, **changes: Any) -> "RadixShmemConfig":
-        return dataclasses.replace(self, server={**self.server, **changes})
+        return dataclasses.replace(self, server=dataclasses.replace(self.server, **changes))
+
+    def replace_client(self, **changes: Any) -> "RadixShmemConfig":
+        return dataclasses.replace(self, client=dataclasses.replace(self.client, **changes))
 
     def describe(self) -> str:
         where = self.path or "(defaults)"
-        s = f"{where}: cluster_id={self.cluster_id}"
-        if self.distributed:
-            s += (f", expected_min_nodes={self.expected_min_nodes}, "
-                  f"registry={self.cluster.get('registry')}, "
-                  f"rpc_interface={self.cluster.get('rpc_interface') or '-'}, "
-                  f"rpc_address={self.rpc_address or '-'}, node_name={self.node_name or '(auto)'}")
-        return s
+        return (f"{where}: radix-server {self.server_name} "
+                f"(endpoint={self.endpoint or 'unix:///dev/shm/' + self.te_server_id + '.sock'}, "
+                f"ready_timeout_s={self.ready_timeout_s:.0f})")
 
 
 # ------------------------------------------------------------------ loading
-
-def _shmradix_dataclasses():
-    try:
-        import shmradix
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError(
-            "shmradix is not installed; install it from the radixshmem repo "
-            "(pip install -e radixshmem/python)") from exc
-    try:
-        return {
-            "cluster": shmradix.ClusterConfig,
-            "data": shmradix.DataPlaneConfig,
-            "index": shmradix.IndexConfig,
-            "server": shmradix.RadixServerConfig,
-        }
-    except AttributeError as exc:
-        raise ImportError(
-            "shmradix lacks the RadixServer configuration dataclasses: FlexKV needs "
-            "the RadixServer / RadixClient surface of radixshmem") from exc
-
 
 def _read_yaml(path: str) -> Dict[str, Any]:
     with open(path) as f:
@@ -214,86 +142,36 @@ def _section(raw: Dict[str, Any], name: str, path: str) -> Dict[str, Any]:
     return dict(sec)
 
 
-def _as_list(value: Any) -> Any:
-    if isinstance(value, str):
-        return [v.strip() for v in value.split(",") if v.strip()]
-    return value
-
-
-def _passthrough_section(name: str, given: Dict[str, Any], dc, path: str) -> Dict[str, Any]:
-    """FlexKV defaults overlaid with the file's keys, validated against the
-    shmradix dataclass ``dc``."""
-    fields = {f.name for f in dataclasses.fields(dc)}
-    if name == "server":
-        # RadixServerConfig's nested sections are configured by their own
-        # sections here, not inline.
-        fields -= {"index", "data", "cluster"}
-    forbidden = FORBIDDEN_KEYS[name] & set(given)
-    if forbidden:
-        raise RadixShmemConfigError(
-            f"{path}: '{name}.{sorted(forbidden)[0]}' is not configurable: "
-            + ("geometry is derived from the FlexKV cache configuration"
-               if name in ("data", "index") else
-               "it is a per-node value; set FLEXKV_RADIX_NODE_NAME / "
-               "FLEXKV_RADIX_RPC_ADDRESS on that node instead"))
-    unknown = set(given) - fields
+def _typed_section(name: str, given: Dict[str, Any], dc, path: str):
+    """``dc(**given)`` after checking the keys and coercing the value types."""
+    fields = {f.name: f for f in dataclasses.fields(dc)}
+    unknown = set(given) - set(fields)
     if unknown:
         raise RadixShmemConfigError(
-            f"{path}: unknown key(s) in '{name}': {sorted(unknown)}; "
-            f"shmradix.{dc.__name__} has {sorted(fields)}")
-    merged = {**FLEXKV_DEFAULTS[name], **given}
-    if "transfer_devices" in merged:
-        merged["transfer_devices"] = [str(d) for d in _as_list(merged["transfer_devices"])]
-    if "rht_shard_holders" in merged:
-        merged["rht_shard_holders"] = [int(r) for r in _as_list(merged["rht_shard_holders"])]
-    return merged
-
-
-def _client_section(given: Dict[str, Any], path: str) -> RadixClientSettings:
-    fields = {f.name for f in dataclasses.fields(RadixClientSettings)}
-    unknown = set(given) - fields
-    if unknown:
-        raise RadixShmemConfigError(
-            f"{path}: unknown key(s) in 'client': {sorted(unknown)}; expected {sorted(fields)}")
-    return RadixClientSettings(**{k: int(v) for k, v in given.items()})
+            f"{path}: unknown key(s) in '{name}': {sorted(unknown)}; expected {sorted(fields)}")
+    values: Dict[str, Any] = {}
+    for key, value in given.items():
+        typ = fields[key].type
+        try:
+            if typ in ("int", int):
+                values[key] = int(value)
+            elif typ in ("float", float):
+                values[key] = float(value)
+            else:
+                values[key] = "" if value is None else str(value)
+        except (TypeError, ValueError) as exc:
+            raise RadixShmemConfigError(f"{path}: '{name}.{key}' has an invalid value {value!r}") from exc
+    return dc(**values)
 
 
 def _validate(cfg: RadixShmemConfig, path: str) -> None:
-    c = cfg.cluster
-    if not cfg.cluster_id:
-        raise RadixShmemConfigError(f"{path}: cluster.cluster_id must not be empty")
-    if cfg.distributed:
-        if not c.get("registry"):
-            raise RadixShmemConfigError(
-                f"{path}: cluster mode (expected_min_nodes > 1) needs cluster.registry, "
-                f"e.g. 'etcd://10.0.0.1:2379'")
-        if not c.get("rpc_interface") and not cfg.rpc_address:
-            raise RadixShmemConfigError(
-                f"{path}: cluster mode needs cluster.rpc_interface (the NIC whose IP peers "
-                f"dial and this node's identity derives from) or FLEXKV_RADIX_RPC_ADDRESS")
-        if cfg.rpc_address == "0.0.0.0":
-            raise RadixShmemConfigError(
-                "FLEXKV_RADIX_RPC_ADDRESS=0.0.0.0 gives every node the same identity; "
-                "use this node's address")
-    if cfg.expected_min_nodes > 0 and cfg.num_rht_shards > cfg.expected_min_nodes:
+    name = cfg.server_name
+    if not name or not name.startswith("/") or len(name) < 2 or any(c.isspace() for c in name):
         raise RadixShmemConfigError(
-            f"{path}: cluster.num_rht_shards={cfg.num_rht_shards} exceeds "
-            f"expected_min_nodes={cfg.expected_min_nodes}; there cannot be more RHT shard "
-            f"holders than nodes")
-    slots = int(c.get("rht_slots_per_bucket", 1))
-    if slots not in _RHT_SLOTS:
-        raise RadixShmemConfigError(
-            f"{path}: cluster.rht_slots_per_bucket={slots} must be one of {sorted(_RHT_SLOTS)}")
-    for key in ("rht_transport", "peer_index_transport"):
-        val = c.get(key)
-        if val is not None and val not in _RDMA_TRANSPORTS:
-            raise RadixShmemConfigError(
-                f"{path}: cluster.{key}={val!r} must be one of {sorted(_RDMA_TRANSPORTS)}")
-    rot = c.get("remote_op_transport")
-    if rot is not None and rot not in _REMOTE_OP_TRANSPORTS:
-        raise RadixShmemConfigError(
-            f"{path}: cluster.remote_op_transport={rot!r} must be one of "
-            f"{sorted(_REMOTE_OP_TRANSPORTS)}")
+            f"{path}: server.name={name!r} must be a shm name that starts with '/' "
+            f"(the radix-server's --name, e.g. '/flexkv')")
+    if cfg.ready_timeout_s <= 0:
+        raise RadixShmemConfigError(f"{path}: server.ready_timeout_s must be > 0")
     if cfg.client.prefetch_max_inflight >= cfg.client.max_outstanding:
         raise RadixShmemConfigError(
             f"{path}: client.prefetch_max_inflight={cfg.client.prefetch_max_inflight} must be "
@@ -302,31 +180,29 @@ def _validate(cfg: RadixShmemConfig, path: str) -> None:
         raise RadixShmemConfigError(f"{path}: client.prefetch_timeout_ms must be > 0")
 
 
-def load_radixshmem_config(path: Optional[str] = None,
-                           *,
-                           node_name: str = "",
-                           rpc_address: str = "") -> RadixShmemConfig:
-    """Parse ``path`` (None or "" = all defaults, i.e. standalone) and apply
-    the per-node overrides. Raises :class:`RadixShmemConfigError` on an
-    invalid file, ``ImportError`` without shmradix."""
-    dcs = _shmradix_dataclasses()
+def load_radixshmem_config(path: Optional[str] = None) -> RadixShmemConfig:
+    """Parse ``path`` (None or "" = all defaults: ``radix-server --name /flexkv``
+    on the local socket). Raises :class:`RadixShmemConfigError` on an invalid
+    file."""
     label = path or "(defaults)"
     raw = _read_yaml(path) if path else {}
+    retired = [s for s in RETIRED_SECTIONS if s in raw]
+    if retired:
+        raise RadixShmemConfigError(
+            f"{label}: section(s) {retired} are not FlexKV's any more: the radix-server owns "
+            f"its cluster, data plane and index settings and takes them on its command line "
+            f"(radix-server --data-bytes / --swa-ratio / --expected-min-nodes / --registry / "
+            f"--transfer-dev ...). FlexKV only attaches to it; keep 'server' and 'client' here. "
+            f"See docs/radixshmem/config_zh.md")
     unknown = set(raw) - set(SECTIONS)
     if unknown:
         raise RadixShmemConfigError(
             f"{label}: unknown section(s) {sorted(unknown)}; expected {list(SECTIONS)}")
-    sections = {name: _passthrough_section(name, _section(raw, name, label), dcs[name], label)
-                for name in ("cluster", "data", "index", "server")}
-    if node_name:
-        sections["cluster"]["node_name"] = str(node_name)
-    if rpc_address:
-        sections["cluster"]["rpc_address"] = str(rpc_address)
-        # radixshmem lets the interface win over the address; an explicit
-        # per-node address means the global interface must not apply here.
-        sections["cluster"]["rpc_interface"] = ""
-    cfg = RadixShmemConfig(path=path or None, client=_client_section(
-        _section(raw, "client", label), label), **sections)
+    cfg = RadixShmemConfig(
+        path=path or None,
+        server=_typed_section("server", _section(raw, "server", label), RadixServerSettings, label),
+        client=_typed_section("client", _section(raw, "client", label), RadixClientSettings, label),
+    )
     _validate(cfg, label)
     return cfg
 
@@ -334,26 +210,22 @@ def load_radixshmem_config(path: Optional[str] = None,
 # -------------------------------------------------------------- singleton
 
 _lock = threading.Lock()
-_cached: Optional[Tuple[Tuple[str, str, str], RadixShmemConfig]] = None
+_cached: Optional[Tuple[Tuple[str], RadixShmemConfig]] = None
 
 
-def _env_key() -> Tuple[str, str, str]:
-    env = GLOBAL_CONFIG_FROM_ENV
-    return (str(env.radixshmem_config_path or ""), str(env.radix_node_name or ""),
-            str(env.radix_rpc_address or ""))
+def _env_key() -> Tuple[str]:
+    return (str(GLOBAL_CONFIG_FROM_ENV.radixshmem_config_path or ""),)
 
 
 def get_radixshmem_config() -> RadixShmemConfig:
     """The process's configuration: loaded from ``GLOBAL_CONFIG_FROM_ENV``
-    (``FLEXKV_RADIXSHMEM_CONFIG_PATH`` + the two per-node overrides) on first
-    use and whenever those three values change."""
+    (``FLEXKV_RADIXSHMEM_CONFIG_PATH``) on first use and whenever that value
+    changes."""
     global _cached
     key = _env_key()
     with _lock:
         if _cached is None or _cached[0] != key:
-            path, node_name, rpc_address = key
-            _cached = (key, load_radixshmem_config(path or None, node_name=node_name,
-                                                   rpc_address=rpc_address))
+            _cached = (key, load_radixshmem_config(key[0] or None))
         return _cached[1]
 
 

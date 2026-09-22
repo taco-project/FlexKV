@@ -20,7 +20,7 @@ Why a subclass rather than more branches in `GlobalCacheEngine`:
 
 Not supported here: the SSD and REMOTE tiers, the Redis-backed P2P paths
 (``enable_p2p_cpu`` / ``enable_p2p_ssd``) and kv sharing. Peer reuse follows
-the radixshmem YAML instead (`RadixShmemConfig.distributed`).
+the radix-server instead (on whenever it is part of a cluster).
 """
 
 from __future__ import annotations
@@ -146,8 +146,8 @@ def _check_cache_config(cache_config: CacheConfig) -> None:
     if cache_config.enable_p2p_cpu or cache_config.enable_p2p_ssd or cache_config.enable_kv_sharing:
         raise ValueError(
             "radix_shmem does its own peer reuse (etcd + RDMA inside the "
-            "radix-server, on whenever the radixshmem YAML makes the cluster "
-            "distributed); enable_p2p_cpu / enable_p2p_ssd must be off")
+            "radix-server, on whenever it is started with cluster flags); "
+            "enable_p2p_cpu / enable_p2p_ssd must be off")
 
 
 class RadixShmemCacheEngine(GlobalCacheEngine):
@@ -173,18 +173,20 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                                 event_collector: Optional[KVEventCollector]):
         """Attach to this node's radix-server as a `RadixClient`.
 
-        The server (index + SlotStore + peer transfer) is brought up by the
-        KVManager bootstrap process or by the operator (`shm_radix_bootstrap`);
-        the attach waits for it to be ready.
+        The server (index + SlotStore + peer transfer) is the operator's
+        `radix-server` process. The attach brings FlexKV's geometry
+        (idempotent: the KVManager already handed it over and adopted the slot
+        counts into `cache_config`) and waits for the server to be ready. Peer
+        reuse follows the server: on whenever it is part of a cluster.
         """
-        from flexkv.server.shm_radix_bootstrap import radix_index_name
+        from flexkv.server.shm_radix_bootstrap import expected_geometry
 
         rcfg = self._radix_config
         return CacheEngineRadixShmem(
-            radix_index_name(rcfg.local_id),
+            rcfg.server_name,
+            geometry=expected_geometry(self.model_config, cache_config),
             tokens_per_block=cache_config.tokens_per_block,
             num_total_blocks=cache_config.num_cpu_blocks,
-            peer_enabled=rcfg.distributed,
             swa_config=cache_config.swa,
             event_collector=event_collector,
             metrics_collector=self._metrics_collector,

@@ -1,42 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # cython: boundscheck=True, wraparound=True
 """
-Bootstrap for the radixshmem-backed CPU tier.
+Attaching the radixshmem-backed CPU tier to this node's radix-server.
 
-One ``radix-server`` process per node owns the radix index shm, the SlotStore
-(the CPU KV pool: one slot per block, a FULL pool and optionally an SWA pool),
-the RDMA transfer engine and the etcd data-plane entry. In this mode FlexKV
-neither allocates CPU KV memory nor moves bytes between nodes itself:
+The radix-server is a process the operator starts on every node, with nothing
+model-specific on its command line::
 
-  * the bootstrap DP process (instance 0, dp 0) launches the server from the
-    FlexKV configuration -- geometry from ``CacheConfig``, everything else from
-    the YAML at ``FLEXKV_RADIXSHMEM_CONFIG_PATH`` (``flexkv.common.radixshmem_config``)
-    -- (``FLEXKV_RADIX_SERVER_LAUNCH_MODE=embedded``) or expects one started by
-    the operator (``external``);
-  * every DP scheduler process, the TE process and its transfer workers attach
-    with ``shmradix.RadixClient(name)``: index operations, ``store`` (the
-    SlotStore mapping) and ``pull_async`` (the server-side peer pull).
+    radix-server --name /flexkv --data-bytes 64G [--swa-ratio 0.5] [cluster flags]
 
-Naming: index ``/shmradix_<local_id>_cpu`` where ``local_id`` is the YAML's
-``cluster.cluster_id`` (plus ``_<node_name>`` when FLEXKV_RADIX_NODE_NAME names
-one of several co-located nodes). A cluster node's index gets ``_<node_name>``
-appended by radixshmem itself and is resolved through the gRPC socket
-``/dev/shm/shmradix_<local_id>_cpu.sock``, so attachers only need the base
-name. The SlotStore is ``<index>_data``.
+It owns the radix index shm, the SlotStore (the CPU KV pool), the RDMA transfer
+engine and the etcd membership. FlexKV neither creates it nor sizes it:
 
-Geometry: FlexKV stays the source of slot counts and slot bytes. One FULL slot
-holds exactly one CPU block as ``StorageEngine`` lays it out (BLOCKFIRST: all
-layers of a block contiguous), one SWA slot one SWA page. ``slot_align`` is
-chosen so that the SlotStore stride equals the block size exactly, which lets
-the H2D / D2H workers address the pool with the strides of a plain tensor. The
-TE re-checks the attached regions against the layouts it builds (``check_geometry``).
+  * the first FlexKV client hands the server FlexKV's *geometry* -- tokens per
+    block, bytes of one CPU block, bytes of one SWA page and the SWA window,
+    the slot alignment that keeps the SlotStore stride equal to the block
+    (``RadixGeometry``, ``expected_geometry``); the server plans the slot
+    COUNTS from its byte budget and publishes them (idempotent: every further
+    client with the same geometry is accepted, one with another geometry is
+    refused);
+  * every FlexKV process (the DP schedulers, the TE and its workers) attaches by
+    the server's name (``attach_radix_client``), checks the published regions
+    against its own layout (``check_geometry``) and takes the slot counts over
+    into ``CacheConfig`` (``adopt_geometry``): ``num_cpu_blocks`` and
+    ``swa.num_slots`` are the server's, not ``cpu_cache_gb``'s.
+
+Geometry: one FULL slot holds exactly one CPU block as ``StorageEngine`` lays
+it out (BLOCKFIRST: all layers of a block contiguous), one SWA slot one SWA
+page. ``slot_align`` is chosen so that the SlotStore stride equals the block
+size exactly, which lets the H2D / D2H workers address the pool with the
+strides of a plain tensor.
 """
 from __future__ import annotations
 
 import dataclasses
-import multiprocessing as mp
-import os
-import signal
 import time
 from typing import Any, Dict, List, Optional
 
@@ -45,8 +41,7 @@ import torch
 from flexkv.common.config import (GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec,
                                   ModelConfig, SWAPoolConfig)
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.radixshmem_config import (REGISTER_CHUNK_TOKENS, RadixShmemConfig,
-                                              get_radixshmem_config)
+from flexkv.common.radixshmem_config import RadixShmemConfig, get_radixshmem_config
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 try:
@@ -55,10 +50,8 @@ except ImportError:  # pragma: no cover
     shmradix = None
 
 
-_SHM_PREFIX = "/shmradix"
 # Pool bases are page aligned regardless; a larger per-slot alignment only pads.
 _MAX_SLOT_ALIGN = 4096
-DEFAULT_HUGETLBFS_DIR = "/mnt/hugepages"
 
 
 def _ensure_shmradix() -> None:
@@ -66,26 +59,11 @@ def _ensure_shmradix() -> None:
         raise ImportError(
             "shmradix is not installed; install it from the radixshmem repo "
             "(pip install -e radixshmem/python)")
-    for name in ("RadixServer", "RadixServerConfig", "IndexConfig", "DataPlaneConfig",
-                 "ClusterConfig", "RadixClient"):
+    for name in ("RadixClient", "Geometry", "GeometryMismatch", "ServerNotReady"):
         if not hasattr(shmradix, name):
             raise ImportError(
-                f"shmradix lacks {name}: FlexKV needs the RadixServer / RadixClient "
-                f"surface of radixshmem (transfer-server branch or later)")
-
-
-def radix_index_name(local_id: str) -> str:
-    """Base shm name of the CPU tier's index for ``local_id``
-    (``RadixShmemConfig.local_id``); it also names the gRPC socket."""
-    return f"{_SHM_PREFIX}_{local_id}_cpu"
-
-
-def radix_data_name(local_id: str) -> str:
-    return radix_index_name(local_id) + "_data"
-
-
-def radix_socket_path(local_id: str) -> str:
-    return "/dev/shm/" + radix_index_name(local_id).lstrip("/").replace("/", "_") + ".sock"
+                f"shmradix lacks {name}: FlexKV needs a radixshmem whose radix-server takes "
+                f"its geometry from the client (RadixClient(name, Geometry))")
 
 
 # ------------------------------------------------------------------ geometry
@@ -135,8 +113,10 @@ def cpu_block_bytes(model_config: ModelConfig, cache_config: CacheConfig) -> int
 
 
 def swa_pool_config(cache_config: CacheConfig) -> Optional[SWAPoolConfig]:
+    """The SWA tier FlexKV wants on the server, or None. The slot count is the
+    server's business (it may still be the placeholder ``cpu_cache_gb`` gave)."""
     swa = cache_config.swa
-    if swa is None or not swa.enabled or swa.num_slots <= 0:
+    if swa is None or not swa.enabled:
         return None
     return swa
 
@@ -178,29 +158,38 @@ def slot_align_for(*sizes: int) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class RadixGeometry:
-    """What FlexKV expects the server's regions to look like."""
+    """FlexKV's side of the geometry: what one slot of each pool must hold. The
+    slot counts are not here; the server plans them from its byte budget."""
     tokens_per_block: int
-    full_slots: int
     full_slot_bytes: int
-    swa_slots: int = 0
     swa_slot_bytes: int = 0
     swa_window_blocks: int = 0
+
+    @property
+    def has_swa(self) -> bool:
+        return self.swa_slot_bytes > 0
 
     @property
     def slot_align(self) -> int:
         return slot_align_for(self.full_slot_bytes, self.swa_slot_bytes)
 
-    @property
-    def data_bytes(self) -> int:
-        return self.full_slots * self.full_slot_bytes + self.swa_slots * self.swa_slot_bytes
+    def to_shmradix(self) -> "shmradix.Geometry":
+        """The ``shmradix.Geometry`` handed to the server (data mode: bytes and
+        window only, no counts)."""
+        _ensure_shmradix()
+        return shmradix.Geometry(
+            block_size=int(self.tokens_per_block),
+            full_slot_bytes=int(self.full_slot_bytes),
+            swa_slot_bytes=int(self.swa_slot_bytes),
+            swa_window_blocks=int(self.swa_window_blocks) if self.has_swa else 0,
+            slot_align=int(self.slot_align),
+        )
 
     def describe(self) -> str:
-        s = (f"tokens_per_block={self.tokens_per_block}, FULL {self.full_slots} x "
-             f"{self.full_slot_bytes} B")
-        if self.swa_slots:
-            s += (f", SWA {self.swa_slots} x {self.swa_slot_bytes} B "
-                  f"(window {self.swa_window_blocks})")
-        return s + f", slot_align={self.slot_align}, data={self.data_bytes / 2**30:.2f} GiB"
+        s = f"tokens_per_block={self.tokens_per_block}, FULL slot {self.full_slot_bytes} B"
+        if self.has_swa:
+            s += f", SWA slot {self.swa_slot_bytes} B (window {self.swa_window_blocks})"
+        return s + f", slot_align={self.slot_align}"
 
 
 def expected_geometry(model_config: ModelConfig, cache_config: CacheConfig) -> RadixGeometry:
@@ -208,11 +197,8 @@ def expected_geometry(model_config: ModelConfig, cache_config: CacheConfig) -> R
         raise ValueError(
             "radixshmem needs FLEXKV_CPU_LAYOUT=BLOCKFIRST: one SlotStore slot is one "
             "contiguous block, which LAYERFIRST does not give")
-    if cache_config.num_cpu_blocks <= 0:
-        raise ValueError(f"cache_config.num_cpu_blocks={cache_config.num_cpu_blocks} must be > 0")
     geo = RadixGeometry(
-        tokens_per_block=cache_config.tokens_per_block,
-        full_slots=int(cache_config.num_cpu_blocks),
+        tokens_per_block=int(cache_config.tokens_per_block),
         full_slot_bytes=cpu_block_bytes(model_config, cache_config),
     )
     swa = swa_pool_config(cache_config)
@@ -220,49 +206,152 @@ def expected_geometry(model_config: ModelConfig, cache_config: CacheConfig) -> R
         if swa.window_blocks < 1:
             raise ValueError(
                 f"cache_config.swa.window_blocks={swa.window_blocks} must be >= 1")
-        if swa.num_slots < swa.window_blocks:
-            # All-or-none window allocation: a pool smaller than one window can
-            # never store anything, so fail at startup.
-            raise ValueError(
-                f"cache_config.swa.num_slots={swa.num_slots} cannot hold one "
-                f"{swa.window_blocks}-block SWA window; raise num_slots or disable SWA")
         geo = dataclasses.replace(
-            geo, swa_slots=int(swa.num_slots),
-            swa_slot_bytes=swa_block_bytes(model_config, cache_config),
+            geo, swa_slot_bytes=swa_block_bytes(model_config, cache_config),
             swa_window_blocks=int(swa.window_blocks))
     return geo
 
 
+# -------------------------------------------------------------------- attach
+
+def attach_radix_client(name: Optional[str] = None,
+                        *,
+                        geometry: Any = None,
+                        rcfg: Optional[RadixShmemConfig] = None,
+                        endpoint: Optional[str] = None,
+                        timeout_s: Optional[float] = None,
+                        max_outstanding: Optional[int] = None,
+                        label: str = "radixshmem") -> "shmradix.RadixClient":
+    """A ready ``shmradix.RadixClient`` on the radix-server ``name`` (default:
+    the configuration's ``server.name``).
+
+    With ``geometry`` (a :class:`RadixGeometry` or a ``shmradix.Geometry``) the
+    client hands the server FlexKV's slot shape on the way; the server plans
+    the counts from its budget. That is idempotent, so every FlexKV process
+    may bring it; a server already serving another geometry (another model or
+    page size on this node) is refused, and so is one whose budget cannot hold
+    FlexKV's slots. Without a geometry the call only waits for a server that
+    somebody else configured.
+
+    Retries while the server is not reachable yet (the operator may start it
+    late), then blocks in ``wait_ready`` -- the rendezvous of a cluster and
+    the SlotStore prefault happen there -- for ``timeout_s`` in total
+    (default: the configuration's ``server.ready_timeout_s``).
+    """
+    _ensure_shmradix()
+    if rcfg is None:
+        rcfg = get_radixshmem_config()
+    name = name or rcfg.server_name
+    if endpoint is None:
+        endpoint = rcfg.endpoint or None
+    if timeout_s is None:
+        timeout_s = rcfg.ready_timeout_s
+    if max_outstanding is None:
+        max_outstanding = rcfg.client.max_outstanding
+    spec = geometry.to_shmradix() if isinstance(geometry, RadixGeometry) else geometry
+    where = endpoint or f"unix:///dev/shm/{name.lstrip('/').replace('/', '_')}.sock"
+
+    deadline = time.monotonic() + float(timeout_s)
+    last: Optional[BaseException] = None
+    while True:
+        try:
+            client = shmradix.RadixClient(name, spec, endpoint=endpoint,
+                                          max_outstanding=max_outstanding)
+            break
+        except shmradix.GeometryMismatch as e:
+            raise ValueError(
+                f"{label}: radix-server {name} already serves another geometry ({e}); every "
+                f"engine attached to one server must run the same model, page size and SWA "
+                f"configuration") from e
+        except ValueError as e:
+            raise ValueError(
+                f"{label}: radix-server {name} cannot serve FlexKV's geometry ({e}); check its "
+                f"--data-bytes / --swa-ratio") from e
+        except Exception as e:  # noqa: BLE001 - not reachable yet: no socket, no listener
+            last = e
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"{label}: no radix-server named {name} reachable at {where} within "
+                    f"{timeout_s:.0f}s (start it with `radix-server --name {name} "
+                    f"--data-bytes ...`): {last}") from e
+            flexkv_logger.debug(f"{label}: radix-server {name} not reachable yet ({e}); retrying")
+            time.sleep(0.5)
+
+    remaining = max(1.0, deadline - time.monotonic())
+    try:
+        info = client.wait_ready(remaining)
+    except TimeoutError as e:
+        mode, err = client.info.mode, client.info.last_error
+        client.close()
+        raise TimeoutError(
+            f"{label}: radix-server {name} not ready within {timeout_s:.0f}s (mode={mode}"
+            + (f", last_error={err!r}" if err else "")
+            + ("; nobody handed it a geometry" if spec is None and mode == "waiting" else "")
+            + ")") from e
+    except RuntimeError as e:
+        client.close()
+        raise RuntimeError(f"{label}: radix-server {name} failed to configure: {e}") from e
+    flexkv_logger.info(
+        f"{label}: attached radix-server {name} ({where}): index={info.index_name}, "
+        f"rank={info.rank}/{info.world_size}, data_plane={info.data_plane}, "
+        f"geometry={_describe_published(info.geometry)}")
+    return client
+
+
+def _describe_published(g: Optional[Dict[str, Any]]) -> str:
+    if not g:
+        return "(none)"
+    parts = [f"block_size={g.get('block_size')}"]
+    for kind, pool in (g.get("pools") or {}).items():
+        s = f"{kind.upper()} {pool.get('num_slots')} x {pool.get('slot_bytes')} B"
+        if kind == "swa":
+            s += f" (window {pool.get('window_blocks')})"
+        parts.append(s)
+    return ", ".join(parts)
+
+
+def _published_geometry(client: "shmradix.RadixClient", label: str) -> Dict[str, Any]:
+    g = client.geometry
+    if not g:
+        info = client.status()
+        g = info.geometry
+        if not g:
+            raise ValueError(
+                f"{label}: radix-server {client.name} has no geometry yet (mode={info.mode}); "
+                f"attach with FlexKV's geometry first")
+    return g
+
+
 def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
                    label: str = "radixshmem") -> None:
-    """Fail closed when the attached regions differ from FlexKV's own layout: a
-    slot count or stride mismatch would otherwise become a silent misaddressed
-    transfer."""
-    g = client.geometry
+    """Fail closed when the server's regions differ from FlexKV's own layout: a
+    stride or page mismatch would otherwise become a silent misaddressed
+    transfer. Slot counts are not checked here -- they are the server's, taken
+    over by :func:`adopt_geometry`."""
+    _ensure_shmradix()
+    g = _published_geometry(client, label)
     pools = g["pools"]
     diffs: List[str] = []
     if int(g["block_size"]) != expected.tokens_per_block:
         diffs.append(f"tokens_per_block server={g['block_size']} flexkv={expected.tokens_per_block}")
     full = pools["full"]
-    if int(full["num_slots"]) != expected.full_slots:
-        diffs.append(f"FULL slots server={full['num_slots']} flexkv={expected.full_slots}")
     if int(full["slot_bytes"]) != expected.full_slot_bytes:
         diffs.append(f"FULL slot_bytes server={full['slot_bytes']} flexkv={expected.full_slot_bytes}")
     if not client.info.data_plane:
-        diffs.append("server is index-only (no SlotStore); FlexKV needs the data plane")
+        diffs.append("server is index-only (no --data-bytes); FlexKV needs the data plane")
     else:
         store = client.store
         stride = int(store.pool(shmradix.ComponentType.FULL).slot_bytes)
         if stride != expected.full_slot_bytes:
             diffs.append(f"FULL stride server={stride} flexkv={expected.full_slot_bytes} "
-                         f"(slot_align must divide the block size)")
+                         f"(the server rounds slots up to slot_align={g.get('slot_align')}; "
+                         f"FlexKV asks for {expected.slot_align})")
     swa = pools.get("swa")
-    if expected.swa_slots > 0:
+    if expected.has_swa:
         if swa is None:
-            diffs.append("server has no SWA pool but FlexKV's SWA tier is on")
+            diffs.append("server has no SWA pool but FlexKV's SWA tier is on "
+                         "(start it with --swa-ratio)")
         else:
-            if int(swa["num_slots"]) != expected.swa_slots:
-                diffs.append(f"SWA slots server={swa['num_slots']} flexkv={expected.swa_slots}")
             if int(swa["slot_bytes"]) != expected.swa_slot_bytes:
                 diffs.append(f"SWA slot_bytes server={swa['slot_bytes']} flexkv={expected.swa_slot_bytes}")
             if int(swa.get("window_blocks", 0)) != expected.swa_window_blocks:
@@ -276,208 +365,56 @@ def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
         diffs.append("server has an SWA pool that FlexKV's configuration does not")
     if diffs:
         raise ValueError(
-            f"{label}: the attached radixshmem regions do not match FlexKV's configuration "
+            f"{label}: the radix-server's regions do not match FlexKV's layout "
             f"({expected.describe()}): " + "; ".join(diffs))
 
 
-# ------------------------------------------------------------- server config
-
-def build_radix_server_config(model_config: ModelConfig,
-                              cache_config: CacheConfig,
-                              rcfg: Optional[RadixShmemConfig] = None,
-                              ) -> "shmradix.RadixServerConfig":
-    """The one radix-server this FlexKV node needs: index sized from
-    ``cache_config`` (FULL slots = ``num_cpu_blocks``, SWA slots = ``swa.num_slots``),
-    SlotStore sized so that every slot is exactly one block, and the cluster /
-    data-plane / index / server settings of ``rcfg`` (default: the process's
-    ``FLEXKV_RADIXSHMEM_CONFIG_PATH``) passed through. Raises on an
-    inconsistent configuration."""
-    _ensure_shmradix()
-    if rcfg is None:
-        rcfg = get_radixshmem_config()
-    geo = expected_geometry(model_config, cache_config)
-    index_kwargs = dict(rcfg.index)
-    # an RHT registration chunk covers REGISTER_CHUNK_TOKENS tokens unless the file says otherwise
-    index_kwargs.setdefault("register_chunk_size",
-                            max(1, REGISTER_CHUNK_TOKENS // geo.tokens_per_block))
-    index = shmradix.IndexConfig(
-        name=radix_index_name(rcfg.local_id),
-        tokens_per_block=geo.tokens_per_block,
-        full_slots=geo.full_slots,
-        swa_slots=geo.swa_slots,
-        swa_window_blocks=geo.swa_window_blocks,
-        **index_kwargs,
-    )
-    data = shmradix.DataPlaneConfig(
-        data_bytes=geo.data_bytes,
-        full_slot_bytes=geo.full_slot_bytes,
-        swa_slot_bytes=geo.swa_slot_bytes,
-        slot_align=geo.slot_align,
-        data_name=radix_data_name(rcfg.local_id),
-        **rcfg.data,
-    )
-    cluster = shmradix.ClusterConfig(**rcfg.cluster)
-    server_kwargs = dict(rcfg.server)
-    if not server_kwargs.get("hugepage_path") and cache_config.use_hugepage_cpu_buffer:
-        server_kwargs["hugepage_path"] = os.environ.get("FLEXKV_HUGETLBFS_DIR",
-                                                        DEFAULT_HUGETLBFS_DIR)
-    cfg = shmradix.RadixServerConfig(index=index, data=data, cluster=cluster, **server_kwargs)
-    flexkv_logger.info(
-        f"radixshmem server config for {index.name}: {geo.describe()}, "
-        f"{rcfg.describe()}, register_chunk_size={index.register_chunk_size}, "
-        f"hugepage_path={cfg.hugepage_path or '(shm)'}, "
-        f"prefault={data.prefault}, transfer_devices={data.transfer_devices or '(all)'}")
-    return cfg
+def adopt_geometry(cache_config: CacheConfig, client: "shmradix.RadixClient",
+                   label: str = "radixshmem") -> Dict[str, int]:
+    """Take the slot counts the server planned from its budget over into
+    ``cache_config``: ``num_cpu_blocks`` = the FULL pool, ``swa.num_slots`` =
+    the SWA pool. Whatever ``cpu_cache_gb`` had produced was a placeholder in
+    this mode. Run it after any ``recompute_cache_block_counts`` in the same
+    process (that recompute sizes from ``cpu_cache_gb`` and would undo this).
+    Returns ``{"full": n, "swa": m}``."""
+    g = _published_geometry(client, label)
+    pools = g["pools"]
+    counts: Dict[str, int] = {"full": int(pools["full"]["num_slots"])}
+    before = int(cache_config.num_cpu_blocks)
+    cache_config.num_cpu_blocks = counts["full"]
+    note = f"FULL {counts['full']} slots (cpu_cache_gb had given {before})"
+    swa = swa_pool_config(cache_config)
+    if swa is not None:
+        published = pools.get("swa")
+        if published is None:
+            raise ValueError(
+                f"{label}: FlexKV's SWA tier is on but radix-server {client.name} planned no SWA "
+                f"pool; start it with --swa-ratio")
+        counts["swa"] = int(published["num_slots"])
+        swa_before = int(swa.num_slots)
+        swa.num_slots = counts["swa"]
+        note += f", SWA {counts['swa']} slots (had {swa_before})"
+    flexkv_logger.info(f"{label}: adopted radix-server {client.name}'s slot counts: {note}")
+    return counts
 
 
-# ------------------------------------------------------------ server process
-
-def _radix_server_main(cfg, ready, stop, conn) -> None:
-    """Body of the radix-server subprocess: bring the server up, report, wait."""
-    import shmradix as _shmradix
-
-    def _on_term(signum, frame):  # noqa: ARG001
-        stop.set()
-
-    signal.signal(signal.SIGTERM, _on_term)
-    signal.signal(signal.SIGINT, _on_term)
+def radix_server_is_distributed(rcfg: Optional[RadixShmemConfig] = None,
+                                *,
+                                timeout_s: Optional[float] = None,
+                                label: str = "radixshmem") -> bool:
+    """Whether this node's radix-server is part of a cluster (world_size > 1),
+    i.e. whether peer pulls are possible. Asked of the server itself once it
+    is ready (a geometry-less attach that only waits), so every process that
+    asks gets the same answer -- the framework adapters gate the prefetch path
+    on it in every TP rank, and the ranks must agree."""
+    client = attach_radix_client(rcfg=rcfg, timeout_s=timeout_s, label=label)
     try:
-        server = _shmradix.RadixServer(cfg)
-        server.start()
-    except BaseException as e:  # noqa: BLE001 - reported to the parent, which raises
-        try:
-            conn.send(("error", f"{type(e).__name__}: {e}"))
-        finally:
-            conn.close()
-        return
-    index = server.index
-    try:
-        conn.send(("ready", {
-            "index_name": index.shm_name(),
-            "rank": int(index.rank()),
-            "world_size": int(index.world_size()),
-            "distributed": bool(index.is_distributed()),
-        }))
+        return int(client.info.world_size) > 1
     finally:
-        conn.close()
-    ready.set()
-    try:
-        while not stop.wait(0.5):
-            pass
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.close()
-
-
-class RadixServerProcess:
-    """The embedded radix-server: a spawned subprocess running ``RadixServer``.
-
-    Not the scheduler process (its gRPC threads and transfer polling thread
-    would contend for the GIL, and a clustered server holds RDMA contexts that
-    do not survive a fork) and not the TE process (which cannot come up before
-    the GPU registrations, while the CEs attach the index at construction).
-    """
-
-    def __init__(self, cfg: "shmradix.RadixServerConfig"):
-        self.cfg = cfg
-        self._ctx = mp.get_context("spawn")
-        self._ready = self._ctx.Event()
-        self._stop = self._ctx.Event()
-        self.process = None
-        self.info: Dict[str, Any] = {}
-
-    def start(self, timeout_s: Optional[float] = None) -> "RadixServerProcess":
-        if timeout_s is None:
-            timeout_s = float(self.cfg.cluster.bootstrap_timeout_sec) + 60.0
-        parent, child = self._ctx.Pipe(duplex=False)
-        self.process = self._ctx.Process(
-            target=_radix_server_main,
-            args=(self.cfg, self._ready, self._stop, child),
-            name="flexkv-radix-server",
-            daemon=True,
-        )
-        self.process.start()
-        child.close()
-        deadline = time.monotonic() + timeout_s
-        try:
-            while True:
-                if parent.poll(0.2):
-                    kind, payload = parent.recv()
-                    break
-                if not self.process.is_alive():
-                    raise RuntimeError("radix-server exited during startup (see its log)")
-                if time.monotonic() > deadline:
-                    self.shutdown()
-                    raise TimeoutError(
-                        f"radix-server did not become ready within {timeout_s:.0f}s "
-                        f"(cluster rendezvous or SlotStore prefault still pending?)")
-        finally:
-            parent.close()
-        if kind == "error":
-            self.shutdown()
-            raise RuntimeError(f"radix-server failed to start: {payload}")
-        self.info = payload
-        flexkv_logger.info(
-            f"radix-server pid={self.process.pid} ready: index={payload['index_name']} "
-            f"rank={payload['rank']}/{payload['world_size']} distributed={payload['distributed']}")
-        return self
-
-    @property
-    def cluster_rank(self) -> int:
-        return int(self.info.get("rank", 0))
-
-    def shutdown(self, timeout: float = 15.0) -> None:
-        if self.process is None:
-            return
-        self._stop.set()
-        self.process.join(timeout)
-        if self.process.is_alive():
-            self.process.terminate()
-            self.process.join(5.0)
-        self.process = None
-
-
-# ------------------------------------------------------------------- attach
-
-def attach_radix_client(name: str,
-                        timeout_s: Optional[float] = None,
-                        *,
-                        rcfg: Optional[RadixShmemConfig] = None,
-                        max_outstanding: Optional[int] = None) -> "shmradix.RadixClient":
-    """``shmradix.RadixClient(name)``, retried until the server's socket exists
-    and the server is ready (an embedded server starts concurrently with the
-    CEs, an external one may still be rendezvousing). Endpoint, timeout and
-    ``max_outstanding`` default to ``rcfg`` (the process's configuration).
-
-    The returned client owns the index attach, the SlotStore mapping and the
-    gRPC channel; keep it alive for as long as its slots are addressed.
-    """
-    _ensure_shmradix()
-    if rcfg is None:
-        rcfg = get_radixshmem_config()
-    if timeout_s is None:
-        timeout_s = rcfg.attach_timeout_s
-    if max_outstanding is None:
-        max_outstanding = rcfg.client.max_outstanding
-    deadline = time.monotonic() + timeout_s
-    last: Optional[BaseException] = None
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"radix-server {name} not attachable within {timeout_s:.0f}s: {last}")
-        try:
-            return shmradix.RadixClient(name, endpoint=rcfg.endpoint or None,
-                                        timeout_s=max(1.0, remaining),
-                                        max_outstanding=max_outstanding)
-        except Exception as e:  # noqa: BLE001 - socket not there yet, server starting
-            last = e
-            flexkv_logger.debug(f"attach to radix-server {name} failed (will retry): {e}")
-            time.sleep(0.2)
+        client.close()
 
 
 def radix_cluster_rank(client: "shmradix.RadixClient") -> int:
-    """The cluster rank etcd assigned this node (0 when standalone)."""
+    """This node's rank in the radix cluster (0 on a standalone server)."""
     rank = int(getattr(client.info, "rank", -1))
     return rank if rank >= 0 else int(client.rank())

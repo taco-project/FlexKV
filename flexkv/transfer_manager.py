@@ -431,11 +431,17 @@ class TransferManager:
 
         radix_client = None
         if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
-            from flexkv.common.radixshmem_config import get_radixshmem_config
-            from flexkv.server.shm_radix_bootstrap import (attach_radix_client,
-                                                           radix_index_name)
-            radix_client = attach_radix_client(
-                radix_index_name(get_radixshmem_config().local_id))
+            # The operator's radix-server; its SlotStore is this TE's CPU pool.
+            # Its slot counts are authoritative: take them over again here,
+            # AFTER the recompute above (which sizes from cpu_cache_gb and would
+            # otherwise undo what the KVManager adopted), so the CPU layouts
+            # below match the server's pools exactly.
+            from flexkv.server.shm_radix_bootstrap import (adopt_geometry, attach_radix_client,
+                                                           check_geometry, expected_geometry)
+            geometry = expected_geometry(self.model_config, self.cache_config)
+            radix_client = attach_radix_client(geometry=geometry, label="TransferManager")
+            check_geometry(radix_client, geometry, label="TransferManager")
+            adopt_geometry(self.cache_config, radix_client, label="TransferManager")
             self._radix_client = radix_client
         self.storage_engine = StorageEngine(
             self.model_config,

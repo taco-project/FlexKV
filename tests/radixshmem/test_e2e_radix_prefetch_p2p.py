@@ -4,12 +4,13 @@ blocks, GET serves them from the local pool, the GPU holds the peer's bytes.
 Two full FlexKV nodes on one host (two processes, two GPUs), one radixshmem
 cluster:
 
-  * each node's KVManager launches its own radix-server (index + SlotStore =
-    the node's CPU pool + RDMA transfer engine) from one shared YAML
-    (FLEXKV_RADIXSHMEM_CONFIG_PATH: cluster_id, expected_min_nodes=2, registry,
-    RDMA devices), told apart by the per-node FLEXKV_RADIX_NODE_NAME override
-    as co-located nodes are; the two servers rendezvous in one etcd namespace,
-    get dense cluster ranks and an RHT to route by;
+  * the test starts one operator-style radix-server per node (index +
+    SlotStore = the node's CPU pool + RDMA transfer engine), joined into one
+    cluster by their command lines (--expected-min-nodes 2, --registry,
+    --node-name, RDMA devices); each FlexKV node attaches to its own server
+    through a per-node YAML (FLEXKV_RADIXSHMEM_CONFIG_PATH: server.name /
+    server.endpoint) and brings the geometry; the two servers rendezvous in
+    one etcd namespace, get dense cluster ranks and an RHT to route by;
   * node 0 PUTs a window of GPU blocks holding a per-block pattern;
   * node 1 calls ``KVManager.prefetch_async`` for the same tokens: the index walk
     finds the prefix on node 0 over RDMA, node 1's radix-server RDMA-reads the
@@ -54,6 +55,8 @@ from radix_e2e_common import (
     start_tp_client,
     stop_private_etcd,
     stop_tp_client,
+    start_radix_server,
+    stop_radix_server,
     sweep_radix_files,
     wait_kv_manager_ready,
     write_pattern,
@@ -115,12 +118,7 @@ def _node_proc(rank, gpu_id, cluster_id, config_path,
     recv_port = f"ipc:///tmp/flexkv_{cluster_id}_{node_name}"
     os.environ.update({
         "FLEXKV_ENABLE_RADIXSHMEM": "1",
-        "FLEXKV_RADIXSHMEM_CONFIG_PATH": config_path,
-        # The two per-node overrides of the global file: etcd keys membership
-        # by node identity, which defaults to the bind IP the co-located nodes
-        # share -- so name each node and give the loopback address explicitly.
-        "FLEXKV_RADIX_NODE_NAME": node_name,
-        "FLEXKV_RADIX_RPC_ADDRESS": "127.0.0.1",
+        "FLEXKV_RADIXSHMEM_CONFIG_PATH": config_path,     # this node's server
         "FLEXKV_ENABLE_MPS": "0",
         "FLEXKV_SERVER_RECV_PORT": recv_port,
     })
@@ -132,8 +130,6 @@ def _node_proc(rank, gpu_id, cluster_id, config_path,
     # case a parent import happened earlier in this process.
     GLOBAL_CONFIG_FROM_ENV.enable_radixshmem = True
     GLOBAL_CONFIG_FROM_ENV.radixshmem_config_path = config_path
-    GLOBAL_CONFIG_FROM_ENV.radix_node_name = node_name
-    GLOBAL_CONFIG_FROM_ENV.radix_rpc_address = "127.0.0.1"
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
     GLOBAL_CONFIG_FROM_ENV.server_recv_port = recv_port
 
@@ -234,16 +230,32 @@ def _run(registry: str, rdma_dev: str) -> dict:
     # One etcd namespace (and shm prefix) per run keeps concurrent runs apart.
     cluster_id = f"p2p{os.getpid()}"
     workdir = tempfile.mkdtemp(prefix="flexkv_radix_p2p_")
-    config_path = write_radix_config(workdir, {
-        "cluster": {
-            "cluster_id": cluster_id,
-            "expected_min_nodes": WORLD_SIZE,
-            "registry": registry,
-            "index_dev": rdma_dev,
-            "rht_slots_per_bucket": 4,
-        },
-        "data": {"transfer_devices": [rdma_dev], "prefault": False},
-    })
+    # Two operator-style radix-servers on one host, one cluster: distinct names,
+    # sockets and node names, the loopback address as the bootstrap IP. The
+    # FlexKV nodes bring the geometry (node 1 adopts what node 0 published).
+    from flexkv.common.config import CacheConfig, ModelConfig
+    from flexkv.server.shm_radix_bootstrap import cpu_block_bytes
+    block_bytes = cpu_block_bytes(
+        ModelConfig(num_layers=2, num_kv_heads=4, head_size=128, dtype=torch.float16,
+                    tp_size=1, dp_size=1),
+        CacheConfig(tokens_per_block=TOKENS_PER_BLOCK, enable_cpu=True, enable_ssd=False,
+                    num_cpu_blocks=NUM_CPU_BLOCKS))
+    sweep_radix_files(cluster_id)
+    servers, config_paths = [], []
+    for rank in range(WORLD_SIZE):
+        name = f"/{cluster_id}_{_node_name(rank)}"
+        endpoint = f"unix:///dev/shm/{cluster_id}_{_node_name(rank)}.sock"
+        servers.append(start_radix_server(
+            name, NUM_CPU_BLOCKS * block_bytes, endpoint=endpoint,
+            extra_args=["--expected-min-nodes", str(WORLD_SIZE), "--registry", registry,
+                        "--cluster-id", cluster_id, "--node-name", _node_name(rank),
+                        "--rpc-address", "127.0.0.1", "--index-dev", rdma_dev,
+                        "--transfer-dev", rdma_dev, "--rht-slots", "4",
+                        "--bootstrap-timeout", "120"],
+            log_path=os.path.join(workdir, f"radix-server-{_node_name(rank)}.log")))
+        config_paths.append(write_radix_config(
+            workdir, {"server": {"name": name, "endpoint": endpoint, "ready_timeout_s": 300}},
+            name=f"radixshmem_{_node_name(rank)}.yaml"))
     ctx = mp.get_context("spawn")
     reader_ready, written, read_done = ctx.Event(), ctx.Event(), ctx.Event()
     result_q = ctx.Queue()
@@ -253,7 +265,7 @@ def _run(registry: str, rdma_dev: str) -> dict:
         for rank in range(WORLD_SIZE):
             proc = ctx.Process(
                 target=_node_proc,
-                args=(rank, rank, cluster_id, config_path,
+                args=(rank, rank, cluster_id, config_paths[rank],
                       reader_ready, written, read_done, result_q),
                 daemon=False,
             )
@@ -273,6 +285,8 @@ def _run(registry: str, rdma_dev: str) -> dict:
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=10)
+        for server in servers:
+            stop_radix_server(server)
         sweep_radix_files(cluster_id)
         shutil.rmtree(workdir, ignore_errors=True)
     return reports
