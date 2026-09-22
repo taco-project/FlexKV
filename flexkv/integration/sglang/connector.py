@@ -62,13 +62,15 @@ from flexkv.transfer.layer_eventfd import build_layerwise_eventfd_socket_path
 from flexkv.transfer_manager import TransferManagerOnRemote
 
 
-def _radixshmem_distributed() -> bool:
+def _radixshmem_distributed(model_config, cache_config) -> bool:
     """Whether this node's radix-server is part of a cluster (peer pulls
     possible). The server is the operator's process and knows; every TP rank
     asks it the same question once it is ready, so the prefetch gate below is
-    the same in all ranks (the PREFETCH_START scatter needs that)."""
+    the same in all ranks (the PREFETCH_START scatter needs that). The attach
+    brings FlexKV's geometry, so the answer does not depend on which process
+    configured the server first."""
     from flexkv.server.shm_radix_bootstrap import radix_server_is_distributed
-    return radix_server_is_distributed(label="FlexKVConnector")
+    return radix_server_is_distributed(model_config, cache_config, label="FlexKVConnector")
 
 
 logger = logging.getLogger(__name__)
@@ -341,7 +343,8 @@ class FlexKVConnector:
             or self.cache_config.enable_kv_sharing
             # radixshmem cluster: prefetch is where a peer's blocks are pulled
             # into this node (RadixClient.pull_async); GET then matches locally.
-            or (GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and _radixshmem_distributed())
+            or (GLOBAL_CONFIG_FROM_ENV.enable_radixshmem
+                and _radixshmem_distributed(self.model_config, self.cache_config))
         )
         self._shutdown_done = False
 

@@ -266,6 +266,25 @@ def expected_geometry(model_config: ModelConfig, cache_config: CacheConfig) -> R
 
 # -------------------------------------------------------------------- attach
 
+def _nothing_answers(e: BaseException) -> bool:
+    """Whether an attach error means no server answered at the socket yet.
+    radixshmem's RPC layer raises ``RuntimeError("UNAVAILABLE: ...")`` for a
+    missing or unreachable server and ``TimeoutError`` for an RPC deadline;
+    both are worth retrying. Anything else is a live server's answer (e.g.
+    ``INTERNAL: server is closed``) or a programming error and is raised as is."""
+    return isinstance(e, TimeoutError) or (
+        isinstance(e, RuntimeError) and str(e).startswith("UNAVAILABLE"))
+
+
+def _current_status(client: "shmradix.RadixClient"):
+    """The server's state now (one RPC); the constructor-time info when the
+    server cannot be asked any more."""
+    try:
+        return client.status()
+    except Exception:  # noqa: BLE001 - gone or unreachable: report what we had
+        return client.info
+
+
 def attach_radix_client(name: Optional[str] = None,
                         *,
                         geometry: Any = None,
@@ -312,7 +331,13 @@ def attach_radix_client(name: Optional[str] = None,
             raise ValueError(
                 f"{label}: radix-server {name} cannot serve FlexKV's geometry ({e}); check its "
                 f"--data-bytes / --swa-ratio") from e
-        except Exception as e:  # noqa: BLE001 - not reachable yet: no socket, no listener
+        except Exception as e:  # noqa: BLE001 - classified below
+            if not _nothing_answers(e):
+                # A live server refused the attach, or FlexKV called it wrongly:
+                # retrying would only hide the cause for READY_TIMEOUT_S.
+                flexkv_logger.error(
+                    f"{label}: attach to radix-server {name} at {where} failed: {e!r}")
+                raise
             last = e
             if time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -326,7 +351,8 @@ def attach_radix_client(name: Optional[str] = None,
     try:
         info = client.wait_ready(remaining)
     except TimeoutError as e:
-        mode, err = client.info.mode, client.info.last_error
+        info = _current_status(client)
+        mode, err = info.mode, info.last_error
         client.close()
         raise TimeoutError(
             f"{label}: radix-server {name} not ready within {timeout_s:.0f}s (mode={mode}"
@@ -488,16 +514,19 @@ def adopt_radix_server(model_config: ModelConfig, cache_config: CacheConfig,
         client.close()
 
 
-def radix_server_is_distributed(name: Optional[str] = None,
+def radix_server_is_distributed(model_config: ModelConfig, cache_config: CacheConfig,
                                 *,
+                                name: Optional[str] = None,
                                 timeout_s: Optional[float] = None,
                                 label: str = "radixshmem") -> bool:
     """Whether this node's radix-server is part of a cluster (world_size > 1),
     i.e. whether peer pulls are possible. Asked of the server itself once it
-    is ready (a geometry-less attach that only waits), so every process that
-    asks gets the same answer -- the framework adapters gate the prefetch path
-    on it in every TP rank, and the ranks must agree."""
-    client = attach_radix_client(name, timeout_s=timeout_s, label=label)
+    is ready, so every process that asks gets the same answer -- the framework
+    adapters gate the prefetch path on it in every TP rank, and the ranks must
+    agree. The attach brings FlexKV's geometry like every other one, so the
+    question can be asked of a server nobody has configured yet."""
+    geometry = expected_geometry(model_config, cache_config)
+    client = attach_radix_client(name, geometry=geometry, timeout_s=timeout_s, label=label)
     try:
         return int(client.info.world_size) > 1
     finally:
