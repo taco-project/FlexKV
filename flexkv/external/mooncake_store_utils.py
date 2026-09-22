@@ -342,7 +342,7 @@ class MooncakeStoreClient:
             return True
         ret_code = self._store.batch_put_from([key], [buffer_ptr], [buffer_size])
 
-        return ret_code == 0
+        return ret_code[0] == 0
 
     def batch_put(
         self,
@@ -421,7 +421,7 @@ class MooncakeStoreClient:
     def exists(self, key: str) -> bool:
         """Check existence of a key in the store."""
         self._ensure_setup()
-        result = self._store._batch_exist([key])
+        result = self._store.batch_is_exist([key])
         return result[0] == 1
 
     def zero_copy_put_impl(
