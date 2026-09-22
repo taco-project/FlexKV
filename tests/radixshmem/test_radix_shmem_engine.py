@@ -682,7 +682,8 @@ def test_client_brings_the_geometry_and_adopts_the_counts(env):
                 client, dataclasses.replace(geo, register_chunk_tokens=4096), "test")
         assert bootstrap.radix_cluster_rank(client) == 0 and client.info.world_size == 1
         # the connectors' prefetch gate asks the server the same question
-        assert bootstrap.radix_server_is_distributed(name, timeout_s=30) is False
+        assert bootstrap.radix_server_is_distributed(
+            model_config, cache_config, name=name, timeout_s=30) is False
         # another expectation against the same regions fails closed
         cache_config.tokens_per_block = 32
         with pytest.raises(ValueError, match="tokens_per_block"):
@@ -723,6 +724,58 @@ def test_attach_waits_for_a_late_server(env):
         client.close()
     with pytest.raises(TimeoutError, match="radix-server --name"):
         bootstrap.attach_radix_client(f"/nobody{os.getpid()}", geometry=geo, timeout_s=2)
+
+
+def test_attach_retries_only_while_nothing_answers(env, monkeypatch):
+    """An unreachable socket (UNAVAILABLE) is retried until the deadline. Any
+    other error is a live server's answer or a bug and comes back at once,
+    instead of being retried for READY_TIMEOUT_S and reported as 'no server'."""
+    name = f"/errs{os.getpid()}"
+    calls = []
+
+    def _ctor_raising(exc):
+        def _ctor(*args, **kwargs):
+            calls.append(exc)
+            raise exc
+        return _ctor
+
+    for exc, exc_type, match in (
+            (TypeError("unexpected keyword argument 'endpoint'"), TypeError, "unexpected keyword"),
+            (RuntimeError("INTERNAL: server is closed"), RuntimeError, "server is closed")):
+        calls.clear()
+        monkeypatch.setattr(shmradix, "RadixClient", _ctor_raising(exc))
+        t0 = time.monotonic()
+        with pytest.raises(exc_type, match=match):
+            bootstrap.attach_radix_client(name, timeout_s=30)
+        assert len(calls) == 1 and time.monotonic() - t0 < 5
+    calls.clear()
+    monkeypatch.setattr(shmradix, "RadixClient",
+                        _ctor_raising(RuntimeError("UNAVAILABLE: failed to connect to all addresses")))
+    with pytest.raises(TimeoutError, match="no radix-server named"):
+        bootstrap.attach_radix_client(name, timeout_s=1.5)
+    assert len(calls) >= 2                                   # retried until the deadline
+
+
+def test_unconfigured_server_answers_the_cluster_question(env):
+    """`radix_server_is_distributed` brings the geometry, so a server nobody
+    configured yet answers instead of timing out; a geometry-less attach on
+    that server names the cause, read from the server's state at that moment."""
+    model_config, cache_config = _configs(num_cpu_blocks=64)
+    geo = bootstrap.expected_geometry(model_config, cache_config)
+    name = f"/waiting{os.getpid()}"
+    env.server(shmradix.ServerConfig(name=name, data_bytes=64 * geo.full_slot_bytes,
+                                     prefault=False))
+    with pytest.raises(TimeoutError, match="mode=waiting; nobody handed it a geometry"):
+        bootstrap.attach_radix_client(name, timeout_s=2)
+    t0 = time.monotonic()
+    assert bootstrap.radix_server_is_distributed(
+        model_config, cache_config, name=name, timeout_s=60) is False
+    assert time.monotonic() - t0 < 30
+    client = bootstrap.attach_radix_client(name, geometry=geo, timeout_s=60)
+    try:
+        assert client.info.mode == "ready" and int(client.mempool_total()) == 64
+    finally:
+        client.close()
 
 
 # =============================================================================

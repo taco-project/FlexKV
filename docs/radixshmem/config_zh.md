@@ -132,5 +132,6 @@ FLEXKV_INSTANCE_NUM=2 FLEXKV_INSTANCE_ID=0    FLEXKV_INSTANCE_NUM=2 FLEXKV_INSTA
 - `FLEXKV_RADIXSHMEM_SERVER_NAME` 须以 `/` 开头且无空白。
 - `CacheConfig`：`FLEXKV_CPU_LAYOUT != BLOCKFIRST`；打开了 `enable_ssd`、`enable_remote`、`enable_p2p_cpu` 或 `enable_p2p_ssd`；
   SWA 开启但 `window_blocks < 1`。
-- attach：600 s 内连不上 server 报 `no radix-server named ... reachable ...`（附启动命令）；server 一直在等几何或
-  配置失败报 `not ready within ...`（附 server 的 `mode` 和 `last_error`）；几何冲突见第 3 节。
+- attach：600 s 内连不上 server 报 `no radix-server named ... reachable ...`（附启动命令）；server 有响应但 attach
+  失败（如 `server is closed`）立即报错；server 一直在等几何或配置失败报 `not ready within ...`（附 server 当时的
+  `mode` 和 `last_error`）；几何冲突见第 3 节。
