@@ -797,6 +797,21 @@ def test_radix_server_name_follows_the_env(monkeypatch):
     assert 0 < bootstrap.PREFETCH_MAX_INFLIGHT < bootstrap.MAX_OUTSTANDING
 
 
+def test_cpu_sizing_notice_names_the_ignored_setting():
+    """Start-up tells the operator that cpu_cache_gb does not size the CPU tier
+    in this mode: a warning when the deployment set it, info for the default."""
+    model_config, cache_config = _configs(num_cpu_blocks=64, swa_slots=16)
+    cache_config._user_cpu_cache_gb = 32
+    level, text = bootstrap.cpu_sizing_notice(cache_config, "/flexkv")
+    assert level == "warning"
+    assert "cpu_cache_gb=32 is ignored" in text
+    assert "radix-server /flexkv" in text and "--data-bytes and --swa-ratio" in text
+    assert "num_cpu_blocks and swa.num_slots (num_cpu_blocks=64 until then)" in text
+    _, cache_config = _configs(num_cpu_blocks=64)
+    level, text = bootstrap.cpu_sizing_notice(cache_config, "/flexkv")
+    assert level == "info" and "cpu_cache_gb is ignored" in text and "--swa-ratio" not in text
+
+
 @pytest.mark.parametrize("name", ["kv", "/a b", "/"])
 def test_radix_server_name_rejects_malformed_names(monkeypatch, name):
     monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radixshmem_server_name", name)

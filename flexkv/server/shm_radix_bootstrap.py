@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -78,6 +78,26 @@ def radix_server_name() -> str:
             f"FLEXKV_RADIXSHMEM_SERVER_NAME={name!r} must be a shm name that starts with '/' "
             f"(the radix-server's --name, e.g. '/flexkv')")
     return name
+
+
+def cpu_sizing_notice(cache_config: CacheConfig, server_name: str) -> Tuple[str, str]:
+    """(log level, text) telling the operator at start-up that ``cpu_cache_gb``
+    does not size the CPU tier in radixshmem mode: the radix-server's budget
+    does, and its slot counts replace ``num_cpu_blocks`` / ``swa.num_slots``.
+    A warning when the deployment configured cpu_cache_gb itself (it expects
+    the value to matter), info for a bare default."""
+    # CacheConfig keeps the deployment's cpu_cache_gb only as _user_cpu_cache_gb
+    # (0 when it was never given); num_cpu_blocks is what it was turned into.
+    user_gb = float(getattr(cache_config, "_user_cpu_cache_gb", 0) or 0)
+    setting = f"cpu_cache_gb={user_gb:g}" if user_gb > 0 else "cpu_cache_gb"
+    swa = cache_config.swa
+    has_swa = swa is not None and swa.enabled
+    replaced = "num_cpu_blocks" + (" and swa.num_slots" if has_swa else "")
+    text = (f"radixshmem mode: {setting} is ignored. The CPU tier is radix-server {server_name}'s "
+            f"SlotStore, sized by its --data-bytes" + (" and --swa-ratio" if has_swa else "")
+            + f"; the slot counts it planned replace {replaced} "
+            f"(num_cpu_blocks={cache_config.num_cpu_blocks} until then)")
+    return ("warning" if user_gb > 0 else "info"), text
 
 
 def default_endpoint(server_name: str) -> str:

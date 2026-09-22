@@ -92,8 +92,10 @@ class KVManager:
         )
 
         if self.enable_radixshmem:
-            flexkv_logger.info("[KVManager] radixshmem mode: the CPU tier is the "
-                               "operator's radix-server")
+            # Say up front that the CPU tier is not sized by cpu_cache_gb here.
+            from flexkv.server.shm_radix_bootstrap import cpu_sizing_notice
+            level, text = cpu_sizing_notice(cache_config, GLOBAL_CONFIG_FROM_ENV.radixshmem_server_name)
+            getattr(flexkv_logger, level)(f"[KVManager] {text}")
 
         # Multi-instance mode also requires server_client_mode
         self.server_client_mode = (model_config.dp_size > 1 or
