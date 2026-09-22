@@ -9,8 +9,8 @@ For every ``dp_size`` in the parametrization:
     node's CPU KV pool) with nothing but a name and a byte budget; every
     KVManager hands it FlexKV's geometry and adopts the slot counts it plans,
     and so does the process that builds the KVTaskEngine. Which server to
-    attach to is the ``server.name`` of a small YAML written per run
-    (FLEXKV_RADIXSHMEM_CONFIG_PATH), which is how a deployment names it too.
+    attach to is FLEXKV_RADIXSHMEM_SERVER_NAME, set per run, which is how a
+    deployment names it too.
   * Phase 1: every DP PUTs its own requests concurrently.
   * Phase 2 (dp_size > 1): dp0 PUTs a prefix that dp1 then finds with
     ``get_match`` -- the shared index is what the radixshmem path exists for.
@@ -52,7 +52,6 @@ from radix_e2e_common import (
     sweep_radix_files,
     wait_kv_manager_ready,
     write_pattern,
-    write_radix_config,
 )
 
 NUM_GPU_BLOCKS = 256
@@ -65,7 +64,7 @@ SHARED_START_BLOCK = 128
 ROUNDTRIP_START_BLOCK = 192
 
 
-def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, config_path: str,
+def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, server_name: str,
              barrier, result_q) -> None:
     """Full lifecycle of one DP scheduler process."""
     # Before the first flexkv import: GLOBAL_CONFIG_FROM_ENV is read at import.
@@ -74,7 +73,7 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, config_path: str,
     recv_port = f"ipc:///tmp/flexkv_{server_id}"
     os.environ.update({
         "FLEXKV_ENABLE_RADIXSHMEM": "1",
-        "FLEXKV_RADIXSHMEM_CONFIG_PATH": config_path,
+        "FLEXKV_RADIXSHMEM_SERVER_NAME": server_name,
         "FLEXKV_ENABLE_MPS": "0",
         "FLEXKV_SERVER_RECV_PORT": recv_port,
     })
@@ -84,7 +83,7 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, config_path: str,
     from flexkv.kvmanager import KVManager
 
     GLOBAL_CONFIG_FROM_ENV.enable_radixshmem = True
-    GLOBAL_CONFIG_FROM_ENV.radixshmem_config_path = config_path
+    GLOBAL_CONFIG_FROM_ENV.radixshmem_server_name = server_name
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
     GLOBAL_CONFIG_FROM_ENV.server_recv_port = recv_port
 
@@ -188,7 +187,6 @@ def _run(dp_size: int) -> dict:
     server_id = f"e2e{dp_size}dp_{os.getpid()}"
     workdir = tempfile.mkdtemp(prefix="flexkv_radix_e2e_")
     name = f"/{server_id}"
-    config_path = write_radix_config(workdir, {"server": {"name": name, "ready_timeout_s": 300}})
     # The operator's server: a byte budget that holds NUM_CPU_BLOCKS blocks of
     # this test's model (the DP processes bring the geometry and adopt the count).
     from flexkv.common.config import CacheConfig, ModelConfig
@@ -206,7 +204,7 @@ def _run(dp_size: int) -> dict:
     result_q = ctx.Queue()
     procs = [
         ctx.Process(target=_dp_proc,
-                    args=(dp, dp_size, server_id, config_path, barrier, result_q),
+                    args=(dp, dp_size, server_id, name, barrier, result_q),
                     daemon=False)
         for dp in range(dp_size)
     ]

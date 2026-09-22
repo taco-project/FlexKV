@@ -102,8 +102,6 @@ ShmRadixMatch = _engine_mod.ShmRadixMatch
 # Pure-Python (no c_ext): the bootstrap (server config, geometry, attach) and
 # the transfer enums.
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV  # noqa: E402
-from flexkv.common.radixshmem_config import (  # noqa: E402
-    RadixShmemConfigError, load_radixshmem_config, set_radixshmem_config)
 from flexkv.common.transfer import TransferType  # noqa: E402
 from flexkv.server import shm_radix_bootstrap as bootstrap  # noqa: E402
 
@@ -205,21 +203,16 @@ class _Env:
                 self._stack.pop()()
 
 
-def _radix_config(**server):
-    """The all-defaults radixshmem configuration with ``server`` keys changed;
-    a short ready timeout so a broken test fails instead of waiting."""
-    return load_radixshmem_config(None).replace_server(**{"ready_timeout_s": 60.0, **server})
-
-
 @pytest.fixture
 def env():
-    set_radixshmem_config(_radix_config())
+    saved = bootstrap.READY_TIMEOUT_S
+    bootstrap.READY_TIMEOUT_S = 60.0     # a broken test fails instead of waiting ten minutes
     e = _Env()
     try:
         yield e
     finally:
         e.close()
-        set_radixshmem_config(None)
+        bootstrap.READY_TIMEOUT_S = saved
 
 
 # =============================================================================
@@ -689,7 +682,7 @@ def test_client_brings_the_geometry_and_adopts_the_counts(env):
                 client, dataclasses.replace(geo, register_chunk_tokens=4096), "test")
         assert bootstrap.radix_cluster_rank(client) == 0 and client.info.world_size == 1
         # the connectors' prefetch gate asks the server the same question
-        assert bootstrap.radix_server_is_distributed(_radix_config(name=name), timeout_s=30) is False
+        assert bootstrap.radix_server_is_distributed(name, timeout_s=30) is False
         # another expectation against the same regions fails closed
         cache_config.tokens_per_block = 32
         with pytest.raises(ValueError, match="tokens_per_block"):
@@ -732,84 +725,30 @@ def test_attach_waits_for_a_late_server(env):
         bootstrap.attach_radix_client(f"/nobody{os.getpid()}", geometry=geo, timeout_s=2)
 
 
-# -----------------------------------------------------------------------------
-# Part 1c — the radixshmem-mode YAML (flexkv.common.radixshmem_config): which
-# radix-server to attach to and FlexKV's client settings; the former
-# server-side sections are refused (docs/radixshmem/config_zh.md).
+# =============================================================================
+# Part 1c — FLEXKV_RADIXSHMEM_SERVER_NAME, the one radixshmem-mode setting
+# (shm_radix_bootstrap.radix_server_name); everything else about the attach
+# is a fixed default.
+# =============================================================================
 
 
-def _write_yaml(tmp_path, text: str) -> str:
-    path = tmp_path / "radixshmem.yaml"
-    path.write_text(text)
-    return str(path)
+def test_radix_server_name_follows_the_env(monkeypatch):
+    monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radixshmem_server_name", "/flexkv")
+    assert bootstrap.radix_server_name() == "/flexkv"
+    assert bootstrap.default_endpoint("/flexkv") == "unix:///dev/shm/flexkv.sock"
+    monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radixshmem_server_name", "/prod/kv")
+    assert bootstrap.radix_server_name() == "/prod/kv"
+    assert bootstrap.default_endpoint("/prod/kv") == "unix:///dev/shm/prod_kv.sock"
+    # the fixed defaults stay consistent with each other
+    assert bootstrap.READY_TIMEOUT_S > 0 and bootstrap.PREFETCH_TIMEOUT_MS > 0
+    assert 0 < bootstrap.PREFETCH_MAX_INFLIGHT < bootstrap.MAX_OUTSTANDING
 
 
-def test_radix_config_defaults():
-    cfg = load_radixshmem_config(None)
-    assert cfg.path is None
-    assert cfg.server_name == "/flexkv" and cfg.endpoint == "" and cfg.ready_timeout_s == 600.0
-    assert cfg.default_endpoint == "unix:///dev/shm/flexkv.sock"
-    assert cfg.client.prefetch_timeout_ms == 5000 and cfg.client.prefetch_max_inflight == 128
-    assert cfg.client.max_outstanding == 256
-    assert "radix-server /flexkv" in cfg.describe()
-
-
-def test_radix_config_file(tmp_path):
-    path = _write_yaml(tmp_path, """
-server:
-  name: /prod/kv
-  endpoint: 10.0.0.2:7000
-  ready_timeout_s: 900
-client:
-  prefetch_timeout_ms: 1000
-  max_outstanding: 512
-  prefetch_max_inflight: 300
-""")
-    cfg = load_radixshmem_config(path)
-    assert cfg.path == path and cfg.server_name == "/prod/kv"
-    assert cfg.default_endpoint == "unix:///dev/shm/prod_kv.sock"
-    assert cfg.endpoint == "10.0.0.2:7000" and cfg.ready_timeout_s == 900.0
-    assert cfg.client.prefetch_timeout_ms == 1000 and cfg.client.max_outstanding == 512
-    assert cfg.client.prefetch_max_inflight == 300
-    assert cfg.replace_server(name="/x").server_name == "/x"
-    assert cfg.replace_client(max_outstanding=1000).client.max_outstanding == 1000
-
-
-@pytest.mark.parametrize("text, match", [
-    ("cluster:\n  cluster_id: prod\n", "radix-server"),      # former server-side sections
-    ("data:\n  prefault: false\n", "radix-server"),
-    ("index:\n  data_pool_ratio: 8\n", "radix-server"),
-    ("peers: {}\n", "unknown section"),
-    ("- a\n", "must be a mapping"),
-    ("server: 5\n", "must be a mapping"),
-    ("server:\n  rpc_workers: 3\n", "unknown key"),
-    ("server:\n  name: kv\n", "starts with"),
-    ("server:\n  name: /a b\n", "starts with"),
-    ("server:\n  ready_timeout_s: 0\n", "ready_timeout_s"),
-    ("server:\n  ready_timeout_s: soon\n", "invalid value"),
-    ("client:\n  prefetch_max_inflight: 256\n", "max_outstanding"),
-    ("client:\n  prefetch_timeout_ms: 0\n", "prefetch_timeout_ms"),
-    ("client:\n  timeout: 5\n", "unknown key"),
-])
-def test_radix_config_rejects(tmp_path, text, match):
-    with pytest.raises(RadixShmemConfigError, match=match):
-        load_radixshmem_config(_write_yaml(tmp_path, text))
-
-
-def test_radix_config_env_singleton_reloads_on_change(tmp_path, monkeypatch):
-    """`get_radixshmem_config` follows GLOBAL_CONFIG_FROM_ENV.radixshmem_config_path;
-    a test-installed config wins until reverted."""
-    from flexkv.common.radixshmem_config import get_radixshmem_config
-    set_radixshmem_config(None)
-    monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radixshmem_config_path", None)
-    assert get_radixshmem_config().server_name == "/flexkv"
-    path = _write_yaml(tmp_path, "server:\n  name: /other\n")
-    monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radixshmem_config_path", path)
-    assert get_radixshmem_config().server_name == "/other"
-    set_radixshmem_config(_radix_config(name="/pinned"))
-    assert get_radixshmem_config().server_name == "/pinned"
-    set_radixshmem_config(None)
-    assert get_radixshmem_config().default_endpoint == "unix:///dev/shm/other.sock"
+@pytest.mark.parametrize("name", ["kv", "/a b", "/"])
+def test_radix_server_name_rejects_malformed_names(monkeypatch, name):
+    monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radixshmem_server_name", name)
+    with pytest.raises(ValueError, match="FLEXKV_RADIXSHMEM_SERVER_NAME"):
+        bootstrap.radix_server_name()
 
 
 # =============================================================================
@@ -1047,7 +986,7 @@ def test_prefetch_starts_a_peer_pull():
     (call,) = engine.prefetch_calls                 # type: ignore[attr-defined]
     assert call["component_mask"] == _engine_mod.COMPONENT_MASK_FULL
     assert call["query_end"] == 4
-    assert call["timeout_ms"] == load_radixshmem_config(None).client.prefetch_timeout_ms
+    assert call["timeout_ms"] == bootstrap.PREFETCH_TIMEOUT_MS
 
 
 def test_prefetch_without_peers_is_an_empty_plan():
@@ -1063,7 +1002,7 @@ def test_prefetch_without_peers_is_an_empty_plan():
 def test_prefetch_backpressure_skips_the_peer_walk():
     """Too many pulls in flight: no pull_async, so the client never blocks."""
     engine = _global_cache_engine()
-    limit = load_radixshmem_config(None).client.prefetch_max_inflight
+    limit = bootstrap.PREFETCH_MAX_INFLIGHT
     engine._prefetch_jobs = [FakeJob(0, 4) for _ in range(limit)]   # none done
     _graph, ops, return_mask = _run_get(
         engine, 4, _local_match([]), prefetch=True, prefetch_job=FakeJob(0, 4))
@@ -1354,10 +1293,11 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
 
     from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
 
-    rcfg = _radix_config(name=f"/swaplanner{os.getpid()}")
-    saved = {"enable_radixshmem": GLOBAL_CONFIG_FROM_ENV.enable_radixshmem}
+    server_name = f"/swaplanner{os.getpid()}"
+    saved = {"enable_radixshmem": GLOBAL_CONFIG_FROM_ENV.enable_radixshmem,
+             "radixshmem_server_name": GLOBAL_CONFIG_FROM_ENV.radixshmem_server_name}
     GLOBAL_CONFIG_FROM_ENV.enable_radixshmem = True
-    set_radixshmem_config(rcfg)
+    GLOBAL_CONFIG_FROM_ENV.radixshmem_server_name = server_name
 
     server = None
     engine = None
@@ -1379,7 +1319,7 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
         # test's; the planner's client brings the geometry.
         geo = bootstrap.expected_geometry(model_config, cache_config)
         data_bytes = num_blocks * geo.full_slot_bytes + swa_slots * geo.swa_slot_bytes
-        cfg = shmradix.ServerConfig(name=rcfg.server_name, data_bytes=data_bytes,
+        cfg = shmradix.ServerConfig(name=server_name, data_bytes=data_bytes,
                                     swa_ratio=swa_slots * geo.swa_slot_bytes / data_bytes,
                                     prefault=False)
         _sweep_region(cfg.name, cfg.resolved_data_name)
@@ -1395,7 +1335,6 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
             server.close()
         for name, value in saved.items():
             setattr(GLOBAL_CONFIG_FROM_ENV, name, value)
-        set_radixshmem_config(None)
 
 
 def _split_swa(ops_of_type):
@@ -1733,24 +1672,26 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
                local_head_blocks=0):
     """One node: a data-mode RadixServer (in-process) plus the FlexKV engine."""
     try:
-        endpoint = f"unix:///dev/shm/{prefix.lstrip('/')}_r{rank}.sock"
+        # Two servers on one host: distinct names, so radixshmem derives
+        # distinct sockets (cluster names are per node; the geometry is shared).
+        name = f"{prefix}_r{rank}"
         data_name = f"{prefix}_data_r{rank}"
-        _sweep_region(prefix, data_name)
+        _sweep_region(name, data_name)
         cluster_kwargs = dict(
             expected_min_nodes=2, registry=registry, cluster_id=cluster_id,
             node_name=f"r{rank}", rpc_address="0.0.0.0", index_dev=rdma_dev,
             gid_idx=int(os.getenv("FLEXKV_TEST_RADIX_GID_IDX", "3")),
             bootstrap_timeout_sec=60, rht_slots_per_bucket=4)
         cfg = shmradix.ServerConfig(
-            name=prefix, data_bytes=PEER_BLOCKS * PEER_SLOT_BYTES, slot_align=4096,
+            name=name, data_bytes=PEER_BLOCKS * PEER_SLOT_BYTES, slot_align=4096,
             data_name=data_name, prefault=False, transfer_devices=[rdma_dev],
-            endpoint=endpoint, cluster=shmradix.ClusterConfig(**cluster_kwargs),
+            cluster=shmradix.ClusterConfig(**cluster_kwargs),
         )
         server = shmradix.RadixServer(cfg).start()      # waiting: the engine's geometry starts the rendezvous
-        set_radixshmem_config(_radix_config(name=prefix, endpoint=endpoint, ready_timeout_s=180.0))
+        bootstrap.READY_TIMEOUT_S = 180.0                # this process only: the rendezvous may take a while
         engine = CacheEngineRadixShmem(
-            prefix, geometry=shmradix.Geometry(block_size=16, full_slot_bytes=PEER_SLOT_BYTES,
-                                               slot_align=4096),
+            name, geometry=shmradix.Geometry(block_size=16, full_slot_bytes=PEER_SLOT_BYTES,
+                                             slot_align=4096),
             num_total_blocks=PEER_BLOCKS, tokens_per_block=16, peer_enabled=True)
         if not engine.peer_enabled:
             raise RuntimeError("engine did not see a distributed region")

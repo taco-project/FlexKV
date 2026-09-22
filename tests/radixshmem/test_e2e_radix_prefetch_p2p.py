@@ -8,8 +8,7 @@ cluster:
     SlotStore = the node's CPU pool + RDMA transfer engine), joined into one
     cluster by their command lines (--expected-min-nodes 2, --registry,
     --node-name, RDMA devices); each FlexKV node attaches to its own server
-    through a per-node YAML (FLEXKV_RADIXSHMEM_CONFIG_PATH: server.name /
-    server.endpoint) and brings the geometry; the two servers rendezvous in
+    (FLEXKV_RADIXSHMEM_SERVER_NAME) and brings the geometry; the two servers rendezvous in
     one etcd namespace, get dense cluster ranks and an RHT to route by;
   * node 0 PUTs a window of GPU blocks holding a per-block pattern;
   * node 1 calls ``KVManager.prefetch_async`` for the same tokens: the index walk
@@ -60,7 +59,6 @@ from radix_e2e_common import (
     sweep_radix_files,
     wait_kv_manager_ready,
     write_pattern,
-    write_radix_config,
 )
 
 WORLD_SIZE = 2
@@ -106,7 +104,7 @@ def _prefetch_until(kvm, token_ids, want_pulled_blocks: int, timeout: float = 60
     return pulled, rounds
 
 
-def _node_proc(rank, gpu_id, cluster_id, config_path,
+def _node_proc(rank, gpu_id, cluster_id, server_name,
                reader_ready, written, read_done, result_q):
     """One FlexKV node: rank 0 writes the windows, rank 1 prefetches and reads."""
     # Before any CUDA context exists: each node drives a different device while
@@ -117,7 +115,7 @@ def _node_proc(rank, gpu_id, cluster_id, config_path,
     recv_port = f"ipc:///tmp/flexkv_{cluster_id}_{node_name}"
     os.environ.update({
         "FLEXKV_ENABLE_RADIXSHMEM": "1",
-        "FLEXKV_RADIXSHMEM_CONFIG_PATH": config_path,     # this node's server
+        "FLEXKV_RADIXSHMEM_SERVER_NAME": server_name,     # this node's server
         "FLEXKV_ENABLE_MPS": "0",
         "FLEXKV_SERVER_RECV_PORT": recv_port,
     })
@@ -128,7 +126,7 @@ def _node_proc(rank, gpu_id, cluster_id, config_path,
     # Built from env at import time; set the fields that matter explicitly in
     # case a parent import happened earlier in this process.
     GLOBAL_CONFIG_FROM_ENV.enable_radixshmem = True
-    GLOBAL_CONFIG_FROM_ENV.radixshmem_config_path = config_path
+    GLOBAL_CONFIG_FROM_ENV.radixshmem_server_name = server_name
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
     GLOBAL_CONFIG_FROM_ENV.server_recv_port = recv_port
 
@@ -240,21 +238,18 @@ def _run(registry: str, rdma_dev: str) -> dict:
         CacheConfig(tokens_per_block=TOKENS_PER_BLOCK, enable_cpu=True, enable_ssd=False,
                     num_cpu_blocks=NUM_CPU_BLOCKS))
     sweep_radix_files(cluster_id)
-    servers, config_paths = [], []
+    servers, names = [], []
     for rank in range(WORLD_SIZE):
         name = f"/{cluster_id}_{_node_name(rank)}"
-        endpoint = f"unix:///dev/shm/{cluster_id}_{_node_name(rank)}.sock"
+        names.append(name)
         servers.append(start_radix_server(
-            name, NUM_CPU_BLOCKS * block_bytes, endpoint=endpoint,
+            name, NUM_CPU_BLOCKS * block_bytes,
             extra_args=["--expected-min-nodes", str(WORLD_SIZE), "--registry", registry,
                         "--cluster-id", cluster_id, "--node-name", _node_name(rank),
                         "--rpc-address", "127.0.0.1", "--index-dev", rdma_dev,
                         "--transfer-dev", rdma_dev, "--rht-slots", "4",
                         "--bootstrap-timeout", "120"],
             log_path=os.path.join(workdir, f"radix-server-{_node_name(rank)}.log")))
-        config_paths.append(write_radix_config(
-            workdir, {"server": {"name": name, "endpoint": endpoint, "ready_timeout_s": 300}},
-            name=f"radixshmem_{_node_name(rank)}.yaml"))
     ctx = mp.get_context("spawn")
     reader_ready, written, read_done = ctx.Event(), ctx.Event(), ctx.Event()
     result_q = ctx.Queue()
@@ -264,7 +259,7 @@ def _run(registry: str, rdma_dev: str) -> dict:
         for rank in range(WORLD_SIZE):
             proc = ctx.Process(
                 target=_node_proc,
-                args=(rank, rank, cluster_id, config_paths[rank],
+                args=(rank, rank, cluster_id, names[rank],
                       reader_ready, written, read_done, result_q),
                 daemon=False,
             )
