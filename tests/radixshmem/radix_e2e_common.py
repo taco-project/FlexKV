@@ -92,16 +92,6 @@ def stop_private_etcd(proc, workdir) -> None:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def write_radix_config(workdir: str, config: dict, name: str = "radixshmem.yaml") -> str:
-    """Write the run's radixshmem YAML (``FLEXKV_RADIXSHMEM_CONFIG_PATH``) and
-    return its path."""
-    import yaml
-    path = os.path.join(workdir, name)
-    with open(path, "w") as f:
-        yaml.safe_dump(config, f)
-    return path
-
-
 def start_radix_server(name: str, data_bytes: int, *, extra_args=(), endpoint: Optional[str] = None,
                        log_path: Optional[str] = None, timeout: float = 60.0) -> subprocess.Popen:
     """Start the operator's ``radix-server`` (``python -m shmradix.cli``) and wait

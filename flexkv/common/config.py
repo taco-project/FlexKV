@@ -839,14 +839,13 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     server_launch_mode=os.getenv('FLEXKV_SERVER_LAUNCH_MODE', 'embedded').lower(),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 
-    # radixshmem mode: the CPU tier is radixshmem's index + SlotStore, one
-    # radix-server per node (a process the operator starts: `radix-server
-    # --name /flexkv --data-bytes ...`), one shared TE, a KVTaskEngine per DP
-    # process (no KVServer). FlexKV only attaches to the server; which one and
-    # the prefetch limits are the YAML at FLEXKV_RADIXSHMEM_CONFIG_PATH
-    # (flexkv.common.radixshmem_config; reference docs/radixshmem/config_zh.md).
+    # radixshmem mode: the CPU tier is a radix-server (index + SlotStore), one
+    # per node, a process the operator starts (`radix-server --name /flexkv
+    # --data-bytes ...`). FlexKV attaches to it by name; everything else about
+    # the attach is a fixed default (flexkv.server.shm_radix_bootstrap;
+    # reference docs/radixshmem/config_zh.md).
     enable_radixshmem=bool(int(os.getenv('FLEXKV_ENABLE_RADIXSHMEM', 0))),
-    radixshmem_config_path=os.getenv('FLEXKV_RADIXSHMEM_CONFIG_PATH', '') or None,
+    radixshmem_server_name=os.getenv('FLEXKV_RADIXSHMEM_SERVER_NAME', '') or '/flexkv',
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),

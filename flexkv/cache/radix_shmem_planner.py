@@ -51,7 +51,8 @@ from flexkv.cache.radix_shmem_engine import (
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.radixshmem_config import RadixShmemConfig, get_radixshmem_config
+from flexkv.server.shm_radix_bootstrap import (PREFETCH_MAX_INFLIGHT, PREFETCH_TIMEOUT_MS,
+                                               expected_geometry, radix_server_name)
 from flexkv.common.transfer import (
     DeviceType,
     TransferOp,
@@ -160,9 +161,8 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                  redis_meta=None,
                  event_collector: Optional[KVEventCollector] = None):
         _check_cache_config(cache_config)
-        self._radix_config: RadixShmemConfig = get_radixshmem_config()
         # GetJobs this engine started and has not yet seen finish; pruned on
-        # every prefetch and used for back-pressure (client.prefetch_max_inflight).
+        # every prefetch and used for back-pressure (PREFETCH_MAX_INFLIGHT).
         self._prefetch_jobs: List[Any] = []
         super().__init__(cache_config, model_config, redis_meta, event_collector)
 
@@ -179,11 +179,8 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         counts into `cache_config`) and waits for the server to be ready. Peer
         reuse follows the server: on whenever it is part of a cluster.
         """
-        from flexkv.server.shm_radix_bootstrap import expected_geometry
-
-        rcfg = self._radix_config
         return CacheEngineRadixShmem(
-            rcfg.server_name,
+            radix_server_name(),
             geometry=expected_geometry(self.model_config, cache_config),
             tokens_per_block=cache_config.tokens_per_block,
             num_total_blocks=cache_config.num_cpu_blocks,
@@ -433,12 +430,11 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         engine = self.cpu_cache_engine
         if not engine.peer_enabled:
             return RadixGetPlan.empty()
-        client_settings = self._radix_config.client
         inflight = self._prefetch_inflight()
-        if inflight >= client_settings.prefetch_max_inflight:
+        if inflight >= PREFETCH_MAX_INFLIGHT:
             flexkv_logger.debug(
                 f"radixshmem prefetch {request_id}: {inflight} peer pulls in flight "
-                f"(limit {client_settings.prefetch_max_inflight}); skipping the peer walk")
+                f"(limit {PREFETCH_MAX_INFLIGHT}); skipping the peer walk")
             return RadixGetPlan.empty()
         swa_active = swa_aware and self.swa_op_constructor.enabled
         mask = (COMPONENT_MASK_FULL | COMPONENT_MASK_SWA) if swa_active else COMPONENT_MASK_FULL
@@ -446,7 +442,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             sequence_meta,
             component_mask=mask,
             query_end=block_mask_end,
-            timeout_ms=client_settings.prefetch_timeout_ms,
+            timeout_ms=PREFETCH_TIMEOUT_MS,
         )
         plan = RadixGetPlan.empty()
         if job is None:

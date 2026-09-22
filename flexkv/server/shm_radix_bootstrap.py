@@ -41,8 +41,6 @@ import torch
 from flexkv.common.config import (GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec,
                                   ModelConfig, SWAPoolConfig)
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.radixshmem_config import (RadixShmemConfig, default_endpoint,
-                                             get_radixshmem_config)
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 try:
@@ -53,6 +51,39 @@ except ImportError:  # pragma: no cover
 
 # Pool bases are page aligned regardless; a larger per-slot alignment only pads.
 _MAX_SLOT_ALIGN = 4096
+
+# FlexKV's side of the attach. The server to attach to is the one setting
+# (FLEXKV_RADIXSHMEM_SERVER_NAME, radix_server_name()); the rest are fixed.
+DEFAULT_SERVER_NAME = "/flexkv"
+# How long a FlexKV process waits for the server to be reachable AND ready:
+# covers the operator starting it late, the SlotStore prefault and, on a
+# cluster, the rendezvous (keep the server's --bootstrap-timeout below this).
+READY_TIMEOUT_S = 600.0
+# Server-side deadline of one peer pull; the job completes with the local hit
+# when it expires.
+PREFETCH_TIMEOUT_MS = 5000
+# Peer pulls in flight per KVTaskEngine before new prefetches skip the peer
+# walk; kept below MAX_OUTSTANDING so pull_async never blocks.
+PREFETCH_MAX_INFLIGHT = 128
+# Uncollected jobs one RadixClient may hold (radixshmem's own default).
+MAX_OUTSTANDING = 256
+
+
+def radix_server_name() -> str:
+    """The ``--name`` of this node's radix-server: ``FLEXKV_RADIXSHMEM_SERVER_NAME``
+    (default ``/flexkv``). A shm name: starts with '/', no whitespace."""
+    name = str(GLOBAL_CONFIG_FROM_ENV.radixshmem_server_name or DEFAULT_SERVER_NAME)
+    if not name.startswith("/") or len(name) < 2 or any(c.isspace() for c in name):
+        raise ValueError(
+            f"FLEXKV_RADIXSHMEM_SERVER_NAME={name!r} must be a shm name that starts with '/' "
+            f"(the radix-server's --name, e.g. '/flexkv')")
+    return name
+
+
+def default_endpoint(server_name: str) -> str:
+    """The gRPC socket radixshmem derives from ``radix-server --name <server_name>``:
+    ``unix:///dev/shm/<name without the leading slash, '/' -> '_'>.sock``."""
+    return f"unix:///dev/shm/{server_name.lstrip('/').replace('/', '_')}.sock"
 
 
 def _ensure_shmradix() -> None:
@@ -238,13 +269,11 @@ def expected_geometry(model_config: ModelConfig, cache_config: CacheConfig) -> R
 def attach_radix_client(name: Optional[str] = None,
                         *,
                         geometry: Any = None,
-                        rcfg: Optional[RadixShmemConfig] = None,
-                        endpoint: Optional[str] = None,
                         timeout_s: Optional[float] = None,
                         max_outstanding: Optional[int] = None,
                         label: str = "radixshmem") -> "shmradix.RadixClient":
     """A ready ``shmradix.RadixClient`` on the radix-server ``name`` (default:
-    the configuration's ``server.name``).
+    :func:`radix_server_name`), at the socket radixshmem derives from the name.
 
     With ``geometry`` (a :class:`RadixGeometry` or a ``shmradix.Geometry``) the
     client hands the server FlexKV's slot shape on the way; the server plans
@@ -257,27 +286,22 @@ def attach_radix_client(name: Optional[str] = None,
     Retries while the server is not reachable yet (the operator may start it
     late), then blocks in ``wait_ready`` -- the rendezvous of a cluster and
     the SlotStore prefault happen there -- for ``timeout_s`` in total
-    (default: the configuration's ``server.ready_timeout_s``).
+    (default ``READY_TIMEOUT_S``).
     """
     _ensure_shmradix()
-    if rcfg is None:
-        rcfg = get_radixshmem_config()
-    name = name or rcfg.server_name
-    if endpoint is None:
-        endpoint = rcfg.endpoint or None
+    name = name or radix_server_name()
     if timeout_s is None:
-        timeout_s = rcfg.ready_timeout_s
+        timeout_s = READY_TIMEOUT_S
     if max_outstanding is None:
-        max_outstanding = rcfg.client.max_outstanding
+        max_outstanding = MAX_OUTSTANDING
     spec = geometry.to_shmradix() if isinstance(geometry, RadixGeometry) else geometry
-    where = endpoint or default_endpoint(name)
+    where = default_endpoint(name)
 
     deadline = time.monotonic() + float(timeout_s)
     last: Optional[BaseException] = None
     while True:
         try:
-            client = shmradix.RadixClient(name, spec, endpoint=endpoint,
-                                          max_outstanding=max_outstanding)
+            client = shmradix.RadixClient(name, spec, max_outstanding=max_outstanding)
             break
         except shmradix.GeometryMismatch as e:
             raise ValueError(
@@ -440,7 +464,7 @@ def adopt_geometry(cache_config: CacheConfig, client: "shmradix.RadixClient",
 
 def adopt_radix_server(model_config: ModelConfig, cache_config: CacheConfig,
                        *,
-                       rcfg: Optional[RadixShmemConfig] = None,
+                       name: Optional[str] = None,
                        label: str = "radixshmem") -> Dict[str, int]:
     """Attach to this node's radix-server with FlexKV's geometry, take over the
     slot counts it planned (:func:`adopt_geometry`) and its cluster rank
@@ -451,7 +475,7 @@ def adopt_radix_server(model_config: ModelConfig, cache_config: CacheConfig,
     the TE. Idempotent: the server accepts the same geometry any number of
     times."""
     geometry = expected_geometry(model_config, cache_config)
-    client = attach_radix_client(rcfg=rcfg, geometry=geometry, label=label)
+    client = attach_radix_client(name, geometry=geometry, label=label)
     try:
         counts = adopt_geometry(cache_config, client, label=label)
         cache_config.distributed_node_id = radix_cluster_rank(client)
@@ -464,7 +488,7 @@ def adopt_radix_server(model_config: ModelConfig, cache_config: CacheConfig,
         client.close()
 
 
-def radix_server_is_distributed(rcfg: Optional[RadixShmemConfig] = None,
+def radix_server_is_distributed(name: Optional[str] = None,
                                 *,
                                 timeout_s: Optional[float] = None,
                                 label: str = "radixshmem") -> bool:
@@ -473,7 +497,7 @@ def radix_server_is_distributed(rcfg: Optional[RadixShmemConfig] = None,
     is ready (a geometry-less attach that only waits), so every process that
     asks gets the same answer -- the framework adapters gate the prefetch path
     on it in every TP rank, and the ranks must agree."""
-    client = attach_radix_client(rcfg=rcfg, timeout_s=timeout_s, label=label)
+    client = attach_radix_client(name, timeout_s=timeout_s, label=label)
     try:
         return int(client.info.world_size) > 1
     finally:
