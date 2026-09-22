@@ -42,6 +42,26 @@ These compiled-module checks are not a complete release-wheel validation.
 The GPU tests retain the previously observed CUDA IPC producer-exit warning;
 they do not establish warning-free shutdown or performance acceptance.
 
+Qwen3-0.6B was also checked on two H20 GPUs (TP2, BF16, eager, Triton
+attention, page 16, CPU cache 0.25 GiB). Each scenario restarts SGLang with cold
+GPU/CPU caches while retaining the dedicated L3 pool. For prompts of
+512/1024/1536 tokens, all 15 restored requests produced exactly the same 32
+greedy output token IDs as the three cold references:
+
+| Policy | Restored L3 tokens at the three prompt lengths | Observed stop |
+|---|---|---|
+| Whole-task wait_complete | 496 / 1008 / 1520 | Complete |
+| Timeout 30 s, chunk 8, window 2 | 496 / 1008 / 1520 | Complete, 4 / 8 / 12 graphs |
+| Timeout 20 ms, chunk 1, window 2 | 32 / 48 / 48 | Deadline, then drain |
+| Best effort, immediately eligible | 0 / 0 / 0 | Demand |
+| Best effort, queued behind four requests | 496 / 1008 / 1520 | Complete while queued |
+
+The queued scenario's 12 blocker requests also completed with 128 output
+tokens each. The short-timeout sessions returned after 33.8-42.6 ms, including
+13.5-22.6 ms of drain: this verifies interruption, not a hard 20 ms return
+deadline. These are small-model correctness checks, not a new GLM throughput
+or tail-latency comparison.
+
 ## Target-branch integration: September 15, 2026
 
 FlexKV was merged with main `6960dfde09`; the companion SGLang review head
