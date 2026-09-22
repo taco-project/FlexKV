@@ -748,7 +748,7 @@ def test_radix_config_defaults():
     cfg = load_radixshmem_config(None)
     assert cfg.path is None
     assert cfg.server_name == "/flexkv" and cfg.endpoint == "" and cfg.ready_timeout_s == 600.0
-    assert cfg.te_server_id == "flexkv"
+    assert cfg.default_endpoint == "unix:///dev/shm/flexkv.sock"
     assert cfg.client.prefetch_timeout_ms == 5000 and cfg.client.prefetch_max_inflight == 128
     assert cfg.client.max_outstanding == 256
     assert "radix-server /flexkv" in cfg.describe()
@@ -766,7 +766,8 @@ client:
   prefetch_max_inflight: 300
 """)
     cfg = load_radixshmem_config(path)
-    assert cfg.path == path and cfg.server_name == "/prod/kv" and cfg.te_server_id == "prod_kv"
+    assert cfg.path == path and cfg.server_name == "/prod/kv"
+    assert cfg.default_endpoint == "unix:///dev/shm/prod_kv.sock"
     assert cfg.endpoint == "10.0.0.2:7000" and cfg.ready_timeout_s == 900.0
     assert cfg.client.prefetch_timeout_ms == 1000 and cfg.client.max_outstanding == 512
     assert cfg.client.prefetch_max_inflight == 300
@@ -808,7 +809,7 @@ def test_radix_config_env_singleton_reloads_on_change(tmp_path, monkeypatch):
     set_radixshmem_config(_radix_config(name="/pinned"))
     assert get_radixshmem_config().server_name == "/pinned"
     set_radixshmem_config(None)
-    assert get_radixshmem_config().te_server_id == "other"
+    assert get_radixshmem_config().default_endpoint == "unix:///dev/shm/other.sock"
 
 
 # =============================================================================

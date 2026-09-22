@@ -1,16 +1,17 @@
 """End-to-end test of FLEXKV_ENABLE_RADIXSHMEM=1 on one node: one or two DP scheduler
-processes, one radix-server, one shared transfer engine.
+processes and one radix-server, on FlexKV's own process model (dp_size 1: the
+KVTaskEngine and its TE subprocess in the engine process; dp_size 2: dp0 embeds
+the KVServer whose KVTaskEngine and TE serve both DPs).
 
 For every ``dp_size`` in the parametrization:
 
   * the test starts the operator's radix-server (index + SlotStore, the
-    node's CPU KV pool) with nothing but a name and a byte budget; dp0's
-    KVManager hands it FlexKV's geometry, adopts the slot counts it plans and
-    spawns the single TE; every other DP attaches to both by name and feeds
-    the TE over its own shm channel with a disjoint graph/op id range. Which
-    server to attach to is the ``server.name`` of a small YAML written per run
+    node's CPU KV pool) with nothing but a name and a byte budget; every
+    KVManager hands it FlexKV's geometry and adopts the slot counts it plans,
+    and so does the process that builds the KVTaskEngine. Which server to
+    attach to is the ``server.name`` of a small YAML written per run
     (FLEXKV_RADIXSHMEM_CONFIG_PATH), which is how a deployment names it too.
-  * Phase 1: every DP PUTs its own requests concurrently through the shared TE.
+  * Phase 1: every DP PUTs its own requests concurrently.
   * Phase 2 (dp_size > 1): dp0 PUTs a prefix that dp1 then finds with
     ``get_match`` -- the shared index is what the radixshmem path exists for.
   * Phase 3: every DP writes a rank-specific byte pattern into its GPU blocks,
@@ -68,8 +69,8 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, config_path: str,
              barrier, result_q) -> None:
     """Full lifecycle of one DP scheduler process."""
     # Before the first flexkv import: GLOBAL_CONFIG_FROM_ENV is read at import.
-    # All DP procs share one TE, so they must agree on server_recv_port (and
-    # therefore on the gpu_register_port the TE listens on).
+    # With dp_size > 1 the DPs are KVServer clients and must agree on
+    # server_recv_port (and therefore on the gpu_register_port the TE listens on).
     recv_port = f"ipc:///tmp/flexkv_{server_id}"
     os.environ.update({
         "FLEXKV_ENABLE_RADIXSHMEM": "1",
@@ -103,9 +104,8 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, config_path: str,
     try:
         kvm = KVManager(model_config, cache_config, dp_client_id=dp_client_id)
         kvm.start()
-        # Each DP drives its own GPU (device id = dp id; the TE opens every
-        # DP's IPC handles because total_gpus > 1 clears CUDA_VISIBLE_DEVICES
-        # for it when dp_size > 1).
+        # Each DP drives its own GPU (device id = dp id); no process pins
+        # CUDA_VISIBLE_DEVICES, so the TE sees every device the DPs registered.
         tp_proc, gpu_tensors = start_tp_client(
             kvm, dp_client_id, dp_client_id, model_config, cache_config, NUM_GPU_BLOCKS)
         wait_kv_manager_ready(kvm, timeout=120)

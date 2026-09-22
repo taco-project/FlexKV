@@ -26,7 +26,6 @@ from flexkv.server.client import KVDPClient
 from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
-from flexkv.common.transfer import TransferOpGraph
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.common.debug import eviction_log_aggregator, flexkv_logger
 from flexkv.cache.redis_meta import RedisMeta
@@ -86,12 +85,6 @@ class KVManager:
                 "and enable_p2p_ssd=False (cross-node reuse follows the "
                 "radix-server's cluster flags)"
             )
-        # Prefix of this host's TE channels: the attached radix-server's name.
-        self._shm_radix_id = None
-        if self.enable_radixshmem:
-            from flexkv.common.radixshmem_config import get_radixshmem_config
-            self._shm_radix_id = get_radixshmem_config().te_server_id
-
         flexkv_logger.info(
             f"[KVManager] IPC ports: server_recv_port={self.server_recv_port}, "
             f"gpu_register_port={self.gpu_register_port}"
@@ -99,17 +92,13 @@ class KVManager:
         )
 
         if self.enable_radixshmem:
-            flexkv_logger.info(f"[KVManager] radix_shmem is enabled"
-                               f"[KVManager] shm_radix_id: {self._shm_radix_id}")
+            flexkv_logger.info("[KVManager] radixshmem mode: the CPU tier is the "
+                               "operator's radix-server")
 
         # Multi-instance mode also requires server_client_mode
-        if self.enable_radixshmem:
-            # Force server_client_mode False — KVServer is bypassed entirely.
-            self.server_client_mode = False
-        else:
-            self.server_client_mode = (model_config.dp_size > 1 or
-                                       model_config.instance_num > 1 or
-                                       GLOBAL_CONFIG_FROM_ENV.server_client_mode)
+        self.server_client_mode = (model_config.dp_size > 1 or
+                                   model_config.instance_num > 1 or
+                                   GLOBAL_CONFIG_FROM_ENV.server_client_mode)
         self.server_launch_mode = GLOBAL_CONFIG_FROM_ENV.server_launch_mode
         if self.server_launch_mode not in ("embedded", "external"):
             raise ValueError(
@@ -138,16 +127,22 @@ class KVManager:
         self.redis_meta_client = None
         self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
         self.owns_mps = self.enable_mps and self.server_launch_mode != "external"
-        # TE-process handle — only the bootstrap process holds this. The
-        # radix-server itself is the operator's process, not FlexKV's.
-        self._shm_te_process = None
-        # Local KVTaskEngine for the radix-shmem path (per-DP).
         self.kv_task_engine = None
         self.server_handle = None
 
         if self.enable_radixshmem:
-            self._init_radix_shmem_path(event_collector)
-        elif self.server_client_mode:
+            # The CPU tier is the operator's radix-server (``radix-server --name
+            # <server.name> --data-bytes ...``); FlexKV never creates one. Hand it
+            # FlexKV's geometry and take over the slot counts it planned BEFORE
+            # anything sizes a pool from cache_config: the KVServer or
+            # KVTaskEngine built below and the TE all read num_cpu_blocks /
+            # swa.num_slots. The process model is FlexKV's own: engine mode for
+            # one DP, the KVServer (one per node, shared by FLEXKV_INSTANCE_NUM
+            # engines) otherwise.
+            from flexkv.server.shm_radix_bootstrap import adopt_radix_server
+            adopt_radix_server(model_config, self.cache_config, label="KVManager")
+
+        if self.server_client_mode:
             # One KVServer per node: with node-local DP the first rank of each
             # node owns it, so nodes 1..n-1 get their own server instead of
             # waiting on node 0's. Without node-local DP local_dp_client_id
@@ -191,93 +186,6 @@ class KVManager:
                 event_collector=event_collector,
             )
 
-    def _init_radix_shmem_path(self,
-                               event_collector: Optional[KVEventCollector]) -> None:
-        """Initialize the radix-shmem multi-DP path.
-
-        The node's radix-server is a process the operator started
-        (``radix-server --name <server.name> --data-bytes ...``); FlexKV never
-        creates one. Every DP process attaches to it with FlexKV's geometry
-        (the first one configures the server, the others find it configured),
-        takes over the slot counts the server planned from its byte budget,
-        and builds its own KVTaskEngine on it. The single TE subprocess all DP
-        processes of this node share is spawned by the node-local bootstrap
-        proc (local DP client 0) only; every other proc attaches to its channel
-        (``ShmControlBlock.wait_ready``).
-
-        Each CE process gets a disjoint graph/op id range so submissions to the
-        single shared TE never collide.
-        """
-        from flexkv.common.transfer import TransferOp
-        from flexkv.server.shm_radix_bootstrap import (adopt_geometry, attach_radix_client,
-                                                       expected_geometry, radix_cluster_rank)
-
-        TransferOpGraph.set_graph_id_range(self.dp_client_id << 32,
-                                           (self.dp_client_id + 1) << 32)
-        TransferOp.set_op_id_range(self.dp_client_id << 32,
-                                   (self.dp_client_id + 1) << 32)
-
-        # Hand the server FlexKV's geometry and take its slot counts BEFORE
-        # anything sizes a pool from cache_config: the TE's StorageEngine and
-        # the cache engine both read num_cpu_blocks / swa.num_slots.
-        geometry = expected_geometry(self.model_config, self.cache_config)
-        client = attach_radix_client(geometry=geometry, label="KVManager")
-        try:
-            adopt_geometry(self.cache_config, client, label="KVManager")
-            self.cache_config.distributed_node_id = radix_cluster_rank(client)
-            flexkv_logger.info(
-                f"[kv manager] radix-server {client.name}: cluster rank "
-                f"{self.cache_config.distributed_node_id}/{client.info.world_size}, "
-                f"FlexKV geometry {geometry.describe()}")
-        finally:
-            client.close()
-
-        try:
-            if self.local_dp_client_id == 0:
-                self._spawn_shm_te()
-
-            # KVTaskEngine reads GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and builds a
-            # RadixShmemCacheEngine (CPU tier = RadixClient on the radix-server).
-            self.kv_task_engine = KVTaskEngine(
-                self.model_config, self.cache_config,
-                self.gpu_register_port,
-                redis_meta=self.redis_meta_client,
-                event_collector=event_collector,
-                shm_te_server_id=self._shm_radix_id,
-                shm_te_channel_id=self.local_dp_client_id,
-            )
-        except BaseException:
-            # A failure after the TE subprocess was spawned must not leave it
-            # running (it would wait for GPU registrations forever).
-            self._shutdown_radix_shmem_children()
-            raise
-
-    def _shutdown_radix_shmem_children(self) -> None:
-        # getattr: shutdown() must work on a KVManager whose __init__ did not
-        # get this far (or was bypassed, as the unit tests do).
-        te = getattr(self, "_shm_te_process", None)
-        if te is not None:
-            self._shm_te_process = None
-            te.shutdown()
-
-    def _spawn_shm_te(self) -> None:
-        """Bootstrap proc (local dp 0) only: spawn the TE subprocess every DP
-        process of this node feeds over its shm channel. The TE attaches to
-        the same radix-server (its SlotStore is the CPU pool) with the cache
-        config whose slot counts were just adopted."""
-        from flexkv.transfer_manager import TransferManagerShmTEProcess
-
-        total_clients = self.model_config.total_clients
-        if self.model_config.local_dp_size is not None:
-            total_clients = self.model_config.local_dp_size
-        self._shm_te_process = TransferManagerShmTEProcess(
-            self.model_config, self.cache_config,
-            gpu_register_port=self.gpu_register_port,
-            server_id=self._shm_radix_id,
-            num_channels=total_clients,
-        )
-        self._shm_te_process.start()
-
     def start(self) -> None:
         if self.owns_mps:
             # try to start MPS
@@ -311,10 +219,6 @@ class KVManager:
         else:
             if self.kv_task_engine is not None:
                 self.kv_task_engine.shutdown()
-
-        # Multi-DP radix-shmem teardown — only the bootstrap proc owns these.
-        # TE first: its workers map the server's SlotStore.
-        self._shutdown_radix_shmem_children()
 
         if self.owns_mps:
             flexkv_logger.info(

@@ -41,7 +41,8 @@ import torch
 from flexkv.common.config import (GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec,
                                   ModelConfig, SWAPoolConfig)
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.radixshmem_config import RadixShmemConfig, get_radixshmem_config
+from flexkv.common.radixshmem_config import (RadixShmemConfig, default_endpoint,
+                                             get_radixshmem_config)
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 try:
@@ -269,7 +270,7 @@ def attach_radix_client(name: Optional[str] = None,
     if max_outstanding is None:
         max_outstanding = rcfg.client.max_outstanding
     spec = geometry.to_shmradix() if isinstance(geometry, RadixGeometry) else geometry
-    where = endpoint or f"unix:///dev/shm/{name.lstrip('/').replace('/', '_')}.sock"
+    where = endpoint or default_endpoint(name)
 
     deadline = time.monotonic() + float(timeout_s)
     last: Optional[BaseException] = None
@@ -435,6 +436,32 @@ def adopt_geometry(cache_config: CacheConfig, client: "shmradix.RadixClient",
              f"{counts['register_chunk_blocks']} blocks")
     flexkv_logger.info(f"{label}: adopted radix-server {client.name}'s geometry: {note}")
     return counts
+
+
+def adopt_radix_server(model_config: ModelConfig, cache_config: CacheConfig,
+                       *,
+                       rcfg: Optional[RadixShmemConfig] = None,
+                       label: str = "radixshmem") -> Dict[str, int]:
+    """Attach to this node's radix-server with FlexKV's geometry, take over the
+    slot counts it planned (:func:`adopt_geometry`) and its cluster rank
+    (``cache_config.distributed_node_id``), then detach. Every process that
+    sizes something from ``cache_config`` runs this before it does: the
+    KVManager before it starts a KVServer or a KVTaskEngine, the KVTaskEngine
+    host itself (a KVServer may be started on its own) and, with a live client,
+    the TE. Idempotent: the server accepts the same geometry any number of
+    times."""
+    geometry = expected_geometry(model_config, cache_config)
+    client = attach_radix_client(rcfg=rcfg, geometry=geometry, label=label)
+    try:
+        counts = adopt_geometry(cache_config, client, label=label)
+        cache_config.distributed_node_id = radix_cluster_rank(client)
+        flexkv_logger.info(
+            f"{label}: radix-server {client.name}: cluster rank "
+            f"{cache_config.distributed_node_id}/{client.info.world_size}, "
+            f"FlexKV geometry {geometry.describe()}")
+        return counts
+    finally:
+        client.close()
 
 
 def radix_server_is_distributed(rcfg: Optional[RadixShmemConfig] = None,

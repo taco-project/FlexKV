@@ -145,8 +145,6 @@ class KVTaskManager:
                  gpu_register_port: Optional[str] = None,
                  redis_meta: RedisMeta = None,
                  event_collector: Optional[KVEventCollector] = None,
-                 shm_te_server_id: Optional[str] = None,
-                 shm_te_channel_id: Optional[int] = None,
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
@@ -179,30 +177,20 @@ class KVTaskManager:
         self.prefetch_jobs: Dict[int, Any] = {}
         if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
             # The CPU tier is a radix-server (shared index + SlotStore); its
-            # planners are a GlobalCacheEngine subclass.
+            # planners are a GlobalCacheEngine subclass. Take the server's slot
+            # counts over first: the planner below and the TE size their pools
+            # from cache_config. Idempotent; the KVManager did it too, but a
+            # KVServer started on its own (FLEXKV_SERVER_LAUNCH_MODE=external)
+            # arrives here with its own config.
             from flexkv.cache.radix_shmem_planner import RadixShmemCacheEngine
+            from flexkv.server.shm_radix_bootstrap import adopt_radix_server
+            adopt_radix_server(model_config, cache_config, label="KVTaskEngine")
             self.cache_engine = RadixShmemCacheEngine(
                 cache_config, model_config, redis_meta, event_collector)
         else:
             self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta, event_collector)
 
-        # Multi-DP shm path: connect this CE to a pre-existing TE process
-        # via a named ShmChannel rather than spawning a new TE subprocess.
-        use_shm_te = (shm_te_server_id is not None
-                      and shm_te_channel_id is not None)
-        if use_shm_te and not self.model_config.use_trtllm_subprocess:
-            self.transfer_handles = [TransferManagerHandle(
-                # Left behind by a rename: the sibling "process" branch below
-                # passes `model_config`, and no *_for_transfer variant exists —
-                # so the shm-TE path (radix_shmem) NameError'd on first use.
-                model_config,
-                self.cache_config,
-                mode="shm",
-                gpu_register_port=gpu_register_port,
-                shm_server_id=shm_te_server_id,
-                shm_channel_id=shm_te_channel_id,
-            )]
-        elif not self.model_config.use_trtllm_subprocess:
+        if not self.model_config.use_trtllm_subprocess:
             self.transfer_handles = [TransferManagerHandle(
                 model_config,
                 cache_config,
@@ -231,7 +219,8 @@ class KVTaskManager:
             ]
             self.transfer_handles[0]._handle.send_config_to_remotes()
 
-        # A node-local shm TE replaces the legacy cross-node remote manager.
+        # Node-local DP: every node runs its own KVServer and TE, so the
+        # cross-node remote transfer manager is not needed.
         needs_remote_transfer_manager = self.model_config.local_dp_size is None
         if self.model_config.nnodes > 1 and needs_remote_transfer_manager:
             # Bind the handle rather than reading it back with a negative
@@ -1116,13 +1105,8 @@ class KVTaskEngine(KVTaskManager):
                  gpu_register_port: Optional[str] = None,
                  redis_meta: Optional[RedisMeta] = None,
                  event_collector: Optional[KVEventCollector] = None,
-                 shm_te_server_id: Optional[str] = None,
-                 shm_te_channel_id: Optional[int] = None,
                  ):
-        super().__init__(model_config, cache_config, gpu_register_port,
-                         redis_meta, event_collector,
-                         shm_te_server_id=shm_te_server_id,
-                         shm_te_channel_id=shm_te_channel_id)
+        super().__init__(model_config, cache_config, gpu_register_port, redis_meta, event_collector)
         self.tracer = FlexKVTracer()
         self.tracer.trace_config(model_config, cache_config, gpu_layout=None)
 

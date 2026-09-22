@@ -11,9 +11,9 @@ the two things FlexKV has to know, and nothing else:
 
   server
       Which radix-server to attach to: its ``--name`` (which also derives the
-      default gRPC socket ``unix:///dev/shm/<name>.sock`` and the prefix of
-      FlexKV's own TE channels), an ``endpoint`` override, and how long a
-      FlexKV process waits for the server to exist and become ready.
+      default gRPC socket ``unix:///dev/shm/<name>.sock``), an ``endpoint``
+      override, and how long a FlexKV process waits for the server to exist
+      and become ready.
   client
       FlexKV's RadixClient / prefetch settings.
 
@@ -51,12 +51,17 @@ class RadixShmemConfigError(ValueError):
     """The file is not a valid radixshmem-mode configuration."""
 
 
+def default_endpoint(server_name: str) -> str:
+    """radixshmem's default gRPC socket for ``radix-server --name <server_name>``:
+    ``unix:///dev/shm/<name without the leading slash, '/' -> '_'>.sock``."""
+    return f"unix:///dev/shm/{server_name.lstrip('/').replace('/', '_')}.sock"
+
+
 @dataclasses.dataclass(frozen=True)
 class RadixServerSettings:
     """Which radix-server this node's FlexKV attaches to."""
     # ``radix-server --name``: the index shm name. Also the default socket
-    # (``unix:///dev/shm/<name>.sock``) and, sanitized, the prefix of FlexKV's
-    # TE shm channels on this host (``RadixShmemConfig.te_server_id``).
+    # (``unix:///dev/shm/<name>.sock``, ``default_endpoint``).
     name: str = DEFAULT_SERVER_NAME
     # gRPC endpoint; "" = the default socket derived from ``name``.
     endpoint: str = ""
@@ -100,12 +105,10 @@ class RadixShmemConfig:
         return float(self.server.ready_timeout_s)
 
     @property
-    def te_server_id(self) -> str:
-        """Prefix of FlexKV's own IPC objects on this host (the TE control
-        block and channels): the server name without its leading slash, so
-        two FlexKV deployments on one host that attach to different servers
-        never share a channel."""
-        return self.server.name.lstrip("/").replace("/", "_")
+    def default_endpoint(self) -> str:
+        """The gRPC endpoint radixshmem derives from the server name when no
+        ``endpoint`` is given: ``unix:///dev/shm/<name>.sock``."""
+        return default_endpoint(self.server.name)
 
     # ------------------------------------------------------------- tests
     def replace_server(self, **changes: Any) -> "RadixShmemConfig":
@@ -117,7 +120,7 @@ class RadixShmemConfig:
     def describe(self) -> str:
         where = self.path or "(defaults)"
         return (f"{where}: radix-server {self.server_name} "
-                f"(endpoint={self.endpoint or 'unix:///dev/shm/' + self.te_server_id + '.sock'}, "
+                f"(endpoint={self.endpoint or self.default_endpoint}, "
                 f"ready_timeout_s={self.ready_timeout_s:.0f})")
 
 
