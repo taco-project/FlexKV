@@ -93,7 +93,7 @@ radix-server --name /flexkv --data-bytes 64G --swa-ratio 0.5 \
   --expected-min-nodes 4 --num-rht-shards 4 --rht-slots 4 \
   --registry etcd://10.0.0.1:2379 --cluster-id prod_a \
   --rpc-interface bond0 --index-dev mlx5_bond_0 --gid-idx 3 \
-  --transfer-dev mlx5_1 --transfer-dev mlx5_2 --bootstrap-timeout 600
+  --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7 --bootstrap-timeout 600
 ```
 
 集群一致的几何字段（`block_size`、池集合、每池 `slot_bytes`、SWA 窗口、`slot_align`、`register_chunk_tokens`）由第一个
