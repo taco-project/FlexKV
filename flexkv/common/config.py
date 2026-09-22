@@ -840,20 +840,13 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 
     # radixshmem mode: the CPU tier is radixshmem's index + SlotStore, one
-    # radix-server per node, one shared TE, a KVTaskEngine per DP process (no
-    # KVServer). Everything else about that mode -- cluster membership, RDMA
-    # devices, prefetch limits -- is the YAML at FLEXKV_RADIXSHMEM_CONFIG_PATH
+    # radix-server per node (a process the operator starts: `radix-server
+    # --name /flexkv --data-bytes ...`), one shared TE, a KVTaskEngine per DP
+    # process (no KVServer). FlexKV only attaches to the server; which one and
+    # the prefetch limits are the YAML at FLEXKV_RADIXSHMEM_CONFIG_PATH
     # (flexkv.common.radixshmem_config; reference docs/radixshmem/config_zh.md).
     enable_radixshmem=bool(int(os.getenv('FLEXKV_ENABLE_RADIXSHMEM', 0))),
     radixshmem_config_path=os.getenv('FLEXKV_RADIXSHMEM_CONFIG_PATH', '') or None,
-    # embedded: the bootstrap DP process launches the radix-server subprocess;
-    # external: a radix-server started by the operator is attached to.
-    radix_server_launch_mode=os.getenv('FLEXKV_RADIX_SERVER_LAUNCH_MODE', 'embedded').lower(),
-    # Per-node overrides of the global YAML, for several nodes on one host
-    # (tests): the node's etcd identity and the bootstrap IP peers dial. Unset
-    # in a real deployment, where both derive from cluster.rpc_interface.
-    radix_node_name=os.getenv('FLEXKV_RADIX_NODE_NAME', ''),
-    radix_rpc_address=os.getenv('FLEXKV_RADIX_RPC_ADDRESS', ''),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),

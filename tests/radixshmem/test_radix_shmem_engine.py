@@ -5,12 +5,15 @@ Skipped if `shmradix` is missing.
 Four parts, one file:
 
   Part 1 — `CacheEngineRadixShmem` semantics against an in-process
-    `shmradix.RadixServer` (index + SlotStore): take / insert / match / recycle,
-    insert-after-transfer publication, lock vs. eviction, SWA windows, and the
-    fact that a standalone region has no peer to prefetch from.
+    `shmradix.RadixServer` (index + SlotStore, started the way the operator's
+    `radix-server` is: a name and a byte budget; FlexKV's client brings the
+    geometry): take / insert / match / recycle, insert-after-transfer
+    publication, lock vs. eviction, SWA windows, and the fact that a standalone
+    region has no peer to prefetch from.
   Part 1b — the data plane: the SlotStore pool viewed as FlexKV's CPU tensor,
-    the exact-stride geometry the bootstrap derives from the configuration, and
-    the embedded radix-server subprocess.
+    the exact-stride geometry FlexKV derives from its configuration and hands
+    to the server, the slot counts it adopts back, and a client that arrives
+    before its server.
   Part 2 — `GlobalCacheEngine.get()/put()` planning on the radixshmem backend,
     driven by synthetic matches (no region): the local GET is one H2D, the
     prefetch plan carries a `pull_async` job, the PUT arms the deferred insert;
@@ -32,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import glob
 import importlib.util
 import multiprocessing as mp
@@ -41,6 +45,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -59,7 +64,7 @@ except ImportError as exc:
     pytest.skip(f"shmradix unusable ({exc}); rebuild the extension",
                 allow_module_level=True)
 
-for _name in ("RadixServer", "RadixServerConfig", "IndexConfig", "DataPlaneConfig"):
+for _name in ("RadixServer", "ServerConfig", "Geometry", "RadixClient"):
     if not hasattr(shmradix, _name):
         pytest.skip(f"shmradix lacks {_name}: needs the RadixServer/RadixClient surface",
                     allow_module_level=True)
@@ -141,20 +146,31 @@ def _sweep_region(name: str, data_name: str | None = None) -> None:
             os.remove(path)
 
 
+def _server_budget(blocks: int, swa_slots: int = 0, slot_bytes: int = SLOT_BYTES):
+    """(data_bytes, swa_ratio) that make a data-mode server plan exactly
+    ``blocks`` FULL and ``swa_slots`` SWA slots of ``slot_bytes`` each (the
+    stride equals the slot bytes, see ``slot_align_for``)."""
+    data_bytes = (blocks + swa_slots) * slot_bytes
+    swa_ratio = (swa_slots * slot_bytes) / data_bytes if swa_slots else 0.0
+    return data_bytes, swa_ratio
+
+
 def _server_config(name: str, blocks: int, tokens_per_block: int,
                    swa_slots: int = 0, window_blocks: int = 0,
                    slot_bytes: int = SLOT_BYTES):
-    """A standalone data-mode server: one slot per block, stride == slot bytes."""
+    """A standalone data-mode radix-server the way the operator starts it (a
+    name and a byte budget, nothing about the model) plus the Geometry
+    FlexKV's client brings. Budget and ratio are chosen so the counts the
+    server plans equal the test's ``blocks`` / ``swa_slots``."""
     align = bootstrap.slot_align_for(slot_bytes)
-    return shmradix.RadixServerConfig(
-        index=shmradix.IndexConfig(
-            name=name, tokens_per_block=tokens_per_block, full_slots=blocks,
-            swa_slots=swa_slots, swa_window_blocks=window_blocks),
-        data=shmradix.DataPlaneConfig(
-            data_bytes=(blocks + swa_slots) * slot_bytes, full_slot_bytes=slot_bytes,
-            swa_slot_bytes=slot_bytes if swa_slots else 0, slot_align=align,
-            prefault=False),
-    )
+    data_bytes, swa_ratio = _server_budget(blocks, swa_slots, slot_bytes)
+    cfg = shmradix.ServerConfig(name=name, data_bytes=data_bytes, swa_ratio=swa_ratio,
+                                slot_align=align, prefault=False)
+    geo = shmradix.Geometry(block_size=tokens_per_block, full_slot_bytes=slot_bytes,
+                            swa_slot_bytes=slot_bytes if swa_slots else 0,
+                            swa_window_blocks=window_blocks if swa_slots else 0,
+                            slot_align=align)
+    return cfg, geo
 
 
 class _Env:
@@ -165,7 +181,8 @@ class _Env:
         self._stack = []
 
     def server(self, cfg):
-        _sweep_region(cfg.index.name, cfg.resolved_data_name)
+        """Start the server: ``waiting`` until a client brings the geometry."""
+        _sweep_region(cfg.name, cfg.resolved_data_name)
         server = shmradix.RadixServer(cfg).start()
         self._stack.append(server.close)
         return server
@@ -176,9 +193,9 @@ class _Env:
         return engine
 
     def make(self, name: str, blocks: int = 2000, tokens_per_block: int = 4, **engine_kwargs):
-        cfg = _server_config(name, blocks, tokens_per_block)
+        cfg, geo = _server_config(name, blocks, tokens_per_block)
         server = self.server(cfg)
-        engine = self.engine(name, num_total_blocks=blocks,
+        engine = self.engine(name, geometry=geo, num_total_blocks=blocks,
                              tokens_per_block=tokens_per_block, **engine_kwargs)
         return engine, server
 
@@ -188,10 +205,10 @@ class _Env:
                 self._stack.pop()()
 
 
-def _radix_config(**cluster):
-    """The all-defaults radixshmem configuration (standalone, socket derived
-    from the index name) with ``cluster`` keys changed."""
-    return load_radixshmem_config(None).replace_cluster(**cluster)
+def _radix_config(**server):
+    """The all-defaults radixshmem configuration with ``server`` keys changed;
+    a short ready timeout so a broken test fails instead of waiting."""
+    return load_radixshmem_config(None).replace_server(**{"ready_timeout_s": 60.0, **server})
 
 
 @pytest.fixture
@@ -374,11 +391,11 @@ def _make_swa_engine(env, name: str, blocks: int = 2000, swa_slots: int = 64,
                      tokens_per_block: int = 16, window_blocks: int = SWA_W):
     """A single region carrying the SWA component, and an engine that knows it."""
     from flexkv.common.config import SWAPoolConfig
-    cfg = _server_config(name, blocks, tokens_per_block,
-                         swa_slots=swa_slots, window_blocks=window_blocks)
+    cfg, geo = _server_config(name, blocks, tokens_per_block,
+                              swa_slots=swa_slots, window_blocks=window_blocks)
     server = env.server(cfg)
     engine = env.engine(
-        name, num_total_blocks=blocks, tokens_per_block=tokens_per_block,
+        name, geometry=geo, num_total_blocks=blocks, tokens_per_block=tokens_per_block,
         swa_config=SWAPoolConfig(enabled=True, num_slots=swa_slots,
                                  window_blocks=window_blocks))
     return engine, server
@@ -571,84 +588,94 @@ def _configs(num_cpu_blocks: int = 64, swa_slots: int = 0):
 def test_expected_geometry_mirrors_the_storage_engine_layout():
     """One FULL slot is one CPU block exactly as StorageEngine lays it out:
     2 layers x 2 (K,V) x 16 tokens x 4 heads x 64 x fp16 = 32768 B; one SWA
-    slot is one SWA page: 1 layer x 16 tokens x 64 B."""
+    slot is one SWA page: 1 layer x 16 tokens x 64 B. Counts are not part of
+    it: the server plans them from its budget."""
     model_config, cache_config = _configs(num_cpu_blocks=64, swa_slots=16)
     geo = bootstrap.expected_geometry(model_config, cache_config)
-    assert geo.tokens_per_block == 16
-    assert geo.full_slots == 64 and geo.full_slot_bytes == 32768
-    assert geo.swa_slots == 16 and geo.swa_slot_bytes == 1024 and geo.swa_window_blocks == SWA_W
+    assert geo.tokens_per_block == 16 and geo.full_slot_bytes == 32768
+    assert geo.has_swa and geo.swa_slot_bytes == 1024 and geo.swa_window_blocks == SWA_W
     assert geo.slot_align == 1024                  # gcd power of two of 32768 and 1024
-    assert geo.data_bytes == 64 * 32768 + 16 * 1024
-
-
-def test_server_config_and_geometry_check(env):
-    """`build_radix_server_config` starts a server whose regions pass
-    `check_geometry`; a different expectation is rejected, not papered over."""
-    model_config, cache_config = _configs(num_cpu_blocks=64, swa_slots=16)
-    rcfg = _radix_config(cluster_id=f"geo{os.getpid()}")
-    set_radixshmem_config(rcfg)
-    try:
-        cfg = bootstrap.build_radix_server_config(model_config, cache_config, rcfg)
-        assert cfg.index.name == bootstrap.radix_index_name(rcfg.local_id)
-        assert cfg.cluster.cluster_id == rcfg.cluster_id
-        # FlexKV's own defaults, where they differ from radixshmem's.
-        assert cfg.cluster.rht_slots_per_bucket == 4
-        assert cfg.cluster.bootstrap_timeout_sec == 120
-        assert cfg.index.data_pool_ratio == 8.0
-        # one RHT registration chunk per 4096 tokens, whatever the block size
-        assert cfg.index.register_chunk_size == 4096 // cache_config.tokens_per_block
-        assert cfg.data.slot_align == 1024
-        assert cfg.index.full_slots == 64 and cfg.index.swa_slots == 16
-        env.server(cfg)
-        client = bootstrap.attach_radix_client(cfg.index.name, timeout_s=30)
-        try:
-            geo = bootstrap.expected_geometry(model_config, cache_config)
-            bootstrap.check_geometry(client, geo, "test")
-            assert int(client.store.pool(FULL).slot_bytes) == geo.full_slot_bytes
-            assert int(client.store.pool(_SWA).slot_bytes) == geo.swa_slot_bytes
-            assert bootstrap.radix_cluster_rank(client) == 0
-            cache_config.num_cpu_blocks = 65
-            with pytest.raises(ValueError, match="FULL slots"):
-                bootstrap.check_geometry(
-                    client, bootstrap.expected_geometry(model_config, cache_config), "test")
-        finally:
-            client.close()
-    finally:
-        set_radixshmem_config(None)
-
-
-def test_embedded_server_process_lifecycle():
-    """The bootstrap DP process runs the radix-server as a spawned subprocess:
-    start() returns once it is ready, clients attach by name, shutdown() takes
-    the socket down with it."""
+    spec = geo.to_shmradix().to_dict()
+    assert spec["block_size"] == 16 and spec["slot_align"] == 1024
+    assert spec["pools"]["full"] == {"slot_bytes": 32768, "num_slots": 0}
+    assert spec["pools"]["swa"] == {"slot_bytes": 1024, "num_slots": 0, "window_blocks": SWA_W}
+    # Without SWA the pool is absent from what the server is asked for.
     model_config, cache_config = _configs(num_cpu_blocks=64)
-    rcfg = _radix_config(cluster_id=f"proc{os.getpid()}")
-    set_radixshmem_config(rcfg)
-    shm_radix_id = rcfg.local_id
-    cfg = bootstrap.build_radix_server_config(model_config, cache_config, rcfg)
-    _sweep_region(cfg.index.name, cfg.resolved_data_name)
-    server = bootstrap.RadixServerProcess(cfg)
+    spec = bootstrap.expected_geometry(model_config, cache_config).to_shmradix().to_dict()
+    assert set(spec["pools"]) == {"full"}
+
+
+def test_client_brings_the_geometry_and_adopts_the_counts(env):
+    """The operator's server knows only its budget; FlexKV's first client hands
+    it the slot shape, the server plans the counts, `check_geometry` verifies
+    the regions and `adopt_geometry` takes the counts into CacheConfig. A
+    different geometry is refused, not papered over."""
+    model_config, cache_config = _configs(num_cpu_blocks=64, swa_slots=16)
+    geo = bootstrap.expected_geometry(model_config, cache_config)
+    name = f"/geo{os.getpid()}"
+    data_bytes = 64 * geo.full_slot_bytes + 16 * geo.swa_slot_bytes
+    env.server(shmradix.ServerConfig(name=name, data_bytes=data_bytes,
+                                     swa_ratio=16 * geo.swa_slot_bytes / data_bytes,
+                                     prefault=False))       # slot_align comes with the geometry
+    client = bootstrap.attach_radix_client(name, geometry=geo, timeout_s=60)
     try:
-        server.start(timeout_s=120)
-        assert server.cluster_rank == 0
-        assert server.info["distributed"] is False
-        assert os.path.exists(bootstrap.radix_socket_path(shm_radix_id))
-        client = bootstrap.attach_radix_client(cfg.index.name, timeout_s=30)
-        assert client.info.data_plane
-        assert int(client.mempool_total()) == 64
-        client.close()
+        bootstrap.check_geometry(client, geo, "test")
+        pools = client.geometry["pools"]
+        assert pools["full"]["num_slots"] == 64 and pools["swa"]["num_slots"] == 16
+        assert int(client.store.pool(FULL).slot_bytes) == geo.full_slot_bytes    # exact stride
+        assert int(client.store.pool(_SWA).slot_bytes) == geo.swa_slot_bytes
+        # cpu_cache_gb's placeholders give way to the server's counts
+        cache_config.num_cpu_blocks, cache_config.swa.num_slots = 7, 3
+        assert bootstrap.adopt_geometry(cache_config, client, "test") == {"full": 64, "swa": 16}
+        assert cache_config.num_cpu_blocks == 64 and cache_config.swa.num_slots == 16
+        assert bootstrap.radix_cluster_rank(client) == 0 and client.info.world_size == 1
+        # the connectors' prefetch gate asks the server the same question
+        assert bootstrap.radix_server_is_distributed(_radix_config(name=name), timeout_s=30) is False
+        # another expectation against the same regions fails closed
+        cache_config.tokens_per_block = 32
+        with pytest.raises(ValueError, match="tokens_per_block"):
+            bootstrap.check_geometry(
+                client, bootstrap.expected_geometry(model_config, cache_config), "test")
+        # ...and a second client bringing another geometry is refused by the server
+        other = dataclasses.replace(geo, tokens_per_block=32)
+        with pytest.raises(ValueError, match="another geometry"):
+            bootstrap.attach_radix_client(name, geometry=other, timeout_s=60)
     finally:
-        server.shutdown()
-        set_radixshmem_config(None)
-    assert server.process is None
-    assert not os.path.exists(bootstrap.radix_socket_path(shm_radix_id))
+        client.close()
+
+
+def test_attach_waits_for_a_late_server(env):
+    """The operator may start the radix-server after the engine: the attach
+    retries until the socket answers, brings the geometry and waits for
+    ready. No server at all fails with the command that starts one."""
+    name = f"/late{os.getpid()}"
+    cfg, geo = _server_config(name, blocks=32, tokens_per_block=4)
+    _sweep_region(cfg.name, cfg.resolved_data_name)
+    started = threading.Event()
+
+    def _start_later():
+        time.sleep(1.5)
+        env._stack.append(shmradix.RadixServer(cfg).start().close)
+        started.set()
+
+    threading.Thread(target=_start_later, daemon=True).start()
+    t0 = time.monotonic()
+    client = bootstrap.attach_radix_client(name, geometry=geo, timeout_s=60)
+    try:
+        assert started.is_set() and time.monotonic() - t0 >= 1.0
+        assert client.info.mode == "ready" and client.info.data_plane
+        assert int(client.mempool_total()) == 32
+        assert bootstrap.radix_cluster_rank(client) == 0
+    finally:
+        client.close()
+    with pytest.raises(TimeoutError, match="radix-server --name"):
+        bootstrap.attach_radix_client(f"/nobody{os.getpid()}", geometry=geo, timeout_s=2)
 
 
 # -----------------------------------------------------------------------------
-# Part 1c — the radixshmem-mode YAML (flexkv.common.radixshmem_config): pass-
-# through sections validated against shmradix's dataclasses, FlexKV's own
-# defaults, the per-node overrides, and the startup checks
-# (docs/radixshmem/config_zh.md section 6).
+# Part 1c — the radixshmem-mode YAML (flexkv.common.radixshmem_config): which
+# radix-server to attach to and FlexKV's client settings; the former
+# server-side sections are refused (docs/radixshmem/config_zh.md).
 
 
 def _write_yaml(tmp_path, text: str) -> str:
@@ -657,89 +684,50 @@ def _write_yaml(tmp_path, text: str) -> str:
     return str(path)
 
 
-def test_radix_config_defaults_and_passthrough(tmp_path):
+def test_radix_config_defaults():
     cfg = load_radixshmem_config(None)
-    assert cfg.cluster_id == "flexkv" and cfg.local_id == "flexkv"
-    assert not cfg.distributed and cfg.endpoint == ""
-    # FlexKV's defaults where they differ from radixshmem's; nothing else is set.
-    assert cfg.cluster == {"cluster_id": "flexkv", "bootstrap_timeout_sec": 120,
-                           "rht_slots_per_bucket": 4}
-    assert cfg.index == {"data_pool_ratio": 8.0} and cfg.data == {} and cfg.server == {}
-    assert cfg.attach_timeout_s == 180.0
+    assert cfg.path is None
+    assert cfg.server_name == "/flexkv" and cfg.endpoint == "" and cfg.ready_timeout_s == 600.0
+    assert cfg.te_server_id == "flexkv"
+    assert cfg.client.prefetch_timeout_ms == 5000 and cfg.client.prefetch_max_inflight == 128
+    assert cfg.client.max_outstanding == 256
+    assert "radix-server /flexkv" in cfg.describe()
 
+
+def test_radix_config_file(tmp_path):
     path = _write_yaml(tmp_path, """
-cluster:
-  cluster_id: prod
-  expected_min_nodes: 3
-  registry: etcd://10.0.0.1:2379
-  rpc_interface: eth0
-  index_dev: mlx5_0
-  rht_transport: xrc
-  peer_index_transport: dc
-  num_rht_shards: 2
-  rht_shard_holders: "0,2"
-data:
-  transfer_devices: mlx5_1,mlx5_2
-  prefault: false
-index:
-  background_evict_ratio: 0.1
 server:
-  rpc_workers: 8
+  name: /prod/kv
+  endpoint: 10.0.0.2:7000
+  ready_timeout_s: 900
 client:
   prefetch_timeout_ms: 1000
+  max_outstanding: 512
+  prefetch_max_inflight: 300
 """)
     cfg = load_radixshmem_config(path)
-    assert cfg.path == path and cfg.distributed and cfg.expected_min_nodes == 3
-    assert cfg.cluster["rht_shard_holders"] == [0, 2]
-    assert cfg.data == {"transfer_devices": ["mlx5_1", "mlx5_2"], "prefault": False}
-    assert cfg.index == {"data_pool_ratio": 8.0, "background_evict_ratio": 0.1}
-    assert cfg.server == {"rpc_workers": 8}
-    assert cfg.client.prefetch_timeout_ms == 1000 and cfg.client.max_outstanding == 256
-    # Every section constructs its shmradix dataclass as is.
-    shmradix.ClusterConfig(**cfg.cluster)
-    shmradix.IndexConfig(**cfg.index)
-    shmradix.DataPlaneConfig(data_bytes=1, full_slot_bytes=1, **cfg.data)
-
-
-def test_radix_config_per_node_overrides(tmp_path):
-    path = _write_yaml(tmp_path, """
-cluster:
-  cluster_id: prod
-  expected_min_nodes: 2
-  registry: etcd://10.0.0.1:2379
-  rpc_interface: eth0
-""")
-    cfg = load_radixshmem_config(path, node_name="r1", rpc_address="127.0.0.1")
-    assert cfg.node_name == "r1" and cfg.rpc_address == "127.0.0.1"
-    # The explicit address must not lose to the file's interface (radixshmem
-    # lets the interface win), and co-located nodes get distinct regions.
-    assert cfg.cluster["rpc_interface"] == ""
-    assert cfg.local_id == "prod_r1"
-    assert bootstrap.radix_index_name(cfg.local_id) == "/shmradix_prod_r1_cpu"
-    # Without the interface, the address alone satisfies the cluster check.
-    path = _write_yaml(tmp_path, "cluster:\n  expected_min_nodes: 2\n  registry: etcd://h:1\n")
-    with pytest.raises(RadixShmemConfigError, match="rpc_interface"):
-        load_radixshmem_config(path)
-    load_radixshmem_config(path, rpc_address="10.0.0.5")
+    assert cfg.path == path and cfg.server_name == "/prod/kv" and cfg.te_server_id == "prod_kv"
+    assert cfg.endpoint == "10.0.0.2:7000" and cfg.ready_timeout_s == 900.0
+    assert cfg.client.prefetch_timeout_ms == 1000 and cfg.client.max_outstanding == 512
+    assert cfg.client.prefetch_max_inflight == 300
+    assert cfg.replace_server(name="/x").server_name == "/x"
+    assert cfg.replace_client(max_outstanding=1000).client.max_outstanding == 1000
 
 
 @pytest.mark.parametrize("text, match", [
-    ("cluster:\n  node_name: n0\n", "per-node"),
-    ("cluster:\n  rpc_address: 10.0.0.1\n", "per-node"),
-    ("index:\n  full_slots: 5\n", "geometry is derived"),
-    ("data:\n  slot_align: 4096\n", "geometry is derived"),
-    ("cluster:\n  transport: xrc\n", "unknown key"),
-    ("server:\n  cluster: {}\n", "unknown key"),
+    ("cluster:\n  cluster_id: prod\n", "radix-server"),      # former server-side sections
+    ("data:\n  prefault: false\n", "radix-server"),
+    ("index:\n  data_pool_ratio: 8\n", "radix-server"),
     ("peers: {}\n", "unknown section"),
     ("- a\n", "must be a mapping"),
-    ("cluster:\n  expected_min_nodes: 2\n  rpc_interface: eth0\n", "registry"),
-    ("cluster:\n  expected_min_nodes: 2\n  registry: etcd://h:1\n  rpc_interface: eth0\n"
-     "  num_rht_shards: 3\n", "num_rht_shards"),
-    ("cluster:\n  rht_slots_per_bucket: 3\n", "rht_slots_per_bucket"),
-    ("cluster:\n  rht_transport: rc\n", "rht_transport"),
-    ("cluster:\n  peer_index_transport: tcp\n", "peer_index_transport"),
-    ("cluster:\n  remote_op_transport: xrc\n", "remote_op_transport"),
+    ("server: 5\n", "must be a mapping"),
+    ("server:\n  rpc_workers: 3\n", "unknown key"),
+    ("server:\n  name: kv\n", "starts with"),
+    ("server:\n  name: /a b\n", "starts with"),
+    ("server:\n  ready_timeout_s: 0\n", "ready_timeout_s"),
+    ("server:\n  ready_timeout_s: soon\n", "invalid value"),
     ("client:\n  prefetch_max_inflight: 256\n", "max_outstanding"),
+    ("client:\n  prefetch_timeout_ms: 0\n", "prefetch_timeout_ms"),
     ("client:\n  timeout: 5\n", "unknown key"),
 ])
 def test_radix_config_rejects(tmp_path, text, match):
@@ -748,62 +736,19 @@ def test_radix_config_rejects(tmp_path, text, match):
 
 
 def test_radix_config_env_singleton_reloads_on_change(tmp_path, monkeypatch):
-    """`get_radixshmem_config` follows GLOBAL_CONFIG_FROM_ENV: the path and the
-    two per-node overrides; a test-installed config wins until reverted."""
+    """`get_radixshmem_config` follows GLOBAL_CONFIG_FROM_ENV.radixshmem_config_path;
+    a test-installed config wins until reverted."""
     from flexkv.common.radixshmem_config import get_radixshmem_config
     set_radixshmem_config(None)
     monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radixshmem_config_path", None)
-    monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radix_node_name", "")
-    monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radix_rpc_address", "")
-    assert get_radixshmem_config().cluster_id == "flexkv"
-    path = _write_yaml(tmp_path, "cluster:\n  cluster_id: other\n")
+    assert get_radixshmem_config().server_name == "/flexkv"
+    path = _write_yaml(tmp_path, "server:\n  name: /other\n")
     monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radixshmem_config_path", path)
-    assert get_radixshmem_config().cluster_id == "other"
-    monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radix_node_name", "n7")
-    assert get_radixshmem_config().local_id == "other_n7"
-    set_radixshmem_config(_radix_config(cluster_id="pinned"))
-    assert get_radixshmem_config().cluster_id == "pinned"
+    assert get_radixshmem_config().server_name == "/other"
+    set_radixshmem_config(_radix_config(name="/pinned"))
+    assert get_radixshmem_config().server_name == "/pinned"
     set_radixshmem_config(None)
-    assert get_radixshmem_config().local_id == "other_n7"
-
-
-def test_server_config_takes_the_yaml_sections(tmp_path):
-    """`build_radix_server_config` passes the four sections through and keeps
-    the geometry / naming its own."""
-    model_config, cache_config = _configs(num_cpu_blocks=64)
-    cfg_path = _write_yaml(tmp_path, """
-cluster:
-  cluster_id: yamlsrv
-  expected_min_nodes: 2
-  registry: etcd://10.0.0.1:2379
-  rpc_interface: eth0
-  index_dev: mlx5_3
-  rht_transport: dc
-  num_rht_shards: 1
-data:
-  transfer_devices: [mlx5_4]
-  prefault: false
-  max_pending_jobs: 7
-index:
-  data_pool_ratio: 5.5
-  register_chunk_size: 64
-server:
-  rpc_workers: 3
-  endpoint: unix:///dev/shm/yamlsrv.sock
-""")
-    rcfg = load_radixshmem_config(cfg_path)
-    cfg = bootstrap.build_radix_server_config(model_config, cache_config, rcfg)
-    assert cfg.index.name == "/shmradix_yamlsrv_cpu" and cfg.index.full_slots == 64
-    assert cfg.index.data_pool_ratio == 5.5
-    assert cfg.index.register_chunk_size == 64        # the file wins over the derived default
-    assert cfg.resolved_data_name == "/shmradix_yamlsrv_cpu_data"
-    assert cfg.data.transfer_devices == ["mlx5_4"] and cfg.data.max_pending_jobs == 7
-    assert cfg.data.prefault is False and cfg.data.full_slot_bytes == 32768
-    assert cfg.cluster.expected_min_nodes == 2 and cfg.cluster.index_dev == "mlx5_3"
-    assert cfg.cluster.rht_transport == "dc" and cfg.cluster.peer_index_transport == "xrc"
-    assert cfg.cluster.rht_slots_per_bucket == 4 and cfg.cluster.node_name == ""
-    assert cfg.rpc_workers == 3 and cfg.endpoint == "unix:///dev/shm/yamlsrv.sock"
-    assert cfg.distributed
+    assert get_radixshmem_config().te_server_id == "other"
 
 
 # =============================================================================
@@ -1317,7 +1262,7 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
 
     from flexkv.common.config import CacheConfig, ModelConfig, SWAPoolConfig
 
-    rcfg = _radix_config(cluster_id=f"swaplanner{os.getpid()}")
+    rcfg = _radix_config(name=f"/swaplanner{os.getpid()}")
     saved = {"enable_radixshmem": GLOBAL_CONFIG_FROM_ENV.enable_radixshmem}
     GLOBAL_CONFIG_FROM_ENV.enable_radixshmem = True
     set_radixshmem_config(rcfg)
@@ -1338,8 +1283,14 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
         model_config = ModelConfig(num_layers=2, num_kv_heads=4, head_size=64,
                                    dtype=torch.float16,
                                    tp_size=1, dp_size=1)
-        cfg = bootstrap.build_radix_server_config(model_config, cache_config, rcfg)
-        _sweep_region(cfg.index.name, cfg.resolved_data_name)
+        # The operator's server: a budget sized so the planned counts are the
+        # test's; the planner's client brings the geometry.
+        geo = bootstrap.expected_geometry(model_config, cache_config)
+        data_bytes = num_blocks * geo.full_slot_bytes + swa_slots * geo.swa_slot_bytes
+        cfg = shmradix.ServerConfig(name=rcfg.server_name, data_bytes=data_bytes,
+                                    swa_ratio=swa_slots * geo.swa_slot_bytes / data_bytes,
+                                    prefault=False)
+        _sweep_region(cfg.name, cfg.resolved_data_name)
         server = shmradix.RadixServer(cfg).start()
         engine = RadixShmemCacheEngine(cache_config, model_config)
         assert engine.swa_op_constructor.enabled, \
@@ -1698,20 +1649,17 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
             node_name=f"r{rank}", rpc_address="0.0.0.0", index_dev=rdma_dev,
             gid_idx=int(os.getenv("FLEXKV_TEST_RADIX_GID_IDX", "3")),
             bootstrap_timeout_sec=60, rht_slots_per_bucket=4)
-        cfg = shmradix.RadixServerConfig(
-            index=shmradix.IndexConfig(name=prefix, tokens_per_block=16,
-                                       full_slots=PEER_BLOCKS),
-            data=shmradix.DataPlaneConfig(
-                data_bytes=PEER_BLOCKS * PEER_SLOT_BYTES, full_slot_bytes=PEER_SLOT_BYTES,
-                slot_align=4096, data_name=data_name, prefault=False,
-                transfer_devices=[rdma_dev]),
-            cluster=shmradix.ClusterConfig(**cluster_kwargs),
-            endpoint=endpoint,
+        cfg = shmradix.ServerConfig(
+            name=prefix, data_bytes=PEER_BLOCKS * PEER_SLOT_BYTES, slot_align=4096,
+            data_name=data_name, prefault=False, transfer_devices=[rdma_dev],
+            endpoint=endpoint, cluster=shmradix.ClusterConfig(**cluster_kwargs),
         )
-        server = shmradix.RadixServer(cfg).start()      # collective: waits for both
-        set_radixshmem_config(_radix_config().replace_server(endpoint=endpoint))
-        engine = CacheEngineRadixShmem(prefix, num_total_blocks=PEER_BLOCKS,
-                                       tokens_per_block=16, peer_enabled=True)
+        server = shmradix.RadixServer(cfg).start()      # waiting: the engine's geometry starts the rendezvous
+        set_radixshmem_config(_radix_config(name=prefix, endpoint=endpoint, ready_timeout_s=180.0))
+        engine = CacheEngineRadixShmem(
+            prefix, geometry=shmradix.Geometry(block_size=16, full_slot_bytes=PEER_SLOT_BYTES,
+                                               slot_align=4096),
+            num_total_blocks=PEER_BLOCKS, tokens_per_block=16, peer_enabled=True)
         if not engine.peer_enabled:
             raise RuntimeError("engine did not see a distributed region")
         cluster_rank = bootstrap.radix_cluster_rank(engine.client)

@@ -3,13 +3,13 @@ processes, one radix-server, one shared transfer engine.
 
 For every ``dp_size`` in the parametrization:
 
-  * dp0 is the bootstrap process: its KVManager launches the radix-server
-    (index + SlotStore, the node's CPU KV pool) and spawns the single TE; every
-    other DP attaches to both by name and feeds the TE over its own shm
-    channel with a disjoint graph/op id range. The run's namespace is the
-    ``cluster.cluster_id`` of a small YAML written per run
-    (FLEXKV_RADIXSHMEM_CONFIG_PATH), which is how a deployment names its
-    regions too.
+  * the test starts the operator's radix-server (index + SlotStore, the
+    node's CPU KV pool) with nothing but a name and a byte budget; dp0's
+    KVManager hands it FlexKV's geometry, adopts the slot counts it plans and
+    spawns the single TE; every other DP attaches to both by name and feeds
+    the TE over its own shm channel with a disjoint graph/op id range. Which
+    server to attach to is the ``server.name`` of a small YAML written per run
+    (FLEXKV_RADIXSHMEM_CONFIG_PATH), which is how a deployment names it too.
   * Phase 1: every DP PUTs its own requests concurrently through the shared TE.
   * Phase 2 (dp_size > 1): dp0 PUTs a prefix that dp1 then finds with
     ``get_match`` -- the shared index is what the radixshmem path exists for.
@@ -46,6 +46,8 @@ from radix_e2e_common import (
     mismatched_blocks,
     start_tp_client,
     stop_tp_client,
+    start_radix_server,
+    stop_radix_server,
     sweep_radix_files,
     wait_kv_manager_ready,
     write_pattern,
@@ -185,8 +187,20 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, config_path: str,
 def _run(dp_size: int) -> dict:
     server_id = f"e2e{dp_size}dp_{os.getpid()}"
     workdir = tempfile.mkdtemp(prefix="flexkv_radix_e2e_")
-    config_path = write_radix_config(workdir, {"cluster": {"cluster_id": server_id},
-                                               "data": {"prefault": False}})
+    name = f"/{server_id}"
+    config_path = write_radix_config(workdir, {"server": {"name": name, "ready_timeout_s": 300}})
+    # The operator's server: a byte budget that holds NUM_CPU_BLOCKS blocks of
+    # this test's model (the DP processes bring the geometry and adopt the count).
+    from flexkv.common.config import CacheConfig, ModelConfig
+    from flexkv.server.shm_radix_bootstrap import cpu_block_bytes
+    block_bytes = cpu_block_bytes(
+        ModelConfig(num_layers=2, num_kv_heads=4, head_size=128, dtype=torch.float16,
+                    tp_size=1, dp_size=dp_size),
+        CacheConfig(tokens_per_block=TOKENS_PER_BLOCK, enable_cpu=True, enable_ssd=False,
+                    num_cpu_blocks=NUM_CPU_BLOCKS))
+    sweep_radix_files(server_id)
+    server = start_radix_server(name, NUM_CPU_BLOCKS * block_bytes,
+                                log_path=os.path.join(workdir, "radix-server.log"))
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(dp_size)
     result_q = ctx.Queue()
@@ -214,6 +228,7 @@ def _run(dp_size: int) -> dict:
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=10)
+        stop_radix_server(server)
         sweep_radix_files(server_id)
         shutil.rmtree(workdir, ignore_errors=True)
     return reports

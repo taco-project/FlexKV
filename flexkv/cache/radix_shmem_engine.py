@@ -2,9 +2,9 @@
 # cython: boundscheck=True, wraparound=True
 """
 The radixshmem CPU tier: one process's `shmradix.RadixClient` on the node's
-radix-server (index shm + SlotStore + RDMA engine, see
-`flexkv.server.shm_radix_bootstrap`). Used only by
-`flexkv.cache.radix_shmem_planner.RadixShmemCacheEngine`.
+radix-server (the operator's process: index shm + SlotStore + RDMA engine; the
+attach and the geometry hand-off are in `flexkv.server.shm_radix_bootstrap`).
+Used only by `flexkv.cache.radix_shmem_planner.RadixShmemCacheEngine`.
 
 Contracts:
 
@@ -147,18 +147,23 @@ class CacheEngineRadixShmem:
     (one per DP scheduler process) share a server and operate concurrently."""
 
     def __init__(self,
-                 shm_name: str,
+                 server_name: str,
                  *,
                  tokens_per_block: int,
                  num_total_blocks: int,
-                 peer_enabled: bool = False,
+                 geometry: Any = None,
+                 peer_enabled: Optional[bool] = None,
                  swa_config: Optional[SWAPoolConfig] = None,
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector=None):
-        """`shm_name` is the base index name (`radix_index_name`); the server
-        must be running or starting. `peer_enabled` only takes effect on a
-        clustered region. `num_total_blocks` is FlexKV's expectation; the
-        region's capacity is authoritative."""
+        """`server_name` is the radix-server's ``--name``; the server is the
+        operator's process, running but not necessarily ready. With
+        `geometry` (FlexKV's `RadixGeometry` or a `shmradix.Geometry`) the
+        attach hands it FlexKV's slot shape (idempotent) and waits for it to
+        come up. `peer_enabled` None = follow the region: peer reuse whenever
+        the server is part of a cluster; False switches it off.
+        `num_total_blocks` is FlexKV's expectation; the region's capacity is
+        authoritative."""
         from flexkv.server.shm_radix_bootstrap import attach_radix_client
 
         self.event_collector = event_collector
@@ -166,10 +171,13 @@ class CacheEngineRadixShmem:
         cpu_swa = swa_config.for_cache_tier(DeviceType.CPU) if swa_config is not None else None
         self.swa_enabled = cpu_swa is not None and cpu_swa.num_slots > 0
 
-        self._client = attach_radix_client(shm_name)
+        self._client = attach_radix_client(server_name, geometry=geometry,
+                                           label="CacheEngineRadixShmem")
         self._tree = self._client  # index ops pass through the client
         self.shm_name = self._client.info.index_name  # node-suffixed when distributed
         self.is_distributed = bool(self._client.is_distributed())
+        if peer_enabled is None:
+            peer_enabled = self.is_distributed
         self.peer_enabled = bool(peer_enabled) and self.is_distributed
         if peer_enabled and not self.is_distributed:
             flexkv_logger.warning(

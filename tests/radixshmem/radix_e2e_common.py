@@ -19,6 +19,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from typing import List, Optional, Tuple
@@ -99,6 +100,44 @@ def write_radix_config(workdir: str, config: dict, name: str = "radixshmem.yaml"
     with open(path, "w") as f:
         yaml.safe_dump(config, f)
     return path
+
+
+def start_radix_server(name: str, data_bytes: int, *, extra_args=(), endpoint: Optional[str] = None,
+                       log_path: Optional[str] = None, timeout: float = 60.0) -> subprocess.Popen:
+    """Start the operator's ``radix-server`` (``python -m shmradix.cli``) and wait
+    for its socket. Nothing model-specific goes on its command line: FlexKV's
+    clients bring the geometry, the server plans the slot counts from
+    ``data_bytes``."""
+    cmd = [sys.executable, "-m", "shmradix.cli", "--name", name, "--data-bytes", str(int(data_bytes)),
+           "--no-prefault", "--interval", "0", *extra_args]
+    if endpoint:
+        cmd += ["--endpoint", endpoint]
+    log = open(log_path, "w") if log_path else subprocess.DEVNULL
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+    if endpoint and endpoint.startswith("unix://"):
+        sock = endpoint[len("unix://"):]
+    else:
+        sock = f"/dev/shm/{name.lstrip('/').replace('/', '_')}.sock"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"radix-server {name} exited with {proc.returncode}"
+                               + (f"; see {log_path}" if log_path else ""))
+        if os.path.exists(sock):
+            return proc
+        time.sleep(0.2)
+    proc.terminate()
+    raise TimeoutError(f"radix-server {name} did not open {sock} within {timeout:.0f}s")
+
+
+def stop_radix_server(proc: Optional[subprocess.Popen]) -> None:
+    if proc is None:
+        return
+    proc.terminate()
+    with contextlib.suppress(Exception):
+        proc.wait(20)
+    if proc.poll() is None:
+        proc.kill()
 
 
 def sweep_radix_files(cluster_id: str) -> None:

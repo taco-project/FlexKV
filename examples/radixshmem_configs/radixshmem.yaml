@@ -1,0 +1,19 @@
+# FlexKV side of radixshmem mode: which radix-server to attach to and the
+# prefetch limits. Every key is at its default; the file is equivalent to not
+# setting FLEXKV_RADIXSHMEM_CONFIG_PATH at all.
+#
+#   export FLEXKV_ENABLE_RADIXSHMEM=1
+#   export FLEXKV_CPU_LAYOUT=BLOCKFIRST
+#   export FLEXKV_RADIXSHMEM_CONFIG_PATH=$PWD/examples/radixshmem_configs/radixshmem.yaml
+#
+# The server itself is the operator's process (radix_server_single_node.sh /
+# radix_server_multi_node.sh). FlexKV hands it the geometry and adopts the slot
+# counts it plans from --data-bytes. Reference: docs/radixshmem/config_zh.md
+server:
+  name: /flexkv          # radix-server --name
+  endpoint: ""           # "" = unix:///dev/shm/flexkv.sock
+  ready_timeout_s: 600   # reachable AND ready (prefault, cluster rendezvous)
+client:
+  prefetch_timeout_ms: 5000
+  prefetch_max_inflight: 128
+  max_outstanding: 256

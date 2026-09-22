@@ -63,9 +63,12 @@ from flexkv.transfer_manager import TransferManagerOnRemote
 
 
 def _radixshmem_distributed() -> bool:
-    """Whether the radixshmem YAML describes a cluster (peer pulls possible)."""
-    from flexkv.common.radixshmem_config import get_radixshmem_config
-    return get_radixshmem_config().distributed
+    """Whether this node's radix-server is part of a cluster (peer pulls
+    possible). The server is the operator's process and knows; every TP rank
+    asks it the same question once it is ready, so the prefetch gate below is
+    the same in all ranks (the PREFETCH_START scatter needs that)."""
+    from flexkv.server.shm_radix_bootstrap import radix_server_is_distributed
+    return radix_server_is_distributed(label="FlexKVConnector")
 
 
 logger = logging.getLogger(__name__)
