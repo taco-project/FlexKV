@@ -86,19 +86,21 @@ FlexKV 交给 server 的几何（`shm_radix_bootstrap.expected_geometry` → `sh
 | `full_slot_bytes` | 按 `StorageEngine` 的 BLOCKFIRST 布局算出的一个 CPU block 字节数（每 PP 段层数 × 节点内 KV head 数 × head_size × kv_dim × dtype × tokens_per_block） |
 | `swa_slot_bytes` / `swa_window_blocks` | `CacheConfig.swa` 开启时：一个 SWA page 的字节数（uint8）与窗口块数；未开启则没有 SWA 池 |
 | `slot_align` | 不超过 4096 且整除每个池 slot 字节数的最大二次幂，保证 SlotStore stride 等于 block 字节数 |
+| `register_chunk_tokens` | 不传（0）：RHT 注册粒度由 server 的 `--register-chunk-tokens` 决定（radixshmem 默认 4096 token）。FlexKV 不再有自己的 4096 常量，attach 后采纳 server 发布的值，并按 radixshmem 的规则换算成 block 数（`tokens // tokens_per_block`，至少 1）：`adopt_geometry` 返回的 `register_chunk_tokens` / `register_chunk_blocks`，`CacheEngineRadixShmem` 的同名属性。`RadixGeometry.register_chunk_tokens` 非 0 时原样交给 server（pin） |
 
 server 收到几何后的规划（radixshmem 的规则）：`swa_slots = floor(swa_ratio × data_bytes / swa_stride)`，
 `full_slots = (data_bytes − SWA 占用) / full_stride`。任一池算出 0 个 slot、模型有 SWA 而 `--swa-ratio` 为 0，
 都在 configure 时拒绝，FlexKV 报 `cannot serve FlexKV's geometry`。
 
 **采纳**：attach 成功后 `adopt_geometry` 把 `pools.full.num_slots` 写进 `CacheConfig.num_cpu_blocks`，
-`pools.swa.num_slots` 写进 `CacheConfig.swa.num_slots`，日志形如
-`adopted radix-server /flexkv's slot counts: FULL 8605 slots (cpu_cache_gb had given 1524), SWA 1024 slots`。
+`pools.swa.num_slots` 写进 `CacheConfig.swa.num_slots`，并带回 server 的 `register_chunk_tokens` 及其 block 数，日志形如
+`adopted radix-server /flexkv's geometry: FULL 8605 slots (cpu_cache_gb had given 1524), SWA 1024 slots (had 1024); RHT registration chunk 4096 tokens = 64 blocks`。
 之后 TE 的 StorageEngine、cache engine、指标都用采纳后的值。
 
 **校验**：每个 attach 方（KVManager、cache engine、TE）用 `check_geometry` 复核 server 发布的
 `block_size`、各池 `slot_bytes`、SlotStore stride、SWA 窗口与自己的布局一致，不一致报错退出，不会静默错位传输。
-slot 数不在校验范围内，它们是 server 的。
+slot 数不在校验范围内，它们是 server 的；`register_chunk_tokens` 只在 FlexKV pin 了值时比对，server 的值不是
+`tokens_per_block` 的整数倍时只告警（chunk 取整到整 block）。
 
 **同一 server 上的多个 client** 必须带相同的几何：相同模型、page size、SWA 配置。第二个不同的几何被 server 以
 `GeometryMismatch` 拒绝，FlexKV 报 `already serves another geometry`。单机下 TP 不同的同一模型通常几何相同
@@ -136,7 +138,7 @@ radix-server --name /flexkv --data-bytes 64G --swa-ratio 0.5 \
   --transfer-dev mlx5_1 --transfer-dev mlx5_2 --bootstrap-timeout 600
 ```
 
-集群一致的几何字段（`block_size`、池集合、每池 `slot_bytes`、SWA 窗口、`slot_align`）由第一个拿到几何的节点发布到
+集群一致的几何字段（`block_size`、池集合、每池 `slot_bytes`、SWA 窗口、`slot_align`、`register_chunk_tokens`）由第一个拿到几何的节点发布到
 etcd `radix/<cluster_id>/geometry/<node>`，其余 `waiting` 的节点采纳；各节点的 slot 数可以不同（预算可以不同）。
 FlexKV 侧每个节点同一份 YAML 即可。`ready_timeout_s` 要不小于 `--bootstrap-timeout`。
 
@@ -196,7 +198,8 @@ server 一直在等几何或配置失败报 `not ready within ...`（带 server 
 | `cluster.index_dev` / `gid_idx` / `rht_transport` / `peer_index_transport` / `remote_op_transport` / `zmq_listen_port` | 同名 `--index-dev` 等 |
 | `data.transfer_devices` / `transfer_protocol` / `transfer_ip` / `transfer_port` / `transfer_metadata` | `--transfer-dev`（可重复）/ `--transfer-protocol` / `--transfer-ip` / `--transfer-port` / `--transfer-metadata` |
 | `data.prefault` / `max_inflight` / `max_pending_jobs` / `job_ttl_s` | `--no-prefault` / `--max-inflight` / `--max-pending-jobs` / `--job-ttl` |
-| `index.data_pool_ratio` / `background_evict_ratio` / `max_nodes` / `register_chunk_size` | `--data-pool-ratio` / `--background-evict-ratio` / `--max-nodes` / `--register-chunk-tokens`（按 token 数） |
+| `index.data_pool_ratio` / `background_evict_ratio` / `max_nodes` | `--data-pool-ratio` / `--background-evict-ratio` / `--max-nodes` |
+| `index.register_chunk_size`（block 数；FlexKV 曾固定按 4096 token 换算） | `--register-chunk-tokens`（token 数，默认 4096）；FlexKV 采纳 server 的值，见第 3 节 |
 | `server.endpoint` | 保留：server 的 `--endpoint` 与 YAML `server.endpoint` 各写一次 |
 | `server.rpc_workers` / `hugepage_path` | `--rpc-workers` / `--hugepage-path` |
 | （由 FlexKV 推导的 slot 数、`data_bytes`） | slot 数由 `--data-bytes` 和 `--swa-ratio` 决定，FlexKV 采纳 |
