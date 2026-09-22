@@ -756,6 +756,51 @@ def test_attach_retries_only_while_nothing_answers(env, monkeypatch):
     assert len(calls) >= 2                                   # retried until the deadline
 
 
+def test_attach_retries_a_peer_rht_shard_that_is_not_up_yet(env, monkeypatch):
+    """Right after a cluster rendezvous a peer's RHT holder may refuse the RDMA
+    connect; radixshmem raises 'RhtConsumer: failed to connect RHT holder' from
+    the index attach. attach_radix_client retries that until the deadline and
+    still raises other index errors at once."""
+    class _Fake:
+        def __init__(self, failures, error="RhtConsumer: failed to connect RHT holder"):
+            self.failures, self.error, self.closed = failures, error, False
+            self.info = SimpleNamespace(mode="ready", index_name="/x", rank=0, world_size=2,
+                                        data_plane=True, geometry=None, last_error="")
+            self.name = "/x"
+
+        def wait_ready(self, timeout_s):
+            return self.info
+
+        @property
+        def index(self):
+            if self.failures > 0:
+                self.failures -= 1
+                raise RuntimeError(self.error)
+            return object()
+
+        def close(self):
+            self.closed = True
+
+    fakes = []
+
+    def _ctor(name, spec, max_outstanding=256):
+        fakes.append(_Fake(fakes and fakes[-1].failures or 2))   # first client: 2 failures, then ok
+        return fakes[-1]
+
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda s: None)
+    monkeypatch.setattr(shmradix, "RadixClient", _ctor)
+    client = bootstrap.attach_radix_client("/x", timeout_s=60, attach_index=True)
+    assert client is fakes[0] and fakes[0].failures == 0 and not fakes[0].closed
+    fakes.clear()
+    monkeypatch.setattr(shmradix, "RadixClient", lambda *a, **k: _Fake(1, "index/store/geometry mismatch: x"))
+    with pytest.raises(RuntimeError, match="attaching the index failed"):
+        bootstrap.attach_radix_client("/x", timeout_s=60, attach_index=True)
+    # without attach_index the index is left alone (info-only callers open no RDMA state)
+    fakes.clear()
+    monkeypatch.setattr(shmradix, "RadixClient", lambda *a, **k: _Fake(5))
+    assert bootstrap.attach_radix_client("/x", timeout_s=60).failures == 5
+
+
 def test_unconfigured_server_answers_the_cluster_question(env):
     """`radix_server_is_distributed` brings the geometry, so a server nobody
     configured yet answers instead of timing out; a geometry-less attach on

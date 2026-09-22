@@ -439,7 +439,8 @@ class TransferManager:
             from flexkv.server.shm_radix_bootstrap import (adopt_geometry, attach_radix_client,
                                                            check_geometry, expected_geometry)
             geometry = expected_geometry(self.model_config, self.cache_config)
-            radix_client = attach_radix_client(geometry=geometry, label="TransferManager")
+            radix_client = attach_radix_client(geometry=geometry, attach_index=True,
+                                               label="TransferManager")
             check_geometry(radix_client, geometry, label="TransferManager")
             adopt_geometry(self.cache_config, radix_client, label="TransferManager")
             self._radix_client = radix_client
