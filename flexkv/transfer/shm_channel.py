@@ -130,20 +130,44 @@ _FRAG_HDR_SIZE = _FRAG_HDR.size  # 5
 _COMPLETED_OP = struct.Struct("<qqBIQBddd")
 COMPLETED_OP_WIRE_SIZE = _COMPLETED_OP.size
 
-# transfer_type frozen as a byte index; 0xFF = None (VIRTUAL ops).
+# transfer_type frozen as a byte index; 0xFF = None (VIRTUAL ops). Every
+# TransferType value must be here (tests/test_shm_channel.py checks): the TE
+# sends `op.transfer_type.value` for each completed op. Append only, the index
+# is the wire format.
 _TT_NONE = 0xFF
 _TT_NAMES = (
     "H2D", "D2H", "DISK2H", "H2DISK", "DISK2D", "D2DISK",
     "REMOTE2H", "H2REMOTE", "PEERH2H", "H2PEERH", "PEERSSD2H", "H2PEERSSD",
-    "VIRTUAL",
+    "VIRTUAL", "LAYERWISE",
 )
 _TT_NAME_TO_IDX = {name: i for i, name in enumerate(_TT_NAMES)}
+_tt_unknown_warned: set = set()
+
+
+def transfer_type_index(tt: Any) -> int:
+    """Wire index of a CompletedOp.transfer_type (a TransferType value, the
+    member itself, or None). A name the table does not know goes out as None
+    with one warning per name: the CE loses that op's type attribution, which
+    beats a KeyError in the TE's result thread that would stop every
+    completion on the node."""
+    if tt is None:
+        return _TT_NONE
+    key = getattr(tt, "value", tt)
+    idx = _TT_NAME_TO_IDX.get(key)
+    if idx is None:
+        if key not in _tt_unknown_warned:
+            _tt_unknown_warned.add(key)
+            from flexkv.common.debug import flexkv_logger
+            flexkv_logger.warning(
+                f"shm channel: transfer type {key!r} has no wire index; it is sent as "
+                f"None (add it to shm_channel._TT_NAMES)")
+        return _TT_NONE
+    return idx
 
 
 def encode_completed_op(op: Any) -> bytes:
     """Pack a CompletedOp into its fixed-width record."""
-    tt = op.transfer_type
-    tt_idx = _TT_NONE if tt is None else _TT_NAME_TO_IDX[tt]
+    tt_idx = transfer_type_index(op.transfer_type)
     flags = 1 if getattr(op, "failed", False) else 0
     return _COMPLETED_OP.pack(
         op.graph_id, op.op_id, tt_idx, op.num_blocks, op.num_bytes, flags,
@@ -158,7 +182,7 @@ def decode_completed_op(buf: Any, off: int) -> Any:
     from flexkv.common.transfer import CompletedOp
     graph_id, op_id, tt_idx, num_blocks, num_bytes, flags, wait_ms, xfer_ms, e2e_ms = \
         _COMPLETED_OP.unpack_from(buf, off)
-    tt = None if tt_idx == _TT_NONE else _TT_NAMES[tt_idx]
+    tt = None if tt_idx == _TT_NONE or tt_idx >= len(_TT_NAMES) else _TT_NAMES[tt_idx]
     return CompletedOp(
         graph_id=graph_id,
         op_id=op_id,
@@ -415,9 +439,18 @@ class ShmChannel:
                                         off + _FRAG_HDR_SIZE + n]))
             rp = (rp + 1) & (slots - 1)
             if is_last:
-                out.append(pickle.loads(b"".join(frags)))
+                payload = b"".join(frags)
                 frags.clear()
-                self._submit_r.value = rp  # release this message's slots
+                self._submit_r.value = rp  # release this message's slots (payload is a copy)
+                try:
+                    out.append(pickle.loads(payload))
+                except Exception as e:  # noqa: BLE001 - a record we cannot decode
+                    # Dropping it costs the sender one task; keeping it would
+                    # re-raise on every poll and stall the whole ring.
+                    from flexkv.common.debug import flexkv_logger
+                    flexkv_logger.error(
+                        f"shm channel {self.channel_id}: dropping an undecodable "
+                        f"{len(payload)}-byte submit record ({e!r})")
         return out
 
     def result_send(self, ops: List[Any]) -> None:

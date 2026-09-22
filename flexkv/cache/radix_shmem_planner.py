@@ -510,73 +510,97 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             return _release_match()
 
         swa_new: Optional[np.ndarray] = None
-        if self.swa_op_constructor.enabled:
-            k = min(block_mask_end, self.cache_config.swa.window_blocks)
-            swa_take = cpu_engine.take(num_required_blocks=k, component=COMPONENT_SWA)
-            if len(swa_take) == k:
-                swa_new = swa_take
-            else:
-                # All-or-none contract says this is empty; recycle defensively
-                # in case it ever is not.
-                cpu_engine.recycle(swa_take, component=COMPONENT_SWA)
-                flexkv_logger.warning(
-                    f"radixshmem PUT {request_id}: no {k}-slot SWA window "
-                    f"available; storing Full KV only"
-                )
+        try:
+            if self.swa_op_constructor.enabled:
+                k = min(block_mask_end, self.cache_config.swa.window_blocks)
+                swa_take = cpu_engine.take(num_required_blocks=k, component=COMPONENT_SWA)
+                if len(swa_take) == k:
+                    swa_new = swa_take
+                else:
+                    # All-or-none contract says this is empty; recycle defensively
+                    # in case it ever is not.
+                    cpu_engine.recycle(swa_take, component=COMPONENT_SWA)
+                    flexkv_logger.warning(
+                        f"radixshmem PUT {request_id}: no {k}-slot SWA window "
+                        f"available; storing Full KV only"
+                    )
 
-        transfer_graph = TransferOpGraph()
-        finished_ops_ids: List[int] = []
+            transfer_graph = TransferOpGraph()
+            finished_ops_ids: List[int] = []
 
-        fragment_gpu_blocks = gpu_block_ids[num_skipped:]
-        op_d2h = TransferOp(
-            graph_id=transfer_graph.graph_id,
-            transfer_type=TransferType.D2H,
-            src_block_ids=fragment_gpu_blocks,
-            dst_block_ids=cpu_new,
-            dp_client_id=dp_client_id,
-        )
-        transfer_graph.add_transfer_op(op_d2h)
-        finished_ops_ids.append(op_d2h.op_id)
-
-        if swa_new is not None:
-            swa_ops = self.swa_op_constructor.build_put_chain(
-                transfer_graph,
-                gpu_slot_ids=np.zeros(len(swa_new), dtype=np.int64),
-                cpu_slot_ids=swa_new,
+            fragment_gpu_blocks = gpu_block_ids[num_skipped:]
+            op_d2h = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=TransferType.D2H,
+                src_block_ids=fragment_gpu_blocks,
+                dst_block_ids=cpu_new,
                 dp_client_id=dp_client_id,
-                return_op_ids=True,
             )
-            assert swa_ops.d2h_id is not None
-            finished_ops_ids.append(swa_ops.d2h_id)
+            transfer_graph.add_transfer_op(op_d2h)
+            finished_ops_ids.append(op_d2h.op_id)
 
-        on_complete: List[Action] = []
-        on_abort: List[Action] = []
+            if swa_new is not None:
+                swa_ops = self.swa_op_constructor.build_put_chain(
+                    transfer_graph,
+                    gpu_slot_ids=np.zeros(len(swa_new), dtype=np.int64),
+                    cpu_slot_ids=swa_new,
+                    dp_client_id=dp_client_id,
+                    return_op_ids=True,
+                )
+                assert swa_ops.d2h_id is not None
+                finished_ops_ids.append(swa_ops.d2h_id)
 
-        def _arm(slots: np.ndarray, hold: Optional[Action], label: str,
-                 component=COMPONENT_FULL) -> None:
-            staged = StagedRadixInsert(engine=cpu_engine,
-                                       sequence_meta=sequence_meta,
-                                       slots=slots,
-                                       path_end=block_mask_end,
-                                       label=label,
-                                       holds=[] if hold is None else [hold],
-                                       component=component)
-            on_complete.append(staged.publish)
-            on_abort.append(staged.abort)
+            on_complete: List[Action] = []
+            on_abort: List[Action] = []
 
-        # The match pin travels with the LAST publish: SWA's insert refuses paths
-        # the Full tree does not reach yet, so it runs after FULL and releases.
-        _arm(cpu_new, cpu_match.release if swa_new is None else None,
-             f"PUT {request_id} CPU")
-        if swa_new is not None:
-            _arm(swa_new, cpu_match.release, f"PUT {request_id} CPU SWA",
-                 component=COMPONENT_SWA)
+            def _arm(slots: np.ndarray, hold: Optional[Action], label: str,
+                     component=COMPONENT_FULL) -> None:
+                staged = StagedRadixInsert(engine=cpu_engine,
+                                           sequence_meta=sequence_meta,
+                                           slots=slots,
+                                           path_end=block_mask_end,
+                                           label=label,
+                                           holds=[] if hold is None else [hold],
+                                           component=component)
+                on_complete.append(staged.publish)
+                on_abort.append(staged.abort)
 
-        return RadixPutPlan(
-            transfer_graph=transfer_graph,
-            finished_ops_ids=finished_ops_ids,
-            num_gpu_blocks_to_transfer=len(fragment_gpu_blocks),
-            skipped_gpu_blocks=num_skipped,
-            on_complete=on_complete,
-            on_abort=on_abort,
-        )
+            # The match pin travels with the LAST publish: SWA's insert refuses paths
+            # the Full tree does not reach yet, so it runs after FULL and releases.
+            _arm(cpu_new, cpu_match.release if swa_new is None else None,
+                 f"PUT {request_id} CPU")
+            if swa_new is not None:
+                _arm(swa_new, cpu_match.release, f"PUT {request_id} CPU SWA",
+                     component=COMPONENT_SWA)
+
+            return RadixPutPlan(
+                transfer_graph=transfer_graph,
+                finished_ops_ids=finished_ops_ids,
+                num_gpu_blocks_to_transfer=len(fragment_gpu_blocks),
+                skipped_gpu_blocks=num_skipped,
+                on_complete=on_complete,
+                on_abort=on_abort,
+            )
+        except BaseException:
+            # Planning failed after slots were taken and before any handle could
+            # own them: hand them back, drop the match pin, then re-raise. (A
+            # StagedRadixInsert armed above is garbage now; nothing calls it.)
+            for slots, comp in ((cpu_new, COMPONENT_FULL), (swa_new, COMPONENT_SWA)):
+                if slots is None or len(slots) == 0:
+                    continue
+                try:
+                    if comp == COMPONENT_FULL:
+                        cpu_engine.recycle(slots)
+                    else:
+                        cpu_engine.recycle(slots, component=comp)
+                except Exception as e:  # noqa: BLE001 - report, keep unwinding
+                    flexkv_logger.error(
+                        f"radixshmem PUT {request_id}: could not return {len(slots)} "
+                        f"{comp} slots after a planning failure: {e!r}")
+            try:
+                cpu_match.release()
+            except Exception as e:  # noqa: BLE001
+                flexkv_logger.error(
+                    f"radixshmem PUT {request_id}: could not release the match pin "
+                    f"after a planning failure: {e!r}")
+            raise

@@ -41,10 +41,15 @@ def hash_array_with_prefix(array: np.ndarray, prefix: int) -> HashType:
     return HashType(_HASHER.digest())
 
 def gen_hashes(token_ids: np.ndarray, tokens_per_block: int, hasher: Optional[Hasher] = None) -> np.ndarray:
+    token_ids = np.ascontiguousarray(token_ids)
+    if token_ids.dtype != np.int64:
+        # The hash covers the 8-byte token words; another width would be
+        # reinterpreted, not converted. Same contract as the torch path had.
+        raise TypeError(f"gen_hashes: token_ids must be int64, got {token_ids.dtype}")
     block_hashes = np.zeros(token_ids.size // tokens_per_block, dtype=np.uint64)
     if hasher is None:
         hasher = Hasher()
-    c_ext.gen_hashes_numpy(hasher.hasher, np.ascontiguousarray(token_ids), tokens_per_block, block_hashes)
+    c_ext.gen_hashes_numpy(hasher.hasher, token_ids, tokens_per_block, block_hashes)
     return block_hashes
 
 if __name__ == "__main__":

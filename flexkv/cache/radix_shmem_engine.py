@@ -358,14 +358,38 @@ class CacheEngineRadixShmem:
              component: shmradix.ComponentType = COMPONENT_FULL) -> np.ndarray:
         """Allocate up to `num_required_blocks` slots, evicting unpinned LRU
         blocks as needed; fewer come back when the pool cannot supply them
-        (the SWA pool is all-or-none)."""
-        slots = np.asarray(self._tree.allocate_slots(num_required_blocks,
-                                                     component=component),
-                           dtype=np.int64)
+        (the SWA pool is all-or-none). A request above the pool's size is
+        clamped to it: radixshmem refuses such a request outright
+        (`allocate_slots` raises), and a refusal here would leak whatever the
+        caller took before."""
+        total = self._pool_total(component)
+        n = int(num_required_blocks)
+        if total is not None and n > total:
+            n = total
+        if n <= 0:
+            return _empty_i64()
+        try:
+            slots = np.asarray(self._tree.allocate_slots(n, component=component),
+                               dtype=np.int64)
+        except ValueError as e:
+            # Refused by the index (component not enabled, pool gone): nothing
+            # was allocated, so an empty answer is the truthful one.
+            flexkv_logger.warning(
+                f"radix-server {self.shm_name} refused a {n}-slot {component} "
+                f"allocation: {e}")
+            return _empty_i64()
         if (self._metrics_collector is not None and len(slots) > 0
                 and component == COMPONENT_FULL):  # SWA has its own pool
             self._metrics_collector.record_allocation("cpu", len(slots))
         return slots
+
+    def _pool_total(self, component: shmradix.ComponentType) -> Optional[int]:
+        """Slots in `component`'s pool, None when the index has no such pool."""
+        if component == COMPONENT_FULL:
+            return int(self._tree.mempool_total())
+        if component == COMPONENT_SWA:
+            return int(self._tree.swa_mempool_total())
+        return None
 
     def recycle(self,
                 physical_blocks: np.ndarray,
