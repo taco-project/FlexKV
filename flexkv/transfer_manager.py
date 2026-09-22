@@ -1557,107 +1557,6 @@ class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
         flexkv_logger.info("TransferManagerMultiNodeHandle shutdown complete")
 
 
-def shm_te_clears_cuda_visible_devices(cvd: Optional[str], gpus_needed: int) -> bool:
-    """Whether TransferManagerShmTEProcess drops CUDA_VISIBLE_DEVICES for the TE.
-
-    The TE opens every registered GPU buffer with cudaIpcOpenMemHandle, so it
-    must number the devices exactly as the workers did when they registered:
-
-    * one CUDA_VISIBLE_DEVICES for the whole engine (sglang, single-GPU vLLM):
-      the workers register logical ids inside that namespace, so the TE has to
-      INHERIT it. Clearing it renumbers the devices and puts the TE on the wrong
-      physical GPUs (or, on one GPU, fails with "device >= 0 && device < num_gpus").
-    * one CUDA_VISIBLE_DEVICES per DP rank (vLLM DP, each rank pinned to its own
-      device): the parent sees fewer GPUs than this node's TE has to reach, and
-      the ids the workers registered are physical. Only then is it cleared.
-    """
-    if cvd is None:
-        return False
-    visible = len([d for d in cvd.split(",") if d.strip()])
-    return visible < gpus_needed
-
-
-class TransferManagerShmTEProcess:
-    """Spawns the single TE subprocess for the multi-DP shm path.
-
-    The bootstrap (instance 0, dp 0) creates this; CEs in other DP processes
-    just connect via `TransferManagerHandle(mode="shm", shm_server_id=...,
-    shm_channel_id=...)`.
-    """
-
-    def __init__(self,
-                 model_config: ModelConfig,
-                 cache_config: CacheConfig,
-                 gpu_register_port: str,
-                 server_id: str,
-                 num_channels: int):
-        self.model_config = model_config
-        self.cache_config = cache_config
-        self.gpu_register_port = gpu_register_port
-        self.server_id = server_id
-        self.num_channels = num_channels
-
-        self.mp_ctx = mp.get_context("spawn")
-        self._start_event = self.mp_ctx.Event()
-        self._ready_event = self.mp_ctx.Event()
-        self._stop_event = self.mp_ctx.Event()
-        self.process: Optional[Process] = None
-
-    def start(self) -> None:
-        if self.process is not None and self.process.is_alive():
-            return
-        from flexkv.transfer.shm_channel_handle import te_shm_main
-        # mp.Process(spawn) inherits the parent's env. The TE keeps the parent's
-        # CUDA_VISIBLE_DEVICES whenever that namespace covers the GPUs it serves
-        # (the workers registered ids inside it); it is cleared only when the
-        # parent is pinned to fewer GPUs than the node's TE must reach. See
-        # shm_te_clears_cuda_visible_devices. Pop / restore around .start().
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-        gpus_needed = self.model_config.instance_num * self.model_config.gpus_per_node
-        clear_cvd = shm_te_clears_cuda_visible_devices(cvd, gpus_needed)
-        if cvd is not None:
-            flexkv_logger.info(
-                f"TransferManagerShmTEProcess: parent CUDA_VISIBLE_DEVICES={cvd!r}, "
-                f"TE serves {gpus_needed} GPU(s) on this node -> "
-                f"{'clearing it for the TE (per-rank pinned layout)' if clear_cvd else 'the TE inherits it'}")
-        _saved_cuda = os.environ.pop("CUDA_VISIBLE_DEVICES", None) if clear_cvd else None
-        try:
-            self.process = self.mp_ctx.Process(
-                target=te_shm_main,
-                args=(self.model_config,
-                      self.cache_config,
-                      self.gpu_register_port,
-                      self.server_id,
-                      self.num_channels,
-                      self._start_event,
-                      self._ready_event,
-                      self._stop_event),
-                daemon=False,
-            )
-            self.process.start()
-        finally:
-            if _saved_cuda is not None:
-                os.environ["CUDA_VISIBLE_DEVICES"] = _saved_cuda
-        self._start_event.wait()
-        flexkv_logger.info(
-            f"TransferManagerShmTEProcess started, PID={self.process.pid}, "
-            f"server_id={self.server_id}, channels={self.num_channels}"
-        )
-
-    def is_ready(self) -> bool:
-        return self._ready_event.is_set()
-
-    def shutdown(self, timeout: float = 5.0) -> None:
-        if self.process is None:
-            return
-        self._stop_event.set()
-        self.process.join(timeout=timeout)
-        if self.process.is_alive():
-            self.process.terminate()
-            self.process.join()
-        self.process = None
-
-
 class TransferManagerHandle:
     def __init__(self,
                  model_config: ModelConfig,
@@ -1686,22 +1585,8 @@ class TransferManagerHandle:
             self._handle: TransferManagerHandleBase = TransferManagerMultiNodeHandle(
                 model_config, cache_config, gpu_register_port, master_host, master_ports
             )
-        elif mode == "shm":
-            # Multi-DP path: each CE process gets a dedicated ShmChannel to a
-            # single TE subprocess. The TE is created by the bootstrap process
-            # via TransferManagerShmTEProcess; clients attach by server_id.
-            from flexkv.transfer.shm_channel_handle import (
-                TransferManagerShmChannelHandle,
-            )
-            server_id = kwargs["shm_server_id"]
-            channel_id = kwargs["shm_channel_id"]
-            self._handle: TransferManagerHandleBase = TransferManagerShmChannelHandle(
-                model_config, cache_config, server_id, channel_id
-            )
         else:
-            raise ValueError(
-                f"Invalid mode: {mode}, must be process, thread, remote, or shm"
-            )
+            raise ValueError(f"Invalid mode: {mode}, must be process, thread or remote")
 
     def start(self) -> None:
         self._handle.start()

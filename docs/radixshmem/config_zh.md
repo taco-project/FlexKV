@@ -22,13 +22,13 @@ radixshmem 侧的接口见 radixshmem 仓库 `python/README.md`。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `FLEXKV_ENABLE_RADIXSHMEM` | `0` | 模式总开关。`1` 时 CPU 层由 radixshmem 承担，KVServer 不启动，每个 DP 进程各建一个 KVTaskEngine 并 attach 同一个 radix-server。在 `flexkv` 首次 import 前设置。 |
+| `FLEXKV_ENABLE_RADIXSHMEM` | `0` | 模式总开关。`1` 时 CPU 层由 radixshmem 承担。进程模型沿用 FlexKV 原有的：`dp_size=1` 且单实例时 KVTaskEngine 在引擎进程内并自带 TE 子进程；`dp_size>1` 或多实例时走 server-client 模式，每节点一个 KVServer，其中的 KVTaskEngine 和 TE attach radix-server。在 `flexkv` 首次 import 前设置。 |
 | `FLEXKV_RADIXSHMEM_CONFIG_PATH` | 空 | 第 2 节 YAML 的路径。为空时全部取默认值：attach 本机 `radix-server --name /flexkv`。 |
 
 另有两个 FlexKV 通用变量在该模式下有约束：
 
 - `FLEXKV_CPU_LAYOUT` 必须是 `BLOCKFIRST`。一个 SlotStore slot 就是一个连续的 CPU block，LAYERFIRST 给不出这个布局。
-- `FLEXKV_INSTANCE_NUM` / `FLEXKV_INSTANCE_ID`：同一节点上多个推理引擎共享同一个 radix-server 和同一个 TE 时用来区分实例（第 4.4 节）。
+- `FLEXKV_INSTANCE_NUM` / `FLEXKV_INSTANCE_ID`：同一节点上多个推理引擎共享同一个 radix-server 时用来区分实例，语义与 FlexKV 原有的多实例模式相同（第 4.4 节）。
 
 该模式与 `enable_ssd`、`enable_remote` 互斥，启动时报错。`enable_p2p_cpu` / `enable_p2p_ssd` 也必须为 False：
 跨节点复用由 radix-server 自己完成（etcd + RDMA），在它以集群参数启动时自动开启，不经过 FlexKV 的 Redis P2P 路径。
@@ -46,7 +46,7 @@ radixshmem 侧的接口见 radixshmem 仓库 `python/README.md`。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `name` | `/flexkv` | `radix-server --name`，即索引 shm 名。以 `/` 开头。也派生默认 socket 和 FlexKV 自己的 TE channel 前缀（第 5 节）。 |
+| `name` | `/flexkv` | `radix-server --name`，即索引 shm 名。以 `/` 开头。也派生默认 socket（第 5 节）。 |
 | `endpoint` | 空 | gRPC 端点。空为 `unix:///dev/shm/<name>.sock`；server 以 `--endpoint` 改成 TCP 或别的路径时这里写同一个值。 |
 | `ready_timeout_s` | `600` | 一个 FlexKV 进程等 server **可达且 ready** 的总时长。覆盖运维晚起 server、SlotStore prefault、集群 rendezvous（server 的 `--bootstrap-timeout`）。超时报错并给出启动命令。 |
 
@@ -55,7 +55,7 @@ radixshmem 侧的接口见 radixshmem 仓库 `python/README.md`。
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `prefetch_timeout_ms` | `5000` | 一次 prefetch 拉取的服务端超时。到期后 job 以本地命中的部分完成。 |
-| `prefetch_max_inflight` | `128` | 每个 DP 进程在飞的 peer 拉取上限，达到后新的 prefetch 跳过 peer 查询。需小于 `max_outstanding`。 |
+| `prefetch_max_inflight` | `128` | 每个 KVTaskEngine 在飞的 peer 拉取上限，达到后新的 prefetch 跳过 peer 查询。需小于 `max_outstanding`。 |
 | `max_outstanding` | `256` | `RadixClient` 未领取 job 的上限。 |
 
 ### 2.3 不再接受的段
@@ -92,12 +92,12 @@ server 收到几何后的规划（radixshmem 的规则）：`swa_slots = floor(s
 `full_slots = (data_bytes − SWA 占用) / full_stride`。任一池算出 0 个 slot、模型有 SWA 而 `--swa-ratio` 为 0，
 都在 configure 时拒绝，FlexKV 报 `cannot serve FlexKV's geometry`。
 
-**采纳**：attach 成功后 `adopt_geometry` 把 `pools.full.num_slots` 写进 `CacheConfig.num_cpu_blocks`，
+**采纳**：attach 成功后 `adopt_geometry`（KVManager 和 KVTaskEngine 通过 `adopt_radix_server` 调用）把 `pools.full.num_slots` 写进 `CacheConfig.num_cpu_blocks`，
 `pools.swa.num_slots` 写进 `CacheConfig.swa.num_slots`，并带回 server 的 `register_chunk_tokens` 及其 block 数，日志形如
 `adopted radix-server /flexkv's geometry: FULL 8605 slots (cpu_cache_gb had given 1524), SWA 1024 slots (had 1024); RHT registration chunk 4096 tokens = 64 blocks`。
 之后 TE 的 StorageEngine、cache engine、指标都用采纳后的值。
 
-**校验**：每个 attach 方（KVManager、cache engine、TE）用 `check_geometry` 复核 server 发布的
+**校验**：每个 attach 方（KVManager、KVTaskEngine、cache engine、TE）用 `check_geometry` 复核 server 发布的
 `block_size`、各池 `slot_bytes`、SlotStore stride、SWA 窗口与自己的布局一致，不一致报错退出，不会静默错位传输。
 slot 数不在校验范围内，它们是 server 的；`register_chunk_tokens` 只在 FlexKV pin 了值时比对，server 的值不是
 `tokens_per_block` 的整数倍时只告警（chunk 取整到整 block）。
@@ -150,14 +150,16 @@ FlexKV 侧每个节点同一份 YAML 即可。`ready_timeout_s` 要不小于 `--
 
 ### 4.4 一节点多引擎共享一个 server
 
-两个独立的推理引擎（各自的 FlexKV、各自的 GPU）attach 同一个 radix-server，互相命中对方存的 KV：
+两个独立的推理引擎（各自的 FlexKV、各自的 GPU）attach 同一个 radix-server，互相命中对方存的 KV。这就是 FlexKV
+原有的多实例模式：
 
 ```bash
 # 引擎 A                                      # 引擎 B
 FLEXKV_INSTANCE_NUM=2 FLEXKV_INSTANCE_ID=0    FLEXKV_INSTANCE_NUM=2 FLEXKV_INSTANCE_ID=1
 ```
 
-同一份 YAML。`instance 0` 的 dp0 拉起本节点唯一的 TE（`channels = instance_num × dp_size`），TE 等到
+同一份 YAML。`instance_num > 1` 自动进入 server-client 模式：`instance 0` 的 dp0 内嵌本节点唯一的 KVServer（或者用
+`FLEXKV_SERVER_LAUNCH_MODE=external` 单独启动它），KVServer 里的 KVTaskEngine attach radix-server，它的 TE 等到
 `instance_num × gpus_per_node` 张 GPU 都注册才 ready，所以两个引擎都要启动。两边模型 / page size / SWA 配置必须相同
 （第 3 节）。node-local DP（多机 DP attention）路径下 `local_dp_client_id` 不带 instance，多实例暂不支持。
 
@@ -171,7 +173,6 @@ FLEXKV_INSTANCE_NUM=2 FLEXKV_INSTANCE_ID=0    FLEXKV_INSTANCE_NUM=2 FLEXKV_INSTA
 | SlotStore shm | `<name>_data`（`--data-name` 可改） |
 | gRPC socket | `/dev/shm/<name>.sock`（`--endpoint` 可改；YAML `server.endpoint` 跟着改） |
 | etcd 键空间 | `radix/<cluster_id>/...` |
-| FlexKV TE channel / ctrl | `/dev/shm/flexkv_te_ch_<te_server_id>_<k>`、`flexkv_te_ctrl_<te_server_id>`，`te_server_id` = `name` 去掉开头的 `/`（`/` 换成 `_`） |
 
 ---
 

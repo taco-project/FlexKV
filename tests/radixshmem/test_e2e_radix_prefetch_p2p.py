@@ -113,8 +113,7 @@ def _node_proc(rank, gpu_id, cluster_id, config_path,
     # addressing it as device 0.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     node_name = _node_name(rank)
-    # FlexKV's own IPC names are per node too (its radix regions get the
-    # node name appended through the same override).
+    # FlexKV's own IPC names are per node too.
     recv_port = f"ipc:///tmp/flexkv_{cluster_id}_{node_name}"
     os.environ.update({
         "FLEXKV_ENABLE_RADIXSHMEM": "1",
@@ -142,8 +141,8 @@ def _node_proc(rank, gpu_id, cluster_id, config_path,
         tokens_per_block=TOKENS_PER_BLOCK,
         enable_cpu=True, enable_ssd=False, enable_remote=False,
         num_cpu_blocks=NUM_CPU_BLOCKS,
-        # Peer reuse follows the radixshmem YAML (expected_min_nodes=2 below),
-        # not enable_p2p_cpu.
+        # Peer reuse follows the radix-server (started with cluster flags
+        # below), not enable_p2p_cpu.
     )
 
     report = {"rank": rank}
