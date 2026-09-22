@@ -185,6 +185,12 @@ class ModelConfig:
     # and token_size_in_bytes/num_cpu_blocks are computed by summing across groups.
     layer_groups: Optional[List[LayerGroupSpec]] = None
 
+    # SGLang DP-Attention node-local width. Set when every DP group lives on
+    # one node, which makes FlexKV form one instance per node instead of one
+    # spanning the cluster (FlexKVConfig.get_sglang_node_local_dp_size).
+    # None keeps the cross-node path.
+    local_dp_size: Optional[int] = None
+
     # ------------------------------------------------------------------
     # Freeze mechanism: after post_init, ModelConfig must not be mutated
     # ------------------------------------------------------------------
@@ -207,6 +213,24 @@ class ModelConfig:
                 f"[ModelConfig] cannot derive gpus_per_node: "
                 f"total_gpus={self.total_gpus} not divisible by nnodes={self.nnodes}"
             )
+        if self.local_dp_size is not None:
+            if self.local_dp_size < 1:
+                raise ValueError(
+                    "[ModelConfig] local_dp_size must be >= 1, got "
+                    f"{self.local_dp_size}"
+                )
+            if not self.enable_dp_attention or self.pp_size != 1:
+                raise ValueError(
+                    "[ModelConfig] local_dp_size is only supported for "
+                    "SGLang DP Attention with pp_size=1"
+                )
+            if self.nnodes * self.local_dp_size != self.dp_size:
+                raise ValueError(
+                    "[ModelConfig] node-local DP requires every DP group to "
+                    "reside on exactly one node, but "
+                    f"nnodes={self.nnodes} * local_dp_size={self.local_dp_size} "
+                    f"!= dp_size={self.dp_size}"
+                )
         if self.nnodes_per_pp_rank > 2:
             raise ValueError(
                 f"[ModelConfig] only support 2-nodes TP for now, but got "
@@ -513,6 +537,15 @@ class RankInfo:
         return self.instance_id * self.model_config.dp_size + self.dp_rank
 
     @property
+    def local_dp_client_id(self) -> int:
+        """Dense node-local id: which rank owns this node's KVServer or
+        radix-server and its TE channel, and the shared-memory IPC names."""
+        local_dp_size = self.model_config.local_dp_size
+        if local_dp_size is None:
+            return self.dp_client_id
+        return self.dp_rank % local_dp_size
+
+    @property
     def attn_tp_rank(self) -> int:
         """Compatibility alias for the normalized attention TP rank."""
         return self.tp_rank
@@ -589,6 +622,10 @@ class RankInfo:
             f", local_rank={self.local_rank}, effective_tp_rank={self.effective_tp_rank}"
         )
 
+
+RADIX_SWA_WINDOW_BLOCKS = 8
+
+
 @dataclass
 class SWAPoolConfig:
     """Configuration for SWA (Sliding Window Attention) host pool(s).
@@ -603,11 +640,17 @@ class SWAPoolConfig:
     num_remote_slots: int = 0          # Number of REMOTE SWA pool slots (0 = no REMOTE SWA tier)
     num_swa_layers: int = 61           # Number of SWA layers (all 61 for DSv4)
     bytes_per_token_per_layer: int = 584  # nope_fp8(448) + rope_bf16(128) + scale(8)
+
+    window_blocks: int = RADIX_SWA_WINDOW_BLOCKS
     # True when the SWA page also carries heterogeneous sidecar groups (for
     # example DeepSeek-V4 attention/indexer compress states).
     multi_group: bool = False
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
     pin_memory: bool = True            # Use pinned memory for async DMA
+    # Sidecar groups packed into one SWA page (DSv4 compress states). The TE
+    # learns them from the GPU registration; the radixshmem bootstrap needs them
+    # earlier to size the SWA slot, so the connector records them here.
+    layer_groups: Optional[List['LayerGroupSpec']] = None
 
     def for_ssd_tier(self) -> "SWAPoolConfig":
         """Derive the SSD-tier SWA config (same slot geometry, num_ssd_slots slots).
@@ -724,6 +767,9 @@ class CacheConfig:
     # Stored for deferred recomputation when layer_groups become known
     _user_cpu_cache_gb: float = 0
     _user_ssd_cache_gb: float = 0
+    # Layers one CPU block covers (this node's PP stage), recorded by the
+    # adapters' config resolution; 0 = derive num_layers // pp_size.
+    _num_layers_per_pp_stage: int = 0
 
     # SWA pool config (DeepSeek V4)
     swa: Optional['SWAPoolConfig'] = None
@@ -792,6 +838,14 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     server_client_mode=bool(int(os.getenv('FLEXKV_SERVER_CLIENT_MODE', 0))),
     server_launch_mode=os.getenv('FLEXKV_SERVER_LAUNCH_MODE', 'embedded').lower(),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
+
+    # radixshmem mode: the CPU tier is a radix-server (index + SlotStore), one
+    # per node, a process the operator starts (`radix-server --name /flexkv
+    # --data-bytes ...`). FlexKV attaches to it by name; everything else about
+    # the attach is a fixed default (flexkv.server.shm_radix_bootstrap;
+    # reference docs/radixshmem/config_zh.md).
+    enable_radixshmem=bool(int(os.getenv('FLEXKV_ENABLE_RADIXSHMEM', 0))),
+    radixshmem_server_name=os.getenv('FLEXKV_RADIXSHMEM_SERVER_NAME', '') or '/flexkv',
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),
@@ -1174,6 +1228,7 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     # Store original GB values for deferred recomputation (when layer_groups become known)
     cache_config._user_cpu_cache_gb = user_config.cpu_cache_gb
     cache_config._user_ssd_cache_gb = user_config.ssd_cache_gb
+    cache_config._num_layers_per_pp_stage = int(rank_info.num_layers_per_pp_stage)
 
     cache_config.num_cpu_blocks = (
         convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)

@@ -310,6 +310,18 @@ class SWAReadReservation:
     h2d_id: int
 
 
+@dataclass(frozen=True)
+class RequestWindow:
+    """A GET/PUT request reduced to whole blocks: the masked block range
+    ``[block_start_idx, block_end_idx)``, the GPU blocks it maps to, and the
+    SequenceMeta of the block-aligned token prefix."""
+
+    block_start_idx: int
+    block_end_idx: int
+    gpu_block_ids: np.ndarray
+    sequence_meta: SequenceMeta
+
+
 class TransferPlanHandle:
     """Completion callback for a planned get/put, with an abort path.
 
@@ -992,37 +1004,7 @@ class GlobalCacheEngine:
             )
 
         if cache_config.enable_cpu:
-            if cache_config.enable_p2p_cpu:
-                self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(
-                    cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta)
-            elif self.index_accel:
-                self.cpu_cache_engine = CacheEngineAccel(
-                    device_type=DeviceType.CPU,
-                    num_total_blocks=cache_config.num_cpu_blocks,
-                    tokens_per_block=cache_config.tokens_per_block,
-                    evict_ratio=self.evict_ratio,
-                    hit_reward_seconds=self.hit_reward_seconds,
-                    evict_start_threshold=self.evict_start_threshold,
-                    eviction_policy=self.eviction_policy,
-                    event_collector=event_collector,
-                    metrics_collector=self._metrics_collector,
-                    protected_threshold=self.protected_threshold,
-                    swa_config=cache_config.swa,
-                )
-            else:
-                self.cpu_cache_engine = CacheEngine(
-                    device_type=DeviceType.CPU,
-                    num_total_blocks=cache_config.num_cpu_blocks,
-                    tokens_per_block=cache_config.tokens_per_block,
-                    evict_ratio=self.evict_ratio,
-                    hit_reward_seconds=self.hit_reward_seconds,
-                    evict_start_threshold=self.evict_start_threshold,
-                    eviction_policy=self.eviction_policy,
-                    event_collector=event_collector,
-                    metrics_collector=self._metrics_collector,
-                    protected_threshold=self.protected_threshold,
-                    swa_config=cache_config.swa,
-                )
+            self.cpu_cache_engine = self._build_cpu_cache_engine(cache_config, event_collector)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
             if cache_config.enable_p2p_ssd:
@@ -1112,6 +1094,45 @@ class GlobalCacheEngine:
         # Update initial mempool stats
         self._update_mempool_metrics()
 
+    def _build_cpu_cache_engine(self,
+                                cache_config: CacheConfig,
+                                event_collector: Optional[KVEventCollector]):
+        """Pick the index engine of the CPU tier.
+
+        A subclass can back the tier with a different engine by overriding this
+        (see ``flexkv.cache.radix_shmem_planner``).
+        """
+        if cache_config.enable_p2p_cpu:
+            return HierarchyLRCacheEngine.from_cache_config(
+                cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta)
+        if self.index_accel:
+            return CacheEngineAccel(
+                device_type=DeviceType.CPU,
+                num_total_blocks=cache_config.num_cpu_blocks,
+                tokens_per_block=cache_config.tokens_per_block,
+                evict_ratio=self.evict_ratio,
+                hit_reward_seconds=self.hit_reward_seconds,
+                evict_start_threshold=self.evict_start_threshold,
+                eviction_policy=self.eviction_policy,
+                event_collector=event_collector,
+                metrics_collector=self._metrics_collector,
+                protected_threshold=self.protected_threshold,
+                swa_config=cache_config.swa,
+            )
+        return CacheEngine(
+            device_type=DeviceType.CPU,
+            num_total_blocks=cache_config.num_cpu_blocks,
+            tokens_per_block=cache_config.tokens_per_block,
+            evict_ratio=self.evict_ratio,
+            hit_reward_seconds=self.hit_reward_seconds,
+            evict_start_threshold=self.evict_start_threshold,
+            eviction_policy=self.eviction_policy,
+            event_collector=event_collector,
+            metrics_collector=self._metrics_collector,
+            protected_threshold=self.protected_threshold,
+            swa_config=cache_config.swa,
+        )
+
     def start(self) -> None:
         if self.cpu_cache_engine and self.cache_config.enable_p2p_cpu:
             self.cpu_cache_engine.start()
@@ -1153,34 +1174,14 @@ class GlobalCacheEngine:
             namespace: Optional[List[str]] = None,
             swa_aware: bool = False) \
                  -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
-        self._check_input(token_ids, token_mask, slot_mapping)
-
-        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
-
-        aligned_token_ids = token_ids[:aligned_length]
-        token_mask[aligned_length:] = False
-
-        if aligned_length == 0 or not token_mask.any():
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        if req.block_end_idx == 0:
             transfer_graph = TransferOpGraph.create_empty_graph()
             return_mask = np.zeros_like(token_mask, dtype=np.bool_)
             callback = partial(self._transfer_callback, node_to_unlock={}, buffer_to_free={})
             return transfer_graph, return_mask, callback, {}, -1
-
-        block_start_idx, block_end_idx = self._get_block_range(token_mask)
-        # block_end_idx is the block just past the LAST True in token_mask. On the
-        # plain path the caller marks every non-resident token up to the aligned
-        # end, so this equals aligned_length // tokens_per_block. On the SWA-aware
-        # path (swa_aware=True) _get_impl_* clamps the window to usable = min(full,
-        # swa) after matching, which can end before the aligned length. So the
-        # invariant is <= (can never exceed the aligned length), not ==. Nothing
-        # below uses aligned_length; all downstream sizing keys off block_end_idx.
-        assert block_end_idx <= aligned_length // self.tokens_per_block
-        gpu_block_ids = self.slot_mapping_to_block_ids(slot_mapping,
-                                                       self.tokens_per_block)[:block_end_idx-block_start_idx]
-
-        sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
-                                     tokens_per_block=self.cache_config.tokens_per_block,
-                                     namespace=namespace)
+        block_start_idx, block_end_idx = req.block_start_idx, req.block_end_idx
+        gpu_block_ids, sequence_meta = req.gpu_block_ids, req.sequence_meta
 
         temp_cache_strategy = resolve_get_cache_strategy(
             self.use_mooncake_store_backend, temp_cache_strategy)
@@ -2048,22 +2049,11 @@ class GlobalCacheEngine:
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
-        self._check_input(token_ids, token_mask, slot_mapping)
-        # ignore the last incomplete block
-        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
-        aligned_token_ids = token_ids[:aligned_length]
-        token_mask[aligned_length:] = False
-        block_start_idx, block_end_idx = self._get_block_range(token_mask)
-
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        block_start_idx, block_end_idx = req.block_start_idx, req.block_end_idx
         # the mask should has a prefix of True
         assert block_start_idx == 0
-
-        gpu_block_ids = self.slot_mapping_to_block_ids(slot_mapping,
-                                                       self.tokens_per_block)[:block_end_idx-block_start_idx]
-
-        sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
-                                     tokens_per_block=self.cache_config.tokens_per_block,
-                                     namespace=namespace)
+        gpu_block_ids, sequence_meta = req.gpu_block_ids, req.sequence_meta
 
         assert not temp_cache_strategy.ignore_gpu
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
@@ -3472,6 +3462,37 @@ class GlobalCacheEngine:
             remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result
+
+    def _prepare_request(self,
+                         token_ids: np.ndarray,
+                         token_mask: np.ndarray,
+                         slot_mapping: np.ndarray,
+                         namespace: Optional[List[str]]) -> RequestWindow:
+        """Shared GET/PUT prologue.
+
+        Validates the arrays, drops the trailing partial block (``token_mask``
+        is cleared past the aligned length in place) and resolves the masked
+        block window. ``block_end_idx == 0`` means nothing is left to plan.
+        """
+        self._check_input(token_ids, token_mask, slot_mapping)
+        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
+        aligned_token_ids = token_ids[:aligned_length]
+        token_mask[aligned_length:] = False
+        block_start_idx, block_end_idx = self._get_block_range(token_mask)
+        # block_end_idx is the block just past the LAST True in token_mask. On the
+        # plain path the caller marks every non-resident token up to the aligned
+        # end, so this equals aligned_length // tokens_per_block. On the SWA-aware
+        # path (swa_aware=True) _get_impl_* clamps the window to usable = min(full,
+        # swa) after matching, which can end before the aligned length. So the
+        # invariant is <= (can never exceed the aligned length), not ==. Nothing
+        # downstream uses aligned_length; all sizing keys off block_end_idx.
+        assert block_end_idx <= aligned_length // self.tokens_per_block
+        gpu_block_ids = self.slot_mapping_to_block_ids(
+            slot_mapping, self.tokens_per_block)[:block_end_idx - block_start_idx]
+        sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
+                                     tokens_per_block=self.cache_config.tokens_per_block,
+                                     namespace=namespace)
+        return RequestWindow(block_start_idx, block_end_idx, gpu_block_ids, sequence_meta)
 
     def _check_input(self,
                       token_ids: np.ndarray,

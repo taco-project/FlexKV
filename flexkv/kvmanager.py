@@ -38,7 +38,8 @@ class KVManager:
                  dp_client_id: int = 0,
                  server_recv_port: str = "",
                  gpu_register_port: str = "",
-                 event_collector: Optional[KVEventCollector] = None):
+                 event_collector: Optional[KVEventCollector] = None,
+                 local_dp_client_id: Optional[int] = None):
         # Use the curated ``__str__`` summaries. Dataclass repr includes
         # credential-bearing fields such as ``redis_password``.
         flexkv_logger.info(
@@ -60,10 +61,41 @@ class KVManager:
         else:
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
+        self.enable_radixshmem = GLOBAL_CONFIG_FROM_ENV.enable_radixshmem
+        if self.enable_radixshmem and cache_config.enable_remote:
+            # CacheEngineRadixShmem indexes the CPU tier in shm and reaches
+            # peers over RDMA; but the 3rd-party (PCFS) tier has its own
+            # Redis-published index and GET planner.
+            raise ValueError(
+                "radix_shmem and enable_remote (3rd-party remote storage) "
+                "cannot be enabled at the same time"
+            )
+        if self.enable_radixshmem and cache_config.enable_ssd:
+            raise ValueError(
+                "radix_shmem backs the CPU tier only (index + SlotStore + peer "
+                "pull); set ssd_cache_gb=0 / enable_ssd=False"
+            )
+        if self.enable_radixshmem and (cache_config.enable_p2p_cpu
+                                     or cache_config.enable_p2p_ssd):
+            # Peer reuse is the radix-server's (etcd + RDMA), switched on by
+            # its cluster flags (--expected-min-nodes / --registry); the
+            # Redis-backed P2P paths these flags select must stay off.
+            raise ValueError(
+                "radix_shmem does its own peer reuse; set enable_p2p_cpu=False "
+                "and enable_p2p_ssd=False (cross-node reuse follows the "
+                "radix-server's cluster flags)"
+            )
         flexkv_logger.info(
             f"[KVManager] IPC ports: server_recv_port={self.server_recv_port}, "
             f"gpu_register_port={self.gpu_register_port}"
+
         )
+
+        if self.enable_radixshmem:
+            # Say up front that the CPU tier is not sized by cpu_cache_gb here.
+            from flexkv.server.shm_radix_bootstrap import cpu_sizing_notice
+            level, text = cpu_sizing_notice(cache_config, GLOBAL_CONFIG_FROM_ENV.radixshmem_server_name)
+            getattr(flexkv_logger, level)(f"[KVManager] {text}")
 
         # Multi-instance mode also requires server_client_mode
         self.server_client_mode = (model_config.dp_size > 1 or
@@ -80,18 +112,44 @@ class KVManager:
                 "FLEXKV_SERVER_LAUNCH_MODE=external requires server-client mode"
             )
 
+        self.dp_client_id = dp_client_id
+        self.local_dp_client_id = (
+            dp_client_id if local_dp_client_id is None else local_dp_client_id
+        )
+
         flexkv_logger.info(
             f"[KVManager] instance_num={model_config.instance_num}, dp_size={model_config.dp_size}, "
+            f"dp_client_id={self.dp_client_id}, "
+            f"local_dp_client_id={self.local_dp_client_id}, "
             f"server_client_mode={self.server_client_mode}, "
-            f"server_launch_mode={self.server_launch_mode}"
+            f"server_launch_mode={self.server_launch_mode}, "
+            f"enable_radixshmem={self.enable_radixshmem}"
         )
 
         self.redis_meta_client = None
         self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
         self.owns_mps = self.enable_mps and self.server_launch_mode != "external"
+        self.kv_task_engine = None
+        self.server_handle = None
+
+        if self.enable_radixshmem:
+            # The CPU tier is the operator's radix-server (``radix-server --name
+            # <server.name> --data-bytes ...``); FlexKV never creates one. Hand it
+            # FlexKV's geometry and take over the slot counts it planned BEFORE
+            # anything sizes a pool from cache_config: the KVServer or
+            # KVTaskEngine built below and the TE all read num_cpu_blocks /
+            # swa.num_slots. The process model is FlexKV's own: engine mode for
+            # one DP, the KVServer (one per node, shared by FLEXKV_INSTANCE_NUM
+            # engines) otherwise.
+            from flexkv.server.shm_radix_bootstrap import adopt_radix_server
+            adopt_radix_server(model_config, self.cache_config, label="KVManager")
 
         if self.server_client_mode:
-            if self.server_launch_mode == "embedded" and dp_client_id == 0:
+            # One KVServer per node: with node-local DP the first rank of each
+            # node owns it, so nodes 1..n-1 get their own server instead of
+            # waiting on node 0's. Without node-local DP local_dp_client_id
+            # equals dp_client_id and this is the previous condition.
+            if self.server_launch_mode == "embedded" and self.local_dp_client_id == 0:
                 self.server_handle = KVServer.create_server(model_config=model_config,
                                                             cache_config=cache_config,
                                                             gpu_register_port=self.gpu_register_port,
@@ -161,7 +219,8 @@ class KVManager:
                     self.server_handle.shutdown()
                     self.server_handle = None
         else:
-            self.kv_task_engine.shutdown()
+            if self.kv_task_engine is not None:
+                self.kv_task_engine.shutdown()
 
         if self.owns_mps:
             flexkv_logger.info(
@@ -192,6 +251,7 @@ class KVManager:
                 token_ids=token_ids,
                 slot_mapping=slot_mapping,
                 token_mask=token_mask,
+                dp_client_id=self.dp_client_id,
                 namespace=namespace,
             )
         return task_id
@@ -225,6 +285,7 @@ class KVManager:
                 token_ids=token_ids,
                 token_mask=token_mask,
                 cpu_only=cpu_only,
+                dp_client_id=self.dp_client_id,
                 namespace=namespace,
                 swa_aware=swa_aware,
             )
@@ -250,6 +311,7 @@ class KVManager:
                 token_ids=token_ids,
                 slot_mapping=slot_mapping,
                 token_mask=token_mask,
+                dp_client_id=self.dp_client_id,
                 namespace=namespace,
             )
         return task_id
@@ -270,6 +332,7 @@ class KVManager:
             task_id, mask = self.kv_task_engine.put_match(
                 token_ids=token_ids,
                 token_mask=token_mask,
+                dp_client_id=self.dp_client_id,
                 namespace=namespace,
             )
         return task_id, mask
@@ -299,6 +362,7 @@ class KVManager:
         else:
             task_id = self.kv_task_engine.prefetch_async(
                 token_ids,
+                dp_client_id=self.dp_client_id,
                 namespace=namespace,
                 swa_aware=swa_aware,
             )
