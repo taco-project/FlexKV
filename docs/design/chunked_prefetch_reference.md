@@ -166,19 +166,18 @@ Timeout budget is `min(max_s, base_s + per_ki_s * candidate_tokens / 1024)`;
 `timeout_budget_s` overrides the formula. Configuration policy wins over SGLang's
 `--hicache-storage-prefetch-policy` when both are supplied.
 
-The SGLang changes are proposed in
-[review PR XingLiu1/sglang#6](https://github.com/XingLiu1/sglang/pull/6),
-head `c6b51c1b5c`, targeting `agent/flexkv-dsv4-main`. That branch is the source
-of the upstream [FlexKV adaptation PR #31781](https://github.com/sgl-project/sglang/pull/31781).
-The prefetch changes require review and are not yet incorporated into that
-adaptation branch. Use the review PR head with this FlexKV version for testing.
+The SGLang prefetch changes were merged through
+[XingLiu1/sglang#6](https://github.com/XingLiu1/sglang/pull/6) and are now included
+in the upstream [FlexKV adaptation PR #31781](https://github.com/sgl-project/sglang/pull/31781).
+The September 22 H20 validation paired SGLang `2ef249ef91` with FlexKV
+`0dff8ea024` from [PR #291](https://github.com/taco-project/FlexKV/pull/291).
+Both upstream PRs are still under review. Use their source branches directly;
+no companion patch is required.
 
-The companion `flexkv/integration/sglang/sglang_chunked_prefetch.patch` is an
-incremental patch against the adaptation branch at `5166ce06aa`. From that checkout, run
-`git apply --check /path/to/sglang_chunked_prefetch.patch` followed by
-`git apply /path/to/sglang_chunked_prefetch.patch`. Do not apply it again on the
-review PR head, or directly on SGLang main. The separate upstream PR #38451 is
-superseded by the branch-targeted review PR.
+`FlexKVConnector` and `FlexKVComm` are maintained only in
+`flexkv/integration/sglang`. SGLang imports the connector from FlexKV and owns
+the cache adapters and scheduler lifecycle hooks. Changes to those hooks must
+still be made in SGLang; installing FlexKV alone does not add them.
 
 The adapter starts prefetch on queue entry without a foreground remote lookup,
 emits demand at scheduler candidacy, propagates abort, and passes actual

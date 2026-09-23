@@ -1,5 +1,18 @@
 # Chunked prefetch validation
 
+## Integration cleanup: September 23, 2026
+
+Removed the obsolete SGLang bootstrap and incremental prefetch patches. The
+prefetch changes are already in the source branch of SGLang PR #31781 through
+merged review PR #6. FlexKV owns the connector and communication implementation;
+SGLang imports it and maintains the cache/scheduler lifecycle integration.
+Installation and design docs now refer to those source branches directly.
+
+This cleanup changes only patch artifacts and documentation. Runtime sources
+are unchanged from FlexKV `0dff8ea024` and paired SGLang `2ef249ef91`; it does
+not add a new GPU or performance result. Earlier patch checks below describe
+their original revisions.
+
 ## Insert-after integration: September 22, 2026
 
 The prefetch branch now includes main `738ddc141a`, including the merged
@@ -16,9 +29,10 @@ so release Cython builds with `wraparound=False` preserve Python behavior.
 The GPU fixture explicitly sets its 32 MiB staging limit; it no longer relies
 on the removed experimental per-chunk byte target.
 
-The companion SGLang head remains `c6b51c1b5c`, which already contains its
-current adaptation target `5166ce06aa`. No additional SGLang conflict edit is
-needed; the bundled patch still reproduces that head exactly.
+The initial companion SGLang head was `c6b51c1b5c`, which already contained
+its adaptation target `5166ce06aa`. At that revision, the companion patch was
+checked to reproduce the head exactly. These patch checks are historical; the
+patch files were removed after the changes entered the adaptation branch.
 
 Validation on an isolated H20 container (Python 3.12, PyTorch 2.13.0+cu130,
 CUDA 13.0), after rebuilding the current C++/CUDA extension:

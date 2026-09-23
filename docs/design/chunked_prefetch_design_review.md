@@ -314,10 +314,10 @@ chunk 结束在 checkpoint 时，向原 Full 图附加现有 SWA peer op，使�
 | 协议与策略 | [types.py](../../flexkv/prefetch/types.py)、[policy.py](../../flexkv/prefetch/policy.py) | 句柄、状态快照、配置验证和启动期策略注册 |
 | 控制与构图 | [coordinator.py](../../flexkv/prefetch/coordinator.py)、[planner.py](../../flexkv/prefetch/planner.py)、[runtime.py](../../flexkv/prefetch/runtime.py) | claim/seal 顺序、窗口公平性、连续发布、预算、失败所有权 |
 | 前台与 RPC | [kvtask.py](../../flexkv/kvtask.py)、[kvmanager.py](../../flexkv/kvmanager.py)、[server](../../flexkv/server) | 完成通道单线程消费、wait 不阻塞控制、句柄和客户端归属 |
-| SGLang | [connector.py](../../flexkv/integration/sglang/connector.py)、[配套 patch](../../flexkv/integration/sglang/sglang_chunked_prefetch.patch) | 入队/demand/abort、TP 一致性、CPU-only LOOKUP、准入和两次 lease 交接 |
+| SGLang | [connector.py](../../flexkv/integration/sglang/connector.py)、[SGLang 适配源码](https://github.com/sgl-project/sglang/pull/31781) | 入队/demand/abort、TP 一致性、CPU-only LOOKUP、准入和两次 lease 交接 |
 | 回归与模型验收 | [prefetch tests](../../tests/prefetch)、[实机报告](chunked_prefetch_validation.md) | 部分读取、乱序完成、停止竞态、真实数据一致性及模型 checkpoint |
 
-FlexKV PR 基线为 `016c290`。SGLang 改动通过 [分支间 PR XingLiu1/sglang#6](https://github.com/XingLiu1/sglang/pull/6) 提交，head=`2f91f9f5f0`，base=`agent/flexkv-dsv4-main`；评审后才进入上游 [适配 PR #31781](https://github.com/sgl-project/sglang/pull/31781)。配套 patch 以适配分支 `4b76341435`（源码树与 `16780ea0c8` 一致）为基线，不能直接应用到 main，也不应在评审 PR head 上重复应用。关闭开关是启动时回退方式，运行中已有工作仍必须经过 drain。
+SGLang 预取改动已通过[分支间 PR #6](https://github.com/XingLiu1/sglang/pull/6) 合入适配分支，并包含在上游 [PR #31781](https://github.com/sgl-project/sglang/pull/31781) 中。2026-09-22 的 H20 验证配对为 FlexKV `0dff8ea024` 与 SGLang `2ef249ef91`，两个主仓 PR 仍待合入。connector/通信层只在 FlexKV 维护，缓存适配器与调度钩子在 SGLang 维护；直接使用两侧源码，无需额外 patch。关闭开关是启动时回退方式，运行中已有工作仍必须经过 drain。
 
 ### 8.2 已有证据与尚需完成的验证
 

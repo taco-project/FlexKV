@@ -17,8 +17,7 @@ SGLang 目前有两条不同的 FlexKV 集成路径，请根据模型选择。
 
 基础 FlexKV 集成已通过
 [sglang#29701](https://github.com/sgl-project/sglang/pull/29701) 合入 SGLang
-官方主干，并从 SGLang `v0.5.16` 开始随版本发布。使用这些版本时，**不要**再应用
-`sglang_flexkv_connector.patch`。
+官方主干，并从 SGLang `v0.5.16` 开始随版本发布。
 
 ```bash
 git clone https://github.com/sgl-project/sglang.git
@@ -84,13 +83,15 @@ FlexKV connector 的核心逻辑（`FlexKVComm` 和 `FlexKVConnector`）位于�
 | `comm.py` | 3-axis（PP × CP × TP）跨 rank 通信层 |
 | `connector.py` | `FlexKVConnector`，封装 `KVManager` 供 SGLang 调用 |
 
-SGLang 侧的 `storage/flexkv/__init__.py` 通过 `importlib` 从 `flexkv.integration.sglang.connector`
-动态加载 connector，后续 FlexKV 逻辑改动通常只需更新 FlexKV 仓库。
+SGLang 从 `flexkv.integration.sglang.connector` 导入 `FlexKVConnector`。
+connector 和通信层由 FlexKV 维护；缓存适配器和调度生命周期钩子仍由 SGLang 维护。
 
 设置环境变量 `FLEXKV_ENABLE_COLLECTIVE_SYNC=0` 可禁用跨 rank 同步（scatter/barrier/all_reduce），
 在不使用 Pipeline Parallelism (PP) 的部署中关闭可减少同步开销、提升性能。
 
-## 关于本目录中的 patch
+## 分段预取
 
-`sglang_flexkv_connector.patch` 仅作为 FlexKV 尚未合入 SGLang 主干前的历史参考保留。
-受支持的 SGLang 正式版本不需要它，上述 DeepSeek V4 路径也不能使用它。
+分段预取需要同时使用 FlexKV PR [#291](https://github.com/taco-project/FlexKV/pull/291)
+和已包含预取生命周期钩子的 SGLang PR [#31781](https://github.com/sgl-project/sglang/pull/31781)。
+请使用[预取对接指南](../../../docs/design/chunked_prefetch_reference.md#configuration-and-sglang)
+中的配套版本，而不是上面的基础接入版本。两侧直接维护源码，不需要额外应用 patch。

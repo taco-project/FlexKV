@@ -222,7 +222,7 @@ SGLang Hybrid Radix 继续管理 GPU 树。H2D 恢复到请求持有的槽位，
 }
 ```
 
-`0.02` 秒仅为演示值。chunk 仅用 `chunk_max_blocks` 控制大小；单个 block 及绑定的 SWA 快照不能拆分，实际段长仍受剩余前缀、checkpoint 和资源容量约束。全局 `prefetch_max_reserved_bytes` 和 `prefetch_max_pinned_bytes` 是资源硬上限。保留已有 CPU/Mooncake 配置，SSD 容量设为 0。新模式默认关闭，需搭配本分支提供的 SGLang 补丁。
+`0.02` 秒仅为演示值。chunk 仅用 `chunk_max_blocks` 控制大小；单个 block 及绑定的 SWA 快照不能拆分，实际段长仍受剩余前缀、checkpoint 和资源容量约束。全局 `prefetch_max_reserved_bytes` 和 `prefetch_max_pinned_bytes` 是资源硬上限。保留已有 CPU/Mooncake 配置，SSD 容量设为 0。新模式默认关闭，需搭配包含预取调度钩子的 [SGLang PR #31781](https://github.com/sgl-project/sglang/pull/31781)；配套版本见[对接指南](chunked_prefetch_reference.md#configuration-and-sglang)。
 
 调用顺序是：`start → progress/demand/stop → terminal → held GET → release`。完整 token 链必须从头传入，不能只传待加载后缀；`candidate_start_token` 仅用于计算 timeout 的候选长度。
 

@@ -18,8 +18,7 @@ your model.
 
 The base FlexKV integration was merged into upstream SGLang by
 [sglang#29701](https://github.com/sgl-project/sglang/pull/29701) and is included
-in SGLang `v0.5.16` and later. Do **not** apply
-`sglang_flexkv_connector.patch` to these versions.
+in SGLang `v0.5.16` and later.
 
 ```bash
 git clone https://github.com/sgl-project/sglang.git
@@ -90,16 +89,19 @@ this directory:
 | `comm.py` | 3-axis (PP × CP × TP) cross-rank communication layer |
 | `connector.py` | `FlexKVConnector` wrapping `KVManager` for SGLang |
 
-SGLang's `storage/flexkv/__init__.py` dynamically loads the connector from
-`flexkv.integration.sglang.connector` via `importlib`, so future FlexKV logic
-changes typically only require updating the FlexKV repo.
+SGLang imports `FlexKVConnector` from
+`flexkv.integration.sglang.connector`. Connector and communication changes
+belong in FlexKV; cache adapters and scheduler lifecycle hooks remain in SGLang.
 
 Set `FLEXKV_ENABLE_COLLECTIVE_SYNC=0` to disable cross-rank sync
 (scatter/barrier/all_reduce). In deployments without Pipeline Parallelism (PP),
 disabling it reduces sync overhead and improves performance.
 
-## About the patch in this directory
+## Chunked prefetch
 
-`sglang_flexkv_connector.patch` is retained only as a legacy reference for the
-old pre-upstream integration. It is not required for supported SGLang releases,
-and it must not be used for the DeepSeek V4 path above.
+Chunked prefetch requires both FlexKV PR
+[#291](https://github.com/taco-project/FlexKV/pull/291) and the SGLang lifecycle
+hooks now included in PR [#31781](https://github.com/sgl-project/sglang/pull/31781).
+Use the paired revisions in the [prefetch integration guide](../../../docs/design/chunked_prefetch_reference.md#configuration-and-sglang)
+instead of the baseline versions above. The repositories contain the integration
+source directly; no local patch is required.
