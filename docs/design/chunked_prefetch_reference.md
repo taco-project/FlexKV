@@ -69,8 +69,14 @@ implementation does not change the existing storage key format or transcode KV.
 - `integration/sglang/connector.py`: leader submits/progresses; ranks receive the
   same handle/terminal snapshot; a held foreground GET takes over the result lease.
 
-The transfer handle still receives `submit_batch(List[TransferOpGraph])`. A
-window of two chunks overlaps next-chunk planning/submission with current transfer;
+The transfer handle still receives `submit_batch(List[TransferOpGraph])`.
+Receiver-created GPU replicas use internal op IDs below `-1`, disjoint from the
+nonnegative incoming parent IDs; `-1` remains the graph-terminal sentinel. This
+keeps worker completions and failure/trace bookkeeping unambiguous across
+process-local counters without changing the worker message format or kernels.
+Only parent IDs are returned to the task layer.
+
+A window of two chunks overlaps next-chunk planning/submission with current transfer;
 multiple sessions' graphs can share a batch. This is the TBO-inspired pipeline
 mechanism. An end-to-end speedup has not been established by the completed correctness tests.
 
@@ -119,8 +125,12 @@ Snapshots expose `planned_end_token`, `reusable_prefix_end_token`, `l3_loaded_sp
 `lease_valid`. Planned hits are never reported as loaded tokens.
 
 Handles carry a runtime epoch and monotonically increasing session ID. Active
-records cannot expire. Terminal leases expire after 60 seconds by default; a
-bounded lightweight tombstone then returns an empty `expired` result. Once that
+records cannot expire. A terminal session that is explicitly released immediately
+returns its admission slot and drops its backend context; an active release waits
+for all claimed graphs to drain first. A bounded lightweight terminal snapshot
+remains queryable with `lease_valid=False`, without consuming session capacity.
+Unreleased terminal leases still count against admission and expire after 60
+seconds by default; their tombstones return an empty `expired` result. Once that
 bounded tombstone is evicted, old/unknown handles fail explicitly. Reset changes
 the epoch. Release is idempotent. After releasing a lease the snapshot does not
 promise continued residency; take a foreground held GET first.
