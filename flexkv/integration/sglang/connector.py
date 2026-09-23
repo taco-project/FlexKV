@@ -95,6 +95,59 @@ def _is_terminal_status(status: str) -> bool:
     return status in {"success", "failed", "cancelled", "not_found"}
 
 
+def _pack_dsv4_indexer_full_pages(
+    buffers: Sequence[torch.Tensor],
+    *,
+    full_page_size: int,
+    compress_ratio: int,
+    physical_page_size: int,
+) -> Tuple[List[torch.Tensor], int]:
+    """View indexer rows so one GPU row is one FlexKV (full) page.
+
+    V4.1 ratio-1/2 indexers page at 64 or 128 tokens, while FlexKV addresses
+    every main-KV group by the full ``page_size`` id. SGLang's PD path already
+    groups ``(full_page_size // ratio) / physical_page_size`` indexer rows
+    into one transfer item; this view lets the existing DSv4
+    ``LayerGroupSpec`` path do the same without a new transfer mode.
+
+    Returns ``(buffers, logical_tokens_per_full_page)``.
+    """
+    if compress_ratio < 1 or full_page_size % compress_ratio != 0:
+        raise RuntimeError(
+            f"FlexKV DSv4 indexer compress_ratio={compress_ratio} does not "
+            f"divide page_size={full_page_size}"
+        )
+    slots_per_full_page = full_page_size // compress_ratio
+    if physical_page_size < 1 or slots_per_full_page % physical_page_size != 0:
+        raise RuntimeError(
+            f"FlexKV DSv4 ratio-{compress_ratio} indexer page_size="
+            f"{physical_page_size} does not tile a full page of "
+            f"{slots_per_full_page} slots"
+        )
+    pages_per = slots_per_full_page // physical_page_size
+    if pages_per <= 1:
+        return list(buffers), slots_per_full_page
+    packed: List[torch.Tensor] = []
+    for buf in buffers:
+        if buf.ndim != 2:
+            raise RuntimeError(
+                "FlexKV DSv4 indexer buffers must be 2D page rows, "
+                f"got shape={tuple(buf.shape)}"
+            )
+        usable_rows = (buf.shape[0] // pages_per) * pages_per
+        if usable_rows == 0:
+            raise RuntimeError(
+                "FlexKV DSv4 indexer is shorter than one full page: "
+                f"rows={buf.shape[0]}, pages_per_full_page={pages_per}"
+            )
+        packed.append(
+            buf[:usable_rows].reshape(
+                usable_rows // pages_per, pages_per * buf.shape[1]
+            )
+        )
+    return packed, slots_per_full_page
+
+
 class FlexKVHostReleaseShim:
     """HiCache-compatible host-release hook for ``release_host_resources``.
 
@@ -218,12 +271,26 @@ class FlexKVConnector:
         # MLA/MHA models keep the single-layout path.
         self._kvcache = kvcache
         self._swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
-        self._is_dsv4 = hasattr(kvcache, "c4_kv_pool")
+        self._is_dsv4 = getattr(sgl_model_config, "is_deepseek_v4_arch", False)
         self._dsv4_layer_groups: List[Dict[str, Any]] = []
         self._dsv4_state_groups: List[Dict[str, Any]] = []
         self._deduplicate_indexer_group = os.getenv(
             "FLEXKV_DEDUP_INDEXER_GROUP", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
+
+        # Encoder bounded replay rebuilds the window from the full KV, so the
+        # model has no paged SWA pool to register. The host SWA pool must go
+        # with it: the cache engine plans SWA ops from that config alone, and
+        # they would reach a transfer engine with no SWA GPU handle behind it.
+        if self._swa_kv_pool is None and self.cache_config.swa is not None:
+            self.cache_config.swa = None
+            self.cache_config.enable_swa_transfer = False
+            logger.info(
+                "[FlexKV] No paged SWA KV pool on this rank "
+                "(encoder SWA bounded replay); disabling the FlexKV SWA pool %s",
+                self._label,
+            )
+
         kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
 
         # Heterogeneous groups change the bytes represented by one logical
@@ -1872,6 +1939,10 @@ class FlexKVConnector:
         self, kvcache: Any
     ) -> Tuple[List[torch.Tensor], Optional[_IndexerBufferGroup]]:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
+        for attr in kvcache.__dict__:
+            print(f"attr: {attr}")
+            print(f"value: {getattr(kvcache, attr)}")
+            print("-"*100)
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
         if indexer_buffers:
             if self._deduplicate_indexer_group:
@@ -1921,17 +1992,26 @@ class FlexKVConnector:
         compression_ratios = list(kvcache.compression_ratios)
         stage_start = int(getattr(kvcache, "_stage_start", 0))
         stage_end = int(getattr(kvcache, "_stage_end", len(compression_ratios)))
-        c4_global_layer_ids = [
-            i for i in range(stage_start, stage_end) if compression_ratios[i] == 4
-        ]
-        c128_global_layer_ids = [
-            i for i in range(stage_start, stage_end) if compression_ratios[i] == 128
-        ]
+        sources_by_ratio = getattr(kvcache, "sources_by_ratio", None) or {}
         # FlexKV's transfer workers and layerwise eventfds use PP-stage-local
         # layer coordinates. Keep the global ids only for indexing SGLang's
         # full-model state-pool arrays.
-        c4_layer_ids = [i - stage_start for i in c4_global_layer_ids]
-        c128_layer_ids = [i - stage_start for i in c128_global_layer_ids]
+
+        def stage_global_layer_ids(ratio: int) -> List[int]:
+            if ratio in sources_by_ratio:
+                return [
+                    i
+                    for i in sources_by_ratio[ratio]
+                    if stage_start <= i < stage_end
+                ]
+            return [
+                i
+                for i in range(stage_start, stage_end)
+                if compression_ratios[i] == ratio
+            ]
+
+        def stage_local_layer_ids(ratio: int) -> List[int]:
+            return [i - stage_start for i in stage_global_layer_ids(ratio)]
 
         def add_kv_group(
             name: str,
@@ -1954,63 +2034,125 @@ class FlexKVConnector:
                     }
                 )
 
-        c4_pool = getattr(kvcache, "c4_kv_pool", None)
-        c128_pool = getattr(kvcache, "c128_kv_pool", None)
-        if c4_pool is not None:
+        kv_pools = getattr(kvcache, "kv_pools", None)
+        if not isinstance(kv_pools, dict):
+            kv_pools = {}
+        else:
+            kv_pools = dict(kv_pools)
+        for ratio, attr in ((4, "c4_kv_pool"), (128, "c128_kv_pool")):
+            if kv_pools.get(ratio) is None:
+                pool = getattr(kvcache, attr, None)
+                if pool is not None:
+                    kv_pools[ratio] = pool
+
+        for ratio in (4, 128, 1, 2):
+            pool = kv_pools.get(ratio)
+            if pool is None:
+                continue
+            layer_ids = stage_local_layer_ids(ratio)
+            buffers = list(getattr(pool, "kv_buffer", None) or [])
+            if not buffers or not layer_ids:
+                continue
+            if len(buffers) != len(layer_ids):
+                raise RuntimeError(
+                    f"FlexKV DSv4 group c{ratio}: {len(buffers)} GPU buffers "
+                    f"vs {len(layer_ids)} source layers"
+                )
             add_kv_group(
-                "c4",
-                4,
-                c4_layer_ids,
-                c4_pool.kv_buffer,
-                c4_pool.page_size,
-                c4_pool.get_bytes_per_token(),
-            )
-        if c128_pool is not None:
-            add_kv_group(
-                "c128",
-                128,
-                c128_layer_ids,
-                c128_pool.kv_buffer,
-                c128_pool.page_size,
-                c128_pool.get_bytes_per_token(),
+                f"c{ratio}",
+                ratio,
+                layer_ids,
+                buffers,
+                pool.page_size,
+                pool.get_bytes_per_token(),
             )
 
-        indexer_pool = getattr(kvcache, "c4_indexer_kv_pool", None)
-        dsv4_indexer_buffers = (
-            list(getattr(indexer_pool, "index_k_with_scale_buffer", []))
-            if indexer_pool is not None
-            else []
-        )
-        if dsv4_indexer_buffers:
-            sample = dsv4_indexer_buffers[0]
+        index_pools = getattr(kvcache, "index_pools", None)
+        if not isinstance(index_pools, dict):
+            index_pools = {}
+        else:
+            index_pools = dict(index_pools)
+        if index_pools.get(4) is None:
+            c4_indexer = getattr(kvcache, "c4_indexer_kv_pool", None)
+            if c4_indexer is not None:
+                index_pools[4] = c4_indexer
+
+        for ratio in (4, 1, 2):
+            indexer_pool = index_pools.get(ratio)
+            if indexer_pool is None:
+                continue
+            raw_buffers = list(
+                getattr(indexer_pool, "index_k_with_scale_buffer", None) or []
+            )
+            if not raw_buffers:
+                continue
+            layer_ids = stage_local_layer_ids(ratio)
+            if not layer_ids:
+                continue
+            if len(raw_buffers) != len(layer_ids):
+                raise RuntimeError(
+                    f"FlexKV DSv4 group c{ratio}_indexer: {len(raw_buffers)} "
+                    f"GPU buffers vs {len(layer_ids)} source layers"
+                )
+            packed, logical_page = _pack_dsv4_indexer_full_pages(
+                raw_buffers,
+                full_page_size=self.page_size,
+                compress_ratio=ratio,
+                physical_page_size=int(indexer_pool.page_size),
+            )
+            sample = packed[0]
+            if sample.shape[1] % logical_page != 0:
+                raise RuntimeError(
+                    f"FlexKV DSv4 group c{ratio}_indexer page stride "
+                    f"{sample.shape[1]} is not divisible by {logical_page}"
+                )
             add_kv_group(
-                "c4_indexer",
-                4,
-                list(c4_layer_ids),
-                dsv4_indexer_buffers,
-                indexer_pool.page_size,
-                sample.shape[1] // indexer_pool.page_size,
+                f"c{ratio}_indexer",
+                ratio,
+                list(layer_ids),
+                packed,
+                logical_page,
+                sample.shape[1] // logical_page,
             )
 
-        # Compress states share the SWA physical-page mapping. The FlexKV
-        # user option is intentionally tri-state: omitted/None enables the
+        # Compress states share the SWA physical-page mapping. Only paged
+        # (non-request-scoped) pools tile a SWA page: classic DSv4 ratio-4
+        # attention/indexer state. DSv4.1 ratio-2 pair state and ratio-128
+        # online state are request-scoped rings and must not ride this path.
+        # The FlexKV user option is tri-state: omitted/None enables the
         # correctness-preserving default; explicit false keeps SWA-only I/O.
         swa_multi_group = getattr(
             getattr(self.flexkv_config, "user_config", None),
             "swa_multi_group",
             None,
         )
-        if swa_multi_group is not False:
-            self._append_dsv4_state_group(
-                "c4_attention_state",
-                c4_layer_ids,
-                [kvcache.compress_state_pools[i] for i in c4_global_layer_ids],
+        if getattr(self, "_swa_kv_pool", None) is None:
+            logger.info(
+                "[FlexKV-DSv4] no paged SWA pool; skipping SWA and "
+                "compress-state sidecars"
             )
-            self._append_dsv4_state_group(
-                "c4_indexer_state",
-                c4_layer_ids,
-                [kvcache.indexer_compress_state_pools[i] for i in c4_global_layer_ids],
+        elif swa_multi_group is not False:
+            attn_state_pools = getattr(kvcache, "compress_state_pools", None) or []
+            indexer_state_pools = (
+                getattr(kvcache, "indexer_compress_state_pools", None) or []
             )
+            for ratio in (4, 128, 1, 2):
+                global_ids = stage_global_layer_ids(ratio)
+                local_ids = stage_local_layer_ids(ratio)
+                self._append_dsv4_state_group(
+                    f"c{ratio}_attention_state",
+                    local_ids,
+                    [attn_state_pools[i] for i in global_ids]
+                    if global_ids
+                    else [],
+                )
+                self._append_dsv4_state_group(
+                    f"c{ratio}_indexer_state",
+                    local_ids,
+                    [indexer_state_pools[i] for i in global_ids]
+                    if global_ids
+                    else [],
+                )
         else:
             logger.info(
                 "[FlexKV-DSv4] swa_multi_group=false; registering SWA without "
@@ -2042,8 +2184,27 @@ class FlexKVConnector:
         layer_ids: List[int],
         pools: List[Any],
     ) -> None:
-        if not pools or any(pool is None for pool in pools):
+        if not pools:
             return
+        if any(pool is None for pool in pools):
+            if all(pool is None for pool in pools):
+                return
+            raise RuntimeError(
+                f"FlexKV DSv4 state group {name!r} has a mix of missing and "
+                f"present compress-state pools for layers {layer_ids}"
+            )
+        if any(bool(getattr(pool, "request_scoped", False)) for pool in pools):
+            logger.info(
+                "[FlexKV-DSv4] skipping request-scoped state group %s "
+                "(not SWA-page mapped)",
+                name,
+            )
+            return
+        if len(pools) != len(layer_ids):
+            raise RuntimeError(
+                f"FlexKV DSv4 state group {name!r}: {len(pools)} pools vs "
+                f"{len(layer_ids)} layers"
+            )
         ring_sizes = {int(pool.ring_size) for pool in pools}
         if len(ring_sizes) != 1:
             raise RuntimeError(
