@@ -51,3 +51,10 @@ _setup_library_path()
 # them without requiring the caller to ``import torch`` first or to set
 # ``LD_LIBRARY_PATH``.
 import torch  # noqa: E402,F401  (side-effect import: load libtorch/libc10)
+
+# Written by setup.py at build time; absent in a bare source checkout that has
+# never been built.
+try:
+    from flexkv._version import __version__  # noqa: E402,F401
+except ImportError:  # pragma: no cover
+    __version__ = "0.0.0+unknown"

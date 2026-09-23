@@ -1,0 +1,192 @@
+# Publish an sdist to PyPI, and attach a prebuilt wheel to the GitHub release.
+#
+# Why sdist-only on PyPI: flexkv.c_ext links against a specific libtorch ABI,
+# and a wheel filename can encode only the Python version and the platform --
+# there is no field for "built against torch 2.6 + CUDA 12.4". A wheel on PyPI
+# would therefore be installed by pip for users whose torch does not match,
+# failing at import with an undefined symbol. An sdist compiles against
+# whatever torch the user already has, which is always the right one.
+#
+# The convenience wheel still gets built here, but it is attached to the GitHub
+# release so installing it is an explicit, informed choice:
+#   pip install https://github.com/taco-project/FlexKV/releases/download/vX/....whl
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_to_pypi:
+        description: 'Publish to PyPI (otherwise TestPyPI)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  sdist:
+    name: Build sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Vendored xxHash and spdlog are build inputs and must be present for
+          # MANIFEST.in to pack them; prometheus-cpp is not shipped.
+          submodules: recursive
+          # setup.py derives the version from `git describe --tags`.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Build sdist
+        run: |
+          python -m pip install --upgrade setuptools wheel
+          # No compilation happens here, but setup.py imports torch at module
+          # scope, so a CPU-only torch is enough to produce the sdist.
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python setup.py sdist
+
+      - name: Check metadata
+        run: |
+          python -m pip install twine
+          twine check dist/*
+
+      - name: Reject a non-publishable version
+        run: |
+          version=$(python -c "import re,glob,os; print(re.match(r'flexkv-(.+)\.tar\.gz', os.path.basename(glob.glob('dist/*.tar.gz')[0])).group(1))")
+          echo "sdist version: $version"
+          # PEP 440 local versions (1.2.1+gabc1234) are valid locally but PyPI
+          # rejects them. Catch it here rather than at the upload step.
+          if [[ "$version" == *"+"* ]]; then
+            echo "::error::Version '$version' carries a local segment; publish from a clean tag or set FLEXKV_VERSION."
+            exit 1
+          fi
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  verify-sdist:
+    name: Compile the sdist from scratch
+    needs: sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install CUDA 12.4
+        run: |
+          curl -fsSL -o cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-12-4 liburing-dev
+          echo "/usr/local/cuda-12.4/bin" >> $GITHUB_PATH
+
+      - name: Install torch
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0
+
+      # This is the step that actually protects the release: it proves that a
+      # user with torch installed can `pip install` the published artifact and
+      # have it compile, with no git checkout and no prebuilt objects.
+      - name: pip install the sdist
+        env:
+          MAX_JOBS: 4
+          FLEXKV_ENABLE_METRICS: '0'
+          TORCH_CUDA_ARCH_LIST: '8.9'
+        run: |
+          python -m pip install --no-build-isolation -v dist/*.tar.gz
+
+      - name: Import it from outside the source tree
+        run: |
+          cd "$RUNNER_TEMP"
+          python -c "import flexkv; print(flexkv.__version__); import flexkv.c_ext"
+
+  wheel:
+    name: Build convenience wheel
+    needs: sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Linux Env
+        run: bash -x .github/workflows/scripts/env.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install CUDA 12.4
+        run: bash -x .github/workflows/scripts/cuda-install.sh 12.4 ubuntu-22.04
+
+      - name: Install PyTorch 2.6.0
+        run: bash -x .github/workflows/scripts/pytorch-install.sh 3.10 2.6.0 12.4
+
+      - name: Build wheel
+        env:
+          TORCH_CUDA_ARCH_LIST: "8.9 9.0+PTX"
+          MAX_JOBS: 4
+        run: ./build.sh --release
+
+      - name: Name the wheel for what it is
+        run: |
+          # The default filename says nothing about the torch/CUDA it was built
+          # against, which is the one thing a user needs to know before
+          # installing it by hand.
+          cd dist
+          for f in *.whl; do
+            echo "Built: $f  (torch 2.6.0, CUDA 12.4, py3.10)"
+          done
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-torch2.6.0-cu124-cp310
+          path: dist/*.whl
+
+  publish:
+    name: Publish sdist
+    needs: [sdist, verify-sdist]
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions:
+      # Required for PyPI Trusted Publishing; no API token is stored.
+      id-token: write
+    steps:
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: Publish to TestPyPI
+        if: github.event_name == 'workflow_dispatch' && !inputs.publish_to_pypi
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+      - name: Publish to PyPI
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_to_pypi
+        uses: pypa/gh-action-pypi-publish@release/v1
