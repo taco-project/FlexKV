@@ -73,7 +73,9 @@ class PrefetchCoordinator:
         self.max_batch_graphs = max_batch_graphs
         self.epoch = epoch or uuid.uuid4().hex
         self.sessions: Dict[PrefetchHandle, Session] = OrderedDict()
-        self.expired = OrderedDict()  # bounded lightweight terminal tombstones
+        # Released/expired terminal snapshots only: never retain a context or
+        # charge an admission slot after the caller has relinquished its lease.
+        self.expired = OrderedDict()
         self.graphs = {}
         self.reserved_bytes = 0
         self._next_id = 0
@@ -118,6 +120,8 @@ class PrefetchCoordinator:
         self.seal(session, reason)
         if reason in ("reset", "shutdown"):
             session.discard_result = True
+            if session.terminal_at is not None:
+                self._retire(session)
         self._finalize(session)
         return self.snapshot(handle)
 
@@ -303,7 +307,24 @@ class PrefetchCoordinator:
             session.error,
         )
         if session.released or session.discard_result:
-            self.backend.release(session.context)
+            self._retire(session)
+
+    def _retire(self, session):
+        """Return admission credit, retaining only an unprotected snapshot.
+
+        Claimed graphs must have drained before their context can be released.
+        An unconsumed terminal lease stays in sessions until release or TTL;
+        tombstones instead have a separate, bounded history budget.
+        """
+        if session.terminal_at is None or session.chunks:
+            raise RuntimeError("cannot retire an undrained prefetch session")
+        session.version += 1
+        snapshot = replace(self.snapshot(session.handle), lease_valid=False)
+        self.backend.release(session.context)
+        del self.sessions[session.handle]
+        self.expired[session.handle] = snapshot
+        while len(self.expired) > self.max_sessions * 4:
+            self.expired.popitem(last=False)
 
     def release(self, handle):
         if handle not in self.sessions:
@@ -313,9 +334,13 @@ class PrefetchCoordinator:
             return
         session.released = True
         self.seal(session, "request_abort")
-        if session.terminal_at is not None:
-            self.backend.release(session.context)
         session.version += 1
+        if session.terminal_at is not None:
+            self._retire(session)
+        else:
+            # A query-only session has nothing to drain. Inflight sessions
+            # remain in the ledger until tick finalizes their last graph.
+            self._finalize(session)
 
     def snapshot(self, handle):
         if handle in self.expired:
@@ -386,9 +411,7 @@ class PrefetchCoordinator:
                     reusable_prefix_end_token=0,
                     l3_loaded_spans=(),
                 )
-                del self.sessions[handle]
-                while len(self.expired) > self.max_sessions * 4:
-                    self.expired.popitem(last=False)
+                # release() already retired the context and bounded the history.
 
     def stop_all(self, reason):
         self.accepting = False

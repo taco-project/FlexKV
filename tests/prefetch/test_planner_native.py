@@ -186,7 +186,8 @@ def test_stop_drains_claimed_chunks_without_issuing_next(env, policy):
     h = start(env, policy=policy, timeout_budget_s=10)
     env.c.tick()
     if policy == "timeout":
-        env.c.clock = lambda: env.c.sessions[h].deadline + 1
+        deadline = env.c.sessions[h].deadline
+        env.c.clock = lambda: deadline + 1
     else:
         env.c.demand([h])
     env.c.tick()

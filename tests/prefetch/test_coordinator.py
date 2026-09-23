@@ -297,6 +297,95 @@ def test_capacity_terminal_no_deadlock():
     assert c.snapshot(h).terminal and c.snapshot(h).stop_reason == "capacity"
 
 
+def test_released_terminal_sessions_return_admission_without_waiting_for_ttl():
+    clock, backend = Clock(), Backend(target=0)
+    c = PrefetchCoordinator(backend, clock=clock, max_sessions=2)
+    handles = []
+    for _ in range(1000):
+        h = c.start([1])
+        handles.append(h)
+        c.tick()
+        assert c.snapshot(h).terminal
+        c.release(h)
+        c.release(h)
+        assert h not in c.sessions
+        assert not c.snapshot(h).lease_valid
+        assert c.snapshot(h).terminal
+        c.demand([h])
+        assert c.stop(h).terminal
+    assert clock.now == 0  # No TTL advancement hides a leaked admission slot.
+    assert len(backend.releases) == 1000
+    assert len(c.expired) == 8 and not c.sessions
+    assert c.next_wakeup(0.002) is None
+    with pytest.raises(KeyError):
+        c.snapshot(handles[0])
+
+
+def test_unreleased_terminal_lease_still_counts_against_admission():
+    c = PrefetchCoordinator(Backend(target=0), clock=Clock(), max_sessions=1)
+    h = c.start([1])
+    c.tick()
+    assert c.snapshot(h).terminal and c.snapshot(h).lease_valid
+    with pytest.raises(RuntimeError, match="capacity exhausted"):
+        c.start([1])
+    c.release(h)
+    assert c.start([1]) != h
+
+
+def test_release_during_drain_keeps_credit_until_last_graph_completes():
+    c, b, clock, h = setup()
+    c.max_sessions = 1
+    c.tick()
+    c.tick()
+    c.release(h)
+    with pytest.raises(RuntimeError, match="capacity exhausted"):
+        c.start([1])
+    finish(c, b.sent[1])  # Out-of-order completion cannot retire the session.
+    c.tick()
+    assert h in c.sessions and not b.releases
+    finish(c, b.sent[0])
+    c.tick()
+    assert h not in c.sessions
+    assert c.snapshot(h).terminal and not c.snapshot(h).lease_valid
+    assert not c.graphs and c.reserved_bytes == 0 and not b.allocations
+    assert len(b.releases) == 1
+    assert c.start([1]) != h
+
+
+def test_release_while_query_is_pending_can_retire_without_allocations():
+    c, b, clock, h = setup()
+    b.metadata_ready = False
+    c.tick()
+    c.release(h)
+    assert h not in c.sessions
+    assert c.snapshot(h).terminal and not c.snapshot(h).lease_valid
+    assert len(b.releases) == 1 and not b.allocations
+    c.tick()
+    c.release(h)
+    assert len(b.releases) == 1
+
+
+@pytest.mark.parametrize("terminal_first", [False, True])
+def test_reset_retires_results_once_after_drain(terminal_first):
+    c, b, clock, h = setup()
+    c.tick()
+    c.stop(h)
+    if terminal_first:
+        finish(c, b.sent[0])
+        c.tick()
+    c.stop_all("reset")
+    if not terminal_first:
+        assert h in c.sessions and not b.releases
+        finish(c, b.sent[0])
+        c.tick()
+    assert h not in c.sessions
+    assert c.snapshot(h).terminal and not c.snapshot(h).lease_valid
+    c.release(h)
+    clock.now += 61
+    c.reap()
+    assert len(b.releases) == 1
+
+
 def test_stale_handle_and_late_completion():
     c, b, clock, h = setup()
     with pytest.raises(KeyError):
