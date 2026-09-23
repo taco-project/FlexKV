@@ -2,16 +2,17 @@
 
 ## Integration cleanup: September 23, 2026
 
-Removed the obsolete SGLang bootstrap and incremental prefetch patches. The
-prefetch changes are already in the source branch of SGLang PR #31781 through
-merged review PR #6. FlexKV owns the connector and communication implementation;
-SGLang imports it and maintains the cache/scheduler lifecycle integration.
-Installation and design docs now refer to those source branches directly.
+The existing SGLang connector patch and its integration README files remain
+unchanged from main. The incremental prefetch patch is excluded from this PR:
+the prefetch changes are already in the source branch of SGLang PR #31781
+through merged review PR #6. The design docs refer to those source branches
+directly. FlexKV owns the connector and communication implementation; SGLang
+imports it and maintains the cache/scheduler lifecycle integration.
 
 This cleanup changes only patch artifacts and documentation. Runtime sources
 are unchanged from FlexKV `0dff8ea024` and paired SGLang `2ef249ef91`; it does
-not add a new GPU or performance result. Earlier patch checks below describe
-their original revisions.
+not add a new GPU or performance result. Earlier companion-patch checks below
+describe their original revisions.
 
 ## Insert-after integration: September 22, 2026
 
@@ -32,7 +33,7 @@ on the removed experimental per-chunk byte target.
 The initial companion SGLang head was `c6b51c1b5c`, which already contained
 its adaptation target `5166ce06aa`. At that revision, the companion patch was
 checked to reproduce the head exactly. These patch checks are historical; the
-patch files were removed after the changes entered the adaptation branch.
+incremental patch was excluded after the changes entered the adaptation branch.
 
 Validation on an isolated H20 container (Python 3.12, PyTorch 2.13.0+cu130,
 CUDA 13.0), after rebuilding the current C++/CUDA extension:
