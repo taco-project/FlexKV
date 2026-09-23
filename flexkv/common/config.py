@@ -955,6 +955,7 @@ class UserConfig:
     # path. None is intentionally distinct from False so old configs default
     # to the correctness-preserving state restore path.
     swa_multi_group: Optional[bool] = None
+    swa: Optional[Dict[str, int]] = None
 
     def __post_init__(self):
         if self.cpu_cache_gb <= 0:
