@@ -16,6 +16,7 @@ import torch
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
+import contextlib
 
 
 class BaseStorageAllocator(ABC):
@@ -218,10 +219,8 @@ def _cleanup_hugepage_mapping(addr: int, aligned: int, fd: int,
     if fd >= 0:
         _libc.close(fd)
     if path is not None:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
-        except FileNotFoundError:
-            pass
     _live_hugepage_mappings.pop(data_ptr, None)
 
 
@@ -230,10 +229,8 @@ def _cleanup_hugepage_mmap(mm: mmap.mmap, path: str | None, data_ptr: int) -> No
         mm.close()
     finally:
         if path is not None:
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
-            except FileNotFoundError:
-                pass
         _live_hugepage_mappings.pop(data_ptr, None)
 
 
@@ -273,10 +270,8 @@ def _create_hugetlbfs_file(aligned: int) -> tuple[str, int]:
             )
     except Exception:
         os.close(fd)
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
-        except FileNotFoundError:
-            pass
         raise
     return path, fd
 
@@ -429,10 +424,8 @@ def _mmap_huge(num_bytes: int, page_size_bytes: int) -> Tuple[int, int, int]:
     fd = -1
     try:
         path, fd = _create_hugetlbfs_file(aligned)
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(path)
-        except OSError:
-            pass
 
         ctypes.set_errno(0)
         ret = _libc.mmap(
@@ -495,6 +488,7 @@ def alloc_hugepage_tensor(num_elements: int,
                 f"mapping_alignment={mapping_alignment}"
             )
         path, fd = _create_hugetlbfs_file(aligned)
+        mm = None
         try:
             mm = mmap.mmap(
                 fd,
@@ -502,9 +496,17 @@ def alloc_hugepage_tensor(num_elements: int,
                 flags=mmap.MAP_SHARED,
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
+            return _wrap_mmap_tensor(mm, aligned, num_elements, dtype, cleanup_path=path)
+        except Exception:
+            try:
+                if mm is not None:
+                    mm.close()
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
+            raise
         finally:
             os.close(fd)
-        return _wrap_mmap_tensor(mm, aligned, num_elements, dtype, cleanup_path=path)
 
     addr, aligned, fd = _mmap_huge(num_bytes, page_size_bytes)
 
@@ -695,8 +697,10 @@ class SSDAllocator(BaseStorageAllocator):
                         f"SSD allocator progress: {file_count}/{total_num_files} files created "
                         f"({file_count * 100 // total_num_files}%)"
                     )
-        flexkv_logger.info(f"SSD allocator done: {total_num_files} files in {cache_dir}, "
-                           f"each file has {real_file_size/1024/1024/1024:.2f} GB, total size {real_total_size/1024/1024/1024:.2f} GB")
+        flexkv_logger.info(
+            f"SSD allocator done: {total_num_files} files in {cache_dir}, "
+            f"each file has {real_file_size/1024/1024/1024:.2f} GB, total size {real_total_size/1024/1024/1024:.2f} GB"
+        )
         return StorageHandle(
             handle_type=AccessHandleType.FILE,
             data=ssd_files,

@@ -28,12 +28,13 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import math
 import os
 import signal
 import socket
 import struct
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -108,7 +109,7 @@ class FlexKVHostReleaseShim:
     ``FlexKVConnector.shutdown()`` so unpin stays on that same path.
     """
 
-    def __init__(self, connector: "FlexKVConnector") -> None:
+    def __init__(self, connector: FlexKVConnector) -> None:
         self._connector = connector
 
     def destroy(self) -> None:
@@ -331,10 +332,8 @@ class FlexKVConnector:
         #   * atexit runs kv_manager.shutdown() (cudaHostUnregister).
         #   * Stretch the parent's scheduler-exit wait so kill_process_tree
         #     does not SIGKILL mid-unpin (generic env, not FlexKV-named in TM).
-        try:
+        with suppress(Exception):
             signal.signal(signal.SIGINT, signal.SIG_IGN)
-        except Exception:  # noqa: BLE001
-            pass
         # Graceful shutdown timeout hierarchy (see FlexKV config.py):
         #   tokenizer wait (this env)                   = 1200s
         #     > TM parent-side wait (FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S) = 900s
@@ -1269,40 +1268,39 @@ class FlexKVConnector:
         completed_rids: List[str] = []
         completed_by_rid: Dict[str, Any] = {}
 
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            if self._inflight_stores:
-                fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
-                try:
-                    completed_dict = (
-                        self.kv_manager.wait(
-                            list(fk_to_rid.keys()),
-                            timeout=0.0,
-                            completely=True,
-                        )
-                        or {}
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None and self._inflight_stores:
+            fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
+            try:
+                completed_dict = (
+                    self.kv_manager.wait(
+                        list(fk_to_rid.keys()),
+                        timeout=0.0,
+                        completely=True,
                     )
-                except Exception as exc:  # noqa: BLE001
-                    rid = next(iter(self._inflight_stores))
-                    context = getattr(self, "_inflight_store_contexts", {}).get(rid)
-                    context = context or self._new_op_context(
-                        "store", rid, task_id=self._inflight_stores[rid]
-                    )
-                    self._log_cache_op(
-                        context,
-                        "poll",
-                        "failed",
-                        task_id=-1,
-                        flexkv_task_ids=list(fk_to_rid),
-                        error=str(exc),
-                    )
-                    completed_dict = {}
-                for fk_tid, response in completed_dict.items():
-                    status = _status_value(response)
-                    if not _is_terminal_status(status):
-                        continue
-                    rid = fk_to_rid[fk_tid]
-                    completed_rids.append(rid)
-                    completed_by_rid[rid] = response
+                    or {}
+                )
+            except Exception as exc:  # noqa: BLE001
+                rid = next(iter(self._inflight_stores))
+                context = getattr(self, "_inflight_store_contexts", {}).get(rid)
+                context = context or self._new_op_context(
+                    "store", rid, task_id=self._inflight_stores[rid]
+                )
+                self._log_cache_op(
+                    context,
+                    "poll",
+                    "failed",
+                    task_id=-1,
+                    flexkv_task_ids=list(fk_to_rid),
+                    error=str(exc),
+                )
+                completed_dict = {}
+            for fk_tid, response in completed_dict.items():
+                status = _status_value(response)
+                if not _is_terminal_status(status):
+                    continue
+                rid = fk_to_rid[fk_tid]
+                completed_rids.append(rid)
+                completed_by_rid[rid] = response
 
         if self._sync_ctx.needs_sync:
             completed_rids = self._sync_ctx.scatter(
@@ -2227,14 +2225,18 @@ class FlexKVConnector:
 
     def _wait_kv_manager_ready(self, poll_interval: float = 10.0) -> None:
         assert self.kv_manager is not None
-        wait_count = 0
+        timeout = float(os.environ.get("FLEXKV_READY_TIMEOUT_S", "360"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("FLEXKV_READY_TIMEOUT_S must be finite and positive")
+        start = time.monotonic()
         while not self.kv_manager.is_ready():
-            time.sleep(poll_interval)
-            wait_count += 1
+            remaining = timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                raise TimeoutError(f"FlexKV did not become ready within {timeout}s {self._label}")
+            time.sleep(min(poll_interval, remaining))
             logger.info(
                 "[FlexKV] Waiting for FlexKV ready %s (waited %.0fs)",
-                self._label,
-                wait_count * poll_interval,
+                self._label, time.monotonic() - start,
             )
         logger.info("[FlexKV] FlexKV is ready %s", self._label)
 
