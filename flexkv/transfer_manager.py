@@ -1,6 +1,8 @@
 import os
 import multiprocessing as mp
 import signal
+import math
+import traceback
 import time
 import queue
 import selectors
@@ -34,6 +36,7 @@ from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import RegistrationKey, RegisterTPClientRequest, Response
+import contextlib
 
 
 class TransferManager:
@@ -335,10 +338,8 @@ class TransferManager:
                         )
                         time.sleep(0.01)
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 poller.unregister(self.gpu_control_socket)
-            except Exception:
-                pass
 
     def stop_gpu_control_listener(self) -> None:
         self._gpu_control_shutdown.set()
@@ -1029,6 +1030,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
 
         self.command_parent_conn, self.command_child_conn = self.mp_ctx.Pipe()
         self.result_parent_conn, self.result_child_conn = self.mp_ctx.Pipe()
+        self.error_parent_conn, self.error_child_conn = self.mp_ctx.Pipe(duplex=False)
+        self._worker_error: Optional[str] = None
 
         self.process: Optional[Process] = None
         self.start_event = self.mp_ctx.Event()
@@ -1052,10 +1055,12 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                   self.result_child_conn,
                   self.gpu_register_port,
                   self.ready_event,
-                  self.start_event),
+                  self.start_event,
+                  self.error_child_conn),
             daemon=False
         )
         self.process.start()
+        self.error_child_conn.close()
         flexkv_logger.debug(f"TransferManager subprocess spawned, pid={self.process.pid}")
 
     def _process_worker(self,
@@ -1065,20 +1070,11 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         result_conn,
                         gpu_register_port: str,
                         ready_event,
-                        start_event) -> None:
-        # Automatically reap child processes (daemon transfer workers) to
-        # prevent zombie accumulation.  Use a handler that calls waitpid()
-        # with WNOHANG so that multiprocessing.Process.join() still works
-        # correctly (SIG_IGN would cause join() to raise ChildProcessError).
-        def _reap_children(signum, frame):
-            while True:
-                try:
-                    pid, _ = os.waitpid(-1, os.WNOHANG)
-                    if pid == 0:
-                        break
-                except ChildProcessError:
-                    break
-        signal.signal(signal.SIGCHLD, _reap_children)
+                        start_event,
+                        error_conn) -> None:
+        # multiprocessing.Process owns its children's exit status. A generic
+        # waitpid(-1) handler can steal that status and leave join() hanging.
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
         def _on_exit_signal(signum, frame):
             flexkv_logger.warning(
@@ -1141,7 +1137,9 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     for key, mask in events:
                         if key.data == "command":
                             # New command available
-                            inner_range = nvtx.start_range(message="TransferManagerInter.process_worker.req", color="red")
+                            inner_range = nvtx.start_range(
+                                message="TransferManagerInter.process_worker.req", color="red"
+                            )
                             try:
                                 request = command_conn.recv()
                             except (EOFError, BrokenPipeError, ConnectionResetError) as e:
@@ -1181,7 +1179,9 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
 
                     # Only collect finished_ops if selector reported data available
                     if has_finished_ops and not should_exit:
-                        inner_range = nvtx.start_range(message="TransferManagerInter.process_worker.results", color="red")
+                        inner_range = nvtx.start_range(
+                            message="TransferManagerInter.process_worker.results", color="red"
+                        )
                         try:
                             # Directly get from completed_queue without timeout to avoid poll
                             finished_ops = []
@@ -1212,6 +1212,10 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         except Exception as e:
             flexkv_logger.error(f"Failed to initialize transfer manager process: {e}", exc_info=True)
             init_failed = True
+            # Bound encoded bytes so even non-ASCII tracebacks fit the pipe.
+            message = traceback.format_exc().encode("utf-8")[-4096:].decode("utf-8", errors="replace")
+            with contextlib.suppress(BrokenPipeError, EOFError, OSError):
+                error_conn.send(message)
         finally:
             # Cleanup selector (only if it was created)
             if 'sel' in locals():
@@ -1228,38 +1232,69 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                 except Exception as e:
                     flexkv_logger.error(f"Error shutting down transfer manager: {e}")
 
-            try:
+            with contextlib.suppress(Exception):
                 command_conn.close()
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 result_conn.close()
-            except Exception:
-                pass
+            error_conn.close()
             flexkv_logger.info("TransferManager process cleanup complete")
             if init_failed:
                 sys.exit(1)
 
-    def start(self) -> None:
-        os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
-        self._start_process()
-        self.start_event.wait()
-        os.environ['MPI4PY_RC_INITIALIZE'] = 'true'
-
-    def is_ready(self) -> bool:
-        if self.ready_event.is_set():
-            return True
-        # The subprocess can give up during startup (GPU registration timeout).
-        # Surface that instead of leaving callers spinning on a dead process.
-        if self.process is not None and not self.process.is_alive():
+    def _check_worker_health(self) -> None:
+        exited = self.process is not None and not self.process.is_alive()
+        if exited:
+            self.process.join()
+        if self._worker_error is None and self.error_parent_conn.poll():
+            with contextlib.suppress(EOFError):
+                self._worker_error = self.error_parent_conn.recv()
+        if self._worker_error is not None:
+            raise RuntimeError(f"TransferManager worker failed:\n{self._worker_error}")
+        if exited:
             raise RuntimeError(
                 f"TransferManager subprocess (pid={self.process.pid}, "
-                f"exitcode={self.process.exitcode}) exited before becoming ready; "
-                f"see the [FLEXKV] log above for the startup failure."
+                f"exitcode={self.process.exitcode}) exited unexpectedly"
             )
-        return False
+
+    def start(self) -> None:
+        timeout = float(os.environ.get("FLEXKV_WORKER_SPAWN_TIMEOUT_S", "60"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("FLEXKV_WORKER_SPAWN_TIMEOUT_S must be finite and positive")
+        previous_mpi = os.environ.get("MPI4PY_RC_INITIALIZE")
+        os.environ["MPI4PY_RC_INITIALIZE"] = "false"
+        try:
+            self._start_process()
+            deadline = time.monotonic() + timeout
+            while not self.start_event.wait(min(0.1, max(0, deadline - time.monotonic()))):
+                self._check_worker_health()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"TransferManager subprocess did not start within {timeout}s")
+            self._check_worker_health()
+        except BaseException:
+            # The spawn handshake has failed. Do not leave a non-daemon child
+            # behind to block the parent's multiprocessing atexit handler.
+            if self.process is not None and self.process.pid is not None:
+                if self.process.is_alive():
+                    self.process.terminate()
+                self.process.join(timeout=5)
+                if self.process.is_alive():
+                    self.process.kill()
+                    self.process.join()
+            with contextlib.suppress(Exception):
+                self.shutdown()
+            raise
+        finally:
+            if previous_mpi is None:
+                os.environ.pop("MPI4PY_RC_INITIALIZE", None)
+            else:
+                os.environ["MPI4PY_RC_INITIALIZE"] = previous_mpi
+
+    def is_ready(self) -> bool:
+        self._check_worker_health()
+        return self.ready_event.is_set()
 
     def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
+        self._check_worker_health()
         nvtx_range = nvtx.start_range(message="TransferManagerInterProcessHandle.submit", color="green")
         self.command_parent_conn.send({
             'type': 'submit',
@@ -1268,6 +1303,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         nvtx.end_range(nvtx_range)
 
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
+        self._check_worker_health()
         # Batch submit to reduce IPC overhead
         nvtx_range = nvtx.start_range(
             message=f"TransferManagerInterProcessHandle.submit_batch count={len(transfer_graphs)}",
@@ -1281,23 +1317,25 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
 
     def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         finished_ops: List[CompletedOp] = []
-        try:
-            if self.result_parent_conn.poll(timeout=timeout):
-                received_ops = self.result_parent_conn.recv()
-                finished_ops += received_ops
-                while self.result_parent_conn.poll():
-                    received_ops = self.result_parent_conn.recv()
-                    finished_ops += received_ops
-        except EOFError:
-            pass
-
-        return finished_ops
+        deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+        while True:
+            self._check_worker_health()
+            remaining = 0.1 if deadline is None else max(0, deadline - time.monotonic())
+            try:
+                if self.result_parent_conn.poll(timeout=min(0.1, remaining)):
+                    finished_ops.extend(self.result_parent_conn.recv())
+                    while self.result_parent_conn.poll():
+                        finished_ops.extend(self.result_parent_conn.recv())
+                    return finished_ops
+            except EOFError:
+                self._check_worker_health()
+                raise RuntimeError("TransferManager result pipe closed") from None
+            if deadline is not None and time.monotonic() >= deadline:
+                self._check_worker_health()
+                return finished_ops
 
     def shutdown(self) -> None:
-        if self.process is None:
-            return
-
-        if self.process.is_alive():
+        if self.process is not None and self.process.pid is not None and self.process.is_alive():
             try:
                 flexkv_logger.info(
                     "Sending graceful shutdown command to TransferManager subprocess "
@@ -1327,21 +1365,18 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                     self.process.kill()
                     self.process.join()
 
-        try:
-            self.command_parent_conn.close()
-        except Exception:
-            pass
-        try:
-            self.result_parent_conn.close()
-        except Exception:
-            pass
+        if self.process is not None and self.process.pid is not None:
+            self.process.join()
+            self.process.close()
+        for conn in (self.command_parent_conn, self.command_child_conn,
+                     self.result_parent_conn, self.result_child_conn,
+                     self.error_parent_conn, self.error_child_conn):
+            conn.close()
         self.process = None
 
     def __del__(self):
-        try:
+        with contextlib.suppress(Exception):
             self.shutdown()
-        except Exception:
-            pass
 
 
 class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
