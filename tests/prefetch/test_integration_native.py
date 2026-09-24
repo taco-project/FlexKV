@@ -412,3 +412,22 @@ def test_user_configuration_propagates_prefetch_limits(monkeypatch):
     update_default_config_from_user_config(RankInfo(ModelConfig()), cfg, user)
     assert cfg.enable_chunked_prefetch and cfg.prefetch_max_sessions == 17
     assert cfg.prefetch_options["policy"] == "timeout"
+
+
+@pytest.mark.parametrize("namespace", [None, ["tenant-a"], ["tenant-b", "adapter"]])
+def test_connector_forwards_namespace_to_chunked_session(namespace):
+    c = FlexKVConnector.__new__(FlexKVConnector)
+    c._prefetch_enabled = c._chunked_prefetch = True
+    c._chunked_prefetch_options = PrefetchOptions(policy="best_effort")
+    c._prefetch_sessions, c._prefetch_result_sessions = {}, {}
+    c._prefetch_loaded_tokens, c._prefetch_loaded_spans = {}, {}
+    c._swa_kv_pool = None
+    c.kv_manager = Mock()
+    c.kv_manager.start_prefetch.return_value = NS(session_id=17)
+    c._sync_ctx = NS(is_sync_leader=True, needs_sync=False)
+    assert c.supports_cache_namespace is True
+    assert c.prefetch_async("r", [1, 2, 3, 4], namespace=namespace, candidate_start_token=2) == 17
+    call = c.kv_manager.start_prefetch.call_args
+    assert call.args[0].tolist() == [1, 2, 3, 4]
+    assert call.args[1].candidate_start_token == 2
+    assert call.kwargs["namespace"] == namespace

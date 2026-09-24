@@ -142,6 +142,19 @@ class FlexKVConnector:
       * ``reset`` / ``shutdown``.
     """
 
+    _chunked_namespace_supported = True
+
+    @property
+    def supports_cache_namespace(self) -> bool:
+        """All enabled lookup/store/prefetch paths accept ``namespace``.
+
+        A chunked-prefetch connector must opt in separately after forwarding
+        the namespace through every chunk and its session identity.
+        """
+        return not getattr(self, "_chunked_prefetch", False) or getattr(
+            self, "_chunked_namespace_supported", False
+        ) is True
+
     def __init__(
         self,
         *,
@@ -527,6 +540,7 @@ class FlexKVConnector:
         token_mask: torch.Tensor,
         rid: Optional[str] = None,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+        namespace: Optional[List[str]] = None,
     ) -> Tuple[int, int]:
         """Page-aligned prefix lookup against FlexKV.
 
@@ -540,6 +554,8 @@ class FlexKVConnector:
             hit > 0 and the caller didn't ask to track it.
           sglang_req_id: business request ID used only for logs. This can be
             ``None`` when ``rid`` is an internal tracking key.
+
+          namespace: cache identity components shared with store and prefetch.
 
         Returns:
           ``(fkv_task_id, hit_count)``. ``hit_count`` is page-aligned
@@ -562,6 +578,7 @@ class FlexKVConnector:
                     token_mask=mask_np,
                     cpu_only=getattr(self, "_chunked_prefetch", False),
                     swa_aware=self._swa_kv_pool is not None,
+                    namespace=namespace,
                 )
             except Exception as exc:  # noqa: BLE001
                 lookup_error = exc
@@ -1112,6 +1129,7 @@ class FlexKVConnector:
         token_ids: List[int],
         kv_indices: torch.Tensor,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+        namespace: Optional[List[str]] = None,
     ) -> int:
         """Schedule a write back from GPU into FlexKV.
 
@@ -1166,7 +1184,7 @@ class FlexKVConnector:
             try:
                 with self._store_profile_scope("flexkv.connector.store.put_match"):
                     res = self.kv_manager.put_match(
-                        token_ids=token_ids_np, token_mask=None
+                        token_ids=token_ids_np, token_mask=None, namespace=namespace
                     )
             except Exception as exc:  # noqa: BLE001
                 match_error = exc
@@ -1438,12 +1456,13 @@ class FlexKVConnector:
         rid: str,
         token_ids: List[int],
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+        namespace: Optional[List[str]] = None,
         *, candidate_start_token: int = 0,
     ) -> int:
         if not self._prefetch_enabled or not rid:
             return -1
         if getattr(self, "_chunked_prefetch", False):
-            return self._start_chunked_prefetch(rid, token_ids, candidate_start_token)
+            return self._start_chunked_prefetch(rid, token_ids, candidate_start_token, namespace)
         context = self._new_op_context("prefetch", rid, sglang_req_id)
         task_id = -1
         planned_tokens = 0
@@ -1451,7 +1470,8 @@ class FlexKVConnector:
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 prefetch_result = self.kv_manager.prefetch_async(
-                    token_ids=np.asarray(token_ids, dtype=np.int64)
+                    token_ids=np.asarray(token_ids, dtype=np.int64),
+                    namespace=namespace,
                 )
                 # KVManager currently returns
                 # ``(task_id, actual_prefetch_tokens)`` even though older
@@ -1568,7 +1588,7 @@ class FlexKVConnector:
             )
         return done
 
-    def _start_chunked_prefetch(self, rid, token_ids, candidate_start_token=0):
+    def _start_chunked_prefetch(self, rid, token_ids, candidate_start_token=0, namespace=None):
         if rid in self._prefetch_sessions:
             return self._prefetch_sessions[rid].session_id
         self._release_prefetch_result(rid)
@@ -1582,6 +1602,7 @@ class FlexKVConnector:
                         candidate_start_token=candidate_start_token,
                         swa_aware=self._swa_kv_pool is not None,
                     ),
+                    namespace=namespace,
                 )
             except Exception as exc:
                 payload["error"] = str(exc)
