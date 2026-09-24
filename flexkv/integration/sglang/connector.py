@@ -33,7 +33,7 @@ import signal
 import socket
 import struct
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -108,7 +108,7 @@ class FlexKVHostReleaseShim:
     ``FlexKVConnector.shutdown()`` so unpin stays on that same path.
     """
 
-    def __init__(self, connector: "FlexKVConnector") -> None:
+    def __init__(self, connector: FlexKVConnector) -> None:
         self._connector = connector
 
     def destroy(self) -> None:
@@ -141,6 +141,17 @@ class FlexKVConnector:
       * ``release_pending`` — cancel a held task whose load won't run.
       * ``reset`` / ``shutdown``.
     """
+
+    @property
+    def supports_cache_namespace(self) -> bool:
+        """All enabled lookup/store/prefetch paths accept ``namespace``.
+
+        A chunked-prefetch connector must opt in separately after forwarding
+        the namespace through every chunk and its session identity.
+        """
+        return not getattr(self, "_chunked_prefetch", False) or getattr(
+            self, "_chunked_namespace_supported", False
+        ) is True
 
     def __init__(
         self,
@@ -331,10 +342,8 @@ class FlexKVConnector:
         #   * atexit runs kv_manager.shutdown() (cudaHostUnregister).
         #   * Stretch the parent's scheduler-exit wait so kill_process_tree
         #     does not SIGKILL mid-unpin (generic env, not FlexKV-named in TM).
-        try:
+        with suppress(Exception):
             signal.signal(signal.SIGINT, signal.SIG_IGN)
-        except Exception:  # noqa: BLE001
-            pass
         # Graceful shutdown timeout hierarchy (see FlexKV config.py):
         #   tokenizer wait (this env)                   = 1200s
         #     > TM parent-side wait (FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S) = 900s
@@ -481,6 +490,7 @@ class FlexKVConnector:
         token_mask: torch.Tensor,
         rid: Optional[str] = None,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+        namespace: Optional[List[str]] = None,
     ) -> Tuple[int, int]:
         """Page-aligned prefix lookup against FlexKV.
 
@@ -494,6 +504,8 @@ class FlexKVConnector:
             hit > 0 and the caller didn't ask to track it.
           sglang_req_id: business request ID used only for logs. This can be
             ``None`` when ``rid`` is an internal tracking key.
+
+          namespace: cache identity components shared with store and prefetch.
 
         Returns:
           ``(fkv_task_id, hit_count)``. ``hit_count`` is page-aligned
@@ -515,6 +527,7 @@ class FlexKVConnector:
                     token_ids=tids_np,
                     token_mask=mask_np,
                     swa_aware=self._swa_kv_pool is not None,
+                    namespace=namespace,
                 )
             except Exception as exc:  # noqa: BLE001
                 lookup_error = exc
@@ -1061,6 +1074,7 @@ class FlexKVConnector:
         token_ids: List[int],
         kv_indices: torch.Tensor,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+        namespace: Optional[List[str]] = None,
     ) -> int:
         """Schedule a write back from GPU into FlexKV.
 
@@ -1115,7 +1129,7 @@ class FlexKVConnector:
             try:
                 with self._store_profile_scope("flexkv.connector.store.put_match"):
                     res = self.kv_manager.put_match(
-                        token_ids=token_ids_np, token_mask=None
+                        token_ids=token_ids_np, token_mask=None, namespace=namespace
                     )
             except Exception as exc:  # noqa: BLE001
                 match_error = exc
@@ -1269,40 +1283,39 @@ class FlexKVConnector:
         completed_rids: List[str] = []
         completed_by_rid: Dict[str, Any] = {}
 
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            if self._inflight_stores:
-                fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
-                try:
-                    completed_dict = (
-                        self.kv_manager.wait(
-                            list(fk_to_rid.keys()),
-                            timeout=0.0,
-                            completely=True,
-                        )
-                        or {}
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None and self._inflight_stores:
+            fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
+            try:
+                completed_dict = (
+                    self.kv_manager.wait(
+                        list(fk_to_rid.keys()),
+                        timeout=0.0,
+                        completely=True,
                     )
-                except Exception as exc:  # noqa: BLE001
-                    rid = next(iter(self._inflight_stores))
-                    context = getattr(self, "_inflight_store_contexts", {}).get(rid)
-                    context = context or self._new_op_context(
-                        "store", rid, task_id=self._inflight_stores[rid]
-                    )
-                    self._log_cache_op(
-                        context,
-                        "poll",
-                        "failed",
-                        task_id=-1,
-                        flexkv_task_ids=list(fk_to_rid),
-                        error=str(exc),
-                    )
-                    completed_dict = {}
-                for fk_tid, response in completed_dict.items():
-                    status = _status_value(response)
-                    if not _is_terminal_status(status):
-                        continue
-                    rid = fk_to_rid[fk_tid]
-                    completed_rids.append(rid)
-                    completed_by_rid[rid] = response
+                    or {}
+                )
+            except Exception as exc:  # noqa: BLE001
+                rid = next(iter(self._inflight_stores))
+                context = getattr(self, "_inflight_store_contexts", {}).get(rid)
+                context = context or self._new_op_context(
+                    "store", rid, task_id=self._inflight_stores[rid]
+                )
+                self._log_cache_op(
+                    context,
+                    "poll",
+                    "failed",
+                    task_id=-1,
+                    flexkv_task_ids=list(fk_to_rid),
+                    error=str(exc),
+                )
+                completed_dict = {}
+            for fk_tid, response in completed_dict.items():
+                status = _status_value(response)
+                if not _is_terminal_status(status):
+                    continue
+                rid = fk_to_rid[fk_tid]
+                completed_rids.append(rid)
+                completed_by_rid[rid] = response
 
         if self._sync_ctx.needs_sync:
             completed_rids = self._sync_ctx.scatter(
@@ -1389,6 +1402,7 @@ class FlexKVConnector:
         rid: str,
         token_ids: List[int],
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+        namespace: Optional[List[str]] = None,
     ) -> int:
         if not self._prefetch_enabled or not rid:
             return -1
@@ -1399,7 +1413,8 @@ class FlexKVConnector:
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 prefetch_result = self.kv_manager.prefetch_async(
-                    token_ids=np.asarray(token_ids, dtype=np.int64)
+                    token_ids=np.asarray(token_ids, dtype=np.int64),
+                    namespace=namespace,
                 )
                 # KVManager currently returns
                 # ``(task_id, actual_prefetch_tokens)`` even though older
