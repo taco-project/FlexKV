@@ -1,4 +1,7 @@
 import time
+import os
+from contextlib import suppress
+import uuid
 from multiprocessing import Lock, Queue
 from multiprocessing.connection import Connection
 from queue import Queue as ThreadQueue
@@ -53,6 +56,7 @@ class KVDPClient:
             context, zmq.SocketType.PULL, self.client_recv_port, True
         )
         self.dp_client_id = dp_client_id
+        self.server_recv_port = server_recv_port
         self.model_config = model_config
 
         self._task_id_range = (self.dp_client_id * 10000000, (self.dp_client_id + 1) * 10000000)
@@ -60,6 +64,33 @@ class KVDPClient:
         self._task_id_lock = Lock()
         self._rpc_lock = Lock()
         flexkv_logger.info(f"KVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
+
+    def prefetch_control(self, action, **payload):
+        """Isolated control RPC; a legacy wait never owns this reply socket.
+
+        Each call owns its sockets in the calling thread. Only a local IPC
+        endpoint is accepted by the server. Progress calls can be batched.
+        """
+        from flexkv.server.request import PrefetchControlRequest
+        context = zmq.Context.instance()
+        path = os.path.join("/tmp", "flexkv-prefetch-" + uuid.uuid4().hex)
+        reply_port = "ipc://" + path
+        reply = get_zmq_socket(context, zmq.SocketType.PULL, reply_port, True)
+        send = get_zmq_socket(context, zmq.SocketType.PUSH, self.server_recv_port, False)
+        try:
+            send.setsockopt(zmq.SNDTIMEO, 1000)
+            send.send_pyobj(PrefetchControlRequest(self.dp_client_id, reply_port, action, payload))
+            if not reply.poll(30000):
+                raise TimeoutError("prefetch control RPC timed out; submission outcome may be unknown")
+            response = reply.recv_pyobj()
+            if response.error:
+                raise RuntimeError(response.error)
+            return response.result
+        finally:
+            send.close(linger=0)
+            reply.close(linger=0)
+            with suppress(FileNotFoundError):
+                os.unlink(path)
 
     def _get_task_id(self) -> int:
         with self._task_id_lock:

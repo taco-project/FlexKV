@@ -8,7 +8,6 @@ import torch
 from flexkv.common.request import KVResponse, KVResponseStatus
 from flexkv.integration.sglang.comm import FlexKVScatterChannel
 from flexkv.integration.sglang.connector import FlexKVConnector
-from flexkv.common.request import KVResponseStatus
 
 
 def _follower_connector(payload):
@@ -342,3 +341,39 @@ def test_store_reset_waits_for_leader_drain_on_follower():
         "blocking": True,
     }
     assert connector._inflight_stores == {}
+
+
+def test_namespace_capability_is_explicit_for_all_active_paths():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    assert connector.supports_cache_namespace is True
+    # A chunked-prefetch implementation needs its own full-chain opt-in.
+    connector._chunked_prefetch = True
+    connector._chunked_namespace_supported = False
+    assert connector.supports_cache_namespace is False
+    connector._chunked_namespace_supported = True
+    assert connector.supports_cache_namespace is True
+
+
+def test_namespace_is_forwarded_to_lookup_store_and_prefetch():
+    connector = _follower_connector(None)
+    connector._sync_ctx.is_sync_leader = True
+    connector._sync_ctx.needs_sync = False
+    connector._sync_ctx.is_pp_active = False
+    connector._swa_kv_pool = None
+    connector._pending_lookups = {}
+    connector._pending_lookup_contexts = {}
+    connector._prefetch_enabled = True
+    connector._ongoing_prefetches = {}
+    connector._prefetch_contexts = {}
+    connector._prefetch_planned_tokens = {}
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.get_match.return_value = (-1, np.zeros(4, dtype=bool))
+    connector.kv_manager.put_match.return_value = (-1, np.zeros(4, dtype=bool))
+    connector.kv_manager.prefetch_async.return_value = (23, 4)
+    namespace = ['["sglang-cache-v1","adapter","salt"]']
+    connector.lookup_kv([1, 2, 3, 4], torch.ones(4, dtype=torch.bool), rid="r", namespace=namespace)
+    connector.store_kv("r", [1, 2, 3, 4], torch.arange(4), namespace=namespace)
+    assert connector.prefetch_async("r", [1, 2, 3, 4], namespace=namespace) == 23
+    for method in (connector.kv_manager.get_match, connector.kv_manager.put_match, connector.kv_manager.prefetch_async):
+        assert method.call_args.kwargs["namespace"] == namespace
+        assert method.call_args.kwargs["token_ids"].tolist() == [1, 2, 3, 4]
