@@ -72,13 +72,24 @@ class MooncakeStoreConfig:
     enable_ssd_offload: bool = False  # Enable SSD offload.
 
     ssd_offload_path: Optional[str] = None  # SSD offload path.
-    
+
     master_metrics_port: int = 9003  # Master metrics port.
+
+    # Payload byte limits per SDK call; zero preserves unbounded batching.
+    # Provider-specific allocation overhead is deliberately not estimated here.
+    max_get_batch_bytes: int = 0
+    max_put_batch_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("max_get_batch_bytes", "max_put_batch_bytes"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
 
     @classmethod
     def from_file(
         cls, cache_config, override_global_segment_size: Optional[int] = None
-    ) -> "MooncakeStoreConfig":
+    ) -> MooncakeStoreConfig:
         """Load MooncakeStoreConfig from JSON file.
 
         Parameters
@@ -97,15 +108,16 @@ class MooncakeStoreConfig:
             file_path = os.getenv("FLEXKV_MOONCAKE_STORE_CONFIG_PATH", None)
             if file_path is None:
                 raise ValueError(
-                    f"Mooncake store config file path not found in cache config or environment variable MOONCAKE_STORE_CONFIG_PATH"
+                    "Mooncake store config file path not found in cache config or "
+                    "environment variable FLEXKV_MOONCAKE_STORE_CONFIG_PATH"
                 )
         if not os.path.exists(file_path):
             raise FileNotFoundError(
                 f"Mooncake store config file not found: {file_path}"
             )
-        with open(file_path, "r") as f:
+        with open(file_path) as f:
             config = json.load(f)
-            
+
         global_segment_size = (
             override_global_segment_size
             if override_global_segment_size is not None
@@ -126,6 +138,8 @@ class MooncakeStoreConfig:
             enable_ssd_offload=config["enable_ssd_offload"],
             ssd_offload_path=config["ssd_offload_path"],
             master_metrics_port=config["master_metrics_port"],
+            max_get_batch_bytes=config.get("max_get_batch_bytes", 0),
+            max_put_batch_bytes=config.get("max_put_batch_bytes", 0),
         )
 
 
@@ -276,7 +290,7 @@ class MooncakeStoreClient:
 
     def register_buffer(
         self,
-        tensor_or_ptr: "Union[torch.Tensor, int]",  # ensure the params type
+        tensor_or_ptr: Union[torch.Tensor, int],  # ensure the params type
         size: int = 0,
     ) -> None:
         """Register a pinned CPU tensor (or raw ptr + size) with the store for zero-copy RDMA.
@@ -330,19 +344,7 @@ class MooncakeStoreClient:
 
     def put(self, key: str, buffer_ptr: int, buffer_size: int) -> bool:
         """Write a KV block to the store."""
-        self._ensure_setup()
-        assert (
-            buffer_ptr is not None and buffer_size is not None
-        ), "[MooncakeStoreClient] buffer_ptr and buffer_size must be provided"
-        exist_result = self.batch_exists([key])
-        if exist_result == 1:
-            flexkv_logger.info(
-                f"[MooncakeStoreClient] key {key} already exists, skip put"
-            )
-            return True
-        ret_code = self._store.batch_put_from([key], [buffer_ptr], [buffer_size])
-
-        return ret_code == 0
+        return self.batch_put([key], [buffer_ptr], [buffer_size])[0]
 
     def batch_put(
         self,
@@ -350,8 +352,10 @@ class MooncakeStoreClient:
         buffer_ptrs: list[int],
         buffer_sizes: list[int],
     ) -> List[bool]:
-        assert buffer_ptrs is not None and buffer_sizes is not None
-        assert len(key_strs) == len(buffer_ptrs) == len(buffer_sizes)
+        self._ensure_setup()
+        self._validate_buffers(key_strs, buffer_ptrs, buffer_sizes)
+        if not key_strs:
+            return []
 
         exist_results = self.batch_exists_impl(key_strs)
         flexkv_logger.info(f"[MooncakeStoreClient] batch_put exist_results: {exist_results}")
@@ -387,10 +391,7 @@ class MooncakeStoreClient:
 
     def get(self, key: str, buffer_ptr: int, buffer_size: int) -> bool:
         """Read a KV block from the store."""
-        self._ensure_setup()
-        assert buffer_ptr is not None and buffer_size is not None
-        ret_code = self._store.batch_get_into([key], [buffer_ptr], [buffer_size])
-        return ret_code[0] >= 0
+        return self.batch_get([key], [buffer_ptr], [buffer_size])[0]
 
     def batch_get(
         self,
@@ -398,10 +399,10 @@ class MooncakeStoreClient:
         buffer_ptrs: list[int],
         buffer_sizes: list[int],
     ) -> List[bool]:
-        """Read multiple KV blocks from the store in one call."""
+        """Read blocks, accepting only an exact byte count for each key."""
         self._ensure_setup()
         get_results = self.zero_copy_get_impl(key_strs, buffer_ptrs, buffer_sizes)
-        return self._check_success(get_results, is_set_operate=False)
+        return [actual == expected for actual, expected in zip(get_results, buffer_sizes, strict=True)]
 
     def batch_exists(self, keys_strs: list[str]) -> int:
         """
@@ -424,27 +425,71 @@ class MooncakeStoreClient:
         result = self._store._batch_exist([key])
         return result[0] == 1
 
+    @staticmethod
+    def _validate_buffers(keys, pointers, sizes) -> None:
+        if pointers is None or sizes is None or not (len(keys) == len(pointers) == len(sizes)):
+            raise ValueError("Mooncake key, pointer and size counts must match")
+        if any(size <= 0 for size in sizes):
+            raise ValueError("Mooncake buffer sizes must be positive")
+
+    @staticmethod
+    def _check_result_count(results, expected: int, operation: str) -> None:
+        if results is None or len(results) != expected:
+            actual = None if results is None else len(results)
+            raise RuntimeError(
+                f"Mooncake {operation} returned {actual} results for {expected} keys"
+            )
+
+    def _bounded_io(self, operation, keys, pointers, sizes, limit: int) -> List[int]:
+        self._ensure_setup()
+        self._validate_buffers(keys, pointers, sizes)
+        # Validate before submitting any slice so an oversized block cannot
+        # cause an unnoticed partial write. Keys are never split or retried.
+        if limit and any(size > limit for size in sizes):
+            raise ValueError(f"Mooncake block exceeds the {limit}-byte batch limit")
+        results = []
+        start = 0
+        batch_bytes = 0
+        for end, size in enumerate(sizes):
+            if limit and batch_bytes + size > limit:
+                batch = operation(keys[start:end], pointers[start:end], sizes[start:end])
+                self._check_result_count(batch, end - start, operation.__name__)
+                results.extend(batch)
+                start = end
+                batch_bytes = 0
+            batch_bytes += size
+        if start < len(keys):
+            batch = operation(keys[start:], pointers[start:], sizes[start:])
+            self._check_result_count(batch, len(keys) - start, operation.__name__)
+            results.extend(batch)
+        return results
+
     def zero_copy_put_impl(
         self, keys_strs: list[str], buffer_ptrs: list[int], buffer_sizes: list[int]
     ) -> List[int]:
-        """Write multiple KV blocks to the store in one call."""
-        return self._store.batch_put_from(keys_strs, buffer_ptrs, buffer_sizes)
+        """Write byte-bounded batches, preserving the SDK's per-key statuses."""
+        return self._bounded_io(
+            self._store.batch_put_from, keys_strs, buffer_ptrs, buffer_sizes,
+            self._config.max_put_batch_bytes,
+        )
 
     def zero_copy_get_impl(
         self, keys_strs: list[str], buffer_ptrs: list[int], buffer_sizes: list[int]
     ) -> List[int]:
-        """Read multiple KV blocks from the store in one call."""
-        return self._store.batch_get_into(keys_strs, buffer_ptrs, buffer_sizes)
+        """Read byte-bounded batches, preserving the SDK's per-key byte counts."""
+        return self._bounded_io(
+            self._store.batch_get_into, keys_strs, buffer_ptrs, buffer_sizes,
+            self._config.max_get_batch_bytes,
+        )
 
     def batch_exists_impl(self, keys_strs: list[str]) -> List[int]:
-        """Check existence of multiple keys in the store.
-        Returns:
-            List[int]: per-key raw status codes from the SDK.
-                1  = key exists,
-                0  = key not found,
-                -1 = store error.
-        """
-        return self._store.batch_is_exist(keys_strs)
+        """Return per-key SDK status: 1 exists, 0 missing, -1 error."""
+        self._ensure_setup()
+        if not keys_strs:
+            return []
+        results = self._store.batch_is_exist(keys_strs)
+        self._check_result_count(results, len(keys_strs), "batch_is_exist")
+        return results
 
     def _check_success(self, results: List[int], is_set_operate: bool) -> List[bool]:
         # put: success when return == 0; get: success when return > 0 (bytes read)
@@ -511,7 +556,7 @@ class MooncakeStoreCacheEngine:
         mooncake_store_config = MooncakeStoreConfig.from_file(cache_config)
         if mooncake_store_config is None:
             raise ValueError(
-                f"[MooncakeStoreCacheEngine] MooncakeStoreConfig is not found in cache config"
+                "[MooncakeStoreCacheEngine] MooncakeStoreConfig is not found in cache config"
             )
         self.mooncake_store_client = MooncakeStoreClient(
             mooncake_store_config, query_only=True
