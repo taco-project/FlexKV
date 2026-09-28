@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Dict, Optional, List, Union, Tuple
+from typing import Any, Dict, Optional, List, Union, Tuple
 import threading
 from enum import Enum
 from dataclasses import dataclass, field, replace
@@ -99,6 +99,11 @@ class KVTask:
     prefetch_has_swa_remote: bool = False
     prefetch_namespace: Optional[List[str]] = None
     prefetch_swa_aware: bool = False
+    # radixshmem prefetch: the RadixClient.pull_async job this task waits on
+    # (its graph is empty), and the block range it planned to pull.
+    prefetch_job: Optional[Any] = None
+    prefetch_local_hit_blocks: int = 0
+    prefetch_planned_hit_blocks: int = 0
 
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
@@ -139,7 +144,7 @@ class KVTaskManager:
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
                  redis_meta: RedisMeta = None,
-                 event_collector: Optional[KVEventCollector] = None
+                 event_collector: Optional[KVEventCollector] = None,
                  ):
         if not cache_config.enable_cpu:
             raise ValueError("enable_cpu must be True")
@@ -167,7 +172,23 @@ class KVTaskManager:
             f"[KVTaskEngine] topology: {self.model_config}"
         )
 
-        self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta, event_collector)
+        # radixshmem prefetch jobs in flight: task_id -> shmradix PullJob. Polled
+        # in _update_tasks, the thread every other task mutation runs on.
+        self.prefetch_jobs: Dict[int, Any] = {}
+        if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
+            # The CPU tier is a radix-server (shared index + SlotStore); its
+            # planners are a GlobalCacheEngine subclass. Take the server's slot
+            # counts over first: the planner below and the TE size their pools
+            # from cache_config. Idempotent; the KVManager did it too, but a
+            # KVServer started on its own (FLEXKV_SERVER_LAUNCH_MODE=external)
+            # arrives here with its own config.
+            from flexkv.cache.radix_shmem_planner import RadixShmemCacheEngine
+            from flexkv.server.shm_radix_bootstrap import adopt_radix_server
+            adopt_radix_server(model_config, cache_config, label="KVTaskEngine")
+            self.cache_engine = RadixShmemCacheEngine(
+                cache_config, model_config, redis_meta, event_collector)
+        else:
+            self.cache_engine = GlobalCacheEngine(cache_config, model_config, redis_meta, event_collector)
 
         if not self.model_config.use_trtllm_subprocess:
             self.transfer_handles = [TransferManagerHandle(
@@ -198,7 +219,10 @@ class KVTaskManager:
             ]
             self.transfer_handles[0]._handle.send_config_to_remotes()
 
-        if self.model_config.nnodes > 1:
+        # Node-local DP: every node runs its own KVServer and TE, so the
+        # cross-node remote transfer manager is not needed.
+        needs_remote_transfer_manager = self.model_config.local_dp_size is None
+        if self.model_config.nnodes > 1 and needs_remote_transfer_manager:
             # Bind the handle rather than reading it back with a negative
             # index: release builds cythonize this module with
             # wraparound=False, so ``transfer_handles[-1]`` on a list reads off
@@ -423,6 +447,13 @@ class KVTaskManager:
             prefetch_has_swa_remote=prefetch_has_swa_remote,
             prefetch_namespace=namespace,
             prefetch_swa_aware=swa_aware)
+        job = getattr(callback, "prefetch_job", None)
+        if job is not None:
+            task = self.tasks[task_id]
+            task.prefetch_job = job
+            task.prefetch_local_hit_blocks = int(callback.prefetch_local_hit_blocks)
+            task.prefetch_planned_hit_blocks = int(callback.prefetch_planned_hit_blocks)
+            self.prefetch_jobs[task_id] = job
 
         self.prefetch_tasks[self._gen_prefetch_key(token_ids, namespace)] = task_id
 
@@ -453,6 +484,7 @@ class KVTaskManager:
                     transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
+        self._poll_prefetch_jobs()
         completed_ops = self._get_completed_ops(timeout)
         metrics_collector = get_global_collector()
         for completed_op in completed_ops:
@@ -748,6 +780,12 @@ class KVTaskManager:
         if task_id not in self.tasks:
             return
         task = self.tasks[task_id]
+        job = getattr(self, "prefetch_jobs", {}).pop(task_id, None)
+        if job is not None:
+            # The pull finishes in the background and still publishes its
+            # blocks; cancel only drops this task's claim on the result.
+            job.cancel()
+            task.prefetch_job = None
         if not task.is_completed():
             # A task whose graph never launched still holds everything its
             # plan acquired at create time: locked radix nodes and staging
@@ -885,7 +923,65 @@ class KVTaskManager:
         if task.graph is None:
             return
         if task.graph.num_ops == 0:
+            if task.prefetch_job is not None:
+                # Nothing for the TE to do, but the job is still moving bytes:
+                # the task completes from the job, not from the graph.
+                if task.prefetch_job.done():
+                    self._complete_prefetch_job(task_id)
+                return
             self._mark_completed(task_id)
+
+    def _poll_prefetch_jobs(self) -> None:
+        # getattr: lightweight test/fallback managers built with ``__new__``
+        # predate the job table.
+        jobs = getattr(self, "prefetch_jobs", None)
+        if not jobs:
+            return
+        for task_id in [tid for tid, job in jobs.items() if job.done()]:
+            self._complete_prefetch_job(task_id)
+
+    def _complete_prefetch_job(self, task_id: int) -> None:
+        """A radixshmem peer pull finished (or failed, or was refused). The
+        blocks it fetched are already published in the local tree by the
+        RadixClient completer; report the pulled range as this prefetch's
+        return_mask (what sglang books as storage hits) and complete the task."""
+        job = self.prefetch_jobs.pop(task_id, None)
+        task = self.tasks.get(task_id)
+        if job is None or task is None:
+            return
+        result = None
+        try:
+            result = job.wait(0)
+        except Exception as e:  # noqa: BLE001 - cancelled, or the completer failed
+            flexkv_logger.warning(
+                f"[KVTaskEngine] prefetch task {task_id}: peer pull job "
+                f"{job.job_id} failed: {e}")
+            task.transfer_failed = True
+        tpb = self.cache_config.tokens_per_block
+        mask = task.return_mask
+        if isinstance(mask, np.ndarray):
+            mask[:] = False
+            if result is not None:
+                lo = task.prefetch_local_hit_blocks * tpb
+                hi = min(int(result.common_hit), task.prefetch_planned_hit_blocks) * tpb
+                if hi > lo:
+                    mask[lo:hi] = True
+        if result is not None:
+            result.finalize()   # lock=False job: nothing pinned, harmless
+            planned = task.prefetch_planned_hit_blocks - task.prefetch_local_hit_blocks
+            flexkv_logger.info(
+                "[FlexKV-IO] operation=prefetch act=peer_pull status=%s "
+                "flexkv_task_id=%d job=%d source_rank=%d planned_blocks=%d "
+                "pulled_blocks=%d bytes=%d local_hit_after=%d",
+                "success" if result.remote_blocks >= planned else "partial",
+                task_id, job.job_id, result.source_rank, planned,
+                result.remote_blocks, result.remote_bytes, result.common_hit)
+            metrics_collector = get_global_collector()
+            if metrics_collector is not None and result.remote_blocks > 0:
+                metrics_collector.record_transfer_completed(
+                    TransferType.PEERH2H.value, int(result.remote_blocks),
+                    int(result.remote_bytes), "get")
+        self._mark_completed(task_id)
 
     def _get_completed_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         results = []
@@ -1008,7 +1104,7 @@ class KVTaskEngine(KVTaskManager):
                  cache_config: CacheConfig,
                  gpu_register_port: Optional[str] = None,
                  redis_meta: Optional[RedisMeta] = None,
-                 event_collector: Optional[KVEventCollector] = None
+                 event_collector: Optional[KVEventCollector] = None,
                  ):
         super().__init__(model_config, cache_config, gpu_register_port, redis_meta, event_collector)
         self.tracer = FlexKVTracer()
@@ -1492,6 +1588,13 @@ class KVTaskEngine(KVTaskManager):
         # Note: reset_cache() runs on the same thread as the callback dispatch
         # (_update_tasks), so no lock is needed. We keep the graph_to_task
         # mapping so a late-completing op still resolves to its task and warns.
+        prefetch_jobs = getattr(self, "prefetch_jobs", {})
+        for task_id, job in list(prefetch_jobs.items()):
+            job.cancel()
+            task = self.tasks.get(task_id)
+            if task is not None:
+                task.prefetch_job = None
+        prefetch_jobs.clear()
         for task_id, task in list(self.tasks.items()):
             if task.is_completed():
                 continue  # already-fired callbacks are harmless

@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <nvtx3/nvToolsExt.h>
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <sys/mman.h>
@@ -481,6 +482,48 @@ PYBIND11_MODULE(c_ext, m) {
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",
         py::arg("hasher"), py::arg("token_ids"), py::arg("tokens_per_block"),
         py::arg("block_hashes"));
+  m.def(
+      "gen_hashes_numpy",
+      [](flexkv::Hasher &hasher, py::array token_ids, int tokens_per_block,
+         py::array block_hashes) {
+        // numpy-buffer variant of gen_hashes; bypasses torch.from_numpy.
+        // Same contract as gen_hashes(Tensor): int64 tokens, uint64 hashes,
+        // both C-contiguous, one hash per whole block. Checked here because a
+        // raw buffer reinterpreted as int64 would otherwise be read past its
+        // end (an int32 array is half as long as the loop assumes).
+        if (tokens_per_block <= 0)
+          throw py::value_error("gen_hashes_numpy: tokens_per_block must be > 0");
+        if (!py::isinstance<py::array_t<std::int64_t>>(token_ids))
+          throw py::type_error(
+              "gen_hashes_numpy: token_ids must be an int64 array, got dtype " +
+              py::str(token_ids.dtype()).cast<std::string>());
+        if (!py::isinstance<py::array_t<std::uint64_t>>(block_hashes))
+          throw py::type_error(
+              "gen_hashes_numpy: block_hashes must be a uint64 array, got dtype " +
+              py::str(block_hashes.dtype()).cast<std::string>());
+        if (!(token_ids.flags() & py::array::c_style) ||
+            !(block_hashes.flags() & py::array::c_style))
+          throw py::value_error(
+              "gen_hashes_numpy: token_ids and block_hashes must be C-contiguous");
+        py::buffer_info tok = token_ids.request();
+        py::buffer_info bh = block_hashes.request(true);
+        if (bh.size * static_cast<py::ssize_t>(tokens_per_block) > tok.size)
+          throw py::value_error(
+              "gen_hashes_numpy: block_hashes has " + std::to_string(bh.size) +
+              " blocks of " + std::to_string(tokens_per_block) +
+              " tokens but token_ids holds only " + std::to_string(tok.size) +
+              " tokens");
+        const int64_t *tok_ptr = static_cast<const int64_t *>(tok.ptr);
+        flexkv::HashType *bh_ptr = static_cast<flexkv::HashType *>(bh.ptr);
+        for (py::ssize_t i = 0; i < bh.size; i++) {
+          hasher.update(tok_ptr + i * tokens_per_block,
+                        tokens_per_block * sizeof(int64_t));
+          bh_ptr[i] = hasher.digest();
+        }
+      },
+      "Generate block hashes directly from numpy buffers", py::arg("hasher"),
+      py::arg("token_ids"), py::arg("tokens_per_block"),
+      py::arg("block_hashes"));
 
   py::class_<flexkv::SSDIOCTX>(m, "SSDIOCTX")
       .def(
@@ -766,6 +809,17 @@ PYBIND11_MODULE(c_ext, m) {
            py::overload_cast<const void *, size_t>(&flexkv::Hasher::update),
            "Update the hasher with pointer and size", py::arg("input"),
            py::arg("size"))
+      .def(
+          "update_numpy",
+          [](flexkv::Hasher &self, py::array arr) {
+            // Hash the numpy buffer directly, bypassing torch.from_numpy
+            // (whose tensor conversion is not concurrency-safe).
+            py::buffer_info info = arr.request();
+            self.update(info.ptr,
+                        static_cast<size_t>(info.size * info.itemsize));
+          },
+          "Update the hasher directly from a numpy array buffer",
+          py::arg("input"))
       .def("digest", &flexkv::Hasher::digest, "Return the hash value");
 #ifdef FLEXKV_ENABLE_CFS
   py::class_<flexkv::Pcfs>(m, "Pcfs")

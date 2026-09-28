@@ -118,6 +118,7 @@ def test_lookup_accepts_sglang_array_token_ids():
 def test_prefetch_start_accepts_legacy_manager_result_with_planned_tokens():
     connector = FlexKVConnector.__new__(FlexKVConnector)
     connector._prefetch_enabled = True
+    connector._swa_kv_pool = None
     connector.kv_manager = MagicMock()
     connector.kv_manager.prefetch_async.return_value = (23, 256)
     connector._sync_ctx = SimpleNamespace(

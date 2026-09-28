@@ -21,6 +21,56 @@ def _dsv4_swa_transfer_enabled_from_env() -> bool:
     return bool(int(os.getenv("FLEXKV_ENABLE_SWA_TRANSFER", "1")))
 
 
+def _resolve_vllm_dp_rank(parallel_config: object) -> int:
+    """This engine's DP rank, as FlexKV needs it rather than as vLLM reports it.
+
+    For non-MoE models vLLM runs each DP rank as a fully independent engine and
+    resets that child's ``data_parallel_rank`` to 0, keeping the real rank only
+    in ``data_parallel_index`` (vllm/v1/engine/core.py, "Non-MoE DP ranks are
+    completely independent, so treat like DP=1"). FlexKV cannot follow suit: its
+    per-engine identity ``dp_client_id = instance_id * dp_size + dp_rank`` is
+    what keeps the DP engines of one node apart, so a collapsed rank makes all
+    of them claim shm-radix bootstrap ownership, transfer-engine channel 0, the
+    same gpu_register endpoint, and overlapping graph/op id ranges.
+
+    ``FLEXKV_DP_RANK`` overrides both, for launchers that pin the rank
+    themselves.
+    """
+    env_rank = os.environ.get("FLEXKV_DP_RANK")
+    if env_rank:
+        return int(env_rank)
+    dp_index = getattr(parallel_config, "data_parallel_index", None)
+    if dp_index is not None:
+        return int(dp_index)
+    return int(getattr(parallel_config, "data_parallel_rank", 0))
+
+
+def _resolve_vllm_dp_size(parallel_config: object) -> int:
+    """The node's DP width. Needs an env var: vLLM erases it in the children.
+
+    The same non-MoE branch that collapses the rank also sets the child's
+    ``data_parallel_size`` to 1, and unlike the rank it leaves no surviving copy
+    anywhere in ``parallel_config``. FlexKV derives ``total_clients`` (the shared
+    transfer engine's channel count and its expected GPU-registration count) and
+    ``total_gpus`` (which gates clearing ``CUDA_VISIBLE_DEVICES`` in the TE
+    subprocess so it can open every DP rank's IPC handles) from it, so a stale 1
+    leaves the TE waiting for registrations that already arrived under a
+    duplicate device id.
+
+    Only ever raises the value, so single-engine and MoE setups -- where vLLM's
+    own number is already right -- are untouched.
+    """
+    dp_size = int(getattr(parallel_config, "data_parallel_size", 1))
+    env_size = os.environ.get("FLEXKV_DP_SIZE")
+    if env_size and int(env_size) > dp_size:
+        logger.info(
+            f"[FlexKV vllm] dp_size {dp_size} -> {env_size} from FLEXKV_DP_SIZE "
+            f"(vLLM resets data_parallel_size to 1 in non-MoE DP children)"
+        )
+        return int(env_size)
+    return dp_size
+
+
 def _is_nvfp4_dtype_str(dtype_str: Optional[str]) -> bool:
     """Return True if *dtype_str* selects the NVFP4 packed KV cache layout."""
     return isinstance(dtype_str, str) and dtype_str.lower() in ("nvfp4", "fp4", "e2m1")
@@ -108,6 +158,32 @@ class FlexKVConfig:
             self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         if self.gpu_register_port == "":
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
+
+    @staticmethod
+    def get_sglang_node_local_dp_size(
+        server_args: object,
+    ) -> Optional[int]:
+        """Return a safe node-local DP width for SGLang DP Attention.
+
+        SGLang validates the composite TP/CP dimensions and assigns contiguous
+        DP groups. With ``pp_size == 1``, groups are node-local exactly when
+        ``dp_size`` is evenly divisible by ``nnodes``.
+
+        ``None`` keeps the existing cross-node TP/PP topology unchanged.
+        """
+        dp_size = max(1, int(getattr(server_args, "dp_size", 1) or 1))
+        pp_size = max(1, int(getattr(server_args, "pp_size", 1)))
+        nnodes = max(1, int(getattr(server_args, "nnodes", 1)))
+
+        if (
+            not bool(getattr(server_args, "enable_dp_attention", False))
+            or dp_size == 1
+            or nnodes == 1
+            or pp_size != 1
+            or dp_size % nnodes != 0
+        ):
+            return None
+        return dp_size // nnodes
 
     def _resolve_dtype(
         self,
@@ -201,7 +277,7 @@ class FlexKVConfig:
         parallel_config = vllm_config.parallel_config
         tp_rank = int(getattr(parallel_config, 'tensor_parallel_rank', 0))
         pp_rank = int(getattr(parallel_config, 'pipeline_parallel_rank', 0))
-        dp_rank = int(getattr(parallel_config, 'data_parallel_rank', 0))
+        dp_rank = _resolve_vllm_dp_rank(parallel_config)
         node_rank = int(getattr(parallel_config, 'node_rank', 0))
         self.cache_config.tokens_per_block = vllm_config.cache_config.block_size
 
@@ -214,7 +290,7 @@ class FlexKVConfig:
         # kv_dim/num_kv_heads are derived from the physical tensor shape
         # (cache_shape ndim), not from framework MLA flags.
         self.model_config.tp_size = int(parallel_config.tensor_parallel_size)
-        self.model_config.dp_size = int(parallel_config.data_parallel_size)
+        self.model_config.dp_size = _resolve_vllm_dp_size(parallel_config)
         self.model_config.pp_size = int(parallel_config.pipeline_parallel_size)
         # vLLM CP (context parallel) support: read cp_size from parallel_config.
         # Falls back to 1 if the attribute is not present (older vLLM versions).
@@ -520,9 +596,36 @@ class FlexKVConfig:
         enable_dp_attention = bool(server_args.enable_dp_attention)
         attn_cp_size = int(getattr(server_args, 'attn_cp_size', 1))
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
+        # Node-local DP is a property of the SGLang placement, not of the tier
+        # underneath it: with DP attention and pp_size == 1, a dp_size divisible
+        # by nnodes puts every DP group on a single node, so FlexKV forms one
+        # instance per node whatever the shared tier is (radix-shmem, or
+        # mooncake-store, where the store itself carries cross-node reuse).
+        # get_sglang_node_local_dp_size returns None for every placement where
+        # that does not hold, which leaves the cross-node TP/PP path untouched.
+        local_dp_size = self.get_sglang_node_local_dp_size(server_args)
 
+        if dp_rank is None and GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and sglang_dp_size > 1:
+            # Every DP process would derive dp_client_id 0: the same radix-server
+            # bootstrap ownership, TE channel and graph/op id range.
+            raise ValueError(
+                "[FlexKV SGLang] radix_shmem with dp_size > 1 needs the scheduler's "
+                "dp_rank; got None")
         dp_rank = 0 if dp_rank is None else int(dp_rank)
         cp_rank = 0 if cp_rank is None else int(cp_rank)
+        if local_dp_size is not None:
+            logger.info(
+                "[FlexKV SGLang] Enabling node-local DP (one FlexKV instance per "
+                "node): global_dp_size=%d, local_dp_size=%d, node_rank=%d",
+                sglang_dp_size,
+                local_dp_size,
+                int(node_rank),
+            )
+        elif enable_dp_attention and sglang_dp_size > 1 and int(nnodes) > 1:
+            logger.warning(
+                "[FlexKV SGLang] Node-local DP is not available for this DP/PP "
+                "placement; preserving the legacy cross-node path."
+            )
 
         attn_dp_size = sglang_dp_size if enable_dp_attention else 1
         attn_tp_size = max(1, sglang_tp_size // (attn_dp_size * attn_cp_size))
@@ -637,6 +740,7 @@ class FlexKVConfig:
             pp_end_layer = self.model_config.num_layers
         self.model_config.enable_dp_attention = bool(enable_dp_attention)
         self.model_config.nnodes = max(1, int(nnodes))
+        self.model_config.local_dp_size = local_dp_size
         _dist_init_addr = getattr(server_args, 'dist_init_addr', None)
         if _dist_init_addr and int(nnodes) > 1:
             self.model_config.master_host = _dist_init_addr.split(":")[0]
@@ -703,6 +807,9 @@ class FlexKVConfig:
                     enabled=True,
                     num_swa_layers=self.model_config.num_layers,
                     bytes_per_token_per_layer=swa_bytes_per_token,
+                    # DSv4's 128-token window fits inside one 256-token page,
+                    # so a window is a single slot (radixshmem W=1).
+                    window_blocks=1,
                 )
             # Gate the SWA data plane (byte movement) behind an env switch so it
             # can be turned off for A/B or if a byte-layout issue surfaces in

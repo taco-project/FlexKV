@@ -256,6 +256,14 @@ class KVServer:
                 for key, val in os.environ.items():
                     if key.startswith("FLEXKV_") and key not in env:
                         env[key] = val
+                # The child runs the parent's interpreter and must import what
+                # the parent imports (flexkv, shmradix in radixshmem mode) and
+                # find the same shared libraries; these are the variables that
+                # locate them when the packages are not installed into
+                # site-packages.
+                for key in ("PYTHONPATH", "LD_LIBRARY_PATH", "PATH"):
+                    if key in os.environ and key not in env:
+                        env[key] = os.environ[key]
 
             cvd = os.environ.get('CUDA_VISIBLE_DEVICES')
             if cvd is not None and 'CUDA_VISIBLE_DEVICES' not in env:
