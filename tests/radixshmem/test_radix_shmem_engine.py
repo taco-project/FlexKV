@@ -98,6 +98,7 @@ CacheEngineRadixShmem = _engine_mod.CacheEngineRadixShmem
 # The planner only duck-types the match, so the side-loaded class is as good as
 # the one `flexkv.cache.cache_engine` imports — and it needs no c_ext.
 ShmRadixMatch = _engine_mod.ShmRadixMatch
+StagedRadixInsert = _engine_mod.StagedRadixInsert
 
 # Pure-Python (no c_ext): the bootstrap (server config, geometry, attach) and
 # the transfer enums.
@@ -293,6 +294,38 @@ def test_insert_publishes_immediately(env):
 
     r = engine.match(seq)
     assert r.num_matched_blocks == 6
+    r.release()
+
+
+def test_failed_cluster_publish_keeps_the_slots_in_the_tree(env):
+    """A flush error (e.g. an RDMA write to a peer's RHT shard failing) comes
+    after the tree took the slots: publish() must not recycle them again, or
+    the mempool hands out slots the tree still serves."""
+    engine, _server = env.make(f"/cers_flushfail{os.getpid()}", blocks=64)
+
+    class _FlushFails:
+        def __init__(self, tree):
+            self._inner = tree
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def flush(self):
+            raise RuntimeError("DcInitiator::flush WC error status=10 vendor=136")
+
+    engine._tree = _FlushFails(engine._tree)
+    engine.peer_enabled = True
+
+    seq = FakeSeq(block_hashes=_hashes(seed=9, num=6))
+    slots = engine.take(num_required_blocks=6)
+    StagedRadixInsert(engine, seq, slots, path_end=6, label="PUT").publish()
+
+    r = engine.match(seq)
+    assert r.num_matched_blocks == 6
+    np.testing.assert_array_equal(np.sort(r.local_slots), np.sort(slots))
+    rest = engine.take(num_required_blocks=64)    # the pin keeps them from eviction
+    assert not np.isin(slots, rest).any()
+    engine.recycle(rest)
     r.release()
 
 
