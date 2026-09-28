@@ -342,7 +342,14 @@ class CacheEngineRadixShmem:
             return
 
         if self.peer_enabled and component == COMPONENT_FULL:
-            self._tree.flush()  # make the new blocks visible cluster-wide
+            # The tree owns the slots by now: raising would make the caller
+            # recycle them a second time.
+            try:
+                self._tree.flush()  # make the new blocks visible cluster-wide
+            except Exception as e:
+                flexkv_logger.warning(
+                    f"radixshmem insert on {self.shm_name}: {landed} blocks landed "
+                    f"locally but the cluster-wide publish failed: {e}")
 
         if (self.event_collector is not None and component == COMPONENT_FULL
                 and result.error == shmradix.InsertError.OK):
