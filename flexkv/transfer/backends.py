@@ -72,17 +72,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 def op_layer_range(op: "WorkerTransferOp", num_layers: int) -> Tuple[int, int]:
     """``(layer_id, layer_granularity)`` for an op, defaulting to all layers.
 
-    Layer-sliced ops are a read-path feature that no producer currently emits:
-    ``WorkerTransferOp`` (and the ``TransferOp`` it is built from) carry no
-    ``layer_id``/``layer_granularity``, and the one function that would have
-    set them -- ``cache.transfer_pattern.convert_read_graph_to_layer_wise_graph``
-    -- has no live caller.  Reading the attributes directly therefore raises
-    ``AttributeError`` on every production op, so read them defensively: a
-    backend that supports slicing keeps working the day the fields come back,
-    and moves whole blocks until then.
-
-    ``-1`` is the "unset" sentinel the old worker used, kept so a revived
-    producer can leave either field out.
+    ``-1`` is the unset sentinel: CacheConfig.layer_granularity ``<= 0`` and
+    unsliced ops leave both fields at the TransferOp defaults, so a backend
+    that supports slicing still moves whole blocks until a producer sets them.
     """
     layer_id = getattr(op, "layer_id", -1)
     layer_granularity = getattr(op, "layer_granularity", -1)

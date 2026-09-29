@@ -119,6 +119,21 @@ def build_layer_member_map(
     return LayerMemberMap(members=tuple(tuple(b) for b in buckets))
 
 
+def is_multi_group(
+    layer_groups: Optional[List[LayerGroupSpec]],
+    num_layers: int,
+) -> bool:
+    if not layer_groups:
+        return False
+    if len(layer_groups) != 1:
+        return True
+    group = layer_groups[0]
+    if int(getattr(group, "compress_ratio", 1) or 1) != 1:
+        return True
+    indices = list(getattr(group, "layer_indices", []) or [])
+    return indices != list(range(int(num_layers)))
+
+
 @dataclass
 class ModelConfig:
     num_layers: int = 1
@@ -736,6 +751,9 @@ class CacheConfig:
     # transfer type" in the transfer engine. Flip to True once the worker lands.
     enable_swa_transfer: bool = False
 
+    # SSD layer granularity: <= 0 means N=1
+    layer_granularity: int = -1
+
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
             self.enable_p2p_ssd or self.enable_3rd_remote
@@ -800,6 +818,7 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     gds_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_GDS_LAYOUT', 'BLOCKFIRST').upper()),
 
     enable_layerwise_transfer=bool(int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', 0))),
+    layer_granularity=int(os.getenv('FLEXKV_LAYER_GRANULARITY', -1)),
 
     use_ce_transfer_h2d=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0))),
     use_ce_transfer_d2h=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0))),

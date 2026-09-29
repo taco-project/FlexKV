@@ -55,6 +55,7 @@ from flexkv.transfer.layer_eventfd import build_layerwise_eventfd_socket_path
 from flexkv.transfer.worker_op import WorkerTransferResult
 from flexkv.common.config import (
     CacheConfig, LayerGroupSpec, ModelConfig, GLOBAL_CONFIG_FROM_ENV,
+    is_multi_group,
 )
 from flexkv.common.ring_buffer import SharedOpPool
 
@@ -441,7 +442,13 @@ class TransferEngine:
             self._register_worker(_pool, TransferType.D2H, self.d2h_workers)
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
-            ssd_layer_groups = self.model_config.layer_groups
+            # GPU register may copy a Recsys identity group onto model_config.
+            # SSD workers must only see heterogeneous CPU/SSD packing.
+            ssd_layer_groups = (
+                self.model_config.layer_groups
+                if is_multi_group(
+                    self.model_config.layer_groups, self.model_config.num_layers)
+                else None)
             # DISK2H worker.
             #
             # Registered in layerwise mode too.  The layerwise worker is now an
