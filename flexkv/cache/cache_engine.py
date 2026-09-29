@@ -1630,10 +1630,15 @@ class GlobalCacheEngine:
 
         # A prefetch has no H2D op, so its terminal op must be the host-stage
         # transfer itself.  A virtual join preserves parallel SSD and remote IO.
+        # After SSD span split, every DISK2H must be a terminal: joining only
+        # the last span would finish the prefetch while earlier/later spans
+        # are still writing the same CPU blocks.
         op_callback_dict = {}
         host_finished_ops_ids = [
-            op.op_id for op in (op_disk2h, op_remote2h) if op is not None
+            op.op_id for op in op_disk2h_ops
         ]
+        if op_remote2h is not None:
+            host_finished_ops_ids.append(op_remote2h.op_id)
         host_ready_op_id = -1
         if host_finished_ops_ids:
             transfer_graph, host_ready_op_id = add_virtual_op_for_multiple_finished_ops(
@@ -2054,6 +2059,9 @@ class GlobalCacheEngine:
                     dp_client_id=dp_client_id,
                     staged_predecessors=staged_predecessors):
                 finished_ops_ids.append(op_h2d.op_id)
+        elif op_disk2h_ops:
+            # Prefetch / CPU-only: no H2D sink. Wait for every SSD span.
+            finished_ops_ids.extend(op.op_id for op in op_disk2h_ops)
 
         node_to_unlock = {}
         if cpu_node_to_unlock is not None:
