@@ -1272,6 +1272,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         swa_cpu_block_ids: Optional[torch.Tensor],
         swa_gpu_block_ids: Optional[torch.Tensor],
         counter_id: int,
+        layer_id: int = 0,
+        layer_granularity: int = -1,
     ) -> None:
         """One H2D transfer, launched and notified one original layer at a time.
 
@@ -1306,14 +1308,29 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             PoolId.FULL_KV: (gpu_block_ids, cpu_block_ids),
             PoolId.SWA: (swa_gpu_block_ids, swa_cpu_block_ids),
         }
+        start = int(layer_id or 0)
+        if layer_granularity is None or int(layer_granularity) < 0:
+            end = self.num_layers
+        else:
+            end = min(start + int(layer_granularity), self.num_layers)
+        requests = []
         # strict: the two lists are built in lockstep, and a silent truncation
         # here would drop requests and hang the consumer on an unposted fd.
         for req, pool_id in zip(plan.requests, plan.pool_of, strict=True):
+            milestone = int(getattr(req, "milestone_layer", -1))
+            if milestone < start or milestone >= end:
+                continue
             req.gpu_block_id_tensor, req.cpu_block_id_tensor = \
                 ids_by_pool[pool_id]
+            requests.append(req)
+        empty_layers = [
+            layer for layer in plan.empty_layers if start <= layer < end
+        ]
+        if not requests and not empty_layers:
+            return
 
         self.region_batch.submit_layerwise(
-            plan.requests, plan.empty_layers, counter_id)
+            requests, empty_layers, counter_id)
         # Launched, not landed. Returning here would let the engine recycle the
         # source blocks while DMA is still reading them -- and we cannot drain
         # inline before the posts, because the consumer is blocked on the very
@@ -1342,7 +1359,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
         start_time = time.time()
         self._layerwise_transfer_impl(
-            src, dst, swa_src, swa_dst, transfer_op.counter_id)
+            src, dst, swa_src, swa_dst, transfer_op.counter_id,
+            layer_id=int(getattr(transfer_op, "layer_id", 0) or 0),
+            layer_granularity=int(
+                getattr(transfer_op, "layer_granularity", -1) or -1),
+        )
         end_time = time.time()
 
         transfer_size = self._pools[PoolId.FULL_KV].bytes_per_block * len(src)

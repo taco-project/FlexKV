@@ -17,6 +17,7 @@ from flexkv.common.config import (
     CacheConfig,
     GLOBAL_CONFIG_FROM_ENV,
     LayerGroupSpec,
+    is_multi_group,
 )
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import KVCacheLayout
@@ -72,7 +73,13 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.kv_dim = cpu_kv_layout.kv_dim
         self.num_kv_heads = cpu_kv_layout.num_kv_heads
         self.cpu_layout_type = cpu_kv_layout.type
-        self.has_multi_group = layer_groups is not None
+        # Prefer the groups on the CPU/SSD layout over the constructor arg.
+        # Recsys layerwise registers an identity LayerGroupSpec for the GPU
+        # region; that must not flip SSD into whole-block blob I/O.
+        if getattr(cpu_kv_layout, "layer_groups", None) is not None:
+            layer_groups = cpu_kv_layout.layer_groups
+        self.has_multi_group = is_multi_group(
+            layer_groups, cpu_kv_layout.num_layer)
 
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
@@ -207,6 +214,14 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
 
         is_read = (transfer_type == TransferType.DISK2H)
         cpu_base_ptr = self.cpu_layer_ptrs[0].item()
+        layer_id = int(kwargs.get("layer_id", 0) or 0)
+        gran = kwargs.get("layer_granularity", -1)
+        if gran is None or int(gran) < 0:
+            layer_end = self.num_layers
+        else:
+            layer_end = min(layer_id + int(gran), self.num_layers)
+        if layer_end <= layer_id:
+            return
 
         if self.has_multi_group:
             # CPU and SSD share an identical per-block byte layout in multi-group
@@ -241,7 +256,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
         else:
-            layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
+            layer_id_list = torch.arange(layer_id, layer_end, dtype=torch.int32)
 
             transfer_kv_blocks_ssd(
                 self.ioctx,
@@ -269,6 +284,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
         if self.has_multi_group:
             # Multi-group (heterogeneous KV) path — compression not supported here.
+            # Opaque whole-block I/O cannot slice layers; keep the historical
+            # full-block transfer even when the op carries a span.
             start_time = time.time()
             self._transfer_impl(
                 src_block_ids,
