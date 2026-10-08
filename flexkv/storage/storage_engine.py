@@ -5,7 +5,13 @@ from typing import Any, Dict, Optional, List, Tuple, Union
 import torch
 import hashlib
 
-from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec, ModelConfig
+from flexkv.common.config import (
+    GLOBAL_CONFIG_FROM_ENV,
+    CacheConfig,
+    LayerGroupSpec,
+    ModelConfig,
+    is_multi_group,
+)
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.pool import PoolEndpoint, PoolId
@@ -113,12 +119,15 @@ class StorageEngine:
                 "SWA multi-group sidecars require FLEXKV_CPU_LAYOUT=BLOCKFIRST"
             )
 
-        # For multi-group, the CPU/SSD/Remote buffer is sized in BYTES
-        # (kv_shape[1] = bytes_per_block, summed with per-group dtype.itemsize),
-        # so the underlying allocator must use uint8.  Single-group keeps its
-        # native dtype.
-        is_multi_group = self._model_config.layer_groups is not None
-        buffer_dtype = torch.uint8 if is_multi_group else self._model_config.dtype
+        # Heterogeneous groups pack CPU/SSD/Remote as a uint8 byte blob.
+        # A single identity LayerGroupSpec (Recsys layerwise GPU register)
+        # is not that packing: host stays a uniform typed layout so SSD
+        # workers can use per-layer strides.
+        opaque_host = is_multi_group(
+            self._model_config.layer_groups, num_layers_per_pp_stage
+        )
+        host_layer_groups = self._model_config.layer_groups if opaque_host else None
+        buffer_dtype = torch.uint8 if opaque_host else self._model_config.dtype
 
         if self._cache_config.enable_cpu:
             self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
@@ -130,7 +139,7 @@ class StorageEngine:
                 head_size=self._model_config.head_size,
                 kv_dim=self._model_config.kv_dim,
                 num_kv_heads=self._model_config.num_kv_heads,
-                layer_groups=self._model_config.layer_groups,
+                layer_groups=host_layer_groups,
                 tp_size=self._model_config.tp_size,
             )
             self.allocate(
@@ -151,7 +160,7 @@ class StorageEngine:
                 head_size=self._model_config.head_size,
                 kv_dim=self._model_config.kv_dim,
                 num_kv_heads=self._model_config.num_kv_heads,
-                layer_groups=self._model_config.layer_groups,
+                layer_groups=host_layer_groups,
                 tp_size=self._model_config.tp_size,
             )
             self.allocate(
@@ -180,7 +189,7 @@ class StorageEngine:
                     head_size=self._model_config.head_size,
                     kv_dim=self._model_config.kv_dim,
                     num_kv_heads=self._model_config.num_kv_heads,
-                    layer_groups=self._model_config.layer_groups,
+                    layer_groups=host_layer_groups,
                     tp_size=self._model_config.tp_size,
                 )
                 self.allocate(

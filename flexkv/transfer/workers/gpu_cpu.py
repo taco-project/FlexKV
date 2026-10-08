@@ -736,11 +736,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         tpb = cpu_kv_layout.tokens_per_block
         cpu_layout_type = cpu_kv_layout.type
 
-        # For BLOCKFIRST multi-group, get_block_stride() returns bytes_per_block
-        # directly (already accounts for tp_size and per-group dtype sizes).
+        # compile_host_regions already converted this to bytes, including the
+        # uniform typed host used by an identity Recsys group.
         total_block_bytes = (
-            cpu_kv_layout.get_block_stride()
-            if cpu_layout_type == KVCacheLayoutType.BLOCKFIRST else None
+            host_regions[0].block_stride
+            if host_regions and cpu_layout_type == KVCacheLayoutType.BLOCKFIRST
+            else None
         )
 
         pool = _Pool(pool_id=pool_id, name=pool_id.name.lower())
@@ -822,8 +823,10 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             cpu_kv_stride = host.kv_stride
             cpu_tp_stride = cpu_block_stride // self.tp_group_size
 
-            # CPU tensor offset for this group (cpu_tensor is uint8 in multi-group)
-            cpu_blocks_ptr = cpu_tensor.view(-1)[host.base_offset:].data_ptr()
+            # base_offset is bytes. data_ptr() is a byte address, so this is
+            # correct for both the uint8 heterogeneous blob and a typed
+            # uniform buffer (identity group, offset 0).
+            cpu_blocks_ptr = cpu_tensor.data_ptr() + host.base_offset
 
             # Deferred: see _Pool.thread_group_thunks. Every name the body
             # reads is bound as a default argument -- these are loop variables,

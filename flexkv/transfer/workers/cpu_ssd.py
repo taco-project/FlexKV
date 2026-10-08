@@ -5,6 +5,7 @@ Native engine is io_uring (``c_ext.SSDIOCTX`` + ``transfer_kv_blocks_ssd``); a
 """
 
 import time
+from dataclasses import replace
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List, Optional, Union
 
@@ -80,6 +81,13 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             layer_groups = cpu_kv_layout.layer_groups
         self.has_multi_group = is_multi_group(
             layer_groups, cpu_kv_layout.num_layer)
+        # Identity groups stay on the GPU register but must not disable
+        # uniform chunk/layer strides. Opaque packing is has_multi_group.
+        if not self.has_multi_group:
+            if getattr(cpu_kv_layout, "layer_groups", None) is not None:
+                cpu_kv_layout = replace(cpu_kv_layout, layer_groups=None, _kv_shape=None)
+            if getattr(ssd_kv_layout, "layer_groups", None) is not None:
+                ssd_kv_layout = replace(ssd_kv_layout, layer_groups=None, _kv_shape=None)
 
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")

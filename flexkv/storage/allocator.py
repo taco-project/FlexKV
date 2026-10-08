@@ -671,6 +671,13 @@ class SSDAllocator(BaseStorageAllocator):
 
         fsys_max_blocks_per_file = cls.get_file_size_limit(cache_dir[0]) // block_size
         num_blocks_per_file = min(fsys_max_blocks_per_file, cfg_max_blocks_per_file, total_blocks_per_device)
+        if num_blocks_per_file < 1:
+            free_bytes = cls.get_file_size_limit(cache_dir[0])
+            raise RuntimeError(
+                f"SSD directory {cache_dir[0]} has {free_bytes} bytes free, "
+                f"which cannot hold one {block_size}-byte block "
+                f"({total_blocks_per_device} blocks requested)"
+            )
 
         num_files_per_device = (total_blocks_per_device + num_blocks_per_file - 1) // num_blocks_per_file
         real_file_size = num_blocks_per_file * block_size
