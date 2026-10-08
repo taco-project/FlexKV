@@ -126,13 +126,17 @@ def compile_host_regions(
     tokens_per_block = host_layout.tokens_per_block
     layout_type = host_layout.type
     if layout_type == KVCacheLayoutType.BLOCKFIRST:
-        # get_block_stride() already returns bytes_per_block for multi-group
-        # BLOCKFIRST (see KVCacheLayout._compute_kv_shape), which is why it is
-        # not multiplied by an element size here the way the strides below are.
-        whole_block_bytes = (
-            host_layout.get_block_stride()
-            if block_stride_bytes is None else block_stride_bytes
-        )
+        # Heterogeneous BLOCKFIRST stores kv_shape[1] as bytes_per_block.
+        # A uniform typed block (Recsys identity group is not packed onto the
+        # host layout) reports an element count and still needs dtype.itemsize.
+        if block_stride_bytes is not None:
+            whole_block_bytes = block_stride_bytes
+        elif host_layout.layer_groups is not None:
+            whole_block_bytes = host_layout.get_block_stride()
+        else:
+            whole_block_bytes = (
+                host_layout.get_block_stride() * default_dtype.itemsize
+            )
     else:
         whole_block_bytes = None
     num_blocks = host_layout.num_block
