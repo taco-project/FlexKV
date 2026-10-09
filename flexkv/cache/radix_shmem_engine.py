@@ -33,6 +33,7 @@ from flexkv.common.transfer import DeviceType
 if TYPE_CHECKING:  # these pull in the C++ extension; keep them off import time
     from flexkv.common.block import SequenceMeta
     from flexkv.common.config import SWAPoolConfig
+    from flexkv.common.kv_events import KVEventQueue
     from flexkv.integration.dynamo.collector import KVEventCollector
 
 try:
@@ -155,7 +156,8 @@ class CacheEngineRadixShmem:
                  peer_enabled: Optional[bool] = None,
                  swa_config: Optional[SWAPoolConfig] = None,
                  event_collector: Optional[KVEventCollector] = None,
-                 metrics_collector=None):
+                 metrics_collector=None,
+                 kv_event_queue: Optional[KVEventQueue] = None):
         """`server_name` is the radix-server's ``--name``; the server is the
         operator's process, running but not necessarily ready. With
         `geometry` (FlexKV's `RadixGeometry` or a `radixshmem.Geometry`) the
@@ -168,6 +170,8 @@ class CacheEngineRadixShmem:
 
         self.event_collector = event_collector
         self._metrics_collector = metrics_collector
+        self.kv_event_queue = kv_event_queue
+        self._kvevent_ring_ready = False
         cpu_swa = swa_config.for_cache_tier(DeviceType.CPU) if swa_config is not None else None
         self.swa_enabled = cpu_swa is not None and cpu_swa.num_slots > 0
 
@@ -216,11 +220,101 @@ class CacheEngineRadixShmem:
     def reset(self) -> None:
         """Clear the tree. Invalidates outstanding slot ids and matches."""
         self._tree.reset()
+        if self.kv_event_queue is not None:
+            # A reset drops the whole tree at once; the per-node eviction
+            # events that would describe it are not worth the ring.
+            self.kv_event_queue.publish_all_cleared()
+            if self._kvevent_ring_ready and self._client is not None:
+                self._client.kvevent_seek_to_head()
 
     def close(self) -> None:
         client, self._client, self._tree = self._client, None, None
         if client is not None:
             client.close()
+
+    # ---------- KV placement events ----------
+
+    def start_kv_events(self) -> bool:
+        """Arm event publication for this attachment.
+
+        Returns whether the region carries an eviction ring. Without one the
+        stores still publish, but nothing ever retracts them, so the consumer
+        should treat a False here as a reason not to advertise this tier.
+
+        The seek is what keeps a late attacher honest: the ring holds evictions
+        from before this process existed, and republishing those would retract
+        blocks the consumer never heard about being stored.
+        """
+        if self.kv_event_queue is None or self._client is None:
+            return False
+        self.kv_event_queue.enable()
+        if not self._client.kvevent_enabled:
+            flexkv_logger.warning(
+                f"radixshmem {self.shm_name} carries no KV-event ring "
+                f"(server started without kvevent_ring_capacity); evictions "
+                f"from the CPU tier will not be reported")
+            return False
+        self._client.kvevent_seek_to_head()
+        self._kvevent_ring_ready = True
+        return True
+
+    def drain_kv_events(self, max_hashes: int = 65536) -> int:
+        """Move evictions from the shm ring onto the event queue.
+
+        The evictor runs in the radix-server process (and in every other
+        attached process, over the same region), so this is the only way the
+        eviction reaches this process at all. Returns the number of hashes
+        forwarded; an overflow forwards nothing and clears instead.
+        """
+        if not self._kvevent_ring_ready or self._client is None:
+            return 0
+        try:
+            hashes, overflow = self._client.kvevent_drain(max_hashes)
+        except Exception as e:  # noqa: BLE001 - a drain must never fail a tick
+            flexkv_logger.error(
+                f"radixshmem {self.shm_name}: KV-event drain failed: {e}")
+            return 0
+        if overflow:
+            # The evictor lapped this cursor: some removals are gone for good
+            # and the consumer's view is now strictly optimistic. Only a full
+            # resync can fix that.
+            flexkv_logger.warning(
+                f"radixshmem {self.shm_name}: KV-event ring overflowed; "
+                f"publishing AllBlocksCleared to resync the consumer")
+            self.kv_event_queue.publish_all_cleared()
+            return 0
+        if len(hashes) == 0:
+            return 0
+        self.kv_event_queue.publish_removed(hashes, medium="CPU")
+        return len(hashes)
+
+    def _publish_stored_event(self, sequence_meta: SequenceMeta,
+                              first: int, last: int) -> None:
+        """Announce blocks `[first, last)` of this path with their tokens.
+
+        The tokens are the point: a router hashes content its own way, and
+        these hashes are FlexKV's. Sending both is what lets it equate them.
+        """
+        queue = self.kv_event_queue
+        if queue is None or not queue.enabled or last <= first:
+            return
+        tpb = self.tokens_per_block
+        tokens = sequence_meta.token_ids
+        if len(tokens) < last * tpb:
+            # A path longer than its tokens means the caller hashed a prefix
+            # it no longer holds; publishing here would invent token content.
+            flexkv_logger.warning(
+                f"radixshmem {self.shm_name}: skipping store event for blocks "
+                f"[{first}, {last}) — only {len(tokens)} tokens for a "
+                f"{last * tpb}-token path")
+            return
+        hashes = sequence_meta.block_hashes
+        queue.publish_stored(
+            block_hashes=hashes[first:last],
+            token_ids=[tokens[i * tpb:(i + 1) * tpb] for i in range(first, last)],
+            block_size=tpb,
+            parent_block_hash=int(hashes[first - 1]) if first > 0 else None,
+            medium="CPU")
 
     # ---------- queries ----------
 
@@ -351,14 +445,16 @@ class CacheEngineRadixShmem:
                     f"radixshmem insert on {self.shm_name}: {landed} blocks landed "
                     f"locally but the cluster-wide publish failed: {e}")
 
-        if (self.event_collector is not None and component == COMPONENT_FULL
-                and result.error == radixshmem.InsertError.OK):
+        if component == COMPONENT_FULL and result.error == radixshmem.InsertError.OK:
             # Error-free, the only unused slots are a redundant prefix, so what
             # landed is the tail of the path.
-            self.event_collector.publish_stored(
-                block_hashes=sequence_meta.block_hashes[path_end - landed:path_end],
-                block_size=self.tokens_per_block,
-                medium="CPU")
+            first, last = path_end - landed, path_end
+            if self.event_collector is not None:
+                self.event_collector.publish_stored(
+                    block_hashes=sequence_meta.block_hashes[first:last],
+                    block_size=self.tokens_per_block,
+                    medium="CPU")
+            self._publish_stored_event(sequence_meta, first, last)
 
     def take(self,
              num_required_blocks: int,

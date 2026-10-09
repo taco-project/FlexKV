@@ -1047,6 +1047,56 @@ class FlexKVConnector:
         ]
 
     # ------------------------------------------------------------------
+    # Public API — KV placement events
+    # ------------------------------------------------------------------
+
+    def start_kv_events(self) -> bool:
+        """Arm FlexKV's CPU-tier placement events on this rank.
+
+        Returns True only on the rank that owns the FlexKV instance and only
+        when that tier can report evictions as well as stores. Every other
+        rank returns False and :meth:`take_kv_events` gives it nothing —
+        which lines up with sglang, whose event recorder is likewise enabled
+        only on ``pp_rank == attn_tp_rank == attn_cp_rank == 0``.
+        """
+        if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
+            return False
+        try:
+            started = bool(self.kv_manager.start_kv_events())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[FlexKV] KV placement events unavailable %s: %s",
+                self._label,
+                exc,
+            )
+            return False
+        logger.info(
+            "[FlexKV] KV placement events %s %s",
+            "enabled" if started else "not available (no eviction ring)",
+            self._label,
+        )
+        return started
+
+    def take_kv_events(self, max_hashes: int = 65536) -> List[Any]:
+        """FlexKV-tier placement events since the last call.
+
+        Non-blocking, and safe to call on the scheduler tick: it drains a
+        lock-free shm ring plus a local list. Events are framework-neutral
+        (:mod:`flexkv.common.kv_events`); the caller translates them.
+        """
+        if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
+            return []
+        try:
+            return self.kv_manager.take_kv_events(max_hashes)
+        except Exception as exc:  # noqa: BLE001 - never fail a scheduler tick
+            logger.warning(
+                "[FlexKV] KV placement event drain failed %s: %s",
+                self._label,
+                exc,
+            )
+            return []
+
+    # ------------------------------------------------------------------
     # Public API — store
     # ------------------------------------------------------------------
 
