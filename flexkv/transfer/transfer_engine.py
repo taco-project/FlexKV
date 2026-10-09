@@ -1346,6 +1346,12 @@ class TransferEngine:
                 swa_dst_block_ids_h2d=op.swa_dst_block_ids_h2d.copy(),
                 dp_client_id=op.dp_client_id,
                 counter_id=op.counter_id,
+                # Dropping the span makes every replica the whole-KV default
+                # (layer_id=0, layer_granularity=-1). The worker then copies
+                # every layer and posts every eventfd on the first H2D, so
+                # HSTU runs before that layer's DISK2H has reached the GPU.
+                layer_id=op.layer_id,
+                layer_granularity=op.layer_granularity,
             )
             replica.op_id = next(self._replica_op_id_counter)
             register_op_to_buffer(replica, self.pin_buffer)
@@ -1428,6 +1434,8 @@ class TransferEngine:
                     mooncake_store_swa_block_hashes=(
                         list(op.mooncake_store_swa_block_hashes)
                         if op.mooncake_store_swa_block_hashes is not None else None),
+                    layer_id=op.layer_id,
+                    layer_granularity=op.layer_granularity,
                 )
                 replica.op_id = next(self._replica_op_id_counter)
                 register_op_to_buffer(replica, self.pin_buffer)
