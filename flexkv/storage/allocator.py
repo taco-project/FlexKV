@@ -327,12 +327,12 @@ class SlotStoreTensorHandle:
     """
     data_name: str
     hugepage_path: str
-    kind: int              # shmradix.ComponentType value (0 = FULL, 1 = SWA)
+    kind: int              # radixshmem.ComponentType value (0 = FULL, 1 = SWA)
     num_elements: int
     dtype: torch.dtype
 
     def get_tensor(self) -> torch.Tensor:
-        from shmradix import _data
+        from radixshmem import _data
         store = _data.SlotStore.attach(self.data_name, self.hugepage_path, 60000)
         return slot_store_pool_tensor(store, self.kind, self.dtype, self.num_elements)
 

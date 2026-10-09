@@ -172,7 +172,7 @@ class KVTaskManager:
             f"[KVTaskEngine] topology: {self.model_config}"
         )
 
-        # radixshmem prefetch jobs in flight: task_id -> shmradix PullJob. Polled
+        # radixshmem prefetch jobs in flight: task_id -> radixshmem PullJob. Polled
         # in _update_tasks, the thread every other task mutation runs on.
         self.prefetch_jobs: Dict[int, Any] = {}
         if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # cython: boundscheck=True, wraparound=True
 """
-The radixshmem CPU tier: one process's `shmradix.RadixClient` on the node's
+The radixshmem CPU tier: one process's `radixshmem.RadixClient` on the node's
 radix-server (the operator's process: index shm + SlotStore + RDMA engine; the
 attach and the geometry hand-off are in `flexkv.server.shm_radix_bootstrap`).
 Used only by `flexkv.cache.radix_shmem_planner.RadixShmemCacheEngine`.
@@ -36,16 +36,16 @@ if TYPE_CHECKING:  # these pull in the C++ extension; keep them off import time
     from flexkv.integration.dynamo.collector import KVEventCollector
 
 try:
-    import shmradix
+    import radixshmem
 except ImportError as e:  # pragma: no cover
     raise ImportError(
-        "shmradix is not installed; install it from the radixshmem repo "
+        "radixshmem is not installed; install it from the radixshmem repo "
         "(pip install -e radixshmem/python)") from e
 
-COMPONENT_MASK_FULL = int(shmradix.COMPONENT_MASK_FULL)
-COMPONENT_MASK_SWA = int(shmradix.COMPONENT_MASK_SWA)
-COMPONENT_FULL = shmradix.ComponentType.FULL
-COMPONENT_SWA = shmradix.ComponentType.SWA
+COMPONENT_MASK_FULL = int(radixshmem.COMPONENT_MASK_FULL)
+COMPONENT_MASK_SWA = int(radixshmem.COMPONENT_MASK_SWA)
+COMPONENT_FULL = radixshmem.ComponentType.FULL
+COMPONENT_SWA = radixshmem.ComponentType.SWA
 
 
 def _empty_i64() -> np.ndarray:
@@ -93,7 +93,7 @@ class StagedRadixInsert:
                  path_end: int,
                  label: str,
                  holds: Sequence[Callable[[], None]] = (),
-                 component: shmradix.ComponentType = COMPONENT_FULL) -> None:
+                 component: radixshmem.ComponentType = COMPONENT_FULL) -> None:
         self._engine = engine
         self._sequence_meta = sequence_meta
         self._slots = slots
@@ -158,7 +158,7 @@ class CacheEngineRadixShmem:
                  metrics_collector=None):
         """`server_name` is the radix-server's ``--name``; the server is the
         operator's process, running but not necessarily ready. With
-        `geometry` (FlexKV's `RadixGeometry` or a `shmradix.Geometry`) the
+        `geometry` (FlexKV's `RadixGeometry` or a `radixshmem.Geometry`) the
         attach hands it FlexKV's slot shape (idempotent) and waits for it to
         come up. `peer_enabled` None = follow the region: peer reuse whenever
         the server is part of a cluster; False switches it off.
@@ -303,7 +303,7 @@ class CacheEngineRadixShmem:
                sequence_meta: SequenceMeta,
                physical_block_ids: np.ndarray,
                num_insert_blocks: int,
-               component: shmradix.ComponentType = COMPONENT_FULL) -> None:
+               component: radixshmem.ComponentType = COMPONENT_FULL) -> None:
         """Attach transferred slots: `physical_block_ids[i]` is block
         `num_insert_blocks - len(physical_block_ids) + i`. Ownership passes to
         radixshmem (`auto_recycle=True`); do not recycle these slots again."""
@@ -328,12 +328,12 @@ class CacheEngineRadixShmem:
                                    auto_recycle=True, component=component)
 
         landed = num_slots - len(result.unused_slots)
-        if result.error == shmradix.InsertError.FULL_PATH_MISSING:
+        if result.error == radixshmem.InsertError.FULL_PATH_MISSING:
             flexkv_logger.warning(
                 f"radixshmem {component} insert on {self.shm_name}: full path "
                 f"[0, {path_end}) was evicted before the window published "
                 f"(slots were auto-recycled)")
-        elif result.error != shmradix.InsertError.OK:
+        elif result.error != radixshmem.InsertError.OK:
             flexkv_logger.warning(
                 f"radixshmem {component} insert on {self.shm_name} returned "
                 f"{result.error}: {landed}/{num_slots} blocks landed at "
@@ -352,7 +352,7 @@ class CacheEngineRadixShmem:
                     f"locally but the cluster-wide publish failed: {e}")
 
         if (self.event_collector is not None and component == COMPONENT_FULL
-                and result.error == shmradix.InsertError.OK):
+                and result.error == radixshmem.InsertError.OK):
             # Error-free, the only unused slots are a redundant prefix, so what
             # landed is the tail of the path.
             self.event_collector.publish_stored(
@@ -362,7 +362,7 @@ class CacheEngineRadixShmem:
 
     def take(self,
              num_required_blocks: int,
-             component: shmradix.ComponentType = COMPONENT_FULL) -> np.ndarray:
+             component: radixshmem.ComponentType = COMPONENT_FULL) -> np.ndarray:
         """Allocate up to `num_required_blocks` slots, evicting unpinned LRU
         blocks as needed; fewer come back when the pool cannot supply them
         (the SWA pool is all-or-none). A request above the pool's size is
@@ -390,7 +390,7 @@ class CacheEngineRadixShmem:
             self._metrics_collector.record_allocation("cpu", len(slots))
         return slots
 
-    def _pool_total(self, component: shmradix.ComponentType) -> Optional[int]:
+    def _pool_total(self, component: radixshmem.ComponentType) -> Optional[int]:
         """Slots in `component`'s pool, None when the index has no such pool."""
         if component == COMPONENT_FULL:
             return int(self._tree.mempool_total())
@@ -400,7 +400,7 @@ class CacheEngineRadixShmem:
 
     def recycle(self,
                 physical_blocks: np.ndarray,
-                component: shmradix.ComponentType = COMPONENT_FULL) -> None:
+                component: radixshmem.ComponentType = COMPONENT_FULL) -> None:
         if physical_blocks is None or len(physical_blocks) == 0:
             return
         self._tree.recycle_slots(np.ascontiguousarray(physical_blocks, dtype=np.int32),

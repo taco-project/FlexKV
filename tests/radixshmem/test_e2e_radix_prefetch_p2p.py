@@ -22,7 +22,7 @@ A second window checks the extension case: node 1 already holds the first
 LOCAL_HEAD_BLOCKS of it (its own bytes), the prefetch pulls only the tail, and
 the GET serves head and tail from the right writers.
 
-Requires >=2 CUDA devices, an ACTIVE RDMA port, a shmradix built with RDMA +
+Requires >=2 CUDA devices, an ACTIVE RDMA port, a radixshmem built with RDMA +
 etcd + mooncake, and an etcd (FLEXKV_TEST_RADIX_REGISTRY, or ``etcd`` on PATH
 for a private one); skips otherwise. Run inside the container:
 
@@ -290,7 +290,7 @@ def _run(registry: str, rdma_dev: str) -> dict:
 def cluster():
     """(etcd registry, rdma device), skipping when the prerequisites are absent;
     starts a private etcd when none is configured."""
-    pytest.importorskip("shmradix")
+    pytest.importorskip("radixshmem")
     if not torch.cuda.is_available() or torch.cuda.device_count() < WORLD_SIZE:
         pytest.skip(f"needs {WORLD_SIZE} CUDA devices")
     devices = active_rdma_devices()

@@ -7,7 +7,7 @@ FlexKV 以 radixshmem 作为 CPU 层（索引 + SlotStore + 跨节点拉取）�
 | 运维 | `radix-server` 命令行，每节点一个进程 | 名字、SlotStore 字节预算与 SWA 占比、hugepage、传输引擎、集群成员（etcd、网卡、rank）、索引调优 |
 | FlexKV | 两个环境变量 | 是否启用、attach 哪个 server |
 
-FlexKV 只实例化 `shmradix.RadixClient`：第一个 client 把几何（每 block 的 token 数、一个 CPU block 和一个 SWA page
+FlexKV 只实例化 `radixshmem.RadixClient`：第一个 client 把几何（每 block 的 token 数、一个 CPU block 和一个 SWA page
 的字节数、SWA 窗口、slot 对齐）交给 server，server 按 `--data-bytes` 和 `--swa-ratio` 规划各池的 slot 数并发布，
 每个 FlexKV 进程 attach 时把 slot 数采纳到 `CacheConfig`（`num_cpu_blocks`、`swa.num_slots`）。CPU 层容量由
 `radix-server --data-bytes` 决定，`cpu_cache_gb` 在该模式下不起作用（KVManager 启动时打印一条 WARNING 提示）。
@@ -43,7 +43,7 @@ attach 的其余参数是 `flexkv/server/shm_radix_bootstrap.py` 里的常量：
 
 ## 3. 几何与 slot 数
 
-FlexKV 交给 server 的几何（`shm_radix_bootstrap.expected_geometry` → `shmradix.Geometry`）：
+FlexKV 交给 server 的几何（`shm_radix_bootstrap.expected_geometry` → `radixshmem.Geometry`）：
 
 | 字段 | 来源 |
 |---|---|

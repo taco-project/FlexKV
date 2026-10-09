@@ -257,7 +257,7 @@ class KVServer:
                     if key.startswith("FLEXKV_") and key not in env:
                         env[key] = val
                 # The child runs the parent's interpreter and must import what
-                # the parent imports (flexkv, shmradix in radixshmem mode) and
+                # the parent imports (flexkv, radixshmem in radixshmem mode) and
                 # find the same shared libraries; these are the variables that
                 # locate them when the packages are not installed into
                 # site-packages.
