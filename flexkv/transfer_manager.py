@@ -486,6 +486,8 @@ class TransferManager:
 
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None
+        cxl_handle = self.storage_engine.get_storage_handle(DeviceType.CXL) \
+            if self.cache_config.enable_cxl else None
         ssd_handle = self.storage_engine.get_storage_handle(DeviceType.SSD) \
             if self.cache_config.enable_ssd else None
         use_mooncake_store = self.cache_config.use_mooncake_store_backend
@@ -541,6 +543,7 @@ class TransferManager:
             model_config=self.model_config,
             cache_config=self.cache_config,
             cpu_handle=cpu_handle,
+            cxl_handle=cxl_handle,
             ssd_handle=ssd_handle,
             remote_handle=remote_handle,
             gpu_blocks_per_group=grouped_gpu_blocks_per_group,

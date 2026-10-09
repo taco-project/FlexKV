@@ -30,6 +30,7 @@ except ImportError:
 
 from flexkv.transfer import trace  # noqa: F401
 from flexkv.transfer.workers import (  # noqa: F401
+    CPUCXLTransferWorker,
     CPURemoteTransferWorker,
     CPUSSDDiskTransferWorker,
     GDSTransferWorker,
@@ -53,6 +54,7 @@ from flexkv.transfer.backends import (
 from flexkv.transfer.workers import _validate_multi_group_chunk_layout
 
 __all__ = [
+    "CPUCXLTransferWorker",
     "CPURemoteTransferWorker",
     "CPUSSDDiskTransferWorker",
     "GDSTransferWorker",

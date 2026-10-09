@@ -31,6 +31,7 @@ trace.configure(GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace)
 # on for it too -- without turning on the per-op log lines.
 trace.configure_timing(GLOBAL_CONFIG_FROM_ENV.enable_metrics)
 
+from flexkv.transfer.workers.cpu_cxl import CPUCXLTransferWorker  # noqa: E402
 from flexkv.transfer.workers.cpu_ssd import CPUSSDDiskTransferWorker  # noqa: E402
 from flexkv.transfer.workers.gds import GDSTransferWorker  # noqa: E402
 from flexkv.transfer.workers.gpu_cpu import (  # noqa: E402
@@ -47,6 +48,7 @@ from flexkv.transfer.workers.runtime import (  # noqa: E402
 )
 
 __all__ = [
+    "CPUCXLTransferWorker",
     "CPURemoteTransferWorker",
     "CPUSSDDiskTransferWorker",
     "GDSTransferWorker",

@@ -450,7 +450,9 @@ if not debug:
                       "flexkv/**/test_*.py",
                       "flexkv/**/benchmark_*.py",
                       "flexkv/benchmark/**/*.py",
-                      "flexkv/benchmark/test_kvmanager.py"]
+                      "flexkv/benchmark/test_kvmanager.py",
+                      "flexkv/storage/allocator.py",
+                      "flexkv/external/mooncake_store_utils.py"]
     # Import cython when debug is turned off.
     from Cython.Build import cythonize
     cythonized_modules = cythonize(

@@ -658,6 +658,10 @@ class CacheConfig:
     enable_p2p_cpu: bool = False
     enable_p2p_ssd: bool = False
     enable_3rd_remote: bool = False
+    # CXL memory tier (Type 3 memory expander appearing as NUMA node)
+    enable_cxl: bool = False
+    cxl_numa_node: int = -1  # NUMA node ID for CXL memory (-1 = auto-detect)
+    use_hugepage_cxl_buffer: bool = False  # Use hugepages for CXL allocation
 
     # Assigned after Redis metadata initialization for distributed CPU/SSD.
     distributed_node_id: int = -1
@@ -685,6 +689,7 @@ class CacheConfig:
 
     # mempool capacity configs
     num_cpu_blocks: int = 1000000
+    num_cxl_blocks: int = 0
     num_ssd_blocks: int = 10000000
     num_remote_blocks: Optional[int] = None
     num_local_blocks: int = 1000000
@@ -727,6 +732,7 @@ class CacheConfig:
 
     # Stored for deferred recomputation when layer_groups become known
     _user_cpu_cache_gb: float = 0
+    _user_cxl_cache_gb: float = 0
     _user_ssd_cache_gb: float = 0
 
     # SWA pool config (DeepSeek V4)
@@ -931,11 +937,14 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 @dataclass
 class UserConfig:
     cpu_cache_gb: int = 16
+    cxl_cache_gb: int = 0  # 0 means disable CXL tier
+    cxl_numa_node: int = -1  # NUMA node for CXL memory (-1 = auto-detect)
     ssd_cache_gb: int = 0  # 0 means disable ssd
     ssd_cache_dir: Union[str, List[str]] = "./ssd_cache"
     enable_gds: bool = False
     enable_nixl: bool = False
     use_hugepage_cpu_buffer: bool = False
+    use_hugepage_cxl_buffer: bool = False  # Use hugepages for CXL allocation
     use_hugepage_tmp_buffer: bool = False
     hugepage_size_bytes: int = 2 * 1024 * 1024
     mooncake_max_mr_size_bytes: int = 512 * 1024 * 1024 * 1024
@@ -1041,11 +1050,14 @@ def load_user_config_from_env() -> UserConfig:
         prefetch_max_pinned_bytes=int(os.getenv('FLEXKV_PREFETCH_MAX_PINNED_BYTES', 2 * 1024 * 1024 * 1024)),
         prefetch_result_ttl_s=float(os.getenv('FLEXKV_PREFETCH_RESULT_TTL_S', 60)),
         cpu_cache_gb=int(os.getenv('FLEXKV_CPU_CACHE_GB', 16)),
+        cxl_cache_gb=int(os.getenv('FLEXKV_CXL_CACHE_GB', 0)),
+        cxl_numa_node=int(os.getenv('FLEXKV_CXL_NUMA_NODE', -1)),
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
         ssd_cache_dir=parse_path_list(os.getenv('FLEXKV_SSD_CACHE_DIR', "./flexkv_ssd")),
         enable_gds=bool(int(os.getenv('FLEXKV_ENABLE_GDS', 0))),
         enable_nixl=bool(int(os.getenv('FLEXKV_ENABLE_NIXL', 0))),
         use_hugepage_cpu_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_CPU_BUFFER', 0))),
+        use_hugepage_cxl_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_CXL_BUFFER', 0))),
         use_hugepage_tmp_buffer=bool(int(os.getenv('FLEXKV_USE_HUGEPAGE_TMP_BUFFER', 0))),
         hugepage_size_bytes=int(os.getenv('FLEXKV_HUGEPAGE_SIZE_BYTES', 2 * 1024 * 1024)),
         mooncake_max_mr_size_bytes=int(os.getenv(
@@ -1143,6 +1155,21 @@ def recompute_cache_block_counts(
             cache_config.num_cpu_blocks = new_cpu
             changed = True
 
+    if cache_config._user_cxl_cache_gb > 0:
+        old_cxl = cache_config.num_cxl_blocks
+        new_cxl = (
+            convert_to_block_num(
+                cache_config._user_cxl_cache_gb, block_size_in_bytes)
+            // capacity_divisor
+        )
+        if new_cxl != old_cxl:
+            flexkv_logger.info(
+                f"Recomputed num_cxl_blocks with layer_groups: "
+                f"{old_cxl} -> {new_cxl} "
+                f"(block_size={block_size_in_bytes} B)")
+            cache_config.num_cxl_blocks = new_cxl
+            changed = True
+
     if cache_config._user_ssd_cache_gb > 0:
         old_ssd = cache_config.num_ssd_blocks
         new_ssd = (
@@ -1204,10 +1231,15 @@ def update_default_config_from_user_config(rank_info: RankInfo,
 
     # Store original GB values for deferred recomputation (when layer_groups become known)
     cache_config._user_cpu_cache_gb = user_config.cpu_cache_gb
+    cache_config._user_cxl_cache_gb = user_config.cxl_cache_gb
     cache_config._user_ssd_cache_gb = user_config.ssd_cache_gb
 
     cache_config.num_cpu_blocks = (
         convert_to_block_num(user_config.cpu_cache_gb, block_size_in_bytes)
+        // capacity_divisor
+    )
+    cache_config.num_cxl_blocks = (
+        convert_to_block_num(user_config.cxl_cache_gb, block_size_in_bytes)
         // capacity_divisor
     )
     cache_config.num_ssd_blocks = (
@@ -1219,11 +1251,15 @@ def update_default_config_from_user_config(rank_info: RankInfo,
         f"[CacheConfig] GB->blocks conversion: "
         f"block_size={block_size_in_bytes} B; "
         f"cpu_cache_gb={user_config.cpu_cache_gb} -> num_cpu_blocks={cache_config.num_cpu_blocks}, "
+        f"cxl_cache_gb={user_config.cxl_cache_gb} -> num_cxl_blocks={cache_config.num_cxl_blocks}, "
         f"ssd_cache_gb={user_config.ssd_cache_gb} -> num_ssd_blocks={cache_config.num_ssd_blocks}"
     )
 
     cache_config.ssd_cache_dir = user_config.ssd_cache_dir
     cache_config.enable_ssd = user_config.ssd_cache_gb > 0
+    cache_config.enable_cxl = user_config.cxl_cache_gb > 0
+    cache_config.cxl_numa_node = user_config.cxl_numa_node
+    cache_config.use_hugepage_cxl_buffer = user_config.use_hugepage_cxl_buffer
     cache_config.enable_gds = user_config.enable_gds
     cache_config.enable_nixl = user_config.enable_nixl
     cache_config.use_hugepage_cpu_buffer = user_config.use_hugepage_cpu_buffer
