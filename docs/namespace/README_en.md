@@ -4,6 +4,18 @@ This document describes how to use FlexKV's namespace isolation feature to enabl
 
 ## Version Requirements
 
+### SGLang
+
+The connector accepts `namespace: Optional[List[str]]` on `lookup_kv`,
+`store_kv`, and `prefetch_async`. Callers must pass the same identity to all
+three operations. `None` preserves the existing unscoped keys.
+
+The matching SGLang adapter uses one compact JSON namespace component,
+`["sglang-cache-v1", extra_key, cache_salt]`, and enables scoped host reuse only
+when `supports_cache_namespace` is true. Empty strings and null values are
+kept distinct. A chunked-prefetch implementation must also propagate the
+namespace into its session/planner before advertising that capability.
+
 ### vLLM
 
 - For vLLM, please use the `examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector-namespace.patch` patch to support namespace functionality

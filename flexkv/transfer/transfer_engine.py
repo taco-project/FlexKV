@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import itertools
 import queue
 import threading
 import time
@@ -107,6 +108,13 @@ def _te_bounded_cuda_sync(device_ids: List[int], timeout_s: float) -> bool:
     return synchronize_cuda_devices(device_ids, timeout_s, name="flexkv-te")
 
 class TransferEngine:
+    # Parent IDs are nonnegative and arrive from another process via pickle;
+    # receiving them does not advance this process's TransferOp counter.
+    # Replicas share the worker completion/trace namespace with those parents,
+    # so allocate them from a disjoint range. -1 remains the graph sentinel.
+    # These IDs are Python worker-queue metadata, not kernel/buffer indices.
+    _replica_op_id_counter = itertools.count(-2, -1)
+
     def __init__(self,
         gpu_handles: Dict[WorkerKey, List[StorageHandle]],
         model_config: ModelConfig,
@@ -1330,6 +1338,7 @@ class TransferEngine:
                 dp_client_id=op.dp_client_id,
                 counter_id=op.counter_id,
             )
+            replica.op_id = next(self._replica_op_id_counter)
             register_op_to_buffer(replica, self.pin_buffer)
             self._child_id_to_child[replica.op_id] = replica
             self._child_to_parent_op_id[replica.op_id] = op.op_id
@@ -1411,6 +1420,7 @@ class TransferEngine:
                         list(op.mooncake_store_swa_block_hashes)
                         if op.mooncake_store_swa_block_hashes is not None else None),
                 )
+                replica.op_id = next(self._replica_op_id_counter)
                 register_op_to_buffer(replica, self.pin_buffer)
                 self._child_id_to_child[replica.op_id] = replica
                 self._child_to_parent_op_id[replica.op_id] = op.op_id
