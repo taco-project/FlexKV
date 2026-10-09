@@ -1,0 +1,25 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"PingFang SC, Microsoft YaHei, sans-serif","fontSize":"17px","actorBkg":"#edf6f8","actorBorder":"#568896","actorTextColor":"#173344","noteBkgColor":"#fff6e8","noteBorderColor":"#cfac73","signalColor":"#506978"},"sequence":{"mirrorActors":false,"messageMargin":24,"noteMargin":14,"diagramMarginX":15}}}%%
+sequenceDiagram
+    participant S as SGLang / 调用方
+    participant C as 控制线程
+    participant I as 发送线程
+    participant W as 原传输 worker
+    C->>I: chunk 0 / 1 已 claim，submitted = 2
+    I->>W: chunk 0
+    Note over I,W: chunk 1 仍可能在本地队列或 IPC 中
+    alt timeout
+        C->>C: deadline 到期
+    else best_effort
+        S->>C: 调度候选 demand(handle)
+    else 取消请求
+        S->>C: stop(handle, request_abort)
+    end
+    C->>C: seal，冻结 sealed_submit_seq = 2
+    Note over C,W: 不再新增 chunk 2；已有图保留所有权
+    I->>W: 继续发送已登记的 chunk 1
+    W-->>C: chunk 0 完成
+    C->>C: 发布 / 回收，仍然 draining
+    W-->>C: chunk 1 完成
+    C->>C: 发布 / 回收，inflight = 0
+    C-->>S: 可观察到 terminal
+    Note over S,C: 请求继续执行：held GET 接手后 release<br/>请求已取消：只完成回收，不再 H2D / forward
