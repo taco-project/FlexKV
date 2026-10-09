@@ -94,11 +94,11 @@ def stop_private_etcd(proc, workdir) -> None:
 
 def start_radix_server(name: str, data_bytes: int, *, extra_args=(), endpoint: Optional[str] = None,
                        log_path: Optional[str] = None, timeout: float = 60.0) -> subprocess.Popen:
-    """Start the operator's ``radix-server`` (``python -m shmradix.cli``) and wait
+    """Start the operator's ``radix-server`` (``python -m radixshmem.cli``) and wait
     for its socket. Nothing model-specific goes on its command line: FlexKV's
     clients bring the geometry, the server plans the slot counts from
     ``data_bytes``."""
-    cmd = [sys.executable, "-m", "shmradix.cli", "--name", name, "--data-bytes", str(int(data_bytes)),
+    cmd = [sys.executable, "-m", "radixshmem.cli", "--name", name, "--data-bytes", str(int(data_bytes)),
            "--no-prefault", "--interval", "0", *extra_args]
     if endpoint:
         cmd += ["--endpoint", endpoint]

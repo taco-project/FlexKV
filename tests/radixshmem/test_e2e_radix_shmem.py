@@ -235,7 +235,7 @@ def _run(dp_size: int) -> dict:
 @pytest.mark.e2e
 @pytest.mark.parametrize("dp_size", [1, 2])
 def test_radix_shmem_put_get_roundtrip(dp_size):
-    pytest.importorskip("shmradix")
+    pytest.importorskip("radixshmem")
     if not torch.cuda.is_available() or torch.cuda.device_count() < dp_size:
         pytest.skip(f"needs {dp_size} CUDA device(s)")
 

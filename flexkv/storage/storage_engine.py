@@ -84,7 +84,7 @@ class StorageEngine:
                  radix_client: Any = None):
         """Initialize storage engine.
 
-        ``radix_client`` (a ``shmradix.RadixClient``, radixshmem mode) makes the
+        ``radix_client`` (a ``radixshmem.RadixClient``, radixshmem mode) makes the
         CPU FULL / SWA pools views of the radix-server's SlotStore instead of
         allocations of this process; see ``_attach_radix_pool``.
         """
@@ -326,7 +326,7 @@ class StorageEngine:
         misaddressed transfer, not an error. Workers re-attach the pool by name
         through the ``SlotStoreTensorHandle`` in ``worker_data``.
         """
-        from shmradix import ComponentType
+        from radixshmem import ComponentType
         from flexkv.server.shm_radix_bootstrap import layout_block_bytes
 
         kind = ComponentType.SWA if is_swa else ComponentType.FULL

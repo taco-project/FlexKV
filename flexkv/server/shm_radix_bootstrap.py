@@ -44,9 +44,9 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 try:
-    import shmradix
+    import radixshmem
 except ImportError:  # pragma: no cover
-    shmradix = None
+    radixshmem = None
 
 
 # Pool bases are page aligned regardless; a larger per-slot alignment only pads.
@@ -106,15 +106,15 @@ def default_endpoint(server_name: str) -> str:
     return f"unix:///dev/shm/{server_name.lstrip('/').replace('/', '_')}.sock"
 
 
-def _ensure_shmradix() -> None:
-    if shmradix is None:
+def _ensure_radixshmem() -> None:
+    if radixshmem is None:
         raise ImportError(
-            "shmradix is not installed; install it from the radixshmem repo "
+            "radixshmem is not installed; install it from the radixshmem repo "
             "(pip install -e radixshmem/python)")
     for name in ("RadixClient", "Geometry", "GeometryMismatch", "ServerNotReady"):
-        if not hasattr(shmradix, name):
+        if not hasattr(radixshmem, name):
             raise ImportError(
-                f"shmradix lacks {name}: FlexKV needs a radixshmem whose radix-server takes "
+                f"radixshmem lacks {name}: FlexKV needs a radixshmem whose radix-server takes "
                 f"its geometry from the client (RadixClient(name, Geometry))")
 
 
@@ -231,11 +231,11 @@ class RadixGeometry:
     def slot_align(self) -> int:
         return slot_align_for(self.full_slot_bytes, self.swa_slot_bytes)
 
-    def to_shmradix(self) -> "shmradix.Geometry":
-        """The ``shmradix.Geometry`` handed to the server (data mode: bytes and
+    def to_radixshmem(self) -> "radixshmem.Geometry":
+        """The ``radixshmem.Geometry`` handed to the server (data mode: bytes and
         window only, no counts)."""
-        _ensure_shmradix()
-        return shmradix.Geometry(
+        _ensure_radixshmem()
+        return radixshmem.Geometry(
             block_size=int(self.tokens_per_block),
             full_slot_bytes=int(self.full_slot_bytes),
             swa_slot_bytes=int(self.swa_slot_bytes),
@@ -296,7 +296,7 @@ def _nothing_answers(e: BaseException) -> bool:
         isinstance(e, RuntimeError) and str(e).startswith("UNAVAILABLE"))
 
 
-def _current_status(client: "shmradix.RadixClient"):
+def _current_status(client: "radixshmem.RadixClient"):
     """The server's state now (one RPC); the constructor-time info when the
     server cannot be asked any more."""
     try:
@@ -311,8 +311,8 @@ def attach_radix_client(name: Optional[str] = None,
                         timeout_s: Optional[float] = None,
                         max_outstanding: Optional[int] = None,
                         attach_index: bool = False,
-                        label: str = "radixshmem") -> "shmradix.RadixClient":
-    """A ready ``shmradix.RadixClient`` on the radix-server ``name`` (default:
+                        label: str = "radixshmem") -> "radixshmem.RadixClient":
+    """A ready ``radixshmem.RadixClient`` on the radix-server ``name`` (default:
     :func:`radix_server_name`), at the socket radixshmem derives from the name.
 
     ``attach_index=True`` also brings the index client up before returning
@@ -320,7 +320,7 @@ def attach_radix_client(name: Optional[str] = None,
     peer that does not accept yet; callers that only read ``info`` (adopting
     counts, asking about the cluster) leave it off and open no RDMA state.
 
-    With ``geometry`` (a :class:`RadixGeometry` or a ``shmradix.Geometry``) the
+    With ``geometry`` (a :class:`RadixGeometry` or a ``radixshmem.Geometry``) the
     client hands the server FlexKV's slot shape on the way; the server plans
     the counts from its budget. That is idempotent, so every FlexKV process
     may bring it; a server already serving another geometry (another model or
@@ -333,22 +333,22 @@ def attach_radix_client(name: Optional[str] = None,
     the SlotStore prefault happen there -- for ``timeout_s`` in total
     (default ``READY_TIMEOUT_S``).
     """
-    _ensure_shmradix()
+    _ensure_radixshmem()
     name = name or radix_server_name()
     if timeout_s is None:
         timeout_s = READY_TIMEOUT_S
     if max_outstanding is None:
         max_outstanding = MAX_OUTSTANDING
-    spec = geometry.to_shmradix() if isinstance(geometry, RadixGeometry) else geometry
+    spec = geometry.to_radixshmem() if isinstance(geometry, RadixGeometry) else geometry
     where = default_endpoint(name)
 
     deadline = time.monotonic() + float(timeout_s)
     last: Optional[BaseException] = None
     while True:
         try:
-            client = shmradix.RadixClient(name, spec, max_outstanding=max_outstanding)
+            client = radixshmem.RadixClient(name, spec, max_outstanding=max_outstanding)
             break
-        except shmradix.GeometryMismatch as e:
+        except radixshmem.GeometryMismatch as e:
             raise ValueError(
                 f"{label}: radix-server {name} already serves another geometry ({e}); every "
                 f"engine attached to one server must run the same model, page size and SWA "
@@ -397,7 +397,7 @@ def attach_radix_client(name: Optional[str] = None,
     return client
 
 
-def _attach_index(client: "shmradix.RadixClient", name: str, deadline: float, label: str) -> None:
+def _attach_index(client: "radixshmem.RadixClient", name: str, deadline: float, label: str) -> None:
     """Bring the index client up now (``client.index``) instead of on first use.
     On a cluster this opens the RDMA queue pairs to every peer's RHT shard;
     right after the rendezvous a peer's holder may not accept yet, and
@@ -434,7 +434,7 @@ def _describe_published(g: Optional[Dict[str, Any]]) -> str:
     return ", ".join(parts)
 
 
-def _published_geometry(client: "shmradix.RadixClient", label: str) -> Dict[str, Any]:
+def _published_geometry(client: "radixshmem.RadixClient", label: str) -> Dict[str, Any]:
     g = client.geometry
     if not g:
         info = client.status()
@@ -446,13 +446,13 @@ def _published_geometry(client: "shmradix.RadixClient", label: str) -> Dict[str,
     return g
 
 
-def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
+def check_geometry(client: "radixshmem.RadixClient", expected: RadixGeometry,
                    label: str = "radixshmem") -> None:
     """Fail closed when the server's regions differ from FlexKV's own layout: a
     stride or page mismatch would otherwise become a silent misaddressed
     transfer. Slot counts are not checked here -- they are the server's, taken
     over by :func:`adopt_geometry`."""
-    _ensure_shmradix()
+    _ensure_radixshmem()
     g = _published_geometry(client, label)
     pools = g["pools"]
     diffs: List[str] = []
@@ -474,7 +474,7 @@ def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
         diffs.append("server is index-only (no --data-bytes); FlexKV needs the data plane")
     else:
         store = client.store
-        stride = int(store.pool(shmradix.ComponentType.FULL).slot_bytes)
+        stride = int(store.pool(radixshmem.ComponentType.FULL).slot_bytes)
         if stride != expected.full_slot_bytes:
             diffs.append(f"FULL stride server={stride} flexkv={expected.full_slot_bytes} "
                          f"(the server rounds slots up to slot_align={g.get('slot_align')}; "
@@ -491,7 +491,7 @@ def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
                 diffs.append(f"SWA window server={swa.get('window_blocks')} "
                              f"flexkv={expected.swa_window_blocks}")
             if client.info.data_plane:
-                stride = int(client.store.pool(shmradix.ComponentType.SWA).slot_bytes)
+                stride = int(client.store.pool(radixshmem.ComponentType.SWA).slot_bytes)
                 if stride != expected.swa_slot_bytes:
                     diffs.append(f"SWA stride server={stride} flexkv={expected.swa_slot_bytes}")
     elif swa is not None:
@@ -502,7 +502,7 @@ def check_geometry(client: "shmradix.RadixClient", expected: RadixGeometry,
             f"({expected.describe()}): " + "; ".join(diffs))
 
 
-def adopt_geometry(cache_config: CacheConfig, client: "shmradix.RadixClient",
+def adopt_geometry(cache_config: CacheConfig, client: "radixshmem.RadixClient",
                    label: str = "radixshmem") -> Dict[str, int]:
     """Take over what the server planned and published: the slot counts into
     ``cache_config`` (``num_cpu_blocks`` = the FULL pool, ``swa.num_slots`` =
@@ -585,7 +585,7 @@ def radix_server_is_distributed(model_config: ModelConfig, cache_config: CacheCo
         client.close()
 
 
-def radix_cluster_rank(client: "shmradix.RadixClient") -> int:
+def radix_cluster_rank(client: "radixshmem.RadixClient") -> int:
     """This node's rank in the radix cluster (0 on a standalone server)."""
     rank = int(getattr(client.info, "rank", -1))
     return rank if rank >= 0 else int(client.rank())
