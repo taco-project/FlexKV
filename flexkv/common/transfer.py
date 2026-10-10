@@ -242,6 +242,12 @@ class TransferOp:
     # one SSD slice feeds one GPU slice of the same [start, start+gran).
     layer_id: int = 0
     layer_granularity: int = -1
+    # GET inheriting an in-flight prefetch: this DISK2H must not issue SSD I/O.
+    # It completes when every ``span_gate`` source op (prefetch graph_id, op_id)
+    # has finished writing the same CPU blocks. LAYERWISE/H2D then consume
+    # those blocks instead of planning a second SSD read.
+    io_skipped: bool = False
+    span_gate: Tuple[Tuple[int, int], ...] = ()
     # Filled by the scheduler as partial-capable worker completions arrive.
     block_results: Optional[Tuple[bool, ...]] = field(default=None, init=False)
 
@@ -846,6 +852,17 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
     # contains at least one block a predecessor still has to fill.  Callers must
     # not merge across the lane boundary (see _split_h2d_lanes); this only keeps
     # the flag honest on the merged op.
+    skipped = [bool(getattr(op, "io_skipped", False)) for op in ops]
+    if any(skipped) and not all(skipped):
+        raise ValueError(
+            f"_merge_ops[{transfer_type.name}]: cannot mix io_skipped and "
+            f"real I/O ops in the same span (io_skipped={skipped})"
+        )
+    span_gate: Tuple[Tuple[int, int], ...] = tuple(
+        gate
+        for op in ops
+        for gate in (getattr(op, "span_gate", ()) or ())
+    )
     merged_op = TransferOp(
         graph_id=graph.graph_id,
         transfer_type=transfer_type,
@@ -856,6 +873,8 @@ def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
         mooncake_store_block_hashes=merged_kv_hashes,
         layer_id=int(getattr(ops[0], "layer_id", 0) or 0),
         layer_granularity=int(getattr(ops[0], "layer_granularity", -1) or -1),
+        io_skipped=all(skipped) if skipped else False,
+        span_gate=span_gate,
     )
     _attach_merged_callbacks(
         merged_op, ops, callbacks, op_callback_dict)
