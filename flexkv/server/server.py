@@ -40,6 +40,7 @@ from flexkv.server.request import (
     ResetRequest,
     CheckRunningRequest,
     PrefetchRequest,
+    PushRequest,
 )
 import contextlib
 
@@ -198,6 +199,7 @@ class KVServer:
             GetMatchRequest: self._handle_get_match_request,
             PutMatchRequest: self._handle_put_match_request,
             PrefetchRequest: self._handle_prefetch_request,
+            PushRequest: self._handle_push_request,
             WaitRequest: self._handle_wait_request,
             LaunchTaskRequest: self._handle_launch_task_request,
             CancelTaskRequest: self._handle_cancel_task_request,
@@ -461,6 +463,18 @@ class KVServer:
             task_id=req.task_id,
             namespace=req.namespace,
             swa_aware=req.swa_aware,
+        )
+
+    def _handle_push_request(self, req: PushRequest) -> None:
+        """Handle Push request (radixshmem)"""
+        self.kv_task_engine.push_async(
+            token_ids=req.token_ids,
+            dp_client_id=req.dp_client_id,
+            task_id=req.task_id,
+            namespace=req.namespace,
+            swa_aware=req.swa_aware,
+            target_rank=req.target_rank,
+            evict_local=req.evict_local,
         )
 
     def _handle_launch_task_request(self, req: LaunchTaskRequest) -> None:

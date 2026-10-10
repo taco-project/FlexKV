@@ -33,6 +33,7 @@ from flexkv.server.request import (
     UnregisterDPClientRequest,
     ResetRequest,
     PrefetchRequest,
+    PushRequest,
     Response
 )
 
@@ -170,6 +171,26 @@ class KVDPClient:
             task_id=self._get_task_id(),
             namespace=namespace,
             swa_aware=swa_aware,
+        )
+        self.send_to_server.send_pyobj(req)
+        return req.task_id
+
+    def push_async(
+        self,
+        token_ids: np.ndarray,
+        namespace: Optional[List[str]] = None,
+        swa_aware: bool = False,
+        target_rank: Optional[int] = None,
+        evict_local: bool = False,
+    ) -> int:
+        req = PushRequest(
+            dp_client_id=self.dp_client_id,
+            token_ids=token_ids,
+            task_id=self._get_task_id(),
+            namespace=namespace,
+            swa_aware=swa_aware,
+            target_rank=target_rank,
+            evict_local=evict_local,
         )
         self.send_to_server.send_pyobj(req)
         return req.task_id

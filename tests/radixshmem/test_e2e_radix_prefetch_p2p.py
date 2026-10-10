@@ -104,9 +104,27 @@ def _prefetch_until(kvm, token_ids, want_pulled_blocks: int, timeout: float = 60
     return pulled, rounds
 
 
+def _push_and_wait(kvm, token_ids, target_rank: int, timeout: float = 60.0):
+    """push_async + try_wait; returns (pushed_blocks, status)."""
+    from flexkv.common.request import KVResponseStatus
+    task_id = kvm.push_async(token_ids=token_ids, target_rank=target_rank)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        done = kvm.try_wait([task_id])
+        if task_id in done and done[task_id].status != KVResponseStatus.TIMEOUT:
+            mask = done[task_id].return_mask
+            pushed = int(np.count_nonzero(mask)) // TOKENS_PER_BLOCK if mask is not None else 0
+            return pushed, str(done[task_id].status)
+        time.sleep(0.02)
+    return 0, "TIMEOUT"
+
+
 def _node_proc(rank, gpu_id, cluster_id, server_name,
-               reader_ready, written, read_done, result_q):
-    """One FlexKV node: rank 0 writes the windows, rank 1 prefetches and reads."""
+               reader_ready, written, read_done, result_q,
+               mode="prefetch", peer_rank=None):
+    """One FlexKV node: rank 0 writes the windows, rank 1 prefetches and reads.
+    mode="push": rank 0 pushes the windows to rank 1 instead, through the
+    KVServer IPC (the nodes run in server-client mode), and rank 1 only reads."""
     # Before any CUDA context exists: each node drives a different device while
     # addressing it as device 0.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -119,6 +137,8 @@ def _node_proc(rank, gpu_id, cluster_id, server_name,
         "FLEXKV_ENABLE_MPS": "0",
         "FLEXKV_SERVER_RECV_PORT": recv_port,
     })
+    if mode == "push":
+        os.environ["FLEXKV_SERVER_CLIENT_MODE"] = "1"
 
     from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, ModelConfig
     from flexkv.kvmanager import KVManager
@@ -129,6 +149,8 @@ def _node_proc(rank, gpu_id, cluster_id, server_name,
     GLOBAL_CONFIG_FROM_ENV.radixshmem_server_name = server_name
     GLOBAL_CONFIG_FROM_ENV.enable_mps = False
     GLOBAL_CONFIG_FROM_ENV.server_recv_port = recv_port
+    if mode == "push":
+        GLOBAL_CONFIG_FROM_ENV.server_client_mode = True
 
     tag = f"[node r{rank}]"
     model_config = ModelConfig(
@@ -164,13 +186,16 @@ def _node_proc(rank, gpu_id, cluster_id, server_name,
             write_pattern(gpu_tensors, blocks_b[:LOCAL_HEAD_BLOCKS], writer=1)
             report["head_put_ok"] = put_prefix(kvm, tokens_b, slots_b, LOCAL_HEAD_BLOCKS)
             print(f"{tag} head put ok={report['head_put_ok']}", flush=True)
+            if mode == "push":
+                peer_rank.value = report["node_id"]      # the writer's push target
             reader_ready.set()
             if not written.wait(240):
                 raise TimeoutError("writer did not publish in 240s")
 
             # 1) Window A, nothing local: the prefetch pulls all of it off node 0,
             #    then the GET serves it from this node's pool.
-            pulled, rounds = _prefetch_until(kvm, tokens_a, NUM_REQUEST_BLOCKS)
+            pulled, rounds = (_prefetch_until(kvm, tokens_a, NUM_REQUEST_BLOCKS)
+                              if mode != "push" else (0, 0))   # push: node 0 already delivered
             report["a_pulled_blocks"], report["a_prefetch_rounds"] = pulled, rounds
             clear_blocks(gpu_tensors, blocks_a)
             report["a_hit_blocks"] = match_and_load(kvm, tokens_a, slots_a)
@@ -180,8 +205,8 @@ def _node_proc(rank, gpu_id, cluster_id, server_name,
                   flush=True)
 
             # 2) Window B, local head: the prefetch pulls only the tail.
-            pulled, rounds = _prefetch_until(kvm, tokens_b,
-                                             NUM_REQUEST_BLOCKS - LOCAL_HEAD_BLOCKS)
+            pulled, rounds = (_prefetch_until(kvm, tokens_b, NUM_REQUEST_BLOCKS - LOCAL_HEAD_BLOCKS)
+                              if mode != "push" else (0, 0))
             report["b_pulled_blocks"], report["b_prefetch_rounds"] = pulled, rounds
             clear_blocks(gpu_tensors, blocks_b)
             report["b_hit_blocks"] = match_and_load(kvm, tokens_b, slots_b)
@@ -202,6 +227,14 @@ def _node_proc(rank, gpu_id, cluster_id, server_name,
             write_pattern(gpu_tensors, blocks_b, writer=0)
             report["put_ok"] = put_prefix(kvm, tokens_b, slots_b, NUM_REQUEST_BLOCKS) and ok
             print(f"{tag} put ok={report['put_ok']}", flush=True)
+            if mode == "push":
+                target = int(peer_rank.value)
+                report["a_pushed_blocks"], report["a_push_status"] = _push_and_wait(
+                    kvm, tokens_a, target)
+                report["b_pushed_blocks"], report["b_push_status"] = _push_and_wait(
+                    kvm, tokens_b, target)
+                print(f"{tag} pushed to rank {target}: A={report['a_pushed_blocks']} "
+                      f"B={report['b_pushed_blocks']}", flush=True)
             written.set()
             # Stay up: the reader's radix-server reads THIS node's SlotStore.
             if not read_done.wait(300):
@@ -223,7 +256,7 @@ def _node_proc(rank, gpu_id, cluster_id, server_name,
         result_q.put(report)
 
 
-def _run(registry: str, rdma_dev: str) -> dict:
+def _run(registry: str, rdma_dev: str, mode: str = "prefetch") -> dict:
     # One etcd namespace (and shm prefix) per run keeps concurrent runs apart.
     cluster_id = f"p2p{os.getpid()}"
     workdir = tempfile.mkdtemp(prefix="flexkv_radix_p2p_")
@@ -248,10 +281,12 @@ def _run(registry: str, rdma_dev: str) -> dict:
                         "--cluster-id", cluster_id, "--node-name", _node_name(rank),
                         "--rpc-address", "127.0.0.1", "--index-dev", rdma_dev,
                         "--transfer-dev", rdma_dev, "--rht-slots", "4",
+                        "--enable-remote-insert", "--enable-remote-query",  # push needs them
                         "--bootstrap-timeout", "120"],
             log_path=os.path.join(workdir, f"radix-server-{_node_name(rank)}.log")))
     ctx = mp.get_context("spawn")
     reader_ready, written, read_done = ctx.Event(), ctx.Event(), ctx.Event()
+    peer_rank = ctx.Value("i", -1)
     result_q = ctx.Queue()
     procs = []
     reports = {}
@@ -260,7 +295,7 @@ def _run(registry: str, rdma_dev: str) -> dict:
             proc = ctx.Process(
                 target=_node_proc,
                 args=(rank, rank, cluster_id, names[rank],
-                      reader_ready, written, read_done, result_q),
+                      reader_ready, written, read_done, result_q, mode, peer_rank),
                 daemon=False,
             )
             proc.start()
@@ -335,6 +370,29 @@ def test_prefetch_pulls_peer_blocks_over_rdma(cluster):
         f"window B: head does not hold node 1's bytes: {reader['b_head_mismatched']}"
     assert reader["b_tail_mismatched"] == [], \
         f"window B: tail does not hold node 0's bytes: {reader['b_tail_mismatched']}"
+
+
+@pytest.mark.e2e
+def test_push_writes_peer_blocks_over_rdma(cluster):
+    """Node 0 pushes both windows to node 1 by rank (KVManager.push_async over
+    the KVServer IPC); node 1's plain local GET then serves them, window B's
+    head still with node 1's own bytes."""
+    registry, rdma_dev = cluster
+    reports = _run(registry, rdma_dev, mode="push")
+
+    assert len(reports) == WORLD_SIZE, f"only {len(reports)}/{WORLD_SIZE} nodes reported"
+    errors = {rank: r["error"] for rank, r in reports.items() if "error" in r}
+    assert not errors, errors
+    writer, reader = reports[0], reports[1]
+    assert writer["put_ok"] and reader["head_put_ok"]
+    tail = NUM_REQUEST_BLOCKS - LOCAL_HEAD_BLOCKS
+    assert writer["a_pushed_blocks"] == NUM_REQUEST_BLOCKS, \
+        f"window A: pushed {writer['a_pushed_blocks']}/{NUM_REQUEST_BLOCKS} ({writer['a_push_status']})"
+    assert writer["b_pushed_blocks"] == tail, \
+        f"window B: pushed {writer['b_pushed_blocks']}/{tail} tail blocks ({writer['b_push_status']})"
+    assert reader["a_hit_blocks"] == NUM_REQUEST_BLOCKS and reader["a_mismatched"] == []
+    assert reader["b_hit_blocks"] == NUM_REQUEST_BLOCKS
+    assert reader["b_head_mismatched"] == [] and reader["b_tail_mismatched"] == []
 
 
 if __name__ == "__main__":
