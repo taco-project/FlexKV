@@ -223,6 +223,9 @@ class TransferEngine:
         # Ops with at least one failed replica: must be discarded, not
         # finalized, when their pending_count drains to zero.
         self._failed_parent_op_ids: Set[int] = set()
+        # GET inherit: skip-io DISK2H waits for prefetch DISK2H (graph_id, op_id).
+        self._completed_op_keys: Set[Tuple[int, int]] = set()
+        self._parked_skip_io: Dict[int, TransferOp] = {}
 
     # ---- multi-group worker kwargs -------------------------------------------
     # There used to be four of these (main/SWA x TP=1/TP>1).  They differed only
@@ -1073,25 +1076,7 @@ class TransferEngine:
                 # Schedule next operations
                 nvtx_r3 = nvtx.start_range(message="transfer scheduler. schedule next ops", color="orange")
                 if finished_ops or new_graphs_num > 0:
-                    completed_graph_ids, next_ops = self.scheduler.schedule(finished_ops)
-                    # Distribute new ops to workers
-                    for op in next_ops:
-                        if op.transfer_type == TransferType.VIRTUAL:
-                            self.completed_queue.put(CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
-                        else:
-                            self.op_id_to_op[op.op_id] = op
-                            # Unified rule for both main-KV and SWA paths:
-                            # only register here when the resolved worker_map
-                            # entry is a single worker (no PP fan-out). For
-                            # dict-keyed entries (H2D/D2H), each replica is
-                            # registered inside _assign_op_to_worker /
-                            # _assign_swa_op_to_worker per PP sibling.
-                            if self._op_buffer_registered_here(op):
-                                register_op_to_buffer(op, self.pin_buffer)
-                            self._assign_op_to_worker(op)
-                    # Handle completed graphs
-                    for graph_id in completed_graph_ids:
-                        self.completed_queue.put(CompletedOp.completed_graph(graph_id))
+                    self._dispatch_scheduled_ops(finished_ops)
                 nvtx.end_range(nvtx_r3)
 
                 # Outside the dispatch block: a tick may consist solely of a
@@ -1115,6 +1100,64 @@ class TransferEngine:
         # Cleanup
         sel.close()
         flexkv_logger.info("TransferEngine scheduler loop stopped")
+
+    def _gates_satisfied(self, op: TransferOp) -> bool:
+        gates = getattr(op, "span_gate", ()) or ()
+        if not gates:
+            return True
+        return all(gate in self._completed_op_keys for gate in gates)
+
+    def _park_skip_io(self, op: TransferOp) -> None:
+        self._parked_skip_io[op.op_id] = op
+
+    def _take_unparked_skip_io(self) -> List[TransferOp]:
+        ready: List[TransferOp] = []
+        for op_id, op in list(self._parked_skip_io.items()):
+            if self._gates_satisfied(op):
+                ready.append(self._parked_skip_io.pop(op_id))
+        return ready
+
+    def _note_ops_completed(self, ops: List[TransferOp]) -> None:
+        for op in ops:
+            self._completed_op_keys.add((int(op.graph_id), int(op.op_id)))
+
+    def _assign_or_complete_op(self, op: TransferOp) -> Optional[TransferOp]:
+        """Dispatch one ready op. Returns skip-io ops that can complete now."""
+        if op.transfer_type == TransferType.VIRTUAL:
+            self.completed_queue.put(CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
+            return None
+        if getattr(op, "io_skipped", False):
+            if self._gates_satisfied(op):
+                self.completed_queue.put(
+                    CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
+                return op
+            self._park_skip_io(op)
+            return None
+        self.op_id_to_op[op.op_id] = op
+        if self._op_buffer_registered_here(op):
+            register_op_to_buffer(op, self.pin_buffer)
+        self._assign_op_to_worker(op)
+        return None
+
+    def _dispatch_scheduled_ops(self, finished_ops: List[TransferOp]) -> None:
+        """Schedule, complete skip-io DISK2H that inherited a finished prefetch span, dispatch the rest."""
+        self._note_ops_completed(finished_ops)
+        to_schedule = list(finished_ops) + self._take_unparked_skip_io()
+        # First pass always runs: new graphs are dirty even with no completions.
+        # Later passes only run when skip-io DISK2H can complete in this tick.
+        first = True
+        while first or to_schedule:
+            first = False
+            completed_graph_ids, next_ops = self.scheduler.schedule(to_schedule)
+            to_schedule = []
+            for op in next_ops:
+                done = self._assign_or_complete_op(op)
+                if done is not None:
+                    to_schedule.append(done)
+            self._note_ops_completed(to_schedule)
+            to_schedule.extend(self._take_unparked_skip_io())
+            for graph_id in completed_graph_ids:
+                self.completed_queue.put(CompletedOp.completed_graph(graph_id))
 
     def _op_buffer_registered_here(self, op: TransferOp) -> bool:
         """The 'unified rule' shared by dispatch, _finalize_op and

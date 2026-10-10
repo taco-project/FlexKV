@@ -1346,6 +1346,56 @@ class GlobalCacheEngine:
             ops.append(op)
         return ops
 
+    def build_inherited_get_graph(
+            self,
+            prefetch_graph: TransferOpGraph,
+            gpu_block_ids: np.ndarray,
+            dp_client_id: int,
+    ) -> Tuple[TransferOpGraph, int, np.ndarray]:
+        """Build a GET that H2Ds an in-flight prefetch's CPU dst blocks.
+
+        Each prefetch DISK2H span is cloned as ``io_skipped`` with a
+        ``span_gate`` on the original op. The transfer engine completes those
+        clones when the prefetch span has written CPU; LAYERWISE/H2D then
+        consume the same physical blocks instead of issuing a second SSD read.
+        """
+        transfer_graph = TransferOpGraph()
+        skip_ops: List[TransferOp] = []
+        cpu_blocks: Optional[np.ndarray] = None
+        for op in prefetch_graph._op_map.values():
+            if op.transfer_type != TransferType.DISK2H:
+                continue
+            if cpu_blocks is None:
+                cpu_blocks = np.asarray(op.dst_block_ids, dtype=np.int64)
+            skip = TransferOp(
+                graph_id=transfer_graph.graph_id,
+                transfer_type=TransferType.DISK2H,
+                src_block_ids=np.asarray(op.src_block_ids, dtype=np.int64),
+                dst_block_ids=np.asarray(op.dst_block_ids, dtype=np.int64),
+                dp_client_id=dp_client_id,
+                layer_id=int(getattr(op, "layer_id", 0) or 0),
+                layer_granularity=int(getattr(op, "layer_granularity", -1) or -1),
+                io_skipped=True,
+                span_gate=((int(op.graph_id), int(op.op_id)),),
+            )
+            transfer_graph.add_transfer_op(skip)
+            skip_ops.append(skip)
+        if not skip_ops or cpu_blocks is None:
+            raise ValueError("prefetch graph has no DISK2H to inherit")
+        gpu_ids = np.asarray(gpu_block_ids, dtype=np.int64)
+        if gpu_ids.size != cpu_blocks.size:
+            gpu_ids = np.zeros_like(cpu_blocks)
+        h2d_ops = self._build_get_h2d_ops(
+            transfer_graph=transfer_graph,
+            cpu_blocks=cpu_blocks,
+            gpu_blocks=gpu_ids,
+            resident_num_blocks=0,
+            split=False,
+            dp_client_id=dp_client_id,
+            staged_predecessors=skip_ops,
+        )
+        return transfer_graph, h2d_ops[-1].op_id, cpu_blocks
+
     @staticmethod
     def _build_get_h2d_ops(transfer_graph: TransferOpGraph,
                            cpu_blocks: np.ndarray,

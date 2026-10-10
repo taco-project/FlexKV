@@ -307,6 +307,65 @@ class KVTaskManager:
             duration_s,
         )
 
+    def _inflight_prefetch_task(
+            self,
+            token_ids: np.ndarray,
+            namespace: Optional[List[str]] = None,
+    ) -> Optional[KVTask]:
+        prefetch_id = self.prefetch_tasks.get(
+            self._gen_prefetch_key(token_ids, namespace), None)
+        if prefetch_id is None:
+            return None
+        task = self.tasks.get(prefetch_id)
+        if task is None or task.task_type != TaskType.PREFETCH:
+            return None
+        if task.task_end_op_finished or task.status in (
+                TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            return None
+        if not any(op.transfer_type == TransferType.DISK2H
+                   for op in task.graph._op_map.values()):
+            return None
+        return task
+
+    def _create_inherited_get_task(
+            self,
+            task_id: int,
+            prefetch_task: KVTask,
+            token_ids: np.ndarray,
+            slot_mapping: np.ndarray,
+            token_mask: Optional[np.ndarray],
+            dp_client_id: int,
+            is_fake_slot_mapping: bool,
+    ) -> None:
+        graph, task_end_op_id, cpu_blocks = self.cache_engine.build_inherited_get_graph(
+            prefetch_task.graph, slot_mapping, dp_client_id)
+        n_tokens = int(cpu_blocks.size) * int(self.cache_engine.tokens_per_block)
+        return_mask = np.zeros(token_ids.shape[0], dtype=np.bool_)
+        if token_mask is None:
+            return_mask[:n_tokens] = True
+        else:
+            return_mask[:n_tokens] = np.asarray(token_mask[:n_tokens], dtype=np.bool_)
+        self.tasks[task_id] = KVTask(
+            task_id=task_id,
+            task_type=TaskType.GET,
+            task_end_op_id=task_end_op_id,
+            task_end_op_finished=False,
+            status=TaskStatus.UNREADY if is_fake_slot_mapping else TaskStatus.READY,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask,
+            graph=graph,
+            return_mask=return_mask,
+            callback=None,
+            op_callback_dict={})
+        self.graph_to_task[graph.graph_id] = task_id
+        self._log_task_created(self.tasks[task_id])
+        flexkv_logger.info(
+            "[FlexKV-IO] operation=get act=inherit status=ok "
+            f"flexkv_task_id={task_id} prefetch_task_id={prefetch_task.task_id} "
+            f"prefetch_graph_id={prefetch_task.graph.graph_id} "
+            f"spans={sum(1 for op in graph._op_map.values() if op.io_skipped)}")
+
     def create_get_task(self,
                         task_id: int,
                         token_ids: np.ndarray,
@@ -320,6 +379,13 @@ class KVTaskManager:
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
+        prefetch_task = None if swa_aware else self._inflight_prefetch_task(
+            token_ids, namespace)
+        if prefetch_task is not None:
+            self._create_inherited_get_task(
+                task_id, prefetch_task, token_ids, slot_mapping, token_mask,
+                dp_client_id, is_fake_slot_mapping)
+            return
         graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.get(
             request_id=task_id,
             token_ids=token_ids,
@@ -858,6 +924,8 @@ class KVTaskManager:
                 else [task.callback]
             )
             for callback in callbacks:
+                if callback is None:
+                    continue
                 try:
                     callback()
                 except Exception:
@@ -1311,8 +1379,9 @@ class KVTaskEngine(KVTaskManager):
         REMOTE2H length (clamped by deferred publish; for joint SWA only when
         Full+SWA both succeed, else 0). Callers that want that count should
         read ``sum(return_mask)`` on the response, not any launch-time value.
-        Compute H2D length still comes from a subsequent local ``get_match``
-        against the CPU tree.
+        Compute H2D still comes from a subsequent local ``get_match``. If that
+        prefetch is still in flight, GET inherits its CPU dst blocks and does
+        not issue a second DISK2H; LAYERWISE/H2D wait on the prefetch spans.
         """
         if task_id == -1:
             task_id = self._gen_task_id()
