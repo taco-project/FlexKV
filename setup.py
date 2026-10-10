@@ -309,6 +309,7 @@ enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 cpp_sources = [
     "csrc/bindings.cpp",
     "csrc/logging.cpp",
+    "csrc/ce_trace.cpp",
     "csrc/transfer.cu",  # Skip CUDA file for now
     "csrc/ce_transfer.cu",
     "csrc/hash.cpp",
@@ -325,6 +326,7 @@ cpp_sources = [
 
 hpp_sources = [
     "csrc/logging.h",
+    "csrc/ce_trace.h",
     "csrc/cache_utils.h",
     "csrc/tp_transfer_thread_group.h",
     "csrc/device_thread_pool.h",
@@ -450,7 +452,9 @@ if not debug:
                       "flexkv/**/test_*.py",
                       "flexkv/**/benchmark_*.py",
                       "flexkv/benchmark/**/*.py",
-                      "flexkv/benchmark/test_kvmanager.py"]
+                      "flexkv/benchmark/test_kvmanager.py",
+                      # Keep the CPU-only diagnostic CLI runnable via python -m.
+                      "flexkv/transfer/ce_replay.py"]
     # Import cython when debug is turned off.
     from Cython.Build import cythonize
     cythonized_modules = cythonize(
