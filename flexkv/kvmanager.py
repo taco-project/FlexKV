@@ -15,7 +15,7 @@
 
 import os
 import subprocess
-from typing import Optional, Tuple, List, Dict, Union, Iterable
+from typing import Any, Optional, Tuple, List, Dict, Union, Iterable
 import time
 
 import numpy as np
@@ -205,6 +205,29 @@ class KVManager:
             return self.dp_client.is_ready()
         else:
             return self.kv_task_engine.is_ready()
+
+    # ----------------------------------------------------- placement events
+
+    def start_kv_events(self) -> bool:
+        """Arm CPU-tier KV placement events for forwarding to a KV-aware
+        router. Returns True only when this tier can also report evictions —
+        stores alone would leave the router's view permanently optimistic.
+
+        Only the in-process (radixshmem) path supports this: in
+        server_client_mode the tier lives in the KVServer process, where the
+        engine's event pump cannot reach it.
+        """
+        if self.server_client_mode or self.kv_task_engine is None:
+            return False
+        return bool(self.kv_task_engine.start_kv_events())
+
+    def take_kv_events(self, max_hashes: int = 65536) -> List[Any]:
+        """Placement events since the last call. Safe on a scheduler tick:
+        it drains a lock-free shm ring and a local list, and blocks on
+        neither the transfer engine nor the radix-server."""
+        if self.server_client_mode or self.kv_task_engine is None:
+            return []
+        return self.kv_task_engine.take_kv_events(max_hashes)
 
     def shutdown(self) -> None:
         flexkv_logger.info("[FLEXKV] KVManager.shutdown begin.")

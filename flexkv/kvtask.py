@@ -1110,6 +1110,18 @@ class KVTaskEngine(KVTaskManager):
         self.tracer = FlexKVTracer()
         self.tracer.trace_config(model_config, cache_config, gpu_layout=None)
 
+    # --------------------------------------------------- placement events
+
+    def start_kv_events(self) -> bool:
+        """Arm CPU-tier KV placement events. Only the radixshmem tier has
+        them; every other planner reports False and publishes nothing."""
+        start = getattr(self.cache_engine, "start_kv_events", None)
+        return bool(start()) if start is not None else False
+
+    def take_kv_events(self, max_hashes: int = 65536) -> List[Any]:
+        drain = getattr(self.cache_engine, "drain_kv_events", None)
+        return drain(max_hashes) if drain is not None else []
+
     def get_async(self,
                   token_ids: np.ndarray,
                   slot_mapping: np.ndarray,
