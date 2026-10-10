@@ -882,6 +882,10 @@ class KVTaskManager:
 
     def _release_task(self, task_id: int) -> None:
         if task_id not in self.tasks:
+            # reset_cache() drops self.tasks wholesale; the reaper must still be
+            # able to retire the bookkeeping entry or it spins on a dead id.
+            if hasattr(self, "_terminal_tasks"):
+                self._terminal_tasks.pop(task_id, None)
             return
         task = self.tasks[task_id]
         if task.graph is not None:
@@ -1755,6 +1759,8 @@ class KVTaskEngine(KVTaskManager):
         prefetch_jobs.clear()
         # Only terminal response metadata remains after the drain boundary.
         self.tasks.clear()
+        if hasattr(self, "_terminal_tasks"):
+            self._terminal_tasks.clear()
         self.prefetch_tasks.clear()
         self.graph_to_task.clear()
         self.uncompleted_ops.clear()
