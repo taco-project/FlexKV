@@ -21,6 +21,7 @@
 
 #include "monitoring/metrics_manager.h"
 #include "transfer.cuh"
+#include "ce_trace.h"
 #include "ce_transfer.h"
 #include "logging.h"
 
@@ -189,6 +190,23 @@ void transfer_kv_blocks(
   dim3 blockDim(block_size);
   dim3 gridDim(block_count);
 
+  // Capture after rank-sharing/region geometry has been resolved. This one
+  // hook also covers direct bindings and legacy TP thread groups.
+  const bool trace_on = ce_trace_enabled();
+  auto record = [&](CEPath path, const CEAnalysis *analysis) {
+    if (!trace_on)
+      return;
+    int device = -1;
+    (void)cudaGetDevice(&device);
+    ce_trace_log(static_cast<int>(Type), gpu_tensor_handler, num_blocks,
+                 start_layer_id, num_layers, kv_dim, chunk_size_in_bytes,
+                 gpu_block_stride_in_bytes, cpu_kv_stride_in_bytes,
+                 cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
+                 gpu_startoff_inside_chunks, cpu_startoff_inside_chunks,
+                 transfer_num_cta, is_host_to_device, use_ce_transfer, path,
+                 ce_config, analysis, gpu_block_ids, cpu_block_ids, device);
+  };
+
   // CE transfer mode
   if (use_ce_transfer) {
     // Analyze block-id contiguity
@@ -199,6 +217,7 @@ void transfer_kv_blocks(
 
     // path_opt_enabled off → PER_BLOCK; else choose_path() picks a strategy.
     if (!ce_config.path_opt_enabled) {
+      record(CEPath::PER_BLOCK, &analysis);
       ce_transfer_per_block<Type>(
           num_blocks, start_layer_id, num_layers, kv_dim,
           gpu_block_ids, gpu_tensor_handler,
@@ -222,6 +241,7 @@ void transfer_kv_blocks(
                            is_host_to_device, is_full_block);
       }
 
+      record(path, &analysis);
       switch (path) {
         case CEPath::CONTIG_DIRECT:
           ce_transfer_contig_direct<Type>(
@@ -275,6 +295,7 @@ void transfer_kv_blocks(
       }
     }  // end else (path_opt_enabled)
   } else {
+    record(CEPath::PER_BLOCK, nullptr);
     // Custom kernel transfer. Choose the float4 (16B) vs int64 (8B) copy path
     // based on alignment; the 8b path handles kv_shared_across_ranks D2H (num_kv_heads==1) where per-TP
     // shard offsets are 8-aligned but not 16-aligned (e.g. DSv4).

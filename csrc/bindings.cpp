@@ -1,3 +1,4 @@
+#include "ce_trace.h"
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -60,15 +61,31 @@ void transfer_kv_blocks_binding(
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_block_stride_in_bytes,
     int64_t chunk_size_in_bytes, int start_layer_id, int num_layers,
     int transfer_num_cta = 4, bool is_host_to_device = true,
-    bool use_ce_transfer = false, int kv_dim = 2,
-    int num_kv_heads = 1,
-    int gpu_block_type = 0,
-    bool sync = true,
-    bool ce_path_opt = false,
+    bool use_ce_transfer = false, int kv_dim = 2, int num_kv_heads = 1,
+    int gpu_block_type = 0, bool sync = true, bool ce_path_opt = false,
     int ce_segment_threshold = 8, int ce_force_path = -1,
     bool ce_enable_memcpy2d = false, bool is_blockfirst = false,
     int ce_gather_threads = 4, bool ce_gather_nt = true,
-    bool enable_transfer_trace = false) {
+    bool enable_transfer_trace = false, int64_t gpu_startoff_inside_chunks = 0,
+    int64_t cpu_startoff_inside_chunks = 0, int total_num_layers = 0) {
+  TORCH_CHECK(
+      gpu_startoff_inside_chunks >= 0 && gpu_startoff_inside_chunks % 8 == 0,
+      "gpu_startoff_inside_chunks must be nonnegative and aligned to 8 bytes");
+  TORCH_CHECK(
+      cpu_startoff_inside_chunks >= 0 && cpu_startoff_inside_chunks % 8 == 0,
+      "cpu_startoff_inside_chunks must be nonnegative and aligned to 8 bytes");
+  TORCH_CHECK(total_num_layers >= 0, "total_num_layers must be nonnegative");
+  if (total_num_layers > 0) {
+    TORCH_CHECK(start_layer_id >= 0 && num_layers >= 0 &&
+                    int64_t(start_layer_id) + num_layers <= total_num_layers,
+                "layer range exceeds total_num_layers");
+    const int64_t pointer_count =
+        gpu_block_type == 1
+            ? 1
+            : int64_t(total_num_layers) * (gpu_block_type == 2 ? kv_dim : 1);
+    TORCH_CHECK(gpu_tensor_ptrs_tensor.numel() >= pointer_count,
+                "GPU pointer table is shorter than total_num_layers requires");
+  }
   int num_blocks = gpu_block_id_tensor.numel();
 
   int64_t *gpu_block_ids =
@@ -107,7 +124,8 @@ void transfer_kv_blocks_binding(
 
   // Create GTensorHandler
   flexkv::GTensorHandler handler(
-      backend_type, reinterpret_cast<int64_t **>(gpu_tensor_ptrs), num_layers,
+      backend_type, reinterpret_cast<int64_t **>(gpu_tensor_ptrs),
+      total_num_layers > 0 ? total_num_layers : num_layers,
       gpu_kv_stride_in_bytes, gpu_block_stride_in_bytes,
       gpu_layer_stride_in_bytes);
 
@@ -118,12 +136,12 @@ void transfer_kv_blocks_binding(
   flexkv::with_tensor_kind(backend_type, [&](auto tag) {
     flexkv::transfer_kv_blocks<decltype(tag)::value>(
         num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
-        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
+        gpu_startoff_inside_chunks, cpu_block_ids, cpu_ptr,
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
-        cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
+        cpu_block_stride_in_bytes, cpu_startoff_inside_chunks,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
-        use_ce_transfer, kv_dim,
-        gpu_block_stride_in_bytes, sync, ce_config, enable_transfer_trace);
+        use_ce_transfer, kv_dim, gpu_block_stride_in_bytes, sync, ce_config,
+        enable_transfer_trace);
   });
 
   cudaError_t err = cudaGetLastError();
@@ -392,6 +410,11 @@ bool create_gds_file_binding(GDSManager &manager, const std::string &filename,
 #endif
 
 PYBIND11_MODULE(c_ext, m) {
+  m.def("ce_trace_enabled", &flexkv::ce_trace_enabled);
+  m.def("ce_trace_set_enabled", &flexkv::ce_trace_set_enabled);
+  m.def("ce_trace_shutdown", &flexkv::ce_trace_shutdown,
+        py::call_guard<py::gil_scoped_release>());
+
   m.attr("__git_commit__") = FLEXKV_GIT_COMMIT;
 
   // Metrics configuration function - allows Python to configure C++ metrics
@@ -412,17 +435,16 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("cpu_block_stride_in_bytes"), py::arg("chunk_size_in_bytes"),
         py::arg("start_layer_id"), py::arg("num_layers"),
         py::arg("transfer_num_cta") = 4, py::arg("is_host_to_device") = true,
-        py::arg("use_ce_transfer") = false,
-        py::arg("kv_dim") = 2,
-        py::arg("num_kv_heads") = 1,
-        py::arg("gpu_block_type") = 0, py::arg("sync") = true,
-        py::arg("ce_path_opt") = false,
+        py::arg("use_ce_transfer") = false, py::arg("kv_dim") = 2,
+        py::arg("num_kv_heads") = 1, py::arg("gpu_block_type") = 0,
+        py::arg("sync") = true, py::arg("ce_path_opt") = false,
         py::arg("ce_segment_threshold") = 8, py::arg("ce_force_path") = -1,
-        py::arg("ce_enable_memcpy2d") = false,
-        py::arg("is_blockfirst") = false,
-        py::arg("ce_gather_threads") = 4,
-        py::arg("ce_gather_nt") = true,
+        py::arg("ce_enable_memcpy2d") = false, py::arg("is_blockfirst") = false,
+        py::arg("ce_gather_threads") = 4, py::arg("ce_gather_nt") = true,
         py::arg("enable_transfer_trace") = false,
+        py::arg("gpu_startoff_inside_chunks") = 0,
+        py::arg("cpu_startoff_inside_chunks") = 0,
+        py::arg("total_num_layers") = 0,
         // The body launches CUDA work and (when sync=true) blocks in
         // cudaStreamSynchronize. Holding the GIL across that freezes every
         // other thread in the worker process -- including the mp.Queue feeder
