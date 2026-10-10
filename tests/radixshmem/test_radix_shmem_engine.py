@@ -403,6 +403,7 @@ def test_standalone_region_has_no_peer(env):
     assert engine.peer_enabled is False            # asked for, but world_size == 1
     assert bootstrap.radix_cluster_rank(engine.client) == 0
     assert engine.prefetch(seq) is None
+    assert engine.push(seq) is None
     result = engine.match(seq)
     assert result.num_matched_blocks == 3
     assert result.finalize is not None
@@ -1815,8 +1816,10 @@ def _peer_pattern(block: int, writer: int) -> bytes:
 
 
 def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output,
-               local_head_blocks=0):
-    """One node: a data-mode RadixServer (in-process) plus the FlexKV engine."""
+               local_head_blocks=0, mode="prefetch", peer_up=None, peer_rank=None):
+    """One node: a data-mode RadixServer (in-process) plus the FlexKV engine.
+    mode: "prefetch" (the reader pulls), "push" (the writer pushes to the
+    reader's rank) or "push_auto" (the writer pushes to the peer the RHT picks)."""
     try:
         # Two servers on one host: distinct names, so radixshmem derives
         # distinct sockets (cluster names are per node; the geometry is shared).
@@ -1827,7 +1830,8 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
             expected_min_nodes=2, registry=registry, cluster_id=cluster_id,
             node_name=f"r{rank}", rpc_address="0.0.0.0", index_dev=rdma_dev,
             gid_idx=int(os.getenv("FLEXKV_TEST_RADIX_GID_IDX", "3")),
-            bootstrap_timeout_sec=60, rht_slots_per_bucket=4)
+            bootstrap_timeout_sec=60, rht_slots_per_bucket=4,
+            enable_remote_insert=True, enable_remote_query=True)      # push needs the remote ops
         cfg = radixshmem.ServerConfig(
             name=name, data_bytes=PEER_BLOCKS * PEER_SLOT_BYTES, slot_align=4096,
             data_name=data_name, prefault=False, transfer_devices=[rdma_dev],
@@ -1858,7 +1862,25 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
             # insert() publishes and, with peer_enabled, flushes the RHT so the
             # reader can route to us.
             engine.insert(sequence, slots, num_insert_blocks=len(hashes))
-            output.put({"writer_rank": cluster_rank})
+            writer_msg = {"writer_rank": cluster_rank}
+            if mode != "prefetch":
+                if not peer_up.wait(120):
+                    raise TimeoutError("reader did not come up")
+                target = int(peer_rank.value) if mode == "push" else None
+                # The reader's RHT routes land asynchronously: retry until the
+                # push commits the whole prefix on the peer.
+                deadline = time.monotonic() + 30
+                while True:
+                    job = engine.push(_seq(query_hashes), target_rank=target, timeout_ms=20000)
+                    res = job.wait(60)
+                    if res.committed >= len(query_hashes) or time.monotonic() > deadline:
+                        break
+                    time.sleep(0.05)
+                writer_msg.update(
+                    push_committed=int(res.committed), push_remote_blocks=int(res.remote_blocks),
+                    push_remote_bytes=int(res.remote_bytes), push_target_rank=int(res.target_rank),
+                    job_remote_hit=int(job.remote_hit), job_planned_push=int(job.planned_push))
+            output.put(writer_msg)
             ready.set()
             if not done.wait(120):
                 raise TimeoutError("reader did not complete")
@@ -1870,40 +1892,41 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
                 for i, slot in enumerate(head_slots):
                     engine.client.slot_view(int(slot))[:] = _peer_pattern(i, writer=1)
                 engine.insert(_seq(head), head_slots, num_insert_blocks=local_head_blocks)
+            if mode != "prefetch":
+                peer_rank.value = cluster_rank
+                peer_up.set()
             if not ready.wait(120):
                 raise TimeoutError("writer did not publish")
-            # The writer's RHT publication is asynchronous: prefetch until the
-            # pull brings the whole prefix home.
-            expect = len(query_hashes)
-            result = None
-            job = None
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                job = engine.prefetch(_seq(query_hashes), timeout_ms=20000)
-                result = job.wait(60)
-                if result.common_hit >= expect:
-                    break
-                time.sleep(0.05)
-            if result is None or result.common_hit < expect:
-                raise AssertionError(
-                    f"prefetch reached {result.common_hit if result else None} blocks, "
-                    f"expected {expect}")
+            reader_msg = {"reader_rank": cluster_rank}
+            if mode == "prefetch":
+                # The writer's RHT publication is asynchronous: prefetch until the
+                # pull brings the whole prefix home.
+                expect = len(query_hashes)
+                result = None
+                job = None
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    job = engine.prefetch(_seq(query_hashes), timeout_ms=20000)
+                    result = job.wait(60)
+                    if result.common_hit >= expect:
+                        break
+                    time.sleep(0.05)
+                if result is None or result.common_hit < expect:
+                    raise AssertionError(
+                        f"prefetch reached {result.common_hit if result else None} blocks, "
+                        f"expected {expect}")
+                reader_msg.update(
+                    job_local_hit=int(job.local_hit), job_planned_hit=int(job.planned_hit),
+                    remote_blocks=int(result.remote_blocks), remote_bytes=int(result.remote_bytes),
+                    source_rank=int(result.source_rank))
             match = engine.match(_seq(query_hashes))
             bad = []
             for i, slot in enumerate(match.local_slots.tolist()):
                 writer = 1 if i < local_head_blocks else 0
                 if bytes(engine.client.slot_view(int(slot))) != _peer_pattern(i, writer):
                     bad.append(i)
-            output.put({
-                "num_matched": match.num_matched_blocks,
-                "job_local_hit": int(job.local_hit),
-                "job_planned_hit": int(job.planned_hit),
-                "remote_blocks": int(result.remote_blocks),
-                "remote_bytes": int(result.remote_bytes),
-                "source_rank": int(result.source_rank),
-                "bad_blocks": bad,
-                "reader_rank": cluster_rank,
-            })
+            reader_msg.update(num_matched=match.num_matched_blocks, bad_blocks=bad)
+            output.put(reader_msg)
             match.release()
             done.set()
         engine.close()
@@ -1914,10 +1937,12 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
         done.set()
 
 
-def _run_two_nodes(registry, rdma_dev, local_head_blocks=0):
+def _run_two_nodes(registry, rdma_dev, local_head_blocks=0, mode="prefetch"):
     ctx = mp.get_context("spawn")
     ready = ctx.Event()
     done = ctx.Event()
+    peer_up = ctx.Event()                    # push: the reader is up and has published its rank
+    peer_rank = ctx.Value("i", -1)
     output = ctx.Queue()
     prefix = f"/radixshmem_peer_test_{os.getpid()}_{local_head_blocks}"
     cluster_id = f"flexkv-peer-test-{os.getpid()}-{local_head_blocks}"
@@ -1925,7 +1950,7 @@ def _run_two_nodes(registry, rdma_dev, local_head_blocks=0):
     processes = [
         ctx.Process(target=_node_main,
                     args=(rank, prefix, cluster_id, registry, rdma_dev, ready, done,
-                          output, local_head_blocks))
+                          output, local_head_blocks, mode, peer_up, peer_rank))
         for rank in range(2)
     ]
     for process in processes:
@@ -1969,6 +1994,33 @@ def test_prefetch_extends_a_local_prefix_over_rdma(cluster):
     assert reader["job_planned_hit"] == 25
     assert reader["remote_blocks"] == 15
     assert reader["source_rank"] == writer["writer_rank"]
+    assert reader["num_matched"] == 25
+    assert reader["bad_blocks"] == []
+
+
+def test_push_writes_a_prefix_to_a_peer_over_rdma(cluster):
+    """Node 0 pushes 25 blocks to node 1 by rank; node 1 then finds them in its
+    own tree with node 0's bytes."""
+    rdma_dev, registry = cluster
+    reader, writer = _run_two_nodes(registry, rdma_dev, mode="push")
+    assert writer["push_target_rank"] == reader["reader_rank"]
+    assert (writer["job_remote_hit"], writer["job_planned_push"]) == (0, 25)
+    assert writer["push_committed"] == 25
+    assert writer["push_remote_blocks"] == 25
+    assert writer["push_remote_bytes"] == 25 * PEER_SLOT_BYTES
+    assert reader["num_matched"] == 25
+    assert reader["bad_blocks"] == []
+
+
+def test_push_extends_a_peer_prefix_via_rht(cluster):
+    """Node 1 holds blocks 0-9: with target_rank=None the RHT picks node 1 and
+    only blocks 10-24 travel; the match serves the head with node 1's bytes."""
+    rdma_dev, registry = cluster
+    reader, writer = _run_two_nodes(registry, rdma_dev, local_head_blocks=10, mode="push_auto")
+    assert writer["push_target_rank"] == reader["reader_rank"]
+    assert (writer["job_remote_hit"], writer["job_planned_push"]) == (10, 15)
+    assert writer["push_committed"] == 25
+    assert writer["push_remote_blocks"] == 15
     assert reader["num_matched"] == 25
     assert reader["bad_blocks"] == []
 

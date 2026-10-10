@@ -14,7 +14,9 @@ Contracts:
 2. A match is a pin: `ShmRadixMatch.release()` must run on every path, or the
    prefix stays pinned for the life of the region.
 3. `match()` is local only. Peer blocks arrive through `prefetch()`
-   (`RadixClient.pull_async`), which publishes them into the local tree.
+   (`RadixClient.pull_async`), which publishes them into the local tree;
+   `push()` (`RadixClient.push_async`) is the reverse, a local prefix written
+   into a peer's tree.
 
 A region may carry an SWA pool next to FULL. `FULL|SWA` queries return the
 joint hit plus the W-block window ending there; SWA slots are addressed by
@@ -295,6 +297,33 @@ class CacheEngineRadixShmem:
             f"radixshmem prefetch on {self.shm_name}: mask={component_mask:#x} "
             f"blocks={len(hashes)} local_hit={job.local_hit} "
             f"planned_hit={job.planned_hit} job={job.job_id}")
+        return job
+
+    def push(self,
+             sequence_meta: SequenceMeta,
+             *,
+             component_mask: int = COMPONENT_MASK_FULL,
+             query_end: Optional[int] = None,
+             target_rank: Optional[int] = None,
+             evict_local: bool = False,
+             timeout_ms: int = 30000) -> Any:
+        """Start `push_async` for the prefix; None when the region has no peers.
+
+        The reverse of `prefetch`: the suffix the peer lacks is written into its
+        SlotStore and published in its tree. `target_rank=None` lets the RHT
+        pick the peer; `evict_local=True` drops the local copy once the peer
+        holds it. `block=False`: a saturated client completes the job unpushed.
+        """
+        if not self.peer_enabled:
+            return None
+        hashes = self._hashes(sequence_meta, query_end)
+        job = self._client.push_async(hashes, component_mask, rank=target_rank,
+                                      evict_local=evict_local, timeout_ms=int(timeout_ms),
+                                      block=False)
+        flexkv_logger.debug(
+            f"radixshmem push on {self.shm_name}: mask={component_mask:#x} "
+            f"blocks={len(hashes)} target={target_rank} remote_hit={job.remote_hit} "
+            f"planned_push={job.planned_push} job={job.job_id}")
         return job
 
     # ---------- slots ----------
