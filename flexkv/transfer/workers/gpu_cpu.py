@@ -219,10 +219,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
-        # Bind primary GPU + pin op buffer before any CUDA IPC import.
+        # Bind primary GPU before any CUDA IPC import or host registration.
         if gpu_blocks and gpu_blocks[0]:
             self._ensure_cuda_device(gpu_blocks[0][0].device)
-        self._pin_op_buffer()
         # Handle tensor import for multi-process case — set_device per GPU first.
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
@@ -361,6 +360,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
         self._init_completion(completion, layerwise_eventfd_socket,
                               tp_group_size)
+        # Layerwise ops carry their own ID arrays, staged into pinned tensors
+        # by _launch_layerwise. They never read the shared op buffer on GPU.
+        # Whole-op transfers still use registered shared-slot ID views.
+        if not self._completion.needs_eventfd:
+            self._pin_op_buffer()
         self._compressor.attach(self)
 
     def _ordered_pools(self) -> List["_Pool"]:
@@ -1352,6 +1356,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         if isinstance(transfer_op, WorkerLayerwiseTransferOp):
             return self._launch_layerwise(transfer_op)
+        # Keep the unified worker safe if a whole-op transfer is sent to a
+        # PER_LAYER instance. Register before exposing shared-slot ID views;
+        # direct-ID inputs are independently pinned by get_transfer_block_ids.
+        if transfer_op.src_slot_id >= 0 or transfer_op.dst_slot_id >= 0:
+            self._pin_op_buffer()
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
         pool = self._pool_for(transfer_op)
         if self._is_per_group(pool):
