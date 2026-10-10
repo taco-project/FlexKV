@@ -59,7 +59,9 @@ struct CEAnalysis {
   bool gpu_log_contig;   // gpu_block_ids[k+1] == gpu_block_ids[k]+1
   bool cpu_log_contig;   // cpu_block_ids[k+1] == cpu_block_ids[k]+1
   bool cpu_phys_contig;  // cpu_block_stride == chunk_size (LAYERFIRST + non-sharded)
-  bool gpu_phys_contig;  // gpu_block_stride == chunk_size (non-sharded D2H)
+  bool gpu_phys_contig;  // gpu_block_stride == chunk_size (1D packed).
+                         // K/V-interleaved GPU ([block, kv, ...], stride 2*chunk)
+                         // is false here; memcpy2d still copies it in one hop.
   int num_segments;
   std::vector<CESegment> segments;
 };
