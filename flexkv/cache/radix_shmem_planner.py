@@ -71,9 +71,10 @@ class RadixGetPlan:
 
     ``on_complete`` runs when the graph completes (match-pin release);
     ``on_abort`` when the plan is cancelled before its graph ever launched.
-    A PREFETCH plan has an empty graph and carries the `GetJob` instead: the
-    pull it started, the local hit it started from and the hit it plans to
-    reach (blocks). `KVTaskEngine` completes such a task from the job.
+    A PREFETCH or PUSH plan has an empty graph and carries the job instead:
+    the pull (push) it started, the hit it started from and the hit it plans
+    to reach (blocks; for a push both are the peer's). `KVTaskEngine`
+    completes such a task from the job.
     """
 
     transfer_graph: TransferOpGraph
@@ -223,14 +224,40 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             plan = self._plan_get(
                 request_id, req.sequence_meta, req.block_start_idx, req.block_end_idx,
                 req.gpu_block_ids, dp_client_id, swa_aware=swa_aware)
+        return self._plan_result(plan, req, token_mask, dp_client_id)
 
+    @_synchronized_cache_tree
+    def push(self,
+             request_id: int,
+             token_ids: np.ndarray,
+             token_mask: np.ndarray,
+             slot_mapping: np.ndarray,
+             dp_client_id: int,
+             namespace: Optional[List[str]] = None,
+             swa_aware: bool = False,
+             target_rank: Optional[int] = None,
+             evict_local: bool = False) \
+                -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
+        """PUSH: write the prefix this node holds into a peer's tree. The same
+        shape as a prefetch `get()`: an empty graph and the job on the handle."""
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        if req.block_end_idx == 0:
+            return self._empty_result(token_mask)
+        plan = self._plan_push(request_id, req.sequence_meta, req.block_end_idx,
+                               swa_aware=swa_aware, target_rank=target_rank,
+                               evict_local=evict_local)
+        return self._plan_result(plan, req, token_mask, dp_client_id)
+
+    def _plan_result(self, plan: RadixGetPlan, req, token_mask: np.ndarray,
+                     dp_client_id: int) -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
+        """The `get()` / `push()` tuple for a GET or a job-backed plan."""
         transfer_graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
             plan.transfer_graph, plan.finished_ops_ids, dp_client_id)
 
         tpb = self.tokens_per_block
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         if plan.prefetch_job is not None:
-            # The planned pull [local hit, planned hit); KVTaskEngine rewrites
+            # The planned range [start hit, planned end); KVTaskEngine rewrites
             # it to what actually landed when the job completes.
             return_mask[plan.prefetch_local_hit_blocks * tpb:
                         plan.prefetch_planned_hit_blocks * tpb] = True
@@ -453,6 +480,48 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         plan.prefetch_planned_hit_blocks = int(job.planned_hit)
         if self._metrics_collector is not None and job.planned_hit > job.local_hit:
             self._metrics_collector.record_cache_hit("peer", job.planned_hit - job.local_hit)
+        return plan
+
+    # ------------------------------------------------------------------ PUSH
+
+    def _plan_push(self,
+                   request_id: int,
+                   sequence_meta: SequenceMeta,
+                   block_mask_end: int,
+                   swa_aware: bool = False,
+                   target_rank: Optional[int] = None,
+                   evict_local: bool = False) -> RadixGetPlan:
+        """PUSH: start a peer push (`CacheEngineRadixShmem.push`), the reverse
+        of `_plan_prefetch`. Pushes share the pulls' in-flight budget (one
+        RadixClient). The plan's start is the peer's hit, its end the hit plus
+        the blocks the push staged on the peer."""
+        assert self.cpu_cache_engine is not None
+        engine = self.cpu_cache_engine
+        if not engine.peer_enabled:
+            return RadixGetPlan.empty()
+        inflight = self._prefetch_inflight()
+        if inflight >= PREFETCH_MAX_INFLIGHT:
+            flexkv_logger.debug(
+                f"radixshmem push {request_id}: {inflight} peer jobs in flight "
+                f"(limit {PREFETCH_MAX_INFLIGHT}); skipping the push")
+            return RadixGetPlan.empty()
+        swa_active = swa_aware and self.swa_op_constructor.enabled
+        mask = (COMPONENT_MASK_FULL | COMPONENT_MASK_SWA) if swa_active else COMPONENT_MASK_FULL
+        job = engine.push(
+            sequence_meta,
+            component_mask=mask,
+            query_end=block_mask_end,
+            target_rank=target_rank,
+            evict_local=evict_local,
+            timeout_ms=PREFETCH_TIMEOUT_MS,
+        )
+        plan = RadixGetPlan.empty()
+        if job is None:
+            return plan
+        self._prefetch_jobs.append(job)
+        plan.prefetch_job = job
+        plan.prefetch_local_hit_blocks = int(job.remote_hit)
+        plan.prefetch_planned_hit_blocks = int(job.remote_hit) + int(job.planned_push)
         return plan
 
     # ------------------------------------------------------------------- PUT

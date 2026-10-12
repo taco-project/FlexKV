@@ -55,6 +55,7 @@ class TaskType(Enum):
     GET = "get"
     PUT = "put"
     PREFETCH = "prefetch"
+    PUSH = "push"
     BATCH_GET = "batch_get"
     BATCH_PUT = "batch_put"
 
@@ -99,8 +100,9 @@ class KVTask:
     prefetch_has_swa_remote: bool = False
     prefetch_namespace: Optional[List[str]] = None
     prefetch_swa_aware: bool = False
-    # radixshmem prefetch: the RadixClient.pull_async job this task waits on
-    # (its graph is empty), and the block range it planned to pull.
+    # radixshmem prefetch / push: the RadixClient job this task waits on (its
+    # graph is empty) and the block range it planned: for a prefetch [local
+    # hit, planned hit), for a push [the peer's hit, planned end).
     prefetch_job: Optional[Any] = None
     prefetch_local_hit_blocks: int = 0
     prefetch_planned_hit_blocks: int = 0
@@ -286,6 +288,8 @@ class KVTaskManager:
             return "get"
         if task_type in (TaskType.PUT, TaskType.BATCH_PUT):
             return "put"
+        if task_type == TaskType.PUSH:
+            return "push"
         return "prefetch"
 
     def _log_task_created(self, task: KVTask) -> None:
@@ -459,6 +463,56 @@ class KVTaskManager:
 
         self.graph_to_task[graph.graph_id] = task_id
         self._log_task_created(self.tasks[task_id])
+
+    def create_push_task(self,
+                         task_id: int,
+                         token_ids: np.ndarray,
+                         dp_client_id: int,
+                         namespace: Optional[List[str]] = None,
+                         swa_aware: bool = False,
+                         target_rank: Optional[int] = None,
+                         evict_local: bool = False) -> None:
+        """A radixshmem push: like a prefetch, an empty graph completed from its job."""
+        if task_id in self.tasks:
+            raise ValueError(f"Task ID {task_id} already exists")
+        push = getattr(self.cache_engine, "push", None)
+        if push is None:
+            raise RuntimeError("push_async needs the radixshmem cache engine "
+                               "(FLEXKV_ENABLE_RADIXSHMEM=1)")
+        fake_slot_mapping = np.zeros_like(token_ids)
+        fake_token_mask = np.ones_like(token_ids)
+        graph, return_mask, callback, op_callback_dict, task_end_op_id = push(
+            request_id=task_id,
+            token_ids=token_ids,
+            token_mask=fake_token_mask,
+            slot_mapping=fake_slot_mapping,
+            dp_client_id=dp_client_id,
+            namespace=namespace,
+            swa_aware=swa_aware,
+            target_rank=target_rank,
+            evict_local=evict_local)
+        task = KVTask(
+            task_id=task_id,
+            task_type=TaskType.PUSH,
+            task_end_op_id=task_end_op_id,
+            task_end_op_finished=False,
+            status=TaskStatus.READY,
+            token_ids=token_ids,
+            slot_mapping=fake_slot_mapping,
+            token_mask=fake_token_mask,
+            graph=graph,
+            return_mask=return_mask,
+            callback=callback,
+            op_callback_dict=op_callback_dict)
+        self.tasks[task_id] = task
+        job = getattr(callback, "prefetch_job", None)
+        if job is not None:
+            task.prefetch_job = job
+            task.prefetch_local_hit_blocks = int(callback.prefetch_local_hit_blocks)
+            task.prefetch_planned_hit_blocks = int(callback.prefetch_planned_hit_blocks)
+            self.prefetch_jobs[task_id] = job
+        self.graph_to_task[graph.graph_id] = task_id
+        self._log_task_created(task)
 
     def _launch_task(self, task_id: int) -> None:
         transfer_graph = self.check_task_ready(task_id)
@@ -783,8 +837,11 @@ class KVTaskManager:
         job = getattr(self, "prefetch_jobs", {}).pop(task_id, None)
         if job is not None:
             # The pull finishes in the background and still publishes its
-            # blocks; cancel only drops this task's claim on the result.
-            job.cancel()
+            # blocks; cancel only drops this task's claim on the result. A
+            # push job has no cancel and is simply forgotten.
+            cancel = getattr(job, "cancel", None)
+            if cancel is not None:
+                cancel()
             task.prefetch_job = None
         if not task.is_completed():
             # A task whose graph never launched still holds everything its
@@ -808,7 +865,7 @@ class KVTaskManager:
         # may mark an early task_end (e.g. SWA REMOTE2H) while Full is still
         # in flight; SUCCESS before _finalize_prefetch_return_mask /
         # deferred commit would advertise a planned mask that is not yet ready.
-        if task.task_type == TaskType.PREFETCH:
+        if task.task_type in (TaskType.PREFETCH, TaskType.PUSH):
             completely = True
         if completely:
             return task.is_completed()
@@ -941,21 +998,23 @@ class KVTaskManager:
             self._complete_prefetch_job(task_id)
 
     def _complete_prefetch_job(self, task_id: int) -> None:
-        """A radixshmem peer pull finished (or failed, or was refused). The
+        """A radixshmem job finished (or failed, or was refused). PREFETCH: the
         blocks it fetched are already published in the local tree by the
         RadixClient completer; report the pulled range as this prefetch's
-        return_mask (what sglang books as storage hits) and complete the task."""
+        return_mask (what sglang books as storage hits). PUSH: report the range
+        the peer took, [its hit at start, committed). Then complete the task."""
         job = self.prefetch_jobs.pop(task_id, None)
         task = self.tasks.get(task_id)
         if job is None or task is None:
             return
+        is_push = task.task_type == TaskType.PUSH
         result = None
         try:
             result = job.wait(0)
         except Exception as e:  # noqa: BLE001 - cancelled, or the completer failed
             flexkv_logger.warning(
-                f"[KVTaskEngine] prefetch task {task_id}: peer pull job "
-                f"{job.job_id} failed: {e}")
+                f"[KVTaskEngine] {'push' if is_push else 'prefetch'} task {task_id}: "
+                f"peer job {job.job_id} failed: {e}")
             task.transfer_failed = True
         tpb = self.cache_config.tokens_per_block
         mask = task.return_mask
@@ -963,24 +1022,34 @@ class KVTaskManager:
             mask[:] = False
             if result is not None:
                 lo = task.prefetch_local_hit_blocks * tpb
-                hi = min(int(result.common_hit), task.prefetch_planned_hit_blocks) * tpb
+                reached = int(result.committed) if is_push else int(result.common_hit)
+                hi = min(reached, task.prefetch_planned_hit_blocks) * tpb
                 if hi > lo:
                     mask[lo:hi] = True
         if result is not None:
-            result.finalize()   # lock=False job: nothing pinned, harmless
             planned = task.prefetch_planned_hit_blocks - task.prefetch_local_hit_blocks
-            flexkv_logger.info(
-                "[FlexKV-IO] operation=prefetch act=peer_pull status=%s "
-                "flexkv_task_id=%d job=%d source_rank=%d planned_blocks=%d "
-                "pulled_blocks=%d bytes=%d local_hit_after=%d",
-                "success" if result.remote_blocks >= planned else "partial",
-                task_id, job.job_id, result.source_rank, planned,
-                result.remote_blocks, result.remote_bytes, result.common_hit)
+            if is_push:
+                flexkv_logger.info(
+                    "[FlexKV-IO] operation=push act=peer_push status=%s "
+                    "flexkv_task_id=%d job=%d target_rank=%d planned_blocks=%d "
+                    "pushed_blocks=%d bytes=%d committed=%d local_evicted=%d",
+                    "success" if result.committed >= task.prefetch_planned_hit_blocks else "partial",
+                    task_id, job.job_id, result.target_rank, planned, result.remote_blocks,
+                    result.remote_bytes, result.committed, result.local_evicted)
+            else:
+                result.finalize()   # lock=False job: nothing pinned, harmless
+                flexkv_logger.info(
+                    "[FlexKV-IO] operation=prefetch act=peer_pull status=%s "
+                    "flexkv_task_id=%d job=%d source_rank=%d planned_blocks=%d "
+                    "pulled_blocks=%d bytes=%d local_hit_after=%d",
+                    "success" if result.remote_blocks >= planned else "partial",
+                    task_id, job.job_id, result.source_rank, planned,
+                    result.remote_blocks, result.remote_bytes, result.common_hit)
             metrics_collector = get_global_collector()
             if metrics_collector is not None and result.remote_blocks > 0:
                 metrics_collector.record_transfer_completed(
                     TransferType.PEERH2H.value, int(result.remote_blocks),
-                    int(result.remote_bytes), "get")
+                    int(result.remote_bytes), "put" if is_push else "get")
         self._mark_completed(task_id)
 
     def _get_completed_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
@@ -1428,6 +1497,38 @@ class KVTaskEngine(KVTaskManager):
         self._launch_task(task_id)
         return task_id
 
+    def push_async(self,
+                   token_ids: np.ndarray,
+                   dp_client_id: int = 0,
+                   task_id: int = -1,
+                   namespace: Optional[List[str]] = None,
+                   swa_aware: bool = False,
+                   target_rank: Optional[int] = None,
+                   evict_local: bool = False) -> int:
+        """Launch a push task (radixshmem mode only); return its task_id.
+
+        The reverse of ``prefetch_async``: the prefix this node holds is written
+        into a peer's radix-server and published there. ``target_rank=None``
+        lets the RHT pick the peer; ``evict_local=True`` drops the local copy
+        once the peer holds it. Fire-and-forget like prefetch: ``try_wait`` /
+        ``wait`` report ``return_mask`` = the blocks the peer took this time.
+        """
+        if task_id == -1:
+            task_id = self._gen_task_id()
+        self.create_push_task(task_id, token_ids, dp_client_id=dp_client_id, namespace=namespace,
+                              swa_aware=swa_aware, target_rank=target_rank, evict_local=evict_local)
+        self._process_empty_graph(task_id)
+        self.tracer.trace_request(
+            request_type="PUSH_ASYNC",
+            request_id=task_id,
+            token_ids=token_ids,
+            slot_mapping=np.zeros_like(token_ids),
+            token_mask=np.ones_like(token_ids),
+            dp_client_id=dp_client_id
+        )
+        self._launch_task(task_id)
+        return task_id
+
     def merge_to_batch_kvtask(self,
                               batch_id: int,
                               task_ids: List[int],
@@ -1590,7 +1691,9 @@ class KVTaskEngine(KVTaskManager):
         # mapping so a late-completing op still resolves to its task and warns.
         prefetch_jobs = getattr(self, "prefetch_jobs", {})
         for task_id, job in list(prefetch_jobs.items()):
-            job.cancel()
+            cancel = getattr(job, "cancel", None)      # push jobs have none
+            if cancel is not None:
+                cancel()
             task = self.tasks.get(task_id)
             if task is not None:
                 task.prefetch_job = None

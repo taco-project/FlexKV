@@ -37,8 +37,8 @@ attach 的其余参数是 `flexkv/server/shm_radix_bootstrap.py` 里的常量：
 | 常量 | 值 | 含义 |
 |---|---|---|
 | `READY_TIMEOUT_S` | 600 | 等 server 可达且 ready 的总时长，覆盖 server 晚起、SlotStore prefault、集群 rendezvous；server 的 `--bootstrap-timeout` 不要超过它。 |
-| `PREFETCH_TIMEOUT_MS` | 5000 | 一次 prefetch 拉取的服务端超时，到期后 job 以本地命中的部分完成。 |
-| `PREFETCH_MAX_INFLIGHT` | 128 | 每个 KVTaskEngine 在飞的 peer 拉取上限，达到后新的 prefetch 跳过 peer 查询。 |
+| `PREFETCH_TIMEOUT_MS` | 5000 | 一次 prefetch 拉取（或 push 推送）的服务端超时，到期后 job 以已完成的部分结束。 |
+| `PREFETCH_MAX_INFLIGHT` | 128 | 每个 KVTaskEngine 在飞的 peer 拉取与推送之和的上限，达到后新的 prefetch / push 直接跳过。 |
 | `MAX_OUTSTANDING` | 256 | `RadixClient` 未领取 job 的上限。 |
 
 ## 3. 几何与 slot 数
@@ -93,7 +93,8 @@ radix-server --name /flexkv --data-bytes 64G --swa-ratio 0.5 \
   --expected-min-nodes 4 --num-rht-shards 4 --rht-slots 4 \
   --registry etcd://10.0.0.1:2379 --cluster-id prod_a \
   --rpc-interface bond0 --index-dev mlx5_bond_0 --gid-idx 3 \
-  --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7 --bootstrap-timeout 600
+  --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7 --bootstrap-timeout 600 \
+  --enable-remote-insert --enable-remote-query     # 主动推送（第 4.5 节）需要；只拉取可省
 ```
 
 集群一致的几何字段（`block_size`、池集合、每池 `slot_bytes`、SWA 窗口、`slot_align`、`register_chunk_tokens`）由第一个
@@ -117,6 +118,23 @@ FLEXKV_INSTANCE_NUM=2 FLEXKV_INSTANCE_ID=0    FLEXKV_INSTANCE_NUM=2 FLEXKV_INSTA
 同一个 `FLEXKV_RADIXSHMEM_SERVER_NAME`。`instance_num > 1` 走 server-client 模式：`instance 0` 的 dp0 内嵌本节点的 KVServer（或用
 `FLEXKV_SERVER_LAUNCH_MODE=external` 单独启动），它的 TE 等 `instance_num × gpus_per_node` 张 GPU 都注册后 ready，
 所以两个引擎都要启动。两边模型 / page size / SWA 配置必须相同（第 3 节）。node-local DP（多机 DP attention）下不支持多实例。
+
+### 4.5 主动推送（`KVManager.push_async`）
+
+prefetch 是把 peer 的块拉到本节点；push 是反向：把本节点已持有的前缀写进某个 peer 的 radix-server 并在那边发布。
+FlexKV 只暴露接口，不自带触发策略，由上层决定何时推、推哪段、推给谁：
+
+```python
+task_id = kv_manager.push_async(token_ids, target_rank=None, evict_local=False)
+resp = kv_manager.try_wait([task_id])[task_id]   # 轮询到 status 不是 TIMEOUT
+pushed_tokens = int(resp.return_mask.sum())      # 对端这次新拿到的 token 数
+```
+
+- `target_rank`：目标节点的集群 rank；`None` 时由 RHT 选"已持有这段前缀最深的 peer"，没有 peer 持有任何前缀时 job 直接结束、mask 全 False，不会盲推。
+- `evict_local=True`：对端持有后把本地这段前缀逐出（迁移而非复制）；本地有 pin 或该段还有别的分支时不逐出。
+- 对端已有的前缀自动去重，只传缺的尾段；一次最多 8192 块（radixshmem 的 `MAX_REMOTE_OP_BLOCKS`）。
+- 前提：每个节点的 `radix-server` 都带 `--enable-remote-insert --enable-remote-query`；`target_rank=None` 要求 `--rht-slots ≥ 2`（示例用 4）。
+- server-client 模式下走 `PushRequest` 到 KVServer，与 prefetch 相同；push 不可取消，`cancel` 只是不再等它。
 
 ## 5. 命名
 

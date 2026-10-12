@@ -337,15 +337,20 @@ class FlexKVConnector:
         self._prefetch_contexts: Dict[str, _CacheOpContext] = {}
         self._prefetch_planned_tokens: Dict[str, int] = {}
         self._prefetch_loaded_tokens: Dict[str, int] = {}
+        # radixshmem cluster: prefetch is where a peer's blocks are pulled
+        # into this node (RadixClient.pull_async); GET then matches locally.
+        # Push is the reverse (RadixClient.push_async) and exists only there.
+        self._push_enabled = bool(
+            GLOBAL_CONFIG_FROM_ENV.enable_radixshmem
+            and _radixshmem_distributed(self.model_config, self.cache_config))
         self._prefetch_enabled = bool(
             self.cache_config.enable_ssd
             or self.cache_config.enable_remote
             or self.cache_config.enable_kv_sharing
-            # radixshmem cluster: prefetch is where a peer's blocks are pulled
-            # into this node (RadixClient.pull_async); GET then matches locally.
-            or (GLOBAL_CONFIG_FROM_ENV.enable_radixshmem
-                and _radixshmem_distributed(self.model_config, self.cache_config))
+            or self._push_enabled
         )
+        # Pushes (leader-only): task_id -> context, reaped by check_completed_pushes.
+        self._ongoing_pushes: Dict[int, _CacheOpContext] = {}
         self._shutdown_done = False
 
         # Keep FlexKV lifecycle self-contained (avoid scattering hooks in
@@ -1570,6 +1575,82 @@ class FlexKVConnector:
                 task_id=task_id,
                 reason="caller_cancelled_tracking",
             )
+
+    # ------------------------------------------------------------------
+    # Push (radixshmem: the reverse of prefetch)
+    # ------------------------------------------------------------------
+
+    def push_async(
+        self,
+        rid: str,
+        token_ids: List[int],
+        *,
+        target_rank: Optional[int] = None,
+        evict_local: bool = False,
+        sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+    ) -> int:
+        """Push the prefix this node holds for ``token_ids`` into a peer's
+        radix-server (``KVManager.push_async``); ``target_rank=None`` lets the
+        RHT pick the peer that holds the deepest prefix. Leader-only and
+        fire-and-forget: no rank derives state from the result, so nothing is
+        scattered; ``check_completed_pushes`` reaps the task. Returns the task
+        id, -1 when nothing was pushed."""
+        if not self._push_enabled or not rid:
+            return -1
+        if not (self._sync_ctx.is_sync_leader and self.kv_manager is not None):
+            return -1
+        context = self._new_op_context("push", rid, sglang_req_id)
+        try:
+            task_id = int(self.kv_manager.push_async(
+                token_ids=np.asarray(token_ids, dtype=np.int64),
+                swa_aware=self._swa_kv_pool is not None,
+                target_rank=target_rank,
+                evict_local=evict_local,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            self._log_cache_op(context, "complete", "failed", error=str(exc))
+            return -1
+        if task_id < 0:
+            self._log_cache_op(context, "complete", "failed", reason="task_not_created")
+            return -1
+        context.task_id = task_id
+        self._ongoing_pushes[task_id] = context
+        self._log_cache_op(context, "launch", "running", tokens=len(token_ids),
+                           target_rank=target_rank, evict_local=evict_local)
+        return task_id
+
+    def check_completed_pushes(self) -> int:
+        """Reap the pushes in flight (leader-only): ``try_wait`` them, log each
+        terminal one with the tokens the peer took, drop it. Returns how many
+        finished. Called from the scheduler's per-step drain."""
+        pushes = getattr(self, "_ongoing_pushes", None)
+        if not pushes or not (self._sync_ctx.is_sync_leader and self.kv_manager is not None):
+            return 0
+        try:
+            completed = self.kv_manager.try_wait(task_ids=list(pushes)) or {}
+        except Exception as exc:  # noqa: BLE001
+            context = next(iter(pushes.values()))
+            self._log_cache_op(context, "poll", "failed", task_id=-1,
+                               flexkv_task_ids=list(pushes), error=str(exc))
+            return 0
+        done = 0
+        for task_id, response in completed.items():
+            status = _status_value(response)
+            if not _is_terminal_status(status):
+                continue
+            context = pushes.pop(task_id, None)
+            if context is None:
+                continue
+            return_mask = getattr(response, "return_mask", None)
+            if return_mask is None:
+                pushed_tokens = 0
+            elif isinstance(return_mask, list):
+                pushed_tokens = sum(int(np.count_nonzero(mask)) for mask in return_mask)
+            else:
+                pushed_tokens = int(np.count_nonzero(return_mask))
+            self._log_cache_op(context, "complete", status, tokens=pushed_tokens)
+            done += 1
+        return done
 
     # ------------------------------------------------------------------
     # Layerwise transfer hooks

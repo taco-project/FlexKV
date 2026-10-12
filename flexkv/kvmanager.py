@@ -368,6 +368,35 @@ class KVManager:
             )
         return task_id
 
+    def push_async(self,
+                   token_ids: np.ndarray,
+                   namespace: Optional[List[str]] = None,
+                   swa_aware: bool = False,
+                   target_rank: Optional[int] = None,
+                   evict_local: bool = False) -> int:
+        """Launch a push (radixshmem mode only); return the task_id.
+
+        The reverse of ``prefetch_async``: the prefix this node holds is written
+        into a peer's radix-server and published there. ``target_rank=None``
+        lets the RHT pick the peer, ``evict_local=True`` drops the local copy
+        once the peer holds it. Poll ``try_wait``/``wait``: ``sum(return_mask)``
+        is the number of tokens the peer took this time.
+        """
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.numpy()
+        if self.server_client_mode:
+            return self.dp_client.push_async(
+                token_ids, namespace=namespace, swa_aware=swa_aware,
+                target_rank=target_rank, evict_local=evict_local)
+        return self.kv_task_engine.push_async(
+            token_ids,
+            dp_client_id=self.dp_client_id,
+            namespace=namespace,
+            swa_aware=swa_aware,
+            target_rank=target_rank,
+            evict_local=evict_local,
+        )
+
     def launch(self,
                task_ids: Union[int, List[int]],
                slot_mappings: Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]],

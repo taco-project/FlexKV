@@ -84,6 +84,18 @@ class PrefetchRequest:
 
 
 @dataclass
+class PushRequest:
+    """radixshmem: push the prefix this node holds into a peer's radix-server."""
+    dp_client_id: int
+    token_ids: np.ndarray
+    task_id: int = -1
+    namespace: Optional[List[str]] = None
+    swa_aware: bool = False
+    target_rank: Optional[int] = None   # None: the RHT picks the peer
+    evict_local: bool = False
+
+
+@dataclass
 class PutMatchRequest:
     dp_client_id: int
     token_ids: np.ndarray

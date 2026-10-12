@@ -14,4 +14,5 @@ radix-server --name "${NAME:-/flexkv}" \
   --registry "${REGISTRY:-etcd://10.0.0.1:2379}" --cluster-id "${CLUSTER_ID:-flexkv_prod}" \
   --rpc-interface "${RPC_INTERFACE:-bond0}" --index-dev "${INDEX_DEV:-mlx5_bond_0}" --gid-idx "${GID_IDX:-3}" \
   --transfer-dev "${TRANSFER_DEV:-mlx5_0}" \
-  --bootstrap-timeout "${BOOTSTRAP_TIMEOUT:-600}"
+  --bootstrap-timeout "${BOOTSTRAP_TIMEOUT:-600}" \
+  --enable-remote-insert --enable-remote-query   # KVManager.push_async (peer push) needs both
