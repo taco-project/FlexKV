@@ -135,6 +135,56 @@ def _dsv4_swa_padded_bytes_per_token(swa_page_size: int,
     return padded // swa_page_size
 
 
+def scale_storage_kv_heads(
+    physical_num_heads_per_rank: int,
+    tp_size: int,
+    *,
+    kv_shared_across_ranks: bool,
+) -> int:
+    """CPU/SSD head count for one FlexKV block.
+
+    GPU tensors are per-rank. Non-MLA models shard (or replicate) heads
+    across TP, so host storage concatenates one slice per rank:
+    ``physical_num_heads_per_rank * tp_size``. MLA is a single shared
+    head and must not be multiplied, even when the per-rank tensor also
+    reports 1 head.
+
+    Packed GQA after TP split can also report 1 head per rank (e.g.
+    Qwen2.5-0.5B, 2 KV heads, TP=2). That is not MLA: the two ranks hold
+    different heads and must occupy different host slices. Using
+    ``physical_num_heads_per_rank != 1`` as the MLA test collapses those
+    two cases and makes TP>1 GET return mixed-rank KV.
+    """
+    heads = int(physical_num_heads_per_rank)
+    tp = max(1, int(tp_size))
+    if kv_shared_across_ranks:
+        return heads
+    return heads * tp
+
+
+def vllm_kv_shared_across_ranks(
+    vllm_config: Optional["VllmConfig"] = None,
+    cache_ndim: Optional[int] = None,
+) -> bool:
+    """True only for MLA-style KV that is identical on every TP rank.
+
+    3D cache tensors are MLA. vLLM 0.31's KVCacheConfig path is packed
+    (no ndim), so that path falls back to framework MLA flags. Packed
+    4D/5D GQA/MHA is never shared, including the 1-head-per-rank case.
+    """
+    if cache_ndim == 3:
+        return True
+    if vllm_config is None:
+        return False
+    mc = getattr(vllm_config, "model_config", None)
+    if mc is None:
+        return False
+    return bool(
+        getattr(mc, "is_deepseek_mla", False)
+        or getattr(mc, "use_mla", False)
+    )
+
+
 @dataclass
 class FlexKVConfig:
     enable_flexkv: bool = True
@@ -380,7 +430,8 @@ class FlexKVConfig:
             ValueError: if the backend returns an unsupported cache shape.
         """
         if kv_cache_config is not None:
-            self._configure_kv_layout_from_vllm_cache_config(kv_cache_config)
+            self._configure_kv_layout_from_vllm_cache_config(
+                kv_cache_config, vllm_config)
             return
 
         from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -411,11 +462,11 @@ class FlexKVConfig:
         # │ plain MHA     │   2    │      H       │    No     │ K/V separate + H heads│
         # │                                                                          │
         # │ kv_dim: 1 = single KV region (K/V combined), 2 = K/V separated          │
-        # │ num_kv_heads: 1 = shared across ranks (TP does not split heads),         │
-        # │               >1 = per-rank independent (TP splits heads)                │
+        # │ Host num_kv_heads is per-rank H * tp_size unless MLA shares one head.   │
+        # │ Packed GQA may have H=1 after TP split; that is still not shared MLA.   │
         # └──────────────────────────────────────────────────────────────────────────┘
-        # Derive kv_dim/num_kv_heads from the physical tensor shape, not from
-        # framework MLA flags.
+        # Derive kv_dim from the physical tensor ndim. Shared-across-ranks is
+        # 3D MLA (or an explicit vLLM MLA flag), not "per-rank heads == 1".
         if len(cache_shape) == 3:
             # 3D: combined kv_buffer, single head (MLA, etc.)
             physical_num_heads_per_rank = 1
@@ -448,12 +499,12 @@ class FlexKVConfig:
                 f"dimensions, got shape={cache_shape}"
             )
 
-        self.model_config.num_kv_heads = physical_num_heads_per_rank
-        # Combined-KV models (3D, kv_dim=1) use a single head shared across
-        # ranks; multi-head backends (packed/plain MHA) scale by tp_size so
-        # the CPU/SSD layout holds one contiguous slice per TP rank.
-        if kv_dim != 1 or physical_num_heads_per_rank != 1:
-            self.model_config.num_kv_heads *= self.model_config.tp_size
+        self.model_config.num_kv_heads = scale_storage_kv_heads(
+            physical_num_heads_per_rank,
+            self.model_config.tp_size,
+            kv_shared_across_ranks=vllm_kv_shared_across_ranks(
+                vllm_config, cache_ndim=len(cache_shape)),
+        )
         self.model_config.head_size = physical_head_size
         self.model_config.kv_dim = kv_dim
         logger.info(
@@ -467,6 +518,7 @@ class FlexKVConfig:
     def _configure_kv_layout_from_vllm_cache_config(
         self,
         kv_cache_config: "KVCacheConfig",
+        vllm_config: Optional["VllmConfig"] = None,
     ) -> None:
         """Populate the packed storage layout from vLLM resolved KV specs."""
         from vllm.v1.kv_cache_interface import AttentionSpec, iter_layer_specs
@@ -530,9 +582,11 @@ class FlexKVConfig:
                 f"spec={dtype}, flexkv={self.model_config.dtype}"
             )
 
-        self.model_config.num_kv_heads = physical_num_heads_per_rank
-        if physical_num_heads_per_rank != 1:
-            self.model_config.num_kv_heads *= self.model_config.tp_size
+        self.model_config.num_kv_heads = scale_storage_kv_heads(
+            physical_num_heads_per_rank,
+            self.model_config.tp_size,
+            kv_shared_across_ranks=vllm_kv_shared_across_ranks(vllm_config),
+        )
         self.model_config.head_size = physical_head_size
         # vLLM standardized [B, H, N, C] layout packs K/V in C.
         self.model_config.kv_dim = 1

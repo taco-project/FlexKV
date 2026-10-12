@@ -248,7 +248,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         self.gpu_blocks = imported_gpu_blocks
         self.dtype = dtype # note this should be quantized data type
         self.kv_dim = gpu_kv_layouts[0].kv_dim
-        self.num_kv_heads = gpu_kv_layouts[0].num_kv_heads
+        # Addressing mode follows the host block, not the per-rank GPU tensor.
+        # C++ treats num_kv_heads==1 as rank-shared MLA. Packed GQA after TP
+        # split can report 1 GPU head while CPU stores H*tp private slices;
+        # using the GPU count would make both ranks overwrite the same slot
+        # even without SSD layerwise (PR 309).
+        self.num_kv_heads = cpu_kv_layout.num_kv_heads
 
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
@@ -415,7 +420,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         dtype_sz = dtype.itemsize
         tpb = gpu_kv_layouts[0].tokens_per_block
         kv_dim = gpu_kv_layouts[0].kv_dim
-        num_kv_heads = gpu_kv_layouts[0].num_kv_heads
+        num_kv_heads = cpu_kv_layout.num_kv_heads
         num_layers = gpu_kv_layouts[0].num_layer
 
         # Compute GPU strides from the actual tensor to handle different
@@ -442,9 +447,17 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         cpu_chunk_size = cpu_kv_layout.get_chunk_size() * dtype_sz
         # tp has effect on the layout of the cpu tensor: the tp dim is always
         # right after the block dim, on both BLOCKFIRST and LAYERFIRST.
+        # Gate on host heads, not GPU heads: GQA 1-head-per-rank still packs
+        # one slice per rank on CPU (num_kv_heads == tp).
         eff_cpu_layout = cpu_kv_layout
         if (cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST
-                and num_kv_heads > 1):
+                and num_kv_heads > 1
+                and self.tp_group_size > 1):
+            if cpu_kv_layout.num_head % self.tp_group_size != 0:
+                raise ValueError(
+                    "BLOCKFIRST TP H2D requires num_head="
+                    f"{cpu_kv_layout.num_head} divisible by tp_group_size="
+                    f"{self.tp_group_size}")
             eff_cpu_layout = cpu_kv_layout.div_head(self.tp_group_size)
         cpu_layer_stride = eff_cpu_layout.get_layer_stride() * dtype_sz
         cpu_kv_stride = eff_cpu_layout.get_kv_stride() * dtype_sz
