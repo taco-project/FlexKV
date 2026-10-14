@@ -8,6 +8,8 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 
 ## Updates
 
+- **Oct 9, 2026**: DeepSeek-V4.1 support is on FlexKV `main` ([#303](https://github.com/taco-project/FlexKV/pull/303)). The matching SGLang adaptation is not upstream yet; until [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) is merged, fetch that PR and pin its latest commit. Deploy with the current FlexKV `main` branch. See the [SGLang integration guide](flexkv/integration/sglang/README.md).
+
 - **Jul–Aug 2026**: Transfer performance and operability received a broad refresh: [adaptive multi-path GPU↔CPU transfers](https://github.com/taco-project/FlexKV/pull/203), [reliability and operational logging](https://github.com/taco-project/FlexKV/pull/233), [graceful shutdown](https://github.com/taco-project/FlexKV/pull/238), [chunked host-memory registration](https://github.com/taco-project/FlexKV/pull/240), [vectored SSD I/O](https://github.com/taco-project/FlexKV/pull/242), and [per-operation transfer tracing](https://github.com/taco-project/FlexKV/pull/247).
 
 - **Jul 24, 2026**: [Mooncake Store](https://github.com/kvcache-ai/Mooncake) can now serve as FlexKV's key-addressed remote cache tier ([#231](https://github.com/taco-project/FlexKV/pull/231)), enabling cluster-wide KV reuse with zero-copy RDMA and support for DeepSeek-V4 SWA/state sidecars.
@@ -54,6 +56,7 @@ Targeting vLLM:
 Targeting SGLang:
 - The native FlexKV backend is available in upstream SGLang `v0.5.16` and later; no patch is required ([sglang#29701](https://github.com/sgl-project/sglang/pull/29701))
 - Support DeepSeek-V4 heterogeneous C4/C128/indexer KV groups, FullKV + SWA dual caches, compress-state sidecars, and layerwise restore ([#225](https://github.com/taco-project/FlexKV/pull/225)). Until the matching SGLang adaptation is merged, use [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) pinned to [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac). See the [SGLang integration guide](flexkv/integration/sglang/README.md)
+- Support DeepSeek-V4.1 ([#303](https://github.com/taco-project/FlexKV/pull/303)) on the current FlexKV `main` branch. The matching SGLang adaptation is not upstream yet; until [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) is merged, fetch that PR and pin its latest commit. That commit is not the V4 pin `ee0465a`. See the [SGLang integration guide](flexkv/integration/sglang/README.md)
 
 Targeting TensorRT-LLM
 - Support using FlexKV on TensorRT-LLM ([#48](https://github.com/taco-project/FlexKV/pull/48))

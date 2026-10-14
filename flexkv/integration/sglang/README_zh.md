@@ -12,6 +12,7 @@ SGLang 目前有两条不同的 FlexKV 集成路径，请根据模型选择。
 | --- | --- | --- |
 | 普通模型 | SGLang `v0.5.16` 及以上版本，或较新的 `main` | 不需要 |
 | DeepSeek V4 | SGLang PR [#31781](https://github.com/sgl-project/sglang/pull/31781)，固定到 commit [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac) | 不需要本地 patch；使用指定的 SGLang commit |
+|DeepSeek V4.1 |SGLang PR [#31781](https://github.com/sgl-project/sglang/pull/31781)，固定到 最新commit | 不需要本地 patch；使用指定的 SGLang commit e74b2ec897256fe50bffaa97a066e14bfc113c1f |
 
 ### 普通模型：直接使用 SGLang 官方版本
 
@@ -51,6 +52,22 @@ git checkout main
 
 该 PR 仍在开发中，更新固定的 SGLang commit 前请先检查 PR 状态。这个 commit
 暂不支持 DeepSeek V4 unified-KV layout 和 `--enable-hisparse`。
+
+### DeepSeek V4.1：固定使用尚未何如的SGLang适配
+FlexKV 侧的 DeepSeek V4.1 支持已经通过
+[FlexKV#303](https://github.com/taco-project/FlexKV/pull/303) 合入 FlexKV
+`main`，但配套的 SGLang 适配**尚未合入**官方主干。在
+[sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 合入之前，不要只使用
+SGLang 正式版本或 `main`，而应拉取该 PR 并固定到下面的 commit：
+
+
+```bash
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git fetch origin pull/31781/head
+git checkout -b flexkv-dsv4 xxxxxxxxxxx
+```
+同样适用当前FlexKV的`main`分支即可完成部署。
 
 ## 启动方式
 

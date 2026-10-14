@@ -13,6 +13,7 @@ your model.
 | --- | --- | --- |
 | Standard models | SGLang `v0.5.16` or later, or a recent `main` | No |
 | DeepSeek V4 | SGLang PR [#31781](https://github.com/sgl-project/sglang/pull/31781), pinned to commit [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac) | No local patch; use the pinned SGLang commit |
+| DeepSeek V4.1 | SGLang PR [#31781](https://github.com/sgl-project/sglang/pull/31781), pinned to the latest commit | No local patch; use the pinned SGLang commit e74b2ec897256fe50bffaa97a066e14bfc113c1f |
 
 ### Standard models: use upstream SGLang directly
 
@@ -54,6 +55,24 @@ git checkout main
 The PR is still under development, so check its status before updating the
 pinned SGLang commit. DeepSeek V4's unified-KV layout and `--enable-hisparse`
 are not supported by that commit.
+
+### DeepSeek V4.1: pin the unmerged SGLang adaptation
+
+FlexKV's DeepSeek V4.1 support is on FlexKV `main` (merged by
+[FlexKV#303](https://github.com/taco-project/FlexKV/pull/303)), but the matching
+SGLang adaptation has **not** been merged upstream yet. Until
+[sglang#31781](https://github.com/sgl-project/sglang/pull/31781) is merged, do
+not use an SGLang release or `main` alone. Fetch that PR and pin the commit
+below:
+
+```bash
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git fetch origin pull/31781/head
+git checkout -b flexkv-dsv4 xxxxxxxxxxx
+```
+
+The current FlexKV `main` branch is sufficient for this deployment.
 
 ## Launch
 
