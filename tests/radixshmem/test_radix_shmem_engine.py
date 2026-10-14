@@ -1,53 +1,38 @@
-"""Tests for the radixshmem CPU tier: the engine on a radix-server, the data
-plane FlexKV maps as its CPU pool, the planners, and the peer pull.
+"""Tests for FlexKV's side of the radixshmem CPU tier. radixshmem's own
+index, SlotStore, geometry planning and peer pull are tested in the
+radixshmem repo; this file covers only what FlexKV adds on top of them.
 Skipped if `radixshmem` is missing.
 
-Four parts, one file:
-
-  Part 1 — `CacheEngineRadixShmem` semantics against an in-process
-    `radixshmem.RadixServer` (index + SlotStore, started the way the operator's
-    `radix-server` is: a name and a byte budget; FlexKV's client brings the
-    geometry): take / insert / match / recycle, insert-after-transfer
-    publication, lock vs. eviction, SWA windows, and the fact that a standalone
-    region has no peer to prefetch from.
-  Part 1b — the data plane: the SlotStore pool viewed as FlexKV's CPU tensor,
-    the exact-stride geometry FlexKV derives from its configuration and hands
-    to the server, the slot counts it adopts back, and a client that arrives
-    before its server.
+  Part 1 — `CacheEngineRadixShmem` against an in-process `radixshmem.RadixServer`
+    (started the way the operator's `radix-server` is: a name and a byte budget;
+    FlexKV's client brings the geometry): the take / insert / match / recycle
+    wrapper, take() clamping, register-chunk adoption, a failed cluster flush,
+    an orphan SWA insert, a standalone region with no peer.
+  Part 1b — FlexKV's geometry and attach: the SlotStore pool viewed as FlexKV's
+    CPU tensor, the exact-stride geometry FlexKV derives from its configuration,
+    the slot counts it adopts back, attach retries, the server-name setting.
   Part 2 — `GlobalCacheEngine.get()/put()` planning on the radixshmem backend,
-    driven by synthetic matches (no region): the local GET is one H2D, the
-    prefetch plan carries a `pull_async` job, the PUT arms the deferred insert;
-    plus `KVTaskEngine` completing a job-backed prefetch task.
-  Part 3 — a real 2-node radixshmem cluster over RDMA in two spawned
-    processes: node 0 publishes a prefix with bytes, node 1 prefetches it (the
-    server pulls the bytes) and then matches it locally, byte for byte.
+    driven by synthetic matches and by a real region: the local GET is one H2D,
+    the prefetch plan carries a `pull_async` job, the PUT arms the deferred
+    insert, aborts return slots and pins, SWA round trips; plus `KVTaskEngine`
+    completing a job-backed prefetch task.
 
 Import-time notes:
-  * Parts 1 and 3 use a duck-typed fake `SequenceMeta` and side-load
-    `radix_shmem_engine.py`, so they do not pull in `flexkv.c_ext` (CUDA).
+  * Part 1 uses a duck-typed fake `SequenceMeta` and side-loads
+    `radix_shmem_engine.py`, so it does not pull in `flexkv.c_ext` (CUDA).
   * Part 2 needs the real `GlobalCacheEngine` (and therefore `c_ext`), so it
-    imports it lazily and skips instead of breaking collection for Parts 1/3.
-  * Part 3 needs an ACTIVE RDMA device, a radixshmem built WITH RDMA + etcd +
-    mooncake, and an etcd (FLEXKV_TEST_RADIX_REGISTRY, or an `etcd` binary on
-    PATH to start a private one); it is gated behind FLEXKV_RUN_RADIX_PEER_TEST=1.
+    imports it lazily and skips instead of breaking collection for Part 1.
 """
 from __future__ import annotations
 
 import contextlib
 import copy
 import dataclasses
-import glob
 import importlib.util
-import multiprocessing as mp
 import os
-import shutil
-import socket
-import subprocess
 import sys
-import tempfile
 import threading
 import time
-import traceback
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -257,24 +242,6 @@ def test_take_clamps_to_the_pool(env):
     swa_engine.recycle(got, component=_SWA)
 
 
-def test_insert_publishes_immediately(env):
-    """There is no ready bit: being in the tree IS being servable.
-
-    Insert runs after the transfer on this backend, so a matched block is
-    complete by construction — there is no flag to withhold a span with, and a
-    single insert() is the whole publication.
-    """
-    engine, _server = env.make("/cers_unready")
-
-    seq = FakeSeq(block_hashes=_hashes(seed=2, num=6))
-    slots = engine.take(num_required_blocks=6)
-    engine.insert(seq, slots, num_insert_blocks=6)
-
-    r = engine.match(seq)
-    assert r.num_matched_blocks == 6
-    r.release()
-
-
 def test_failed_cluster_publish_keeps_the_slots_in_the_tree(env):
     """A flush error (e.g. an RDMA write to a peer's RHT shard failing) comes
     after the tree took the slots: publish() must not recycle them again, or
@@ -305,64 +272,6 @@ def test_failed_cluster_publish_keeps_the_slots_in_the_tree(env):
     assert not np.isin(slots, rest).any()
     engine.recycle(rest)
     r.release()
-
-
-def test_recycle_returns_staged_slots(env):
-    """Slots whose transfer never landed are only reachable through recycle().
-
-    They were never attached to the tree, so no query finds them and eviction
-    cannot reclaim them — without recycle() they are lost for the life of the
-    region.
-    """
-    engine, _server = env.make("/cers_recycle")
-
-    before = engine.num_free_blocks
-    slots = engine.take(num_required_blocks=5)
-    assert engine.num_free_blocks == before - 5
-    engine.recycle(slots)
-    assert engine.num_free_blocks == before
-
-    seq = FakeSeq(block_hashes=_hashes(seed=22, num=5))
-    r = engine.match(seq)
-    assert r.num_matched_blocks == 0
-    r.release()
-
-
-def test_eviction_reclaims_inserted(env):
-    """A published span is immediately LRU-evictable.
-
-    insert() runs after the transfer, so the span it attaches has no reader and
-    takes no ref — nothing has to be released to make it reclaimable.
-    """
-    engine, _server = env.make("/cers_evict", blocks=2000)
-
-    seq = FakeSeq(block_hashes=_hashes(seed=4, num=1500))
-    s1 = engine.take(num_required_blocks=1500)
-    engine.insert(seq, s1, num_insert_blocks=1500)
-    published = engine.match(seq)
-    assert published.num_matched_blocks == 1500
-    published.release()
-    assert engine.num_free_blocks == 500
-    s2 = engine.take(num_required_blocks=1500)
-    assert len(s2) > 500
-
-
-def test_pinned_match_survives_eviction_pressure(env):
-    """The query pin (`lock=True`) is what keeps a matched prefix out of the
-    evictor's reach until `release()`."""
-    engine, _server = env.make("/cers_pin", blocks=2000)
-    seq = FakeSeq(block_hashes=_hashes(seed=5, num=1500))
-    engine.insert(seq, engine.take(1500), num_insert_blocks=1500)
-
-    pinned = engine.match(seq)
-    assert pinned.num_matched_blocks == 1500
-    short = engine.take(num_required_blocks=1500)
-    assert len(short) == 500
-    engine.recycle(short)
-    pinned.release()
-    evicting = engine.take(num_required_blocks=1500)
-    assert len(evicting) == 1500
-    engine.recycle(evicting)
 
 
 def test_standalone_region_has_no_peer(env):
@@ -425,87 +334,6 @@ def _make_swa_engine(env, name: str, blocks: int = 2000, swa_slots: int = 64,
     return engine, server
 
 
-def _publish_full(engine, seq, num_blocks: int) -> np.ndarray:
-    slots = engine.take(num_blocks)
-    engine.insert(seq, slots, num_insert_blocks=num_blocks)
-    return slots
-
-
-def _publish_swa(engine, seq, path_end: int,
-                 window_blocks: int = SWA_W) -> np.ndarray:
-    k = min(path_end, window_blocks)
-    slots = engine.take(k, component=_SWA)
-    assert len(slots) == k, "SWA pool unexpectedly short in test setup"
-    engine.insert(seq, slots, num_insert_blocks=path_end, component=_SWA)
-    return slots
-
-
-def test_swa_window_invisible_until_published_then_joint_hit(env):
-    """With `common_hit=20` the Full slots cover [0, 20) and the SWA slots cover
-    [12, 20) -- and before insert(SWA), the joint query matches NOTHING even
-    though Full alone matches 20."""
-    engine, _server = _make_swa_engine(env, "/cers_swa_basic")
-    seq = FakeSeq(block_hashes=_hashes(41, 20), tokens_per_block=16)
-
-    _publish_full(engine, seq, 20)
-
-    match = engine.match(seq)
-    assert match.num_matched_blocks == 20
-    assert len(match.swa_slots) == 0 and match.swa_start == 0
-    match.release()
-    match = engine.match(seq, component_mask=JOINT_MASK)
-    assert match.num_matched_blocks == 0
-    assert len(match.swa_slots) == 0
-    match.release()
-
-    swa_slots = _publish_swa(engine, seq, path_end=20)
-
-    match = engine.match(seq, component_mask=JOINT_MASK)
-    assert match.num_matched_blocks == 20           # joint common hit
-    assert match.local_slots.size == 20             # Full covers [0, 20)
-    assert match.swa_start == 12                    # max(0, 20 - 8)
-    assert len(match.swa_slots) == SWA_W            # window covers [12, 20)
-    assert sorted(match.swa_slots.tolist()) == sorted(swa_slots.tolist())
-    match.release()
-
-
-def test_swa_short_path_window_starts_at_zero(env):
-    """A path shorter than W publishes a window over the whole path: k=n slots,
-    swa_start=0 -- the `k = min(path_end, W)` boundary."""
-    engine, _server = _make_swa_engine(env, "/cers_swa_short")
-    seq = FakeSeq(block_hashes=_hashes(42, 5), tokens_per_block=16)
-
-    _publish_full(engine, seq, 5)
-    _publish_swa(engine, seq, path_end=5)
-
-    match = engine.match(seq, component_mask=JOINT_MASK)
-    assert match.num_matched_blocks == 5
-    assert match.swa_start == 0
-    assert len(match.swa_slots) == 5
-    match.release()
-
-
-def test_swa_take_is_all_or_none_and_the_query_pin_protects_the_window(env):
-    """`allocate_slots(k, SWA)` returns k slots or NOTHING. With the pool sized
-    to exactly one window, a joint match's pin keeps that window un-evictable
-    (empty take); releasing the pin frees it for eviction (full take)."""
-    engine, _server = _make_swa_engine(env, "/cers_swa_allornone", swa_slots=SWA_W)
-    seq = FakeSeq(block_hashes=_hashes(43, 20), tokens_per_block=16)
-
-    _publish_full(engine, seq, 20)
-    _publish_swa(engine, seq, path_end=20)
-
-    match = engine.match(seq, component_mask=JOINT_MASK)
-    assert len(match.swa_slots) == SWA_W
-    empty = engine.take(SWA_W, component=_SWA)
-    assert len(empty) == 0                          # all pinned -> all or none
-    match.release()
-
-    evicted = engine.take(SWA_W, component=_SWA)
-    assert len(evicted) == SWA_W                    # pin gone -> window evictable
-    engine.recycle(evicted, component=_SWA)
-
-
 def test_swa_insert_without_full_path_is_benign_and_recycles(env):
     """FULL_PATH_MISSING (Full path evicted/absent under a pending SWA publish)
     must cost the window, not the task: insert() warns, radixshmem auto-recycles
@@ -520,22 +348,6 @@ def test_swa_insert_without_full_path_is_benign_and_recycles(env):
     again = engine.take(SWA_W, component=_SWA)
     assert len(again) == SWA_W                      # auto-recycled, none leaked
     engine.recycle(again, component=_SWA)
-
-
-def test_swa_window_blocks_one_stores_a_single_slot_window(env):
-    """W comes from the region's config, not a constant: window_blocks=1 (the
-    SGLang DSv4 shape, window inside one page) publishes one-slot windows."""
-    engine, _server = _make_swa_engine(env, "/cers_swa_w1", window_blocks=1)
-    seq = FakeSeq(block_hashes=_hashes(45, 20), tokens_per_block=16)
-
-    _publish_full(engine, seq, 20)
-    _publish_swa(engine, seq, path_end=20, window_blocks=1)
-
-    match = engine.match(seq, component_mask=JOINT_MASK)
-    assert match.num_matched_blocks == 20
-    assert match.swa_start == 19                    # max(0, 20 - 1)
-    assert len(match.swa_slots) == 1
-    match.release()
 
 
 def test_slot_store_pool_is_the_cpu_pool(env):
@@ -1631,242 +1443,6 @@ def test_planner_uses_configured_window_blocks():
         _full_h2d, swa_h2d = _split_swa(_ops_by_type(graph)[TransferType.H2D])
         assert swa_h2d[0].src_block_ids.size == 1
         get_cb()
-
-
-PEER_BLOCKS = 1170
-PEER_SLOT_BYTES = 65536
-
-
-def _active_rdma_devices() -> list:
-    """RDMA devices with an ACTIVE port, in FLEXKV_TEST_RDMA_DEVICES order."""
-    def _has_active_port(device: str) -> bool:
-        for state in glob.glob(f"/sys/class/infiniband/{device}/ports/*/state"):
-            with contextlib.suppress(OSError):
-                with open(state) as f:
-                    if "ACTIVE" in f.read():
-                        return True
-        return False
-
-    requested = [d for d in os.getenv("FLEXKV_TEST_RDMA_DEVICES", "").split(",") if d]
-    candidates = requested or sorted(
-        os.path.basename(p) for p in glob.glob("/sys/class/infiniband/*"))
-    return [d for d in candidates if _has_active_port(d)]
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture
-def cluster():
-    """(rdma device, etcd registry): skip when the RDMA prerequisites are
-    absent; start a private etcd when none is configured."""
-    if os.getenv("FLEXKV_RUN_RADIX_PEER_TEST") != "1":
-        pytest.skip("set FLEXKV_RUN_RADIX_PEER_TEST=1 to run the RDMA test")
-    devices = _active_rdma_devices()
-    if not devices:
-        pytest.skip("no ACTIVE RDMA device found")
-    try:
-        from radixshmem import _data
-        if not hasattr(_data, "DataPlaneRegistry"):
-            pytest.skip("radixshmem built without etcd (no DataPlaneRegistry)")
-    except ImportError:
-        pytest.skip("radixshmem built without the _data extension")
-    registry = os.getenv("FLEXKV_TEST_RADIX_REGISTRY", "")
-    proc = None
-    workdir = None
-    if not registry:
-        etcd = shutil.which("etcd")
-        if not etcd:
-            pytest.skip("set FLEXKV_TEST_RADIX_REGISTRY or put etcd on PATH")
-        client_port, peer_port = _free_port(), _free_port()
-        workdir = tempfile.mkdtemp(prefix="flexkv_radix_etcd_")
-        proc = subprocess.Popen(
-            [etcd, "--name", "t", "--data-dir", os.path.join(workdir, "data"),
-             "--listen-client-urls", f"http://127.0.0.1:{client_port}",
-             "--advertise-client-urls", f"http://127.0.0.1:{client_port}",
-             "--listen-peer-urls", f"http://127.0.0.1:{peer_port}",
-             "--initial-advertise-peer-urls", f"http://127.0.0.1:{peer_port}",
-             "--initial-cluster", f"t=http://127.0.0.1:{peer_port}"],
-            stdout=open(os.path.join(workdir, "etcd.log"), "w"),
-            stderr=subprocess.STDOUT)
-        registry = f"etcd://127.0.0.1:{client_port}"
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            with contextlib.suppress(OSError):
-                with socket.create_connection(("127.0.0.1", client_port), timeout=0.5):
-                    break
-            time.sleep(0.2)
-        else:
-            proc.kill()
-            pytest.skip("private etcd did not come up")
-    try:
-        yield devices[0], registry
-    finally:
-        if proc is not None:
-            proc.terminate()
-            with contextlib.suppress(Exception):
-                proc.wait(10)
-            shutil.rmtree(workdir, ignore_errors=True)
-
-
-def _peer_pattern(block: int, writer: int) -> bytes:
-    return bytes([(block * 7 + writer * 131 + 3) % 251 + 1]) * PEER_SLOT_BYTES
-
-
-def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output,
-               local_head_blocks=0):
-    """One node: a data-mode RadixServer (in-process) plus the FlexKV engine."""
-    try:
-        name = f"{prefix}_r{rank}"
-        data_name = f"{prefix}_data_r{rank}"
-        _sweep_region(name, data_name)
-        cluster_kwargs = dict(
-            expected_min_nodes=2, registry=registry, cluster_id=cluster_id,
-            node_name=f"r{rank}", rpc_address="0.0.0.0", index_dev=rdma_dev,
-            gid_idx=int(os.getenv("FLEXKV_TEST_RADIX_GID_IDX", "3")),
-            bootstrap_timeout_sec=60, rht_slots_per_bucket=4)
-        cfg = radixshmem.ServerConfig(
-            name=name, data_bytes=PEER_BLOCKS * PEER_SLOT_BYTES, slot_align=4096,
-            data_name=data_name, prefault=False, transfer_devices=[rdma_dev],
-            cluster=radixshmem.ClusterConfig(**cluster_kwargs),
-        )
-        server = radixshmem.RadixServer(cfg).start()      # waiting: the engine's geometry starts the rendezvous
-        bootstrap.READY_TIMEOUT_S = 180.0                # this process only: the rendezvous may take a while
-        engine = CacheEngineRadixShmem(
-            name, geometry=radixshmem.Geometry(block_size=16, full_slot_bytes=PEER_SLOT_BYTES,
-                                             slot_align=4096),
-            num_total_blocks=PEER_BLOCKS, tokens_per_block=16, peer_enabled=True)
-        if not engine.peer_enabled:
-            raise RuntimeError("engine did not see a distributed region")
-        cluster_rank = bootstrap.radix_cluster_rank(engine.client)
-
-        hashes = np.arange(26, dtype=np.uint64) * 104729 + 101
-        query_hashes = hashes[:-1]
-
-        def _seq(block_hashes):
-            return FakeSeq(block_hashes=block_hashes.view(np.int64), tokens_per_block=16)
-
-        if rank == 0:
-            sequence = _seq(hashes)
-            slots = engine.take(num_required_blocks=len(hashes))
-            assert len(slots) == len(hashes)
-            for i, slot in enumerate(slots):
-                engine.client.slot_view(int(slot))[:] = _peer_pattern(i, writer=0)
-            engine.insert(sequence, slots, num_insert_blocks=len(hashes))
-            output.put({"writer_rank": cluster_rank})
-            ready.set()
-            if not done.wait(120):
-                raise TimeoutError("reader did not complete")
-        else:
-            if local_head_blocks > 0:
-                head = hashes[:local_head_blocks]
-                head_slots = engine.take(num_required_blocks=local_head_blocks)
-                assert len(head_slots) == local_head_blocks
-                for i, slot in enumerate(head_slots):
-                    engine.client.slot_view(int(slot))[:] = _peer_pattern(i, writer=1)
-                engine.insert(_seq(head), head_slots, num_insert_blocks=local_head_blocks)
-            if not ready.wait(120):
-                raise TimeoutError("writer did not publish")
-            expect = len(query_hashes)
-            result = None
-            job = None
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                job = engine.prefetch(_seq(query_hashes), timeout_ms=20000)
-                result = job.wait(60)
-                if result.common_hit >= expect:
-                    break
-                time.sleep(0.05)
-            if result is None or result.common_hit < expect:
-                raise AssertionError(
-                    f"prefetch reached {result.common_hit if result else None} blocks, "
-                    f"expected {expect}")
-            match = engine.match(_seq(query_hashes))
-            bad = []
-            for i, slot in enumerate(match.local_slots.tolist()):
-                writer = 1 if i < local_head_blocks else 0
-                if bytes(engine.client.slot_view(int(slot))) != _peer_pattern(i, writer):
-                    bad.append(i)
-            output.put({
-                "num_matched": match.num_matched_blocks,
-                "job_local_hit": int(job.local_hit),
-                "job_planned_hit": int(job.planned_hit),
-                "remote_blocks": int(result.remote_blocks),
-                "remote_bytes": int(result.remote_bytes),
-                "source_rank": int(result.source_rank),
-                "bad_blocks": bad,
-                "reader_rank": cluster_rank,
-            })
-            match.release()
-            done.set()
-        engine.close()
-        server.close()
-    except Exception:
-        output.put({"error": traceback.format_exc(), "rank": rank})
-        ready.set()
-        done.set()
-
-
-def _run_two_nodes(registry, rdma_dev, local_head_blocks=0):
-    ctx = mp.get_context("spawn")
-    ready = ctx.Event()
-    done = ctx.Event()
-    output = ctx.Queue()
-    prefix = f"/radixshmem_peer_test_{os.getpid()}_{local_head_blocks}"
-    cluster_id = f"flexkv-peer-test-{os.getpid()}-{local_head_blocks}"
-
-    processes = [
-        ctx.Process(target=_node_main,
-                    args=(rank, prefix, cluster_id, registry, rdma_dev, ready, done,
-                          output, local_head_blocks))
-        for rank in range(2)
-    ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=240)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-
-    messages = []
-    while not output.empty():
-        messages.append(output.get())
-    errors = [message for message in messages if "error" in message]
-    assert not errors, errors
-    assert all(process.exitcode == 0 for process in processes)
-    return (next(m for m in messages if "num_matched" in m),
-            next(m for m in messages if "writer_rank" in m))
-
-
-def test_prefetch_pulls_a_peer_prefix_over_rdma(cluster):
-    """Node 1 holds nothing: the prefetch pulls all 25 blocks off node 0 and
-    the local match then serves them with node 0's bytes."""
-    rdma_dev, registry = cluster
-    reader, writer = _run_two_nodes(registry, rdma_dev)
-    assert reader["job_local_hit"] == 0
-    assert reader["job_planned_hit"] == 25
-    assert reader["remote_blocks"] == 25
-    assert reader["remote_bytes"] == 25 * PEER_SLOT_BYTES
-    assert reader["source_rank"] == writer["writer_rank"]
-    assert reader["num_matched"] == 25
-    assert reader["bad_blocks"] == []
-
-
-def test_prefetch_extends_a_local_prefix_over_rdma(cluster):
-    """Node 1 holds blocks 0-9 itself: the prefetch pulls only 10-24, and the
-    match serves the head with node 1's bytes and the tail with node 0's."""
-    rdma_dev, registry = cluster
-    reader, writer = _run_two_nodes(registry, rdma_dev, local_head_blocks=10)
-    assert reader["job_local_hit"] == 10
-    assert reader["job_planned_hit"] == 25
-    assert reader["remote_blocks"] == 15
-    assert reader["source_rank"] == writer["writer_rank"]
-    assert reader["num_matched"] == 25
-    assert reader["bad_blocks"] == []
 
 
 if __name__ == "__main__":

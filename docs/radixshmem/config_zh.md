@@ -23,7 +23,7 @@ radixshmem 侧接口见 radixshmem 仓库的 `README.md` 与 `docs/api.md`，`ra
 | `FLEXKV_ENABLE_RADIXSHMEM` | `0` | `1` 启用。在 `flexkv` 首次 import 前设置。 |
 | `FLEXKV_RADIXSHMEM_SERVER_NAME` | `/flexkv` | attach 的 `radix-server --name`，即索引 shm 名，以 `/` 开头。gRPC 端点是 radixshmem 由名字派生的 `unix:///dev/shm/<name>.sock`。 |
 | `FLEXKV_CPU_LAYOUT` | `BLOCKFIRST` | 必须是 `BLOCKFIRST`（默认即是）：一个 SlotStore slot 就是一个连续的 CPU block。 |
-| `FLEXKV_INSTANCE_NUM` / `FLEXKV_INSTANCE_ID` | `1` / `0` | 同一节点上多个推理引擎共享一个 radix-server 时区分实例（第 4.4 节）。 |
+| `FLEXKV_INSTANCE_NUM` / `FLEXKV_INSTANCE_ID` | `1` / `0` | 同一节点上多个推理引擎共享一个 radix-server 时区分实例（第 4.5 节）。 |
 
 该模式只承担 CPU 层：`enable_ssd`、`enable_remote`、`enable_p2p_cpu`、`enable_p2p_ssd` 必须关闭，KVManager 构造时校验。
 跨节点复用由 radix-server 完成（etcd + RDMA），server 以集群参数启动时自动开启。
@@ -72,11 +72,22 @@ server 的规划：`swa_slots = floor(swa_ratio × data_bytes / swa_stride)`，`
 
 ## 4. 启动
 
-### 4.1 单机
+### 4.1 安装
+
+radixshmem 的安装与传输后端（NIXL / Mooncake）构建见 radixshmem 仓库 `README.md`：
 
 ```bash
-# 运维，每节点一次；nohup / systemd 皆可。有 SWA 池的模型（DSv4 等）给 --swa-ratio。
-radix-server --name /flexkv --data-bytes 64G --swa-ratio 0.5
+cd radixshmem/python && pip install -e .
+```
+
+每个节点运行一个 `radix-server`，它管理 `--data-bytes` 字节的主机内存，slot 大小由 FlexKV 交给它的几何决定。
+`--name` 须显式给出：`radix-server` 的默认名是 `/radixshmem`，而 FlexKV 默认 attach `/flexkv`。
+
+### 4.2 单机
+
+```bash
+# 运维，每节点一次；nohup / systemd 皆可。有 SWA 池的模型（DSv4 等）加 --swa-ratio，如 --swa-ratio 0.2。
+radix-server --name /flexkv --data-bytes 1024G
 
 # 推理引擎侧
 export FLEXKV_ENABLE_RADIXSHMEM=1
@@ -84,37 +95,37 @@ export FLEXKV_CPU_LAYOUT=BLOCKFIRST
 # 不设 FLEXKV_RADIXSHMEM_SERVER_NAME 即 attach /flexkv
 ```
 
-`--name` 须显式给出：`radix-server` 的默认名是 `/radixshmem`，而 FlexKV 默认 attach `/flexkv`。
-
 server 起来后打印 `Waiting for a client's geometry`；FlexKV 的第一个进程 attach 时交出几何，server 建区域后 ready。
 server 可晚于引擎启动，FlexKV 在 `READY_TIMEOUT_S`（600 s）内重试连接。
 
-### 4.2 多机（一个集群）
+### 4.3 多机（一个集群）
 
-每个节点各起一个 server，相同的 `--cluster-id` 和 `--registry`；`--rpc-interface`（或 `--rpc-address`）给对端拨入的 IP，
-`--node-name` 空时为 `node<ip>`：
+4 个节点，经 etcd 协调；除 `--rpc-address` 外每个节点命令相同。`--index-dev` 与 `--transfer-dev` 分别选控制面与数据面的网卡：
 
 ```bash
-radix-server --name /flexkv --data-bytes 64G --swa-ratio 0.5 \
-  --expected-min-nodes 4 --num-rht-shards 4 --rht-slots 4 \
-  --registry etcd://10.0.0.1:2379 --cluster-id prod_a \
-  --rpc-interface bond0 --index-dev mlx5_bond_0 --gid-idx 3 \
-  --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7 --bootstrap-timeout 300
+radix-server --name /flexkv --data-bytes 1024G --swa-ratio 0.2 \
+    --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
+    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
-`--bootstrap-timeout` 要小于 FlexKV 的 `READY_TIMEOUT_S`（600 s），留出 SlotStore prefault 与 attach 的时间。
+- 传输后端用 `--transfer-backend mooncake`（默认）或 `--transfer-backend nixl`；NIXL 不能自选端口，须同时给
+  `--transfer-port`（如 `17000`）。已编入的后端：`python -c "import radixshmem; print(radixshmem._data.TRANSFER_BACKENDS)"`。
+- `--rpc-address` 是对端拨入的 IP，也可用 `--rpc-interface <nic>` 从网卡解析；`--node-name` 空时为 `node<ip>`。
+  同一 etcd 上跑多个集群时用不同的 `--cluster-id`（默认 `default`）。
+- 调大 `--bootstrap-timeout`（默认 60 s）时保持小于 FlexKV 的 `READY_TIMEOUT_S`（600 s）。
 
 集群一致的几何字段（`block_size`、池集合、每池 `slot_bytes`、SWA 窗口、`slot_align`、`register_chunk_tokens`）：每个节点
 配置时把自己的这部分发布到 etcd `radix/<cluster_id>/geometry/<node>`，并与已发布的比对，不一致则拒绝；尚在等待几何的节点
-采纳其中一条，因此只需一个节点的 FlexKV 交出几何。各节点的 slot 数可以不同。FlexKV 侧每个节点
-同一个 `FLEXKV_RADIXSHMEM_SERVER_NAME`。
+采纳其中一条，因此只需一个节点的 FlexKV 交出几何。各节点的 slot 数（`--data-bytes`、`--swa-ratio`）可以不同。FlexKV 侧
+每个节点同一个 `FLEXKV_RADIXSHMEM_SERVER_NAME`。
 
-### 4.3 同机多节点（测试）
+### 4.4 同机多节点（测试）
 
 两个 server 在一台机器上：不同的 `--name`、不同的 `--node-name`、`--rpc-address 127.0.0.1`。两个 FlexKV 进程各自的
 `FLEXKV_RADIXSHMEM_SERVER_NAME` 指向自己的 server，并各给一个 `FLEXKV_SERVER_RECV_PORT`。
 
-### 4.4 一节点多引擎共享一个 server
+### 4.5 一节点多引擎共享一个 server
 
 两个独立的推理引擎（各自的 FlexKV、各自的 GPU）attach 同一个 radix-server，互相命中对方存的 KV：
 
