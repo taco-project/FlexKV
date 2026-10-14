@@ -19,7 +19,6 @@ class Hasher:
         self.hasher.reset()
 
     def update(self, array: np.ndarray) -> None:
-        # update_numpy avoids torch.from_numpy, which is not concurrency-safe.
         self.hasher.update_numpy(np.ascontiguousarray(array))
 
     def digest(self) -> HashType:
@@ -43,8 +42,6 @@ def hash_array_with_prefix(array: np.ndarray, prefix: int) -> HashType:
 def gen_hashes(token_ids: np.ndarray, tokens_per_block: int, hasher: Optional[Hasher] = None) -> np.ndarray:
     token_ids = np.ascontiguousarray(token_ids)
     if token_ids.dtype != np.int64:
-        # The hash covers the 8-byte token words; another width would be
-        # reinterpreted, not converted. Same contract as the torch path had.
         raise TypeError(f"gen_hashes: token_ids must be int64, got {token_ids.dtype}")
     block_hashes = np.zeros(token_ids.size // tokens_per_block, dtype=np.uint64)
     if hasher is None:

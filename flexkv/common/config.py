@@ -185,10 +185,6 @@ class ModelConfig:
     # and token_size_in_bytes/num_cpu_blocks are computed by summing across groups.
     layer_groups: Optional[List[LayerGroupSpec]] = None
 
-    # SGLang DP-Attention node-local width. Set when every DP group lives on
-    # one node, which makes FlexKV form one instance per node instead of one
-    # spanning the cluster (FlexKVConfig.get_sglang_node_local_dp_size).
-    # None keeps the cross-node path.
     local_dp_size: Optional[int] = None
 
     # ------------------------------------------------------------------
@@ -649,9 +645,6 @@ class SWAPoolConfig:
     snapshot_bytes: Optional[int] = None
     evict_ratio: float = 0.1           # Fraction of pool to evict when full
     pin_memory: bool = True            # Use pinned memory for async DMA
-    # Sidecar groups packed into one SWA page (DSv4 compress states). The TE
-    # learns them from the GPU registration; the radixshmem bootstrap needs them
-    # earlier to size the SWA slot, so the connector records them here.
     layer_groups: Optional[List['LayerGroupSpec']] = None
 
     def for_ssd_tier(self) -> "SWAPoolConfig":
@@ -771,8 +764,6 @@ class CacheConfig:
     # Stored for deferred recomputation when layer_groups become known
     _user_cpu_cache_gb: float = 0
     _user_ssd_cache_gb: float = 0
-    # Layers one CPU block covers (this node's PP stage), recorded by the
-    # adapters' config resolution; 0 = derive num_layers // pp_size.
     _num_layers_per_pp_stage: int = 0
 
     # SWA pool config (DeepSeek V4)
@@ -850,11 +841,6 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     server_launch_mode=os.getenv('FLEXKV_SERVER_LAUNCH_MODE', 'embedded').lower(),
     server_recv_port=os.getenv('FLEXKV_SERVER_RECV_PORT', 'ipc:///tmp/flexkv_server'),
 
-    # radixshmem mode: the CPU tier is a radix-server (index + SlotStore), one
-    # per node, a process the operator starts (`radix-server --name /flexkv
-    # --data-bytes ...`). FlexKV attaches to it by name; everything else about
-    # the attach is a fixed default (flexkv.server.shm_radix_bootstrap;
-    # reference docs/radixshmem/config_zh.md).
     enable_radixshmem=bool(int(os.getenv('FLEXKV_ENABLE_RADIXSHMEM', 0))),
     radixshmem_server_name=os.getenv('FLEXKV_RADIXSHMEM_SERVER_NAME', '') or '/flexkv',
 

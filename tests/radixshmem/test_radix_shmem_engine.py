@@ -57,10 +57,6 @@ import pytest
 try:
     import radixshmem
 except ImportError as exc:
-    # Not importorskip: a radixshmem built before the current API (stale `_core.so`
-    # next to a newer `__init__.py`) raises ImportError rather than
-    # ModuleNotFoundError, and pytest >= 8.2 only skips on the latter — which
-    # would abort collection for the whole suite instead of skipping this file.
     pytest.skip(f"radixshmem unusable ({exc}); rebuild the extension",
                 allow_module_level=True)
 
@@ -78,8 +74,6 @@ def _load_module_direct(name: str, path: str):
     """
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
-    # `@dataclass` looks up the module in sys.modules during class
-    # construction; register before exec_module.
     sys.modules[name] = module
     try:
         spec.loader.exec_module(module)
@@ -95,13 +89,9 @@ _engine_mod = _load_module_direct(
     os.path.join(_FLEXKV_ROOT, "flexkv", "cache", "radix_shmem_engine.py"),
 )
 CacheEngineRadixShmem = _engine_mod.CacheEngineRadixShmem
-# The planner only duck-types the match, so the side-loaded class is as good as
-# the one `flexkv.cache.cache_engine` imports — and it needs no c_ext.
 ShmRadixMatch = _engine_mod.ShmRadixMatch
 StagedRadixInsert = _engine_mod.StagedRadixInsert
 
-# Pure-Python (no c_ext): the bootstrap (server config, geometry, attach) and
-# the transfer enums.
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV  # noqa: E402
 from flexkv.common.transfer import TransferType  # noqa: E402
 from flexkv.server import shm_radix_bootstrap as bootstrap  # noqa: E402
@@ -123,7 +113,6 @@ class FakeSeq:
         return len(self.block_hashes)
 
     def gen_hashes(self) -> None:
-        # already populated
         pass
 
 
@@ -216,33 +205,24 @@ def env():
         bootstrap.READY_TIMEOUT_S = saved
 
 
-# =============================================================================
-# Part 1 — local engine semantics on a standalone radix-server
-# =============================================================================
-
-
 def test_take_insert_match_recycle(env):
     engine, _server = env.make("/cers_basic")
 
     seq = FakeSeq(block_hashes=_hashes(seed=1, num=4))
-    # Initial match: nothing.
     r = engine.match(seq)
     assert r.num_matched_blocks == 0
     r.release()
 
-    # take 4 slots and insert.
     slots = engine.take(num_required_blocks=4)
     assert len(slots) == 4
     engine.insert(seq, slots, num_insert_blocks=4)
 
-    # Match should now hit all 4 blocks, all of them this node's slots.
     r2 = engine.match(seq)
     assert r2.num_matched_blocks == 4
     assert r2.local_slots.size == 4
     np.testing.assert_array_equal(np.sort(r2.local_slots), np.sort(slots))
     r2.release()
 
-    # Recycle a fresh allocation; tree-attached slots are not affected.
     free_slots = engine.take(num_required_blocks=2)
     engine.recycle(free_slots)
 
@@ -270,8 +250,6 @@ def test_take_clamps_to_the_pool(env):
     assert 0 < len(slots) <= 64
     engine.recycle(slots)
     assert engine.take(num_required_blocks=0).size == 0
-    # the SWA pool is all-or-none: an oversize window comes back short and the
-    # planner stores Full KV only
     swa_engine, _ = _make_swa_engine(env, f"/cers_clamp_swa{os.getpid()}", blocks=64,
                                      swa_slots=SWA_W, window_blocks=SWA_W)
     got = swa_engine.take(num_required_blocks=SWA_W + 3, component=_SWA)
@@ -344,7 +322,6 @@ def test_recycle_returns_staged_slots(env):
     engine.recycle(slots)
     assert engine.num_free_blocks == before
 
-    # And nothing was published on the way through.
     seq = FakeSeq(block_hashes=_hashes(seed=22, num=5))
     r = engine.match(seq)
     assert r.num_matched_blocks == 0
@@ -362,13 +339,10 @@ def test_eviction_reclaims_inserted(env):
     seq = FakeSeq(block_hashes=_hashes(seed=4, num=1500))
     s1 = engine.take(num_required_blocks=1500)
     engine.insert(seq, s1, num_insert_blocks=1500)
-    # insert() reports nothing, so check the span landed rather than let the
-    # eviction assert below pass on an empty tree.
     published = engine.match(seq)
     assert published.num_matched_blocks == 1500
     published.release()
     assert engine.num_free_blocks == 500
-    # Allocate enough new blocks that eviction is forced (need > current free 500).
     s2 = engine.take(num_required_blocks=1500)
     assert len(s2) > 500
 
@@ -382,7 +356,6 @@ def test_pinned_match_survives_eviction_pressure(env):
 
     pinned = engine.match(seq)
     assert pinned.num_matched_blocks == 1500
-    # 500 free; everything else is pinned, so the take comes up short.
     short = engine.take(num_required_blocks=1500)
     assert len(short) == 500
     engine.recycle(short)
@@ -407,7 +380,6 @@ def test_standalone_region_has_no_peer(env):
     assert result.num_matched_blocks == 3
     assert result.finalize is not None
     result.release()
-    # release() is what drops the query's pin, and it is idempotent.
     assert result.finalize is None
     result.release()
 
@@ -424,23 +396,17 @@ def test_local_range_intersects_the_window():
         num_matched_blocks=4,
         local_slots=np.arange(40, 44, dtype=np.int64),
     )
-    # Wholly inside the hit.
     assert match.local_range(1, 3).tolist() == [41, 42]
-    # Hit runs PAST the window end -> trimmed to the window.
     assert match.local_range(0, 2).tolist() == [40, 41]
-    # Window runs past the hit -> trimmed to the hit, no error.
     assert match.local_range(2, 99).tolist() == [42, 43]
-    # Hit stops short of the window start -> nothing of it is ours.
     assert match.local_range(4, 9).tolist() == []
     assert match.local_range(7, 9).tolist() == []
-    # Empty and inverted windows name no block; full window is the whole hit.
     assert match.local_range(2, 2).tolist() == []
     assert match.local_range(3, 1).tolist() == []
     assert match.local_range(0, 4).tolist() == [40, 41, 42, 43]
 
 
 SWA_W = 8  # == flexkv.common.config.RADIX_SWA_WINDOW_BLOCKS, literal on purpose:
-           # a drive-by change to the constant should fail here, visibly.
 JOINT_MASK = (_engine_mod.COMPONENT_MASK_FULL |
               _engine_mod.COMPONENT_MASK_SWA)
 
@@ -549,7 +515,6 @@ def test_swa_insert_without_full_path_is_benign_and_recycles(env):
 
     swa_slots = engine.take(SWA_W, component=_SWA)
     assert len(swa_slots) == SWA_W
-    # No Full path published: refused with FULL_PATH_MISSING, not raised.
     engine.insert(seq, swa_slots, num_insert_blocks=20, component=_SWA)
 
     again = engine.take(SWA_W, component=_SWA)
@@ -571,11 +536,6 @@ def test_swa_window_blocks_one_stores_a_single_slot_window(env):
     assert match.swa_start == 19                    # max(0, 20 - 1)
     assert len(match.swa_slots) == 1
     match.release()
-
-
-# =============================================================================
-# Part 1b — the data plane: SlotStore as the CPU pool, geometry, server process
-# =============================================================================
 
 
 def test_slot_store_pool_is_the_cpu_pool(env):
@@ -601,7 +561,6 @@ def test_slot_store_pool_is_the_cpu_pool(env):
         block = tensor[int(slot) * SLOT_BYTES:(int(slot) + 1) * SLOT_BYTES]
         assert block.unique().tolist() == [i + 1]
 
-    # A typed view (fp16) over the same pool: 64 blocks x SLOT_BYTES/2 elements.
     typed = slot_store_pool_tensor(store, FULL, torch.float16, 64 * SLOT_BYTES // 2)
     assert typed.dtype == torch.float16 and typed.numel() == 64 * SLOT_BYTES // 2
 
@@ -612,7 +571,6 @@ def test_slot_store_pool_is_the_cpu_pool(env):
     worker_view = handle.get_tensor()               # re-attached by name
     first = int(slots[0])
     assert worker_view[first * SLOT_BYTES:(first + 1) * SLOT_BYTES].unique().tolist() == [1]
-    # And writes through the worker's view are what the owner reads.
     worker_view[first * SLOT_BYTES] = 200
     assert bytes(engine.client.slot_view(first)[:1]) == b"\xc8"
     engine.recycle(slots)
@@ -657,7 +615,6 @@ def test_expected_geometry_mirrors_the_storage_engine_layout():
     assert spec["block_size"] == 16 and spec["slot_align"] == 1024
     assert spec["pools"]["full"] == {"slot_bytes": 32768, "num_slots": 0}
     assert spec["pools"]["swa"] == {"slot_bytes": 1024, "num_slots": 0, "window_blocks": SWA_W}
-    # Without SWA the pool is absent from what the server is asked for.
     model_config, cache_config = _configs(num_cpu_blocks=64)
     spec = bootstrap.expected_geometry(model_config, cache_config).to_radixshmem().to_dict()
     assert set(spec["pools"]) == {"full"}
@@ -702,27 +659,21 @@ def test_client_brings_the_geometry_and_adopts_the_counts(env):
         assert pools["full"]["num_slots"] == 64 and pools["swa"]["num_slots"] == 16
         assert int(client.store.pool(FULL).slot_bytes) == geo.full_slot_bytes    # exact stride
         assert int(client.store.pool(_SWA).slot_bytes) == geo.swa_slot_bytes
-        # cpu_cache_gb's placeholders give way to the server's counts; the RHT
-        # registration chunk comes along: 2048 tokens = 128 blocks of 16
         assert client.geometry["register_chunk_tokens"] == 2048
         cache_config.num_cpu_blocks, cache_config.swa.num_slots = 7, 3
         assert bootstrap.adopt_geometry(cache_config, client, "test") == {
             "full": 64, "swa": 16, "register_chunk_tokens": 2048, "register_chunk_blocks": 128}
         assert cache_config.num_cpu_blocks == 64 and cache_config.swa.num_slots == 16
-        # a chunk FlexKV pinned differently from the server's fails closed too
         with pytest.raises(ValueError, match="register_chunk_tokens"):
             bootstrap.check_geometry(
                 client, dataclasses.replace(geo, register_chunk_tokens=4096), "test")
         assert bootstrap.radix_cluster_rank(client) == 0 and client.info.world_size == 1
-        # the connectors' prefetch gate asks the server the same question
         assert bootstrap.radix_server_is_distributed(
             model_config, cache_config, name=name, timeout_s=30) is False
-        # another expectation against the same regions fails closed
         cache_config.tokens_per_block = 32
         with pytest.raises(ValueError, match="tokens_per_block"):
             bootstrap.check_geometry(
                 client, bootstrap.expected_geometry(model_config, cache_config), "test")
-        # ...and a second client bringing another geometry is refused by the server
         for other in (dataclasses.replace(geo, tokens_per_block=32),
                       dataclasses.replace(geo, register_chunk_tokens=4096)):
             with pytest.raises(ValueError, match="another geometry"):
@@ -828,7 +779,6 @@ def test_attach_retries_a_peer_rht_shard_that_is_not_up_yet(env, monkeypatch):
     monkeypatch.setattr(radixshmem, "RadixClient", lambda *a, **k: _Fake(1, "index/store/geometry mismatch: x"))
     with pytest.raises(RuntimeError, match="attaching the index failed"):
         bootstrap.attach_radix_client("/x", timeout_s=60, attach_index=True)
-    # without attach_index the index is left alone (info-only callers open no RDMA state)
     fakes.clear()
     monkeypatch.setattr(radixshmem, "RadixClient", lambda *a, **k: _Fake(5))
     assert bootstrap.attach_radix_client("/x", timeout_s=60).failures == 5
@@ -856,13 +806,6 @@ def test_unconfigured_server_answers_the_cluster_question(env):
         client.close()
 
 
-# =============================================================================
-# Part 1c — FLEXKV_RADIXSHMEM_SERVER_NAME, the one radixshmem-mode setting
-# (shm_radix_bootstrap.radix_server_name); everything else about the attach
-# is a fixed default.
-# =============================================================================
-
-
 def test_radix_server_name_follows_the_env(monkeypatch):
     monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radixshmem_server_name", "/flexkv")
     assert bootstrap.radix_server_name() == "/flexkv"
@@ -870,7 +813,6 @@ def test_radix_server_name_follows_the_env(monkeypatch):
     monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "radixshmem_server_name", "/prod/kv")
     assert bootstrap.radix_server_name() == "/prod/kv"
     assert bootstrap.default_endpoint("/prod/kv") == "unix:///dev/shm/prod_kv.sock"
-    # the fixed defaults stay consistent with each other
     assert bootstrap.READY_TIMEOUT_S > 0 and bootstrap.PREFETCH_TIMEOUT_MS > 0
     assert 0 < bootstrap.PREFETCH_MAX_INFLIGHT < bootstrap.MAX_OUTSTANDING
 
@@ -896,13 +838,6 @@ def test_radix_server_name_rejects_malformed_names(monkeypatch, name):
     with pytest.raises(ValueError, match="FLEXKV_RADIXSHMEM_SERVER_NAME"):
         bootstrap.radix_server_name()
 
-
-# =============================================================================
-# Part 2 — planning on the radixshmem backend (`RadixShmemCacheEngine._plan_get`,
-# `_plan_prefetch`, `_plan_put`, and the abort path of their handles), plus
-# KVTaskEngine's handling of a job-backed prefetch task. Synthetic matches, no
-# region.
-# =============================================================================
 
 TOKENS_PER_BLOCK = 16
 
@@ -1027,7 +962,6 @@ def _fake_request(num_blocks: int, base: int = 0):
     num_tokens = num_blocks * TOKENS_PER_BLOCK
     token_ids = np.arange(base, base + num_tokens, dtype=np.int64)
     token_mask = np.ones(num_tokens, dtype=np.bool_)
-    # GPU blocks 1000.. so they can't be confused with CPU slot ids.
     slot_mapping = (
         np.repeat(np.arange(1000, 1000 + num_blocks), TOKENS_PER_BLOCK)
         * TOKENS_PER_BLOCK
@@ -1080,7 +1014,6 @@ def test_local_hit_plans_one_h2d_and_releases_the_pin():
     np.testing.assert_array_equal(h2d.src_block_ids, cpu_slots)
     np.testing.assert_array_equal(h2d.dst_block_ids, np.arange(1000, 1004))
     assert return_mask.sum() == 4 * TOKENS_PER_BLOCK
-    # No staging taken, nothing to publish, nothing to give back.
     assert engine.cpu_cache_engine.mempool.num_free_blocks == free_before
     assert released == []
     engine.get_callback()                           # type: ignore[attr-defined]
@@ -1128,7 +1061,6 @@ def test_prefetch_starts_a_peer_pull():
     assert (callback.prefetch_local_hit_blocks, callback.prefetch_planned_hit_blocks) == (1, 4)
     assert not bool(return_mask[:TOKENS_PER_BLOCK].any())
     assert bool(return_mask[TOKENS_PER_BLOCK:4 * TOKENS_PER_BLOCK].all())
-    # Full|SWA mask only when the request is SWA-aware; plain prefetch is FULL.
     (call,) = engine.prefetch_calls                 # type: ignore[attr-defined]
     assert call["component_mask"] == _engine_mod.COMPONENT_MASK_FULL
     assert call["query_end"] == 4
@@ -1214,7 +1146,6 @@ def test_task_engine_completes_a_prefetch_from_its_job():
     assert not bool(task.return_mask[:TOKENS_PER_BLOCK].any())
     assert bool(task.return_mask[TOKENS_PER_BLOCK:].all())
 
-    # A shortfall (transfer refused, evicted before publish) narrows the mask.
     job2 = FakeJob(local_hit=1, planned_hit=4)
     task2 = _prefetch_task(2, job2, num_blocks=4, local_hit=1, planned_hit=4)
     mgr.tasks[2] = task2
@@ -1225,7 +1156,6 @@ def test_task_engine_completes_a_prefetch_from_its_job():
     assert bool(task2.return_mask[TOKENS_PER_BLOCK:2 * TOKENS_PER_BLOCK].all())
     assert not bool(task2.return_mask[2 * TOKENS_PER_BLOCK:].any())
 
-    # Nothing pulled at all: an empty mask, still a completed (not failed) task.
     job3 = FakeJob(local_hit=1, planned_hit=4)
     task3 = _prefetch_task(3, job3, num_blocks=4, local_hit=1, planned_hit=4)
     mgr.tasks[3] = task3
@@ -1257,8 +1187,6 @@ def test_task_engine_cancel_hands_the_job_back():
     mgr._poll_prefetch_jobs()                        # nothing left to do
 
 
-# ---- PUT planning ----
-
 def _run_put(engine, num_blocks: int, cpu_result: ShmRadixMatch):
     """Call put() through `_plan_put` with a forced match result."""
     _force_radixshmem(engine, cpu_result)
@@ -1286,7 +1214,6 @@ def test_put_with_no_match_stores_the_whole_window():
     assert bool(return_mask.all())
 
     engine.put_callback()                           # graph completion
-    # One insert, of the whole window, ending at block 4.
     assert [(n, len(s)) for n, s in engine.inserted_pools] == [(4, 4)]
     assert engine.aborted_slots == []
 
@@ -1302,17 +1229,13 @@ def test_put_skips_the_cached_prefix():
 
     op_d2h = ops[TransferType.D2H][0]
     assert op_d2h.src_block_ids.size == 2
-    # GPU blocks are 1000.., so the skipped prefix is visible in the ids read.
     assert op_d2h.src_block_ids.tolist() == [1003, 1004]
-    # The staged slots are fresh — never the ones the match already holds.
     assert not set(op_d2h.dst_block_ids.tolist()) & set(cached.tolist())
-    # Only the newly stored blocks come back as stored.
     assert not bool(return_mask[:3 * TOKENS_PER_BLOCK].any())
     assert bool(return_mask[3 * TOKENS_PER_BLOCK:].all())
 
     assert released == []                           # pinned while D2H runs
     engine.put_callback()
-    # The span ends at block 5, and carries the 2 new blocks only.
     assert [(n, len(s)) for n, s in engine.inserted_pools] == [(5, 2)]
     assert engine.aborted_slots == []
     assert released == [1]                          # released after the publish
@@ -1331,8 +1254,6 @@ def test_put_with_fully_cached_window_does_nothing():
     assert engine.aborted_slots == []
     assert released == [1]
 
-
-# ---- abort: the plan was cancelled before its graph launched ----
 
 def test_get_abort_drops_the_pin():
     """A cancelled GET never runs its H2D; abort releases the match pin, and a
@@ -1413,10 +1334,6 @@ def test_prefetch_abort_leaves_the_job_alone():
     assert engine.aborted_slots == []               # type: ignore[attr-defined]
 
 
-# =============================================================================
-# Part 2b — SWA planning on a real region (needs c_ext for GlobalCacheEngine)
-# =============================================================================
-
 SWA_ENV_BLOCKS = 64
 
 
@@ -1461,8 +1378,6 @@ def _swa_global_engine(swa_slots: int = 2 * SWA_W,
         model_config = ModelConfig(num_layers=2, num_kv_heads=4, head_size=64,
                                    dtype=torch.float16,
                                    tp_size=1, dp_size=1)
-        # The operator's server: a budget sized so the planned counts are the
-        # test's; the planner's client brings the geometry.
         geo = bootstrap.expected_geometry(model_config, cache_config)
         data_bytes = num_blocks * geo.full_slot_bytes + swa_slots * geo.swa_slot_bytes
         cfg = radixshmem.ServerConfig(name=server_name, data_bytes=data_bytes,
@@ -1506,7 +1421,6 @@ def test_put_then_get_swa_roundtrip_on_real_region():
         cpu = engine.cpu_cache_engine
         num_total = SWA_ENV_BLOCKS
 
-        # Record the publish order without breaking the real inserts.
         published = []
         real_insert = cpu.insert
 
@@ -1719,18 +1633,6 @@ def test_planner_uses_configured_window_blocks():
         get_cb()
 
 
-# =============================================================================
-# Part 3 — opt-in two-node radixshmem cluster over RDMA: prefetch pulls a peer's
-# blocks (index walk over RDMA, server-side RDMA READ of the SlotStore bytes),
-# then a local match finds them and the bytes are the writer's.
-#
-# Two spawned processes each run a data-mode RadixServer (distinct data names
-# and sockets on one host) and a `CacheEngineRadixShmem` attached to it.
-# Gated behind FLEXKV_RUN_RADIX_PEER_TEST=1; needs an ACTIVE RDMA device, a
-# radixshmem built with RDMA + etcd + mooncake, and an etcd
-# (FLEXKV_TEST_RADIX_REGISTRY, or `etcd` on PATH for a private one).
-# =============================================================================
-
 PEER_BLOCKS = 1170
 PEER_SLOT_BYTES = 65536
 
@@ -1818,8 +1720,6 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
                local_head_blocks=0):
     """One node: a data-mode RadixServer (in-process) plus the FlexKV engine."""
     try:
-        # Two servers on one host: distinct names, so radixshmem derives
-        # distinct sockets (cluster names are per node; the geometry is shared).
         name = f"{prefix}_r{rank}"
         data_name = f"{prefix}_data_r{rank}"
         _sweep_region(name, data_name)
@@ -1855,8 +1755,6 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
             assert len(slots) == len(hashes)
             for i, slot in enumerate(slots):
                 engine.client.slot_view(int(slot))[:] = _peer_pattern(i, writer=0)
-            # insert() publishes and, with peer_enabled, flushes the RHT so the
-            # reader can route to us.
             engine.insert(sequence, slots, num_insert_blocks=len(hashes))
             output.put({"writer_rank": cluster_rank})
             ready.set()
@@ -1872,8 +1770,6 @@ def _node_main(rank, prefix, cluster_id, registry, rdma_dev, ready, done, output
                 engine.insert(_seq(head), head_slots, num_insert_blocks=local_head_blocks)
             if not ready.wait(120):
                 raise TimeoutError("writer did not publish")
-            # The writer's RHT publication is asynchronous: prefetch until the
-            # pull brings the whole prefix home.
             expect = len(query_hashes)
             result = None
             job = None

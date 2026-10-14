@@ -596,18 +596,9 @@ class FlexKVConfig:
         enable_dp_attention = bool(server_args.enable_dp_attention)
         attn_cp_size = int(getattr(server_args, 'attn_cp_size', 1))
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
-        # Node-local DP is a property of the SGLang placement, not of the tier
-        # underneath it: with DP attention and pp_size == 1, a dp_size divisible
-        # by nnodes puts every DP group on a single node, so FlexKV forms one
-        # instance per node whatever the shared tier is (radix-shmem, or
-        # mooncake-store, where the store itself carries cross-node reuse).
-        # get_sglang_node_local_dp_size returns None for every placement where
-        # that does not hold, which leaves the cross-node TP/PP path untouched.
         local_dp_size = self.get_sglang_node_local_dp_size(server_args)
 
         if dp_rank is None and GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and sglang_dp_size > 1:
-            # Every DP process would derive dp_client_id 0: the same radix-server
-            # bootstrap ownership, TE channel and graph/op id range.
             raise ValueError(
                 "[FlexKV SGLang] radix_shmem with dp_size > 1 needs the scheduler's "
                 "dp_rank; got None")
@@ -807,8 +798,6 @@ class FlexKVConfig:
                     enabled=True,
                     num_swa_layers=self.model_config.num_layers,
                     bytes_per_token_per_layer=swa_bytes_per_token,
-                    # DSv4's 128-token window fits inside one 256-token page,
-                    # so a window is a single slot (radixshmem W=1).
                     window_blocks=1,
                 )
             # Gate the SWA data plane (byte movement) behind an env switch so it

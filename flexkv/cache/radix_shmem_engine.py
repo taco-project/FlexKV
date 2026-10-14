@@ -190,8 +190,6 @@ class CacheEngineRadixShmem:
                 f"radix-server {self.shm_name} has tokens_per_block={region_tpb}, "
                 f"FlexKV is configured with {tokens_per_block}")
         self.tokens_per_block = int(tokens_per_block)
-        # The RHT registration chunk is the server's (--register-chunk-tokens);
-        # FlexKV adopts it rather than bringing one of its own.
         self.register_chunk_tokens = int(
             (self._client.geometry or {}).get("register_chunk_tokens", 0))
         self.register_chunk_blocks = register_chunk_blocks(self.register_chunk_tokens,
@@ -202,8 +200,6 @@ class CacheEngineRadixShmem:
                 f"radix-server {self.shm_name} has {capacity} FULL slots, FlexKV "
                 f"expected {num_total_blocks}; the index is authoritative")
         self.num_total_blocks = capacity
-
-    # ---------- attachment / lifecycle ----------
 
     @property
     def client(self):
@@ -222,8 +218,6 @@ class CacheEngineRadixShmem:
         if client is not None:
             client.close()
 
-    # ---------- queries ----------
-
     @staticmethod
     def _hashes(sequence_meta: SequenceMeta, query_end: Optional[int]) -> np.ndarray:
         sequence_meta.gen_hashes()
@@ -238,7 +232,6 @@ class CacheEngineRadixShmem:
         """Pinned local prefix match. `query_end` caps the queried path so the
         SWA window ends where the caller's restore will."""
         hashes = self._hashes(sequence_meta, query_end)
-        # A refused query has zeroed fields and an unarmed finalize.
         qr = self._tree.query(hashes, mask=component_mask,
                               local_only=True, lock=True)
         common_hit = int(qr.common_hit)
@@ -297,8 +290,6 @@ class CacheEngineRadixShmem:
             f"planned_hit={job.planned_hit} job={job.job_id}")
         return job
 
-    # ---------- slots ----------
-
     def insert(self,
                sequence_meta: SequenceMeta,
                physical_block_ids: np.ndarray,
@@ -322,7 +313,6 @@ class CacheEngineRadixShmem:
                 f"radixshmem insert of {num_slots} slots overruns the "
                 f"{path_end}-block path on {self.shm_name}")
 
-        # SWA inserts are right-aligned by radixshmem and refuse a non-zero start.
         tree_start = start if component == COMPONENT_FULL else 0
         result = self._tree.insert(hashes[:path_end], slots, start=tree_start,
                                    auto_recycle=True, component=component)
@@ -342,8 +332,6 @@ class CacheEngineRadixShmem:
             return
 
         if self.peer_enabled and component == COMPONENT_FULL:
-            # The tree owns the slots by now: raising would make the caller
-            # recycle them a second time.
             try:
                 self._tree.flush()  # make the new blocks visible cluster-wide
             except Exception as e:
@@ -353,8 +341,6 @@ class CacheEngineRadixShmem:
 
         if (self.event_collector is not None and component == COMPONENT_FULL
                 and result.error == radixshmem.InsertError.OK):
-            # Error-free, the only unused slots are a redundant prefix, so what
-            # landed is the tail of the path.
             self.event_collector.publish_stored(
                 block_hashes=sequence_meta.block_hashes[path_end - landed:path_end],
                 block_size=self.tokens_per_block,
@@ -379,8 +365,6 @@ class CacheEngineRadixShmem:
             slots = np.asarray(self._tree.allocate_slots(n, component=component),
                                dtype=np.int64)
         except ValueError as e:
-            # Refused by the index (component not enabled, pool gone): nothing
-            # was allocated, so an empty answer is the truthful one.
             flexkv_logger.warning(
                 f"radix-server {self.shm_name} refused a {n}-slot {component} "
                 f"allocation: {e}")

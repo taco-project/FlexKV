@@ -57,19 +57,14 @@ from radix_e2e_common import (
 NUM_GPU_BLOCKS = 256
 NUM_CPU_BLOCKS = 4096
 BLOCK_PER_REQUEST = 32
-# A fixed prefix that dp0 writes and dp1 later looks up across the shared index.
 SHARED_SEED = 0x5EED
 SHARED_START_BLOCK = 128
-# GPU blocks phase 3 owns, past the ranges phases 1 and 2 use.
 ROUNDTRIP_START_BLOCK = 192
 
 
 def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, server_name: str,
              barrier, result_q) -> None:
     """Full lifecycle of one DP scheduler process."""
-    # Before the first flexkv import: GLOBAL_CONFIG_FROM_ENV is read at import.
-    # With dp_size > 1 the DPs are KVServer clients and must agree on
-    # server_recv_port (and therefore on the gpu_register_port the TE listens on).
     recv_port = f"ipc:///tmp/flexkv_{server_id}"
     os.environ.update({
         "FLEXKV_ENABLE_RADIXSHMEM": "1",
@@ -103,14 +98,11 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, server_name: str,
     try:
         kvm = KVManager(model_config, cache_config, dp_client_id=dp_client_id)
         kvm.start()
-        # Each DP drives its own GPU (device id = dp id); no process pins
-        # CUDA_VISIBLE_DEVICES, so the TE sees every device the DPs registered.
         tp_proc, gpu_tensors = start_tp_client(
             kvm, dp_client_id, dp_client_id, model_config, cache_config, NUM_GPU_BLOCKS)
         wait_kv_manager_ready(kvm, timeout=120)
         print(f"{tag} READY", flush=True)
 
-        # --- Phase 1: private PUTs, concurrently on every DP. ---
         own = []
         for i in range(3):
             tok, slot, _blk = build_request(
@@ -122,7 +114,6 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, server_name: str,
             len(own))
         print(f"{tag} private puts: {report['private_puts']}", flush=True)
 
-        # --- Phase 2: dp0 PUTs a shared prefix; dp1 finds it in the shared index. ---
         report["shared_hit_blocks"] = -1
         if dp_size > 1:
             tok, slot, _blk = build_request(BLOCK_PER_REQUEST, SHARED_START_BLOCK,
@@ -135,7 +126,6 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, server_name: str,
                 barrier.wait(120)           # release dp1 to look it up
             else:
                 barrier.wait(120)           # until dp0 finished the shared put
-                # Index visibility is asynchronous after the store: poll.
                 hit = 0
                 for _ in range(50):
                     _tid, mask = kvm.get_match(token_ids=tok)
@@ -147,11 +137,8 @@ def _dp_proc(dp_client_id: int, dp_size: int, server_id: str, server_name: str,
                 report["shared_hit_blocks"] = hit
                 print(f"{tag} cross-DP match hit_blocks={hit}", flush=True)
 
-        # --- Phase 3: byte round trip through this DP's own GPU. ---
         tok, slot, blk = build_request(BLOCK_PER_REQUEST, ROUNDTRIP_START_BLOCK,
                                        seed=7000 + dp_client_id)
-        # The DPs use the same block ids on different devices, so the phases are
-        # kept in lockstep: a stray transfer then lands on a block under check.
         write_pattern(gpu_tensors, blk, writer=dp_client_id)
         barrier.wait(120)
         task_id = kvm.put_async(token_ids=tok, slot_mapping=slot)
@@ -187,8 +174,6 @@ def _run(dp_size: int) -> dict:
     server_id = f"e2e{dp_size}dp_{os.getpid()}"
     workdir = tempfile.mkdtemp(prefix="flexkv_radix_e2e_")
     name = f"/{server_id}"
-    # The operator's server: a byte budget that holds NUM_CPU_BLOCKS blocks of
-    # this test's model (the DP processes bring the geometry and adopt the count).
     from flexkv.common.config import CacheConfig, ModelConfig
     from flexkv.server.shm_radix_bootstrap import cpu_block_bytes
     block_bytes = cpu_block_bytes(

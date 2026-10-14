@@ -92,5 +92,4 @@ benchmarks/nvcomp_benchmarks/inputs
 benchmarks/nvcomp_benchmarks/runs
 uv.lock
 
-# mooncake source tree cloned by install.sh --enable-p2p
 .mooncake-build/

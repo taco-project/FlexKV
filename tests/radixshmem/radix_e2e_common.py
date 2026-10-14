@@ -31,8 +31,6 @@ TOKENS_PER_BLOCK = 16
 PATTERN_SEED = 0x5EED
 
 
-# ------------------------------------------------------------------ host
-
 def free_port() -> int:
     with contextlib.closing(socket.socket()) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -140,8 +138,6 @@ def sweep_radix_files(cluster_id: str) -> None:
                 os.unlink(stale)
 
 
-# ----------------------------------------------------------- GPU bytes
-
 def block_pattern(layer: int, block_id: int, shape, dtype,
                   writer: int = 0) -> torch.Tensor:
     """Deterministic content for one (layer, block) as written by ``writer``.
@@ -183,8 +179,6 @@ def mismatched_blocks(gpu_tensors, block_ids, writer: int = 0) -> list:
                 bad.append((layer, int(block_id)))
     return bad
 
-
-# ------------------------------------------------------------ requests
 
 def build_request(num_blocks: int, first_block: int, seed: int,
                   tokens_per_block: int = TOKENS_PER_BLOCK):
@@ -244,8 +238,6 @@ def wait_kv_manager_ready(kvm, timeout: float = 180.0) -> None:
         time.sleep(0.1)
     raise RuntimeError(f"KVManager not ready in {timeout:.0f}s")
 
-
-# ---------------------------------------------------------- TP client
 
 def tp_client_proc(server_recv_port: str, dp_client_id: int, device_id: int,
                    model_config, cache_config, num_gpu_blocks: int, child_conn) -> None:

@@ -49,23 +49,12 @@ except ImportError:  # pragma: no cover
     radixshmem = None
 
 
-# Pool bases are page aligned regardless; a larger per-slot alignment only pads.
 _MAX_SLOT_ALIGN = 4096
 
-# FlexKV's side of the attach. The server to attach to is the one setting
-# (FLEXKV_RADIXSHMEM_SERVER_NAME, radix_server_name()); the rest are fixed.
 DEFAULT_SERVER_NAME = "/flexkv"
-# How long a FlexKV process waits for the server to be reachable AND ready:
-# covers the operator starting it late, the SlotStore prefault and, on a
-# cluster, the rendezvous (keep the server's --bootstrap-timeout below this).
 READY_TIMEOUT_S = 600.0
-# Server-side deadline of one peer pull; the job completes with the local hit
-# when it expires.
 PREFETCH_TIMEOUT_MS = 5000
-# Peer pulls in flight per KVTaskEngine before new prefetches skip the peer
-# walk; kept below MAX_OUTSTANDING so pull_async never blocks.
 PREFETCH_MAX_INFLIGHT = 128
-# Uncollected jobs one RadixClient may hold (radixshmem's own default).
 MAX_OUTSTANDING = 256
 
 
@@ -86,8 +75,6 @@ def cpu_sizing_notice(cache_config: CacheConfig, server_name: str) -> Tuple[str,
     does, and its slot counts replace ``num_cpu_blocks`` / ``swa.num_slots``.
     A warning when the deployment configured cpu_cache_gb itself (it expects
     the value to matter), info for a bare default."""
-    # CacheConfig keeps the deployment's cpu_cache_gb only as _user_cpu_cache_gb
-    # (0 when it was never given); num_cpu_blocks is what it was turned into.
     user_gb = float(getattr(cache_config, "_user_cpu_cache_gb", 0) or 0)
     setting = f"cpu_cache_gb={user_gb:g}" if user_gb > 0 else "cpu_cache_gb"
     swa = cache_config.swa
@@ -117,8 +104,6 @@ def _ensure_radixshmem() -> None:
                 f"radixshmem lacks {name}: FlexKV needs a radixshmem whose radix-server takes "
                 f"its geometry from the client (RadixClient(name, Geometry))")
 
-
-# ------------------------------------------------------------------ geometry
 
 def _resolve_groups(groups: Optional[List[LayerGroupSpec]],
                     default_dtype: torch.dtype) -> Optional[List[LayerGroupSpec]]:
@@ -220,7 +205,6 @@ class RadixGeometry:
     full_slot_bytes: int
     swa_slot_bytes: int = 0
     swa_window_blocks: int = 0
-    # RHT registration granularity in tokens; 0 = the server's --register-chunk-tokens.
     register_chunk_tokens: int = 0
 
     @property
@@ -283,8 +267,6 @@ def expected_geometry(model_config: ModelConfig, cache_config: CacheConfig) -> R
             swa_window_blocks=int(swa.window_blocks))
     return geo
 
-
-# -------------------------------------------------------------------- attach
 
 def _nothing_answers(e: BaseException) -> bool:
     """Whether an attach error means no server answered at the socket yet.
@@ -359,8 +341,6 @@ def attach_radix_client(name: Optional[str] = None,
                 f"--data-bytes / --swa-ratio") from e
         except Exception as e:  # noqa: BLE001 - classified below
             if not _nothing_answers(e):
-                # A live server refused the attach, or FlexKV called it wrongly:
-                # retrying would only hide the cause for READY_TIMEOUT_S.
                 flexkv_logger.error(
                     f"{label}: attach to radix-server {name} at {where} failed: {e!r}")
                 raise

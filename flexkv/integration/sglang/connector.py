@@ -284,8 +284,6 @@ class FlexKVConnector:
         # Heterogeneous groups change the bytes represented by one logical
         # FlexKV block. Recompute CPU/SSD capacities before KVManager starts.
         self._apply_layer_groups_for_cache_sizing(kv_caches, indexer_group)
-        # The radixshmem bootstrap sizes the host SWA slot from the config, before
-        # the TE learns the DSv4 sidecar groups from the GPU registration.
         if self._is_dsv4 and self.cache_config.swa is not None:
             _, _, swa_layer_groups, _, _ = self._build_dsv4_swa_registration()
             self.cache_config.swa.layer_groups = swa_layer_groups
@@ -402,8 +400,6 @@ class FlexKVConnector:
             self.cache_config.enable_ssd
             or self.cache_config.enable_remote
             or self.cache_config.enable_kv_sharing
-            # radixshmem cluster: prefetch is where a peer's blocks are pulled
-            # into this node (RadixClient.pull_async); GET then matches locally.
             or (GLOBAL_CONFIG_FROM_ENV.enable_radixshmem
                 and _radixshmem_distributed(self.model_config, self.cache_config))
         )
@@ -1496,8 +1492,6 @@ class FlexKVConnector:
                 prefetch_result = self.kv_manager.prefetch_async(
                     token_ids=np.asarray(token_ids, dtype=np.int64),
                     namespace=namespace,
-                    # Same joint Full+SWA rule as lookup_kv: without the SWA
-                    # window a later swa_aware match cannot use the prefix.
                     swa_aware=self._swa_kv_pool is not None,
                 )
                 # KVManager currently returns

@@ -161,12 +161,8 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                  redis_meta=None,
                  event_collector: Optional[KVEventCollector] = None):
         _check_cache_config(cache_config)
-        # GetJobs this engine started and has not yet seen finish; pruned on
-        # every prefetch and used for back-pressure (PREFETCH_MAX_INFLIGHT).
         self._prefetch_jobs: List[Any] = []
         super().__init__(cache_config, model_config, redis_meta, event_collector)
-
-    # ------------------------------------------------------------------ tier
 
     def _build_cpu_cache_engine(self,
                                 cache_config: CacheConfig,
@@ -193,12 +189,9 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         if self._metrics_collector is None or self.cpu_cache_engine is None:
             return
         tier = self.cpu_cache_engine
-        # A radixshmem tier reports its own counts (no Mempool object).
         pool = getattr(tier, "mempool", tier)
         self._metrics_collector.update_mempool_stats(
             "cpu", pool.num_total_blocks, pool.num_free_blocks)
-
-    # ------------------------------------------------------------- entrances
 
     @_synchronized_cache_tree
     def get(self,
@@ -216,7 +209,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             return self._empty_result(token_mask)
 
         if temp_cache_strategy.ignore_gpu:
-            # Prefetch: pull a peer's run into this node's tree.
             plan = self._plan_prefetch(
                 request_id, req.sequence_meta, req.block_end_idx, swa_aware=swa_aware)
         else:
@@ -230,8 +222,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         tpb = self.tokens_per_block
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         if plan.prefetch_job is not None:
-            # The planned pull [local hit, planned hit); KVTaskEngine rewrites
-            # it to what actually landed when the job completes.
             return_mask[plan.prefetch_local_hit_blocks * tpb:
                         plan.prefetch_planned_hit_blocks * tpb] = True
         else:
@@ -260,7 +250,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             namespace: Optional[List[str]] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
-        # the mask should have a prefix of True
         assert req.block_start_idx == 0
         assert not temp_cache_strategy.ignore_gpu
         if req.block_end_idx == 0:
@@ -305,8 +294,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                 flexkv_logger.error(
                     f"radixshmem plan {what} action failed", exc_info=True)
 
-    # ----------------------------------------------------------------- match
-
     def _match_cpu(self,
                    sequence_meta: SequenceMeta,
                    swa_aware: bool = False,
@@ -329,8 +316,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                 query_end=swa_query_end,
             )
         return self.cpu_cache_engine.match(sequence_meta)
-
-    # ------------------------------------------------------------------- GET
 
     def _plan_get(self,
                   request_id: int,
@@ -359,7 +344,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
 
         end = min(cpu_match.num_matched_blocks, block_mask_end)
         if end <= block_mask_start:
-            # Nothing to restore; drop the query's pin now.
             cpu_match.release()
             if self._metrics_collector is not None and block_mask_end > block_mask_start:
                 self._metrics_collector.record_cache_miss(
@@ -401,8 +385,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             on_complete=[cpu_match.release],
             on_abort=[cpu_match.release],
         )
-
-    # -------------------------------------------------------------- PREFETCH
 
     def _prefetch_inflight(self) -> int:
         """Peer pulls this engine started that have not finished yet."""
@@ -455,8 +437,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             self._metrics_collector.record_cache_hit("peer", job.planned_hit - job.local_hit)
         return plan
 
-    # ------------------------------------------------------------------- PUT
-
     def _plan_put(self,
                   request_id: int,
                   sequence_meta: SequenceMeta,
@@ -481,16 +461,11 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         cpu_match = self._match_cpu(sequence_meta)
 
         def _release_match() -> RadixPutPlan:
-            # Nothing will consume the matched prefix; drop the query's pin now.
             cpu_match.release()
             return RadixPutPlan.empty()
 
         num_skipped = len(cpu_match.local_range(block_mask_start, block_mask_end))
-        # Window blocks the CPU tier does not already hold.
         num_cpu_new = block_mask_end - block_mask_start - num_skipped
-        # Same policy as _put_impl_local: a fully-matched CPU prefix ends the PUT.
-        # This also skips the SWA sidecar, so a window lost to SWA-pool eviction
-        # is not republished until the Full path ages out (accepted limitation).
         if num_cpu_new <= 0:
             return _release_match()
 
@@ -513,8 +488,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                 if len(swa_take) == k:
                     swa_new = swa_take
                 else:
-                    # All-or-none contract says this is empty; recycle defensively
-                    # in case it ever is not.
                     cpu_engine.recycle(swa_take, component=COMPONENT_SWA)
                     flexkv_logger.warning(
                         f"radixshmem PUT {request_id}: no {k}-slot SWA window "
@@ -561,8 +534,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                 on_complete.append(staged.publish)
                 on_abort.append(staged.abort)
 
-            # The match pin travels with the LAST publish: SWA's insert refuses paths
-            # the Full tree does not reach yet, so it runs after FULL and releases.
             _arm(cpu_new, cpu_match.release if swa_new is None else None,
                  f"PUT {request_id} CPU")
             if swa_new is not None:
@@ -578,9 +549,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                 on_abort=on_abort,
             )
         except BaseException:
-            # Planning failed after slots were taken and before any handle could
-            # own them: hand them back, drop the match pin, then re-raise. (A
-            # StagedRadixInsert armed above is garbage now; nothing calls it.)
             for slots, comp in ((cpu_new, COMPONENT_FULL), (swa_new, COMPONENT_SWA)):
                 if slots is None or len(slots) == 0:
                     continue

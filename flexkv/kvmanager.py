@@ -64,9 +64,6 @@ class KVManager:
 
         self.enable_radixshmem = GLOBAL_CONFIG_FROM_ENV.enable_radixshmem
         if self.enable_radixshmem and cache_config.enable_remote:
-            # CacheEngineRadixShmem indexes the CPU tier in shm and reaches
-            # peers over RDMA; but the 3rd-party (PCFS) tier has its own
-            # Redis-published index and GET planner.
             raise ValueError(
                 "radix_shmem and enable_remote (3rd-party remote storage) "
                 "cannot be enabled at the same time"
@@ -78,9 +75,6 @@ class KVManager:
             )
         if self.enable_radixshmem and (cache_config.enable_p2p_cpu
                                      or cache_config.enable_p2p_ssd):
-            # Peer reuse is the radix-server's (etcd + RDMA), switched on by
-            # its cluster flags (--expected-min-nodes / --registry); the
-            # Redis-backed P2P paths these flags select must stay off.
             raise ValueError(
                 "radix_shmem does its own peer reuse; set enable_p2p_cpu=False "
                 "and enable_p2p_ssd=False (cross-node reuse follows the "
@@ -93,7 +87,6 @@ class KVManager:
         )
 
         if self.enable_radixshmem:
-            # Say up front that the CPU tier is not sized by cpu_cache_gb here.
             from flexkv.server.shm_radix_bootstrap import cpu_sizing_notice
             level, text = cpu_sizing_notice(cache_config, GLOBAL_CONFIG_FROM_ENV.radixshmem_server_name)
             getattr(flexkv_logger, level)(f"[KVManager] {text}")
@@ -134,22 +127,10 @@ class KVManager:
         self.server_handle = None
 
         if self.enable_radixshmem:
-            # The CPU tier is the operator's radix-server (``radix-server --name
-            # <server.name> --data-bytes ...``); FlexKV never creates one. Hand it
-            # FlexKV's geometry and take over the slot counts it planned BEFORE
-            # anything sizes a pool from cache_config: the KVServer or
-            # KVTaskEngine built below and the TE all read num_cpu_blocks /
-            # swa.num_slots. The process model is FlexKV's own: engine mode for
-            # one DP, the KVServer (one per node, shared by FLEXKV_INSTANCE_NUM
-            # engines) otherwise.
             from flexkv.server.shm_radix_bootstrap import adopt_radix_server
             adopt_radix_server(model_config, self.cache_config, label="KVManager")
 
         if self.server_client_mode:
-            # One KVServer per node: with node-local DP the first rank of each
-            # node owns it, so nodes 1..n-1 get their own server instead of
-            # waiting on node 0's. Without node-local DP local_dp_client_id
-            # equals dp_client_id and this is the previous condition.
             if self.server_launch_mode == "embedded" and self.local_dp_client_id == 0:
                 self.server_handle = KVServer.create_server(model_config=model_config,
                                                             cache_config=cache_config,

@@ -19,9 +19,7 @@ def test_gen_hashes_chains_blocks_like_the_incremental_hasher():
         h.update(tokens[b * TPB:(b + 1) * TPB])
         expected.append(int(h.digest()))
     assert hashes.tolist() == expected
-    # a strided view hashes the same tokens as its contiguous copy
     assert gen_hashes(np.repeat(tokens, 2)[::2], TPB).tolist() == expected
-    # a trailing partial block is not hashed
     assert gen_hashes(tokens[:2 * TPB + 5], TPB).tolist() == expected[:2]
     assert gen_hashes(tokens[:TPB - 1], TPB).size == 0
 

@@ -383,11 +383,9 @@ class FlexKVSchedulerConnector:
         request, so we read all three with `getattr` (avoids `hasattr` + attribute
         lookup) and bail out immediately on the common case.
         """
-        # getattr is faster than hasattr+access pair on the common-empty case.
         lora_req = getattr(request, 'lora_request', None)
         cache_salt = getattr(request, 'cache_salt', None)
         user_namespace = getattr(request, 'namespace_info', None)
-        # Common case: no isolation fields → single early return.
         if lora_req is None and cache_salt is None and user_namespace is None:
             return None
 
@@ -433,9 +431,6 @@ class FlexKVSchedulerConnector:
             return -1, 0
 
         np_token_ids = np.asarray(token_ids, dtype=np.int64)
-        # Build mask directly without `np.ones_like + slice False`. With
-        # `np.empty + 2 slice assigns` we skip the implicit memset-then-zero
-        # round-trip that `ones_like` does — ~3-5 µs at 4K-token prompts.
         np_token_mask = np.empty(num_tokens_to_get, dtype=bool)
         np_token_mask[:num_computed_tokens] = False
         np_token_mask[num_computed_tokens:] = True
@@ -445,9 +440,6 @@ class FlexKVSchedulerConnector:
             token_mask=np_token_mask,
             namespace=namespace,
         )
-        # `count_nonzero` on a bool ndarray returns a Python int and is ~2x
-        # faster than `.sum().item()` because it skips the numpy-scalar
-        # allocation + `__index__` round-trip.
         num_new_matched_tokens = int(np.count_nonzero(matched_mask))
 
         # Auto cancel if not call update_state_after_alloc()
@@ -646,7 +638,6 @@ class FlexKVSchedulerConnector:
             namespace=namespace,
         )
 
-        # See _get_match: count_nonzero on bool is ~2x faster than .sum().item()
         num_unmatched_tokens = int(np.count_nonzero(unmatched_mask))
         num_matched_tokens = num_tokens_to_put - num_unmatched_tokens
 
@@ -1303,19 +1294,6 @@ class FlexKVConnectorV1Impl:
             # Track scheduled requests to detect preemptions in build_connector_meta
             self.previous_scheduled_req_ids: set[str] = set()
         elif role == KVConnectorRole.WORKER:
-            # vllm's ParallelConfig has no ``tensor_parallel_rank`` field, so
-            # the value read in post_init_from_vllm_config is always 0 on every
-            # worker.  Override it here using the initialized TP group rank so
-            # each worker registers a distinct device_id with FlexKV.
-            #
-            # ``local_rank`` has to be reset together with it: RankInfo derives
-            # local_rank only when it is negative, so a replace() that carried
-            # the stale 0 over would leave every worker registering
-            # device_id=0 and the GPU registry would wait forever for the
-            # TP>1 devices that never arrive.  vllm's MultiprocExecutor does
-            # not export LOCAL_RANK, so the fresh tp_rank is the only source;
-            # an explicitly exported LOCAL_RANK (torchrun / ray launchers)
-            # stays authoritative.
             try:
                 overrides: dict[str, int] = {
                     "tp_rank": get_tp_group().rank_in_group
