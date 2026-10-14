@@ -52,3 +52,37 @@ def test_registration_distinguishes_physical_and_global_kv_heads():
         ]
         assert layout.num_head == physical_heads
         assert layout.num_kv_heads == global_heads
+
+
+def test_idle_connector_polls_detached_tasks():
+    manager = MagicMock()
+    connector = SimpleNamespace(
+        _sync_ctx=SimpleNamespace(is_sync_leader=True),
+        kv_manager=manager,
+        _launched_load_tids=[],
+    )
+    FlexKVConnector.drain_launched_loads(connector)
+    manager.try_wait.assert_called_once_with(task_ids=[])
+    manager.wait.assert_not_called()
+
+
+def test_legacy_cancel_prefetch_cancels_lookup_and_prefetch_tasks():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._chunked_prefetch = False
+    connector.kv_manager = MagicMock()
+    connector._sync_ctx = SimpleNamespace(is_sync_leader=True)
+    connector._pending_lookups = {"r": 11}
+    connector._pending_lookup_contexts = {}
+    connector._ongoing_prefetches = {"r": 22}
+    connector._prefetch_planned_tokens = {"r": 64}
+    connector._prefetch_loaded_tokens = {}
+    connector._prefetch_contexts = {}
+    connector._log_cache_op = MagicMock()
+
+    connector.cancel_prefetch("r")
+
+    assert [c.args[0] for c in connector.kv_manager.cancel.call_args_list] == [
+        [11],
+        [22],
+    ]
+    assert not connector._pending_lookups and not connector._ongoing_prefetches

@@ -1126,10 +1126,16 @@ class FlexKVConnector:
 
         return n, producer_id
 
-    def drain_launched_loads(self, threshold: int = 100) -> None:
+    def drain_launched_loads(self, threshold: int = 1) -> None:
         """Periodic non-blocking sweep on long-lived launched tasks so the
         FlexKV pipe doesn't accumulate. No-op on non-leader ranks."""
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
+            return
+        # Drive detached/cancelled prefetch completion even when no requests
+        # or stores remain. Otherwise the final graph can keep CPU blocks pinned
+        # until the next request happens to poll the engine.
+        if not self._launched_load_tids:
+            self.kv_manager.try_wait(task_ids=[])
             return
         if len(self._launched_load_tids) < threshold:
             return
@@ -1759,7 +1765,9 @@ class FlexKVConnector:
             self._prefetch_loaded_tokens.pop(rid, None)
             self.release_pending(rid)
             return
-        self._pending_lookups.pop(rid, None)
+        lookup_task = self._pending_lookups.pop(rid, None)
+        if lookup_task is not None and self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            self.kv_manager.cancel([lookup_task])
         lookup_context = getattr(self, "_pending_lookup_contexts", {}).pop(rid, None)
         if lookup_context is not None:
             lookup_context.operation = "load"
@@ -1769,9 +1777,11 @@ class FlexKVConnector:
                 "cancelled",
                 reason="caller_cancelled",
             )
-        # FlexKV doesn't currently support prefetch cancellation, but
-        # we still drop our tracking entry.
+        # Running tasks keep ownership until their graph drains (see
+        # KVTaskManager._cancel_task); unlaunched tasks roll back immediately.
         task_id = self._ongoing_prefetches.pop(rid, -1)
+        if task_id >= 0 and self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            self.kv_manager.cancel([task_id])
         self._prefetch_planned_tokens.pop(rid, None)
         self._prefetch_loaded_tokens.pop(rid, None)
         context = getattr(self, "_prefetch_contexts", {}).pop(rid, None)
@@ -1781,7 +1791,7 @@ class FlexKVConnector:
                 "complete",
                 "cancelled",
                 task_id=task_id,
-                reason="caller_cancelled_tracking",
+                reason="caller_cancelled",
             )
 
     # ------------------------------------------------------------------
