@@ -225,7 +225,8 @@ class KVServer:
                        cache_config: CacheConfig,
                        gpu_register_port: str,
                        server_recv_port: str) -> None:
-
+        from flexkv.common.numa import reset_inherited_numa_binding
+        reset_inherited_numa_binding("KVServer")
         server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
         server.run()
 
@@ -279,6 +280,8 @@ class KVServer:
                 import pickle
                 import sys
                 sys.path.insert(0, "{flexkv_root}")
+                from flexkv.common.numa import reset_inherited_numa_binding
+                reset_inherited_numa_binding("KVServer")
                 from flexkv.server.server import KVServer
 
                 args_data = {args_data!r}

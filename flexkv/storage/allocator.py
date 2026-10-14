@@ -1,4 +1,5 @@
 import ctypes
+import math
 import mmap
 import os
 import weakref
@@ -16,7 +17,90 @@ import torch
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
+from flexkv.common import numa as flexkv_numa
 import contextlib
+
+
+def _numa_block_bytes(layout: KVCacheLayout, dtype: torch.dtype) -> int:
+    """Bytes of one contiguous KV block, or 1 when blocks are not contiguous
+    (only BLOCKFIRST keeps a whole block in one address range).
+
+    Same derivation as the remote worker's ``HostSide.block_stride``, which
+    the Mooncake backend plans its MRs with, so both split the pool at the
+    same boundaries. Multi-group layouts already express the stride in bytes.
+    """
+    if layout.type != KVCacheLayoutType.BLOCKFIRST or layout.num_block <= 0:
+        return 1
+    stride = int(layout.get_block_stride())
+    return stride if layout.layer_groups is not None else stride * dtype.itemsize
+
+
+def _alloc_numa_spread_cpu_tensor(layout: KVCacheLayout,
+                                  dtype: torch.dtype) -> "torch.Tensor | None":
+    """Allocate the CPU pool as shared memory split into one mbind-ed region
+    per NUMA node (see ``flexkv.common.numa``). Returns None to fall back to
+    the legacy allocation.
+
+    Shared up front is also what the legacy path ends up with: passing a
+    private ``torch.empty`` tensor to a spawned worker makes torch copy it
+    into /dev/shm. Here there is no copy.
+
+    The pool is an empty memfd (shmem) whose per-region policy is set with
+    mbind *before* any page exists (shmem keeps that policy on the object),
+    then populated region by region with fallocate. ``_new_shared`` cannot be
+    used: it fallocates every page under the caller's task policy, and mbind
+    does not move existing pages. Populating here instead of leaving it to
+    first touch keeps the later cudaHostRegister / ibv_reg_mr as fast as the
+    legacy path (lazily faulting inside them measured ~3x slower).
+    """
+    nodes = flexkv_numa.get_spread_nodes()
+    if not nodes:
+        return None
+    num_elements = layout.get_total_elements()
+    nbytes = num_elements * dtype.itemsize
+    regions = flexkv_numa.plan_cpu_pool_numa_regions(
+        nbytes, _numa_block_bytes(layout, dtype), flexkv_numa.PAGE_SIZE, nodes)
+    if not regions:
+        return None
+    if not hasattr(torch.UntypedStorage, "_new_shared_fd_cpu") or \
+            not hasattr(os, "memfd_create"):
+        flexkv_logger.warning(
+            "[NUMA] torch/os lack fd-backed shared storage; CPU pool is NOT "
+            "spread over NUMA nodes")
+        return None
+
+    fd = os.memfd_create("flexkv_cpu_kv_pool", os.MFD_CLOEXEC)
+    try:
+        os.ftruncate(fd, nbytes)
+        mm = mmap.mmap(fd, nbytes, flags=mmap.MAP_SHARED,
+                       prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        try:
+            tmp = (ctypes.c_char * 1).from_buffer(mm)
+            ok = flexkv_numa.bind_cpu_pool(
+                ctypes.addressof(tmp), regions, nbytes, "CPUAllocator")
+            del tmp
+        finally:
+            mm.close()
+        if not ok:
+            return None
+        populate_s = flexkv_numa.populate_shmem_fd(fd, regions, nbytes)
+        # torch dups the fd; it owns the mapping from here on.
+        storage = torch.UntypedStorage._new_shared_fd_cpu(fd, nbytes)
+    except Exception as e:  # noqa: BLE001
+        flexkv_logger.warning(
+            f"[NUMA] NUMA-spread CPU pool allocation failed ({e}); falling back "
+            "to the legacy (non-spread) allocation")
+        return None
+    finally:
+        os.close(fd)
+    base = storage.data_ptr()
+    tensor = torch.empty(0, dtype=torch.uint8).set_(storage, 0, (nbytes,), (1,))
+    tensor = tensor.view(dtype)
+    flexkv_logger.info(
+        f"[NUMA] CPU pool {nbytes / 1024**3:.2f} GB spread over nodes "
+        f"{list(nodes)} (populated in {populate_s:.1f}s): "
+        f"{flexkv_numa.describe_cpu_pool_placement(base, regions)}")
+    return tensor
 
 
 class BaseStorageAllocator(ABC):
@@ -103,12 +187,14 @@ class CPUAllocator(BaseStorageAllocator):
         total_size = layout.get_total_elements()
         # although the kv layout may have multiple dimensions, we only have one-dim CPU tensor
         flexkv_logger.info(f"CPU allocate total_size: {dtype.itemsize * total_size/1024/1024/1024} GB")
-        physical_tensor = torch.empty(
-                            size=(total_size,),
-                            dtype=dtype,
-                            device="cpu",
-                            pin_memory=False,
-                        )
+        physical_tensor = _alloc_numa_spread_cpu_tensor(layout, dtype)
+        if physical_tensor is None:
+            physical_tensor = torch.empty(
+                                size=(total_size,),
+                                dtype=dtype,
+                                device="cpu",
+                                pin_memory=False,
+                            )
         return StorageHandle(
             handle_type=AccessHandleType.TENSOR,
             data=physical_tensor,
@@ -597,6 +683,59 @@ def free_hugepage_tensor(tensor: torch.Tensor) -> None:
     mapping.finalizer()
 
 
+def _free_hugepages_per_node(page_size_bytes: int, nodes) -> Dict[int, int]:
+    out: Dict[int, int] = {}
+    for n in nodes:
+        path = (f"/sys/devices/system/node/node{n}/hugepages/"
+                f"hugepages-{page_size_bytes // 1024}kB/free_hugepages")
+        try:
+            with open(path) as f:
+                out[n] = int(f.read().strip())
+        except (OSError, ValueError):
+            out[n] = -1
+    return out
+
+
+def _spread_hugepage_pool_over_numa(tensor: torch.Tensor,
+                                    layout: KVCacheLayout,
+                                    dtype: torch.dtype,
+                                    page_size_bytes: int) -> None:
+    """mbind a freshly mapped (still unpopulated) shareable HugePage pool per
+    NUMA region and prefault it here, Mooncake-style.
+
+    hugetlbfs keeps the mbind policy on this process's VMA only, so the pages
+    must be faulted through it before any worker maps the file.
+    """
+    nodes = flexkv_numa.get_spread_nodes()
+    if not nodes:
+        return
+    mapping = _live_hugepage_mappings.get(tensor.data_ptr())
+    if mapping is None:
+        return
+    logical = tensor.numel() * tensor.element_size()
+    page_align = math.lcm(page_size_bytes, _shareable_mapping_alignment(page_size_bytes))
+    regions = flexkv_numa.plan_cpu_pool_numa_regions(
+        logical, _numa_block_bytes(layout, dtype), page_align, nodes)
+    if not regions:
+        return
+    base = tensor.data_ptr()
+    free = _free_hugepages_per_node(page_size_bytes, nodes)
+    for i, (off, length, node) in enumerate(regions):
+        if i == len(regions) - 1:
+            length = mapping.aligned - off
+        need = (length + page_size_bytes - 1) // page_size_bytes
+        if 0 <= free[node] < need:
+            flexkv_logger.warning(
+                f"[NUMA] node {node} has {free[node]} free HugePages but its "
+                f"region needs {need}; the excess spills to other nodes")
+    if not flexkv_numa.bind_cpu_pool(base, regions, mapping.aligned, "HugePageAllocator"):
+        return
+    flexkv_numa.prefault_cpu_pool(base, regions, mapping.aligned, page_size_bytes)
+    flexkv_logger.info(
+        f"[NUMA] HugePage CPU pool {mapping.aligned / 1024**3:.2f} GB spread over "
+        f"nodes {list(nodes)}: {flexkv_numa.describe_cpu_pool_placement(base, regions)}")
+
+
 class HugePageAllocator(BaseStorageAllocator):
     """CPU KV-cache allocator backed by hugetlbfs HugePages.
 
@@ -650,6 +789,7 @@ class HugePageAllocator(BaseStorageAllocator):
                 f"HugePage allocation failed ({e}); falling back to regular CPU memory."
             )
             return CPUAllocator.allocate(layout, dtype, **kwargs)
+        _spread_hugepage_pool_over_numa(physical_tensor, layout, dtype, page_size_bytes)
         worker_data = get_worker_hugepage_handle(physical_tensor, total_elements, dtype)
         return StorageHandle(
             handle_type=AccessHandleType.TENSOR,

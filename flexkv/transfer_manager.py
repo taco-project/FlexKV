@@ -28,6 +28,7 @@ from flexkv.common.config import (
     recompute_cache_block_counts, GLOBAL_CONFIG_FROM_ENV,
 )
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.numa import reset_inherited_numa_binding
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.pool import PoolId
 from flexkv.common.transfer import DeviceType
@@ -1088,6 +1089,10 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         ready_event,
                         start_event,
                         error_conn) -> None:
+        # This process allocates the shared CPU KV pool for all GPUs and spawns
+        # the transfer workers; drop the launcher's (GPU0) NUMA binding first.
+        reset_inherited_numa_binding("TransferManager")
+
         # multiprocessing.Process owns its children's exit status. A generic
         # waitpid(-1) handler can steal that status and leave join() hanging.
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)

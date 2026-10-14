@@ -55,7 +55,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
+from flexkv.common import numa
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.numa import (
+    plan_cpu_pool_numa_regions,
+    query_page_nodes,
+    touch_pages,
+)
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferType
 from flexkv.transfer.geometry import EdgeGeometry, HostSide
@@ -989,27 +995,60 @@ class MooncakeStoreBackend(StorageBackend):
         # >= the logical pool. Only a HugePage handle knows it; a plain tensor
         # pool maps exactly what it holds.
         mapped_size = cpu.mapped_size
-        if mapped_size is None:
-            return [(base_ptr, logical_size)]
-
         hugepage_size = int(self.cache_config.hugepage_size_bytes)
         size_alignment = int(os.getenv(
             "FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES", str(hugepage_size)))
-        regions = _split_mooncake_registration_regions(
-            base_ptr=base_ptr,
-            logical_size=logical_size,
-            mapped_size=int(mapped_size),
-            block_size=self.block_size_bytes,
-            max_mr_size=int(self.cache_config.mooncake_max_mr_size_bytes),
-            size_alignment=size_alignment,
-            pointer_alignment=hugepage_size,
-            mr_split_policy=self.cache_config.mooncake_mr_split_policy,
+
+        # One MR per NUMA region of the pool (same plan the allocator used,
+        # see flexkv.common.numa). Mooncake labels each MR with the node of its
+        # first page, so every region is served by NICs local to its node.
+        numa_regions = plan_cpu_pool_numa_regions(
+            logical_size,
+            self.block_size_bytes,
+            numa.PAGE_SIZE if mapped_size is None
+            else math.lcm(hugepage_size, size_alignment),
         )
+        if not numa_regions:
+            numa_regions = [(0, logical_size, -1)]
+        total_mapped = logical_size if mapped_size is None else int(mapped_size)
+
+        regions: List[Tuple[int, int]] = []
+        for i, (off, length, _node) in enumerate(numa_regions):
+            is_last = i == len(numa_regions) - 1
+            region_mapped = total_mapped - off if is_last else length
+            if mapped_size is None:
+                regions.append((base_ptr + off, region_mapped))
+                continue
+            regions.extend(_split_mooncake_registration_regions(
+                base_ptr=base_ptr + off,
+                logical_size=length,
+                mapped_size=region_mapped,
+                block_size=self.block_size_bytes,
+                max_mr_size=int(self.cache_config.mooncake_max_mr_size_bytes),
+                size_alignment=size_alignment,
+                pointer_alignment=hugepage_size,
+                mr_split_policy=self.cache_config.mooncake_mr_split_policy,
+            ))
+
+        locations = ["*"] * len(regions)
+        if len(numa_regions) > 1:
+            # Mooncake resolves an MR's location from its first page, which
+            # must therefore be mapped in this process (an unmapped page reads
+            # as "*"). touch_pages only reads, so it never races with writers.
+            starts = [ptr for ptr, _ in regions]
+            touch_pages(starts)
+            try:
+                locations = [f"cpu:{s}" if s >= 0 else "*"
+                             for s in query_page_nodes(starts)]
+            except OSError as e:
+                flexkv_logger.warning(
+                    f"[MooncakeStoreBackend] cannot query MR NUMA nodes: {e}")
         flexkv_logger.info(
             "[MooncakeStoreBackend] registering external MRs: "
             f"logical_size={logical_size} mapped_size={mapped_size} "
             f"mr_split_policy={self.cache_config.mooncake_mr_split_policy} "
-            f"regions={regions}")
+            f"numa_regions={numa_regions} "
+            f"regions={[(hex(p), s, loc) for (p, s), loc in zip(regions, locations)]}")
         return regions
 
     def shutdown(self) -> None:

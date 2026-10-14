@@ -132,6 +132,33 @@ swa_multi_group: false
 
 ---
 
+### CPU KV 池 NUMA 分布
+
+> 注：该配置只能通过环境变量设置
+
+FlexKV 的 KVServer 由 `dp_client_id == 0` 的调用方拉起（例如 SGLang 中 GPU0 的 scheduler），所有 GPU 共用的 CPU KV 池在它派生的 TransferManager 进程中分配。Linux 的内存策略（mempolicy）和 CPU 亲和性会随 fork/exec 继承；当推理引擎把每个 rank 绑到所在 GPU 的 NUMA 节点时（如 SGLang 默认的 `SGLANG_AUTO_NUMA_BIND=1`，即 `numactl --cpunodebind=N --membind=N`），整个 CPU KV 池都会落到 GPU0 所在节点，经 Mooncake 的 RDMA 传输也只走该节点的网卡。
+
+开启后（默认关闭，需设置 `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`）FlexKV 参照 Mooncake 的 `allocate_buffer_numa_segments`：
+
+1. KVServer / TransferManager 启动时丢弃继承的绑定：CPU 亲和性重置为所有参与节点的 CPU，进程内存策略改为在这些节点间 interleave。
+2. CPU KV 池（含 SWA 池）按节点数切成连续的若干段，每段对应一个节点，并用 `mbind(MPOL_PREFERRED)` 设到该节点。段边界同时对齐 KV block 和页（HugePage 时还对齐 `FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES`），不会有 block 跨段。
+   - 默认内存：池子是一个 memfd（shmem）。先 `mbind` 设好段策略，再在 TransferManager 中每段用该节点的 CPU 并行 `fallocate` 预分配，日志中会打印 `populated in Xs`。如果不预分配，就要等 16 个 worker 的 `cudaHostRegister` 和 Mooncake 的 `ibv_reg_mr` 并发触发缺页，实测注册会慢约 3 倍。同时也省掉了旧路径里 torch 把私有 tensor 拷进 `/dev/shm` 的那一次全量拷贝。
+   - HugePage（`FLEXKV_USE_HUGEPAGE_CPU_BUFFER=1`）：hugetlbfs 的 mbind 只对当前 VMA 生效，因此会在 TransferManager 中先用各节点本地的线程预分配全部大页（与 Mooncake 相同）。若某节点空闲大页不足会打印告警，超出部分溢出到其他节点。
+3. Mooncake Store 后端按段分别注册 MR（每段内部仍遵循 `FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES` / `FLEXKV_MOONCAKE_MR_SPLIT_POLICY`）。Mooncake 依据每个 MR 首页所在节点把它标记为 `cpu:N`，因此每一段的 RDMA 读写都会选用该节点的本地网卡。
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD` | int | 0 | 只接受 `0` / `1`，其他值启动时报错。`1`：开启上述 NUMA 分布（重置继承的绑定、CPU 池按节点分段、Mooncake MR 按段注册）。`0`：保持旧行为，内存跟随启动进程的绑定 |
+| `FLEXKV_NUMA_NODES` | str | 未设置 | 参与分布的节点列表，例如 `0,1` 或 `0-3`，会与进程的 `Mems_allowed` 取交集。未设置时使用 `Mems_allowed` 中所有带 CPU 的节点（不含仅有内存的 CXL/HBM 节点）。可用节点少于 2 个时不做任何处理 |
+
+说明：
+
+- 以下情况会打印告警并退回为不分段：容器禁止 `mbind` / `set_mempolicy`（Docker 需 `--cap-add SYS_NICE`），或 `lcm(block 大小, 页/映射对齐)` 太大、无法均匀切分。注意退回后**不等同于** `0`：KVServer / TransferManager 继承的绑定此时已被重置（CPU 亲和性扩展到所有参与节点；`set_mempolicy` 成功时内存策略为 interleave），CPU 池按重置后的策略分配，而不是跟随启动进程的绑定。需要完全的旧行为请设为 `0`。
+- 日志关键字：`[NUMA][TransferManager] ... reset inherited binding`、`[NUMA] CPU pool ... spread over nodes`，以及 `[MooncakeStoreBackend] registering external MRs: ... regions=[(ptr, size, 'cpu:0'), (ptr, size, 'cpu:1')]`。运行时可用 `numastat -p <TransferManager pid>` 或 `numastat -m` 确认各节点的 Shmem/HugePages 占用。
+- 由于 CPU 池被所有 GPU 共享，同一个 block 可能被任意 GPU 读写，H2D/D2H 仍会有约一半流量跨 NUMA；本功能保证的是内存容量和 RDMA 网卡负载在节点间均衡。
+
+---
+
 ### SSD I/O优化
 
 > 注：`iouring_entries`设置为0即禁用iouring，不推荐设置为0。
