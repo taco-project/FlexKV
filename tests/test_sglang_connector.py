@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+import flexkv.integration.sglang.connector as connector_module
 from flexkv.integration.sglang.comm import FlexKVScatterChannel
 from flexkv.integration.sglang.connector import FlexKVConnector
 
@@ -57,16 +58,46 @@ def test_registration_distinguishes_physical_and_global_kv_heads():
         assert layout.num_kv_heads == global_heads
 
 
-def test_idle_connector_polls_detached_tasks():
-    manager = MagicMock()
-    connector = SimpleNamespace(
+def _idle_connector(chunked_prefetch):
+    return SimpleNamespace(
         _sync_ctx=SimpleNamespace(is_sync_leader=True),
-        kv_manager=manager,
+        kv_manager=MagicMock(),
         _launched_load_tids=[],
+        _chunked_prefetch=chunked_prefetch,
     )
+
+
+def test_idle_connector_polls_detached_tasks():
+    connector = _idle_connector(chunked_prefetch=False)
     FlexKVConnector.drain_launched_loads(connector)
-    manager.try_wait.assert_called_once_with(task_ids=[])
-    manager.wait.assert_not_called()
+    connector.kv_manager.try_wait.assert_called_once_with(task_ids=[])
+    connector.kv_manager.wait.assert_not_called()
+
+
+def test_idle_connector_rate_limits_engine_nudges(monkeypatch):
+    connector = _idle_connector(chunked_prefetch=False)
+    now = [100.0]
+    monkeypatch.setattr(connector_module.time, "monotonic", lambda: now[0])
+
+    for _ in range(1000):
+        FlexKVConnector.drain_launched_loads(connector)
+    assert connector.kv_manager.try_wait.call_count == 1
+
+    now[0] += connector_module._IDLE_DRIVE_INTERVAL_S * 0.5
+    FlexKVConnector.drain_launched_loads(connector)
+    assert connector.kv_manager.try_wait.call_count == 1
+
+    now[0] += connector_module._IDLE_DRIVE_INTERVAL_S
+    FlexKVConnector.drain_launched_loads(connector)
+    assert connector.kv_manager.try_wait.call_count == 2
+
+
+def test_idle_chunked_connector_leaves_draining_to_task_runtime():
+    connector = _idle_connector(chunked_prefetch=True)
+    for _ in range(10):
+        FlexKVConnector.drain_launched_loads(connector)
+    connector.kv_manager.try_wait.assert_not_called()
+    connector.kv_manager.wait.assert_not_called()
 
 
 def test_single_launched_load_is_polled_until_fully_complete():

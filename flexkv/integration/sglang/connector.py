@@ -79,6 +79,8 @@ logger = logging.getLogger(__name__)
 _SGLANG_REQ_ID_UNSET = object()
 _INFO_STATUSES = {"hit", "miss", "skipped", "success"}
 _WARNING_STATUSES = {"cancelled", "failed", "missing", "not_found", "timeout"}
+# Minimum gap between idle engine nudges in non-chunked mode (seconds).
+_IDLE_DRIVE_INTERVAL_S = 0.1
 
 
 @dataclass
@@ -1132,11 +1134,19 @@ class FlexKVConnector:
         FlexKV pipe doesn't accumulate. No-op on non-leader ranks."""
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
             return
-        # Drive detached/cancelled prefetch completion even when no requests
-        # or stores remain. Otherwise the final graph can keep CPU blocks pinned
-        # until the next request happens to poll the engine.
         if not self._launched_load_tids:
-            self.kv_manager.try_wait(task_ids=[])
+            # Without chunked prefetch the engine only advances when a client
+            # polls it, so a cancelled graph would keep its CPU blocks pinned
+            # until the next request arrives. Nudge it at a bounded rate: the
+            # scheduler calls this every idle tick, which would otherwise be
+            # thousands of synchronous RPCs per second. Chunked prefetch runs
+            # the TaskRuntime thread, which already drains graphs on its own.
+            if not getattr(self, "_chunked_prefetch", False):
+                now = time.monotonic()
+                last = getattr(self, "_last_idle_drive_ts", None)
+                if last is None or now - last >= _IDLE_DRIVE_INTERVAL_S:
+                    self._last_idle_drive_ts = now
+                    self.kv_manager.try_wait(task_ids=[])
             return
         if len(self._launched_load_tids) < threshold:
             return
