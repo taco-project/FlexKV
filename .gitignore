@@ -91,3 +91,5 @@ ssd_cache*/
 benchmarks/nvcomp_benchmarks/inputs
 benchmarks/nvcomp_benchmarks/runs
 uv.lock
+
+.mooncake-build/
