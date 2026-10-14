@@ -1007,6 +1007,7 @@ class UserConfig:
     # path. None is intentionally distinct from False so old configs default
     # to the correctness-preserving state restore path.
     swa_multi_group: Optional[bool] = None
+    swa: Optional[Dict[str, int]] = None
 
     enable_chunked_prefetch: bool = False
     prefetch_options: Optional[Dict[str, Any]] = None

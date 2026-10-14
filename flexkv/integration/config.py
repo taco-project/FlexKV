@@ -800,6 +800,11 @@ class FlexKVConfig:
                     bytes_per_token_per_layer=swa_bytes_per_token,
                     window_blocks=1,
                 )
+            swa_config = self.cache_config.swa
+            capacities = self.user_config.swa or {}
+            swa_config.num_slots = capacities.get("num_cpu_slots", swa_config.num_slots)
+            swa_config.num_ssd_slots = capacities.get("num_ssd_slots", swa_config.num_ssd_slots)
+            swa_config.num_remote_slots = capacities.get("num_remote_slots", swa_config.num_remote_slots)
             # Gate the SWA data plane (byte movement) behind an env switch so it
             # can be turned off for A/B or if a byte-layout issue surfaces in
             # production, degrading cleanly to full-KV-only (all build_*_chain
@@ -812,7 +817,9 @@ class FlexKVConfig:
                 f"num_swa_layers={self.model_config.num_layers}, "
                 f"bytes_per_token_per_layer="
                 f"{self.cache_config.swa.bytes_per_token_per_layer} (padded), "
-                f"num_slots={self.cache_config.swa.num_slots}, "
+                f"num_cpu_slots={self.cache_config.swa.num_slots}, "
+                f"num_ssd_slots={self.cache_config.swa.num_ssd_slots}, "
+                f"num_remote_slots={self.cache_config.swa.num_remote_slots}, "
                 f"enable_swa_transfer={self.cache_config.enable_swa_transfer}"
             )
 

@@ -8,6 +8,8 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 ## Updates
 
+- **2026 年 10 月 9 日**：FlexKV 完成 DeepSeek-V4.1 适配（[#303](https://github.com/taco-project/FlexKV/pull/303)），已合入 `main`。配套 SGLang 适配尚未合入官方主干；在 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 合入前，请拉取该 PR 并固定到最新 commit。部署使用当前 FlexKV `main`。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)。
+
 - **2026 年 7–8 月**：传输性能与可运维性全面增强，包括 [GPU↔CPU 自适应多路径传输](https://github.com/taco-project/FlexKV/pull/203)、[可靠性与运行日志增强](https://github.com/taco-project/FlexKV/pull/233)、[优雅退出](https://github.com/taco-project/FlexKV/pull/238)、[分块注册 Host Memory](https://github.com/taco-project/FlexKV/pull/240)、[SSD 向量化 I/O](https://github.com/taco-project/FlexKV/pull/242) 和 [Op 级传输 Trace](https://github.com/taco-project/FlexKV/pull/247)。
 
 - **2026 年 7 月 24 日**：支持将 [Mooncake Store](https://github.com/kvcache-ai/Mooncake) 作为基于 Key 的远端缓存层（[#231](https://github.com/taco-project/FlexKV/pull/231)），通过零拷贝 RDMA 实现集群级 KV 复用，并支持 DeepSeek-V4 的 SWA/state sidecar。
@@ -52,6 +54,7 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 针对 SGLang:
 - SGLang `v0.5.16` 及以上版本已原生内置 FlexKV backend，无需再应用 patch（[sglang#29701](https://github.com/sgl-project/sglang/pull/29701)）
 - 支持 DeepSeek-V4 异构 C4/C128/indexer KV group、FullKV + SWA 双缓存、compress-state sidecar 和逐层恢复（[#225](https://github.com/taco-project/FlexKV/pull/225)）。在配套的 SGLang 适配合入前，请使用 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 并固定到 [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac)。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)
+- 支持 DeepSeek-V4.1（[#303](https://github.com/taco-project/FlexKV/pull/303)），FlexKV 使用当前 `main`。配套 SGLang 适配尚未合入官方主干；在 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 合入前，请拉取该 PR 并固定到最新 commit。该 commit 与 V4 使用的 `ee0465a` 不同。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)
 
 针对 TensorRT-LLM
 - 在 TensorRT-LLM 上支持使用 FlexKV ([#48](https://github.com/taco-project/FlexKV/pull/48))
