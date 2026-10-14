@@ -97,6 +97,7 @@ class TransferManager:
 
         self.transfer_engine: Optional[TransferEngine] = None
         self.storage_engine: Optional[StorageEngine] = None
+        self._radix_client = None
         flexkv_logger.info(f"Initialized TransferManager with config successfully, "
                            f"instance_num={self.instance_num}, expected_gpus={self.expected_gpus}")
 
@@ -426,11 +427,22 @@ class TransferManager:
         # KVManager; this path covers late discovery at GPU registration.
         recompute_cache_block_counts(self.model_config, self.cache_config)
 
+        radix_client = None
+        if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
+            from flexkv.server.shm_radix_bootstrap import (adopt_geometry, attach_radix_client,
+                                                           check_geometry, expected_geometry)
+            geometry = expected_geometry(self.model_config, self.cache_config)
+            radix_client = attach_radix_client(geometry=geometry, attach_index=True,
+                                               label="TransferManager")
+            check_geometry(radix_client, geometry, label="TransferManager")
+            adopt_geometry(self.cache_config, radix_client, label="TransferManager")
+            self._radix_client = radix_client
         self.storage_engine = StorageEngine(
             self.model_config,
             self.cache_config,
             num_layers_per_pp_stage,
             swa_layer_groups=self.swa_layer_groups,
+            radix_client=radix_client,
         )
 
         # Logical registration identity is separate from the CUDA device ID.
@@ -577,6 +589,10 @@ class TransferManager:
         # initialized manager must be safe to shut down.
         if getattr(self, 'transfer_engine', None) is not None:
             self.transfer_engine.shutdown()
+        if getattr(self, '_radix_client', None) is not None:
+            self.storage_engine = None
+            self._radix_client.close()
+            self._radix_client = None
 
 class TransferManagerOnRemote(TransferManager):
     """
