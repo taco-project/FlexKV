@@ -931,22 +931,18 @@ class FlexKVWorkerConnector:
         if self.enable_layerwise_transfer:
             self._start_layerwise_eventfd_sender(tuple(main_kv_caches))
 
-        # Build main KV cache layout.
-        #
-        # kv_dim / num_kv_heads are derived from the physical GPU tensor shape
-        # (the ground truth at registration time). The ModelConfig values set
-        # during post_init (from the framework's predicted cache_shape) are used
-        # only as a cross-check.
-        #   3D tensor      -> MLA       : kv_dim=1, num_kv_heads=1
-        #   4D tensor      -> packed MHA: kv_dim=1, num_kv_heads=H (per-rank)
-        #   5D tensor      -> plain MHA : kv_dim=2, num_kv_heads=H (per-rank)
+        # Build main KV cache layout. Match SGLang:
+        #   num_head     = physical heads on this rank's GPU tensor
+        #   num_kv_heads = model-wide heads (1 = KV shared across TP / MLA)
+        # Packed GQA after TP can have physical_num_heads_per_rank == 1 while
+        # model_config.num_kv_heads == tp; that is not MLA.
         gpu_blocks = list(main_kv_caches.values())
         num_layer = len(main_kv_caches)
         if gpu_blocks[0].ndim == 3:
             gpu_layout_type = KVCacheLayoutType.LAYERFIRST
             num_blocks = gpu_blocks[0].shape[0]
             block_size = gpu_blocks[0].shape[1]
-            num_kv_heads = 1
+            physical_num_heads_per_rank = 1
             head_size = gpu_blocks[0].shape[2]
             kv_dim = 1
         elif gpu_blocks[0].ndim == 4:
@@ -967,7 +963,7 @@ class FlexKVWorkerConnector:
             # tensor's physical NHD order.
             gpu_layout_type = KVCacheLayoutType.LAYERFIRST
             num_blocks = gpu_blocks[0].shape[0]
-            num_kv_heads = gpu_blocks[0].shape[1]
+            physical_num_heads_per_rank = gpu_blocks[0].shape[1]
             block_size = gpu_blocks[0].shape[2]
             head_size = gpu_blocks[0].shape[3]
             kv_dim = 1
@@ -989,7 +985,7 @@ class FlexKVWorkerConnector:
                 raise ValueError(
                     f"cannot infer non-MLA kv layout from shape={tuple(gpu_blocks[0].shape)}")
             block_size = gpu_blocks[0].shape[2]
-            num_kv_heads = gpu_blocks[0].shape[3]
+            physical_num_heads_per_rank = gpu_blocks[0].shape[3]
             head_size = gpu_blocks[0].shape[4]
             kv_dim = 2
         gpu_layout = KVCacheLayout(
@@ -997,10 +993,10 @@ class FlexKVWorkerConnector:
             num_layer=num_layer,
             num_block=num_blocks,
             tokens_per_block=block_size,
-            num_head=num_kv_heads,
+            num_head=physical_num_heads_per_rank,
             head_size=head_size,
             kv_dim=kv_dim,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=self.flexkv_config.model_config.num_kv_heads,
         )
 
         if not indexer_kv_caches:
@@ -1030,7 +1026,7 @@ class FlexKVWorkerConnector:
             layer_groups = [
                 LayerGroupSpec(
                     num_layers=num_layer,
-                    num_kv_heads=num_kv_heads,
+                    num_kv_heads=physical_num_heads_per_rank,
                     head_size=head_size,
                     layer_indices=list(range(num_layer)),
                     dtype=gpu_blocks[0].dtype,
