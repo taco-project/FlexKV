@@ -22,7 +22,7 @@ from flexkv.common.config import (
     is_multi_group,
 )
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.storage import KVCacheLayout
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferType
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 from flexkv.transfer.backends import StorageBackend
@@ -82,7 +82,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  cache_config: CacheConfig,
                  compressor: Optional[CompressionStrategy] = None,
                  layer_groups: Optional[List[LayerGroupSpec]] = None,
-                 backend: Optional[StorageBackend] = None):
+                 backend: Optional[StorageBackend] = None,
+                 tp_group_size: int = 1):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         self._pin_op_buffer()
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
@@ -92,6 +93,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
 
         self.num_layers = cpu_kv_layout.num_layer
         self.num_cpu_blocks = cpu_kv_layout.num_block
+        self.tp_group_size = tp_group_size
         self.round_robin = 1
 
         self.dtype = dtype
@@ -243,6 +245,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         layer_end: int,
         num_threads: int,
     ) -> None:
+        """Copy logical layers across the TP slices of BLOCKFIRST storage."""
         cpu_base_ptr = self.cpu_layer_ptrs[0].item()
         if self.has_multi_group:
             # CPU and SSD share an identical per-block byte layout in multi-group
@@ -277,26 +280,36 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                 ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
             )
             return
-        layer_id_list = torch.arange(layer_id, layer_end, dtype=torch.int32)
-        transfer_kv_blocks_ssd(
-            self.ioctx,
-            layer_id_list,
-            cpu_base_ptr,
-            ssd_block_ids,
-            cpu_block_ids,
-            self.cpu_layer_stride_in_bytes,
-            self.cpu_kv_stride_in_bytes,
-            self.ssd_layer_stride_in_bytes,
-            self.ssd_kv_stride_in_bytes,
-            self.chunk_size_in_bytes,
-            self.block_stride_in_bytes,
-            is_read,
-            self.num_blocks_per_file,
-            self.round_robin,
-            num_threads,
-            self.kv_dim,
-            ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
-        )
+        tp_slices = 1
+        if (self.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST
+                and self.num_kv_heads > 1
+                and layer_end - layer_id < self.num_layers):
+            tp_slices = self.tp_group_size
+        for tp_rank in range(tp_slices):
+            layer_offset = tp_rank * self.num_layers
+            layer_id_list = torch.arange(
+                layer_offset + layer_id, layer_offset + layer_end,
+                dtype=torch.int32,
+            )
+            transfer_kv_blocks_ssd(
+                self.ioctx,
+                layer_id_list,
+                cpu_base_ptr,
+                ssd_block_ids,
+                cpu_block_ids,
+                self.cpu_layer_stride_in_bytes // tp_slices,
+                self.cpu_kv_stride_in_bytes // tp_slices,
+                self.ssd_layer_stride_in_bytes // tp_slices,
+                self.ssd_kv_stride_in_bytes // tp_slices,
+                self.chunk_size_in_bytes // tp_slices,
+                self.block_stride_in_bytes,
+                is_read,
+                self.num_blocks_per_file,
+                self.round_robin,
+                num_threads,
+                self.kv_dim,
+                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
+            )
 
     def _transfer_impl(
         self,
