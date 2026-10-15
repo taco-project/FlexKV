@@ -452,7 +452,7 @@ class FlexKVConfig:
         # Combined-KV models (3D, kv_dim=1) use a single head shared across
         # ranks; multi-head backends (packed/plain MHA) scale by tp_size so
         # the CPU/SSD layout holds one contiguous slice per TP rank.
-        if kv_dim != 1 or physical_num_heads_per_rank != 1:
+        if len(cache_shape) != 3:
             self.model_config.num_kv_heads *= self.model_config.tp_size
         self.model_config.head_size = physical_head_size
         self.model_config.kv_dim = kv_dim
@@ -469,7 +469,7 @@ class FlexKVConfig:
         kv_cache_config: "KVCacheConfig",
     ) -> None:
         """Populate the packed storage layout from vLLM resolved KV specs."""
-        from vllm.v1.kv_cache_interface import AttentionSpec, iter_layer_specs
+        from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec, iter_layer_specs
 
         layouts = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -507,6 +507,7 @@ class FlexKVConfig:
                         spec.state_content_size_bytes // element_size,
                         spec.dtype,
                         spec.block_size,
+                        isinstance(spec, MLAAttentionSpec),
                     )
                 )
 
@@ -516,9 +517,7 @@ class FlexKVConfig:
                 f"got {sorted(map(str, layouts))}"
             )
 
-        physical_num_heads_per_rank, physical_head_size, dtype, block_size = (
-            layouts.pop()
-        )
+        physical_num_heads_per_rank, physical_head_size, dtype, block_size, kv_shared_across_ranks = layouts.pop()
         if block_size != self.cache_config.tokens_per_block:
             raise ValueError(
                 "vLLM KV spec block size disagrees with cache config: "
@@ -531,7 +530,7 @@ class FlexKVConfig:
             )
 
         self.model_config.num_kv_heads = physical_num_heads_per_rank
-        if physical_num_heads_per_rank != 1:
+        if not kv_shared_across_ranks:
             self.model_config.num_kv_heads *= self.model_config.tp_size
         self.model_config.head_size = physical_head_size
         # vLLM standardized [B, H, N, C] layout packs K/V in C.
