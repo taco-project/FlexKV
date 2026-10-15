@@ -219,10 +219,27 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
-        # Bind primary GPU + pin op buffer before any CUDA IPC import.
+        if completion is None:
+            # No socket means the caller cannot possibly be asking for
+            # PER_LAYER -- it has nothing to post to. Honouring the env
+            # default here would make every plain H2D/D2H worker raise below,
+            # which is an inverted default: the callers that omit the argument
+            # are exactly the callers that cannot satisfy it.
+            completion = (
+                GLOBAL_CONFIG_FROM_ENV.layerwise_completion_contract
+                if layerwise_eventfd_socket is not None
+                else CompletionContract.WHOLE
+            )
+        if isinstance(completion, str):
+            completion = CompletionContract.from_str(completion)
+        # Bind primary GPU before any CUDA IPC import or host registration.
         if gpu_blocks and gpu_blocks[0]:
             self._ensure_cuda_device(gpu_blocks[0][0].device)
-        self._pin_op_buffer()
+        # Layerwise IDs are staged separately; only whole-op workers consume
+        # shared slots. Preserve their registration on the primary GPU before
+        # importing IPC handles that may switch the current device.
+        if not completion.needs_eventfd:
+            self._pin_op_buffer()
         # Handle tensor import for multi-process case — set_device per GPU first.
         imported_gpu_blocks = []
         for handles_in_one_gpu in gpu_blocks:
@@ -601,7 +618,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
     def _init_completion(
         self,
-        completion: Union[str, "CompletionContract", None],
+        completion: CompletionContract,
         layerwise_eventfd_socket: Optional[str],
         tp_group_size: int,
     ) -> None:
@@ -614,19 +631,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         is told once at the end (WHOLE) or once per original layer (PER_LAYER),
         and PER_LAYER needs its eventfds, which is the handshake below.
         """
-        if completion is None:
-            # No socket means the caller cannot possibly be asking for
-            # PER_LAYER -- it has nothing to post to. Honouring the env
-            # default here would make every plain H2D/D2H worker raise below,
-            # which is an inverted default: the callers that omit the argument
-            # are exactly the callers that cannot satisfy it.
-            completion = (
-                GLOBAL_CONFIG_FROM_ENV.layerwise_completion_contract
-                if layerwise_eventfd_socket is not None
-                else CompletionContract.WHOLE
-            )
-        if isinstance(completion, str):
-            completion = CompletionContract.from_str(completion)
         self._completion = completion
         self._layer_milestones = self._build_layer_milestones()
         # One plan per shape, keyed on whether the op carries SWA blocks.
@@ -1352,6 +1356,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         if isinstance(transfer_op, WorkerLayerwiseTransferOp):
             return self._launch_layerwise(transfer_op)
+        # Keep the unified worker safe if a whole-op transfer is sent to a
+        # PER_LAYER instance. Register before exposing shared-slot ID views;
+        # direct-ID inputs are independently pinned by get_transfer_block_ids.
+        if (transfer_op.src_slot_id >= 0 or transfer_op.dst_slot_id >= 0) and not self._op_buffer_pinned:
+            self._ensure_cuda_device(self._device_ids[0])
+            self._pin_op_buffer()
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
         pool = self._pool_for(transfer_op)
         if self._is_per_group(pool):
