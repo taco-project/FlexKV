@@ -124,9 +124,7 @@ class GDSTransferWorker(TransferWorkerBase):
 
         self.dtype = dtype
         self.kv_dim = gpu_kv_layouts[0].kv_dim
-        # Same as GPUCPUTransferWorker: addressing mode follows host/SSD
-        # heads, not the per-rank GPU tensor (GQA 1-head-per-rank).
-        self.num_kv_heads = ssd_kv_layout.num_kv_heads
+        self.num_kv_heads = gpu_kv_layouts[0].num_kv_heads
         self.num_gpus = len(self.gpu_blocks)
         self.tp_group_size = tp_group_size
         self.has_multi_group = layer_groups is not None
@@ -144,7 +142,7 @@ class GDSTransferWorker(TransferWorkerBase):
             self.ssd_chunk_size_in_bytes = ssd_kv_layout_per_file.get_chunk_size() * self.dtype.itemsize
             self.chunk_size_in_bytes = self.ssd_chunk_size_in_bytes
             self.ssd_block_stride_in_bytes = ssd_kv_layout_per_file.get_block_stride() * self.dtype.itemsize
-            if self.num_kv_heads > 1 and self.tp_group_size > 1:
+            if self.num_kv_heads > 1:
                 ssd_kv_layout_per_file = ssd_kv_layout_per_file.div_head(self.tp_group_size)
 
             # GPU layout calculations — compute strides from actual tensor to handle
