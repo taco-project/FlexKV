@@ -84,11 +84,12 @@ _SCATTER_CHANNEL_TYPES = {
 class FlexKVComm:
     """3-axis (PP × CP × TP) hierarchical sync for the FlexKV connector.
 
-    Notation:
-      * "sync leader" is the unique rank that talks to the FlexKV
-        KVManager: pp_rank=0, attn_cp_rank=0, attn_tp_rank=0.
-      * "PP stage leader" is the (cp=0, tp=0) rank within a PP stage —
-        it does cross-PP P2P (``scatter_pp``).
+    Notation (all scoped to one attention-DP replica; DP replicas own
+    separate KVManagers and never sync with each other):
+      * "sync leader" is the unique rank of the replica that talks to the
+        FlexKV KVManager: pp_rank=0, attn_cp_rank=0, attn_tp_rank=0.
+      * "PP stage leader" is the replica's (cp=0, tp=0) rank within a PP
+        stage — it does cross-PP P2P (``scatter_pp``).
       * Every rank participates in collective layers it belongs to.
 
     Communication strategy:
@@ -170,14 +171,33 @@ class FlexKVComm:
         self.is_tp_leader = self.attn_tp_rank == 0
 
         # P2P routing tables (computed once).
+        #
+        # sglang global rank layout (outermost -> innermost):
+        #   world_rank = pp_rank * sglang_tp_size
+        #              + (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size
+        #              + attn_tp_rank
+        # With DP attention, the attn-DP axis sits *inside* each PP stage, so
+        # one PP stage of this DP replica is a contiguous block of
+        # ``attn_tp * attn_cp`` ranks starting at ``stage_base``, and PP stages
+        # are ``sglang_tp_size`` (not ``attn_tp * attn_cp``) ranks apart.
+        # All routing below stays inside this DP replica.
         stride = self.attn_tp_size * self.attn_cp_size
-        self._pp_stage_leader_ranks = [s * stride for s in range(self.pp_size)]
-        pp_stage_offset = self.pp_rank * stride
-        self._cp_leader_ranks = (
+        local_offset = self.attn_cp_rank * self.attn_tp_size + self.attn_tp_rank
+        stage_base = self.world_rank - local_offset
+        self._stage_base_rank = stage_base
+        self._pp_group_global_ranks = (
             [
-                pp_stage_offset + cp * self.attn_tp_size
-                for cp in range(self.attn_cp_size)
+                dist.get_global_rank(self.pp_cpu_group, i)
+                for i in range(self.pp_cpu_group.size())
             ]
+            if self.pp_size > 1 and self.pp_cpu_group is not None
+            else []
+        )
+        self._pp_stage_leader_ranks = self._compute_pp_stage_leader_ranks(
+            model_config, stage_base, local_offset, stride
+        )
+        self._cp_leader_ranks = (
+            [stage_base + cp * self.attn_tp_size for cp in range(self.attn_cp_size)]
             if self.attn_cp_size > 1
             else []
         )
@@ -194,17 +214,8 @@ class FlexKVComm:
             ]
         else:
             self._tp_group_ranks = []
-        self._pp_group_global_ranks = (
-            [
-                dist.get_global_rank(self.pp_cpu_group, i)
-                for i in range(self.pp_cpu_group.size())
-            ]
-            if self.pp_size > 1 and self.pp_cpu_group is not None
-            else []
-        )
-        self._pp_stage_member_ranks = list(
-            range(pp_stage_offset, pp_stage_offset + stride)
-        )
+        self._pp_stage_member_ranks = list(range(stage_base, stage_base + stride))
+        self._validate_routing_tables(stage_base)
 
         self.needs_sync = (
             self.pp_size > 1 or self.attn_tp_size > 1 or self.attn_cp_size > 1
@@ -228,7 +239,8 @@ class FlexKVComm:
 
         logger.info(
             "[FlexKV] Comm init: rank=%d, pp=%d/%d, tp=%d/%d, cp=%d/%d, "
-            "sync_leader=%s, stage_leader=%s, cross_node_pp=%s",
+            "sync_leader=%s, stage_leader=%s, cross_node_pp=%s, "
+            "pp_stage_leaders=%s, stage_members=%s, cp_leaders=%s, tp_ranks=%s",
             world_rank,
             self.pp_rank,
             self.pp_size,
@@ -239,7 +251,81 @@ class FlexKVComm:
             self.is_sync_leader,
             self.is_pp_stage_leader,
             self.is_cross_node_pp,
+            self._pp_stage_leader_ranks,
+            self._pp_stage_member_ranks,
+            self._cp_leader_ranks,
+            self._tp_group_ranks,
         )
+
+    # ------------------------------------------------------------------
+    # Routing table construction
+    # ------------------------------------------------------------------
+
+    def _compute_pp_stage_leader_ranks(
+        self, model_config, stage_base: int, local_offset: int, stride: int
+    ) -> List[int]:
+        """Global ranks of the (cp=0, tp=0) leader of every PP stage of
+        *this* attention-DP replica.
+
+        Preferred source is sglang's PP group: its members share this rank's
+        sglang ``tp_rank`` (hence its attn-DP rank) across stages, so
+        subtracting the in-stage offset yields each stage's leader. Without a
+        PP group, fall back to the sglang layout where stages are
+        ``attn_tp * attn_cp * attn_dp`` ranks apart.
+        """
+        if self.pp_size <= 1:
+            return [stage_base]
+        if self._pp_group_global_ranks:
+            if len(self._pp_group_global_ranks) != self.pp_size:
+                raise RuntimeError(
+                    f"[FlexKV] pp_group size {len(self._pp_group_global_ranks)} "
+                    f"!= pp_size {self.pp_size} (rank={self.world_rank})"
+                )
+            return [g - local_offset for g in self._pp_group_global_ranks]
+        attn_dp_size = max(1, int(getattr(model_config, "attn_dp_size", 1) or 1))
+        stage_stride = stride * attn_dp_size
+        logger.warning(
+            "[FlexKV] pp_size=%d but no PP group was provided; deriving PP "
+            "stage leaders from the sglang rank layout (stage stride=%d).",
+            self.pp_size,
+            stage_stride,
+        )
+        return [
+            stage_base + (s - self.pp_rank) * stage_stride
+            for s in range(self.pp_size)
+        ]
+
+    def _validate_routing_tables(self, stage_base: int) -> None:
+        """Fail fast if the derived tables disagree with sglang's groups;
+        a mismatch would otherwise deadlock or cross DP replicas."""
+        errors = []
+        if self._pp_stage_leader_ranks[self.pp_rank] != stage_base:
+            errors.append(
+                f"pp_stage_leaders[{self.pp_rank}]="
+                f"{self._pp_stage_leader_ranks[self.pp_rank]} != stage_base={stage_base}"
+            )
+        if self._tp_group_ranks:
+            tp_base = stage_base + self.attn_cp_rank * self.attn_tp_size
+            expected = list(range(tp_base, tp_base + self.attn_tp_size))
+            if self._tp_group_ranks != expected:
+                errors.append(f"attn_tp_group ranks {self._tp_group_ranks} != {expected}")
+        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
+            cp_ranks = [
+                dist.get_global_rank(self.attn_cp_cpu_group, i)
+                for i in range(self.attn_cp_cpu_group.size())
+            ]
+            expected = [
+                stage_base + cp * self.attn_tp_size + self.attn_tp_rank
+                for cp in range(self.attn_cp_size)
+            ]
+            if cp_ranks != expected:
+                errors.append(f"attn_cp_group ranks {cp_ranks} != {expected}")
+        if errors:
+            raise RuntimeError(
+                f"[FlexKV] Comm routing mismatch on rank={self.world_rank} "
+                f"(pp={self.pp_rank}, cp={self.attn_cp_rank}, tp={self.attn_tp_rank}): "
+                + "; ".join(errors)
+            )
 
     # ------------------------------------------------------------------
     # World CPU group resolution
