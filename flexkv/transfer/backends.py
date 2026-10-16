@@ -864,6 +864,25 @@ def _split_mooncake_registration_regions(
     return regions
 
 
+def _assert_block_fits_batch_limits(store_config: Any, block_size_bytes: int) -> None:
+    """One object is one whole CPU block, so it must fit a single SDK call.
+
+    Under a single-node PP stage layout a block carries *every* local PP
+    stage, so this is several times the per-stage size it used to be. A block
+    over the limit is rejected by ``_bounded_io`` on every put and every get,
+    which reads as a silently cold cache -- so refuse to start instead.
+    """
+    for limit_name in ("max_put_batch_bytes", "max_get_batch_bytes"):
+        limit = int(getattr(store_config, limit_name, 0) or 0)
+        if limit and block_size_bytes > limit:
+            raise ValueError(
+                f"[MooncakeStoreBackend] CPU block of {block_size_bytes} B "
+                f"exceeds {limit_name}={limit} B; raise "
+                f"MOONCAKE_{limit_name.upper()} in the store config")
+    flexkv_logger.info(
+        f"[MooncakeStoreBackend] object size = {block_size_bytes} B per CPU block")
+
+
 def _register_mooncake_regions(
     client: Any, regions: List[Tuple[int, int]]
 ) -> List[Tuple[int, int]]:
@@ -972,6 +991,7 @@ class MooncakeStoreBackend(StorageBackend):
             self.cache_config,
             override_global_segment_size=self.override_global_segment_size,
         )
+        _assert_block_fits_batch_limits(store_config, self.block_size_bytes)
         self.mooncake_client = MooncakeStoreClient(store_config)
         self._registered_regions = _register_mooncake_regions(
             self.mooncake_client, self._registration_regions(cpu))

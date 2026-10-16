@@ -148,8 +148,19 @@ class TransferEngine:
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
 
-        first_handles = next(iter(gpu_handles.values()))
-        self._num_layers_for_local_pp_stage = first_handles[0].kv_layout.num_layer
+        if model_config.has_pp_stage_layout:
+            # One CPU block (and one op's byte count) covers every local stage.
+            self._num_layers_for_local_pp_stage = model_config.num_layers
+            if cache_config.enable_gds:
+                raise NotImplementedError(
+                    "GDS is not supported with a single-node PP stage layout")
+            if swa_gpu_handles or swa_cpu_handle is not None:
+                raise NotImplementedError(
+                    "SWA pools are not supported with a single-node PP stage "
+                    "layout")
+        else:
+            first_handles = next(iter(gpu_handles.values()))
+            self._num_layers_for_local_pp_stage = first_handles[0].kv_layout.num_layer
 
         # Use spawn context for CUDA compatibility
         self.mp_ctx = mp.get_context('spawn')
@@ -268,8 +279,19 @@ class TransferEngine:
         if per_device_blocks[0] is None or per_device_layouts[0] is None:
             return {}
 
-        num_groups = len(layer_groups)
         num_devices = len(per_device_blocks)
+        if pool_id is PoolId.FULL_KV and self.model_config.has_pp_stage_layout:
+            # Pair the worker's GPU groups with its own stage's groups, not
+            # with the whole-block list that sizes the CPU pool.
+            layer_groups = self.model_config.pp_stage_layer_groups(
+                worker_key.pp_rank)
+            for di in range(num_devices):
+                if len(per_device_blocks[di] or ()) != len(layer_groups):
+                    raise ValueError(
+                        f"worker {worker_key} device {di} registered "
+                        f"{len(per_device_blocks[di] or ())} groups, PP stage "
+                        f"layout expects {len(layer_groups)}")
+        num_groups = len(layer_groups)
         return dict(
             layer_groups=layer_groups,
             gpu_blocks_per_group=[
@@ -363,6 +385,29 @@ class TransferEngine:
             layerwise_eventfd_socket=layerwise_eventfd_socket,
             **self._get_multi_group_kwargs(worker_key),
             **self._get_swa_kwargs(worker_key),
+            **self._get_pp_stage_kwargs(worker_key),
+        )
+
+    def _get_pp_stage_kwargs(self, worker_key: WorkerKey) -> dict:
+        """Where one PP stage lives inside a block that packs every stage.
+
+        Empty (legacy whole-block-is-one-stage) unless the model config
+        carries a single-node PP stage layout.
+        """
+        mc = self.model_config
+        if not mc.has_pp_stage_layout:
+            return {}
+        group_slice = mc.pp_stage_group_slice(worker_key.pp_rank)
+        # The CPU layout's own list: it is what sized the block (dtypes
+        # already resolved by StorageEngine), so offsets derived from it match.
+        host_groups = self._cpu_handle.kv_layout.layer_groups
+        if host_groups is None or len(host_groups) != len(mc.layer_groups):
+            raise ValueError(
+                "CPU layout does not carry the whole PP stage layout's groups")
+        return dict(
+            host_layer_groups=list(host_groups),
+            host_group_range=(group_slice.start, group_slice.stop),
+            num_original_layers=mc.pp_stage_num_layers_of(worker_key.pp_rank),
         )
 
     def _create_gds_worker(

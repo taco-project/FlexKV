@@ -188,6 +188,20 @@ class ModelConfig:
     local_dp_size: Optional[int] = None
 
     # ------------------------------------------------------------------
+    # Single-node PP: one CPU block packs every local PP stage
+    # ------------------------------------------------------------------
+    # When set, ``layer_groups`` is the concatenation of every PP stage's own
+    # groups in pp_rank order, ``pp_stage_group_counts[p]`` groups for stage
+    # ``p``, and ``pp_stage_num_layers[p]`` is that stage's original layer
+    # count (stages may be uneven, e.g. 18/20/20/20). Every byte computation
+    # that sums ``layer_groups`` (block size, recompute, CPU/SSD/remote
+    # layouts, Mooncake objects) therefore sees the whole local model, and a
+    # PP stage's worker addresses its own slice of the block. Both None when
+    # the node holds a single PP stage (no PP, or cross-node PP).
+    pp_stage_group_counts: Optional[Tuple[int, ...]] = None
+    pp_stage_num_layers: Optional[Tuple[int, ...]] = None
+
+    # ------------------------------------------------------------------
     # Freeze mechanism: after post_init, ModelConfig must not be mutated
     # ------------------------------------------------------------------
     _frozen: bool = field(default=False, init=False, repr=False)
@@ -240,8 +254,77 @@ class ModelConfig:
 
         # ---- LayerGroup invariants ----
         self._validate_layer_groups()
+        self._validate_pp_stage_layout()
 
         object.__setattr__(self, '_frozen', True)
+
+    # ------------------------------------------------------------------
+    # Single-node PP stage layout
+    # ------------------------------------------------------------------
+    @property
+    def has_pp_stage_layout(self) -> bool:
+        """True when one CPU block packs several local PP stages."""
+        return self.pp_stage_group_counts is not None
+
+    def _validate_pp_stage_layout(self) -> None:
+        counts = self.pp_stage_group_counts
+        stage_layers = self.pp_stage_num_layers
+        if counts is None and stage_layers is None:
+            return
+        if counts is None or stage_layers is None:
+            raise ValueError(
+                "[ModelConfig] pp_stage_group_counts and pp_stage_num_layers "
+                "must be set together")
+        if not self.layer_groups:
+            raise ValueError(
+                "[ModelConfig] a PP stage layout requires layer_groups")
+        if len(counts) != self.pp_size or len(stage_layers) != self.pp_size:
+            raise ValueError(
+                f"[ModelConfig] PP stage layout must describe pp_size="
+                f"{self.pp_size} stages, got group_counts={counts} "
+                f"num_layers={stage_layers}")
+        if self.nnodes != 1:
+            raise ValueError(
+                "[ModelConfig] a PP stage layout is single-node only "
+                f"(nnodes={self.nnodes})")
+        if any(c <= 0 for c in counts) or sum(counts) != len(self.layer_groups):
+            raise ValueError(
+                f"[ModelConfig] pp_stage_group_counts={counts} does not "
+                f"partition {len(self.layer_groups)} layer_groups")
+        if sum(stage_layers) != self.num_layers:
+            raise ValueError(
+                f"[ModelConfig] pp_stage_num_layers={stage_layers} does not "
+                f"sum to num_layers={self.num_layers}")
+        for pp_rank in range(self.pp_size):
+            n = stage_layers[pp_rank]
+            for g in self.pp_stage_layer_groups(pp_rank):
+                if any(not 0 <= idx < n for idx in g.layer_indices):
+                    raise ValueError(
+                        f"[ModelConfig] PP stage {pp_rank} has a layer index "
+                        f"outside its {n} local layers: {g.layer_indices}")
+
+    def pp_stage_group_slice(self, pp_rank: int) -> slice:
+        """Slice of ``layer_groups`` owned by one PP stage."""
+        if not self.has_pp_stage_layout:
+            raise ValueError("pp_stage_group_slice() needs a PP stage layout")
+        counts = self.pp_stage_group_counts
+        if not 0 <= pp_rank < len(counts):
+            raise ValueError(
+                f"pp_rank={pp_rank} outside the PP stage layout {counts}")
+        start = sum(counts[:pp_rank])
+        return slice(start, start + counts[pp_rank])
+
+    def pp_stage_layer_groups(self, pp_rank: int) -> List[LayerGroupSpec]:
+        """The layer groups one PP stage registers (stage-local indices)."""
+        if not self.has_pp_stage_layout:
+            return list(self.layer_groups) if self.layer_groups else []
+        return list(self.layer_groups[self.pp_stage_group_slice(pp_rank)])
+
+    def pp_stage_num_layers_of(self, pp_rank: int) -> int:
+        """Original layer count of one PP stage."""
+        if not self.has_pp_stage_layout:
+            raise ValueError("pp_stage_num_layers_of() needs a PP stage layout")
+        return int(self.pp_stage_num_layers[pp_rank])
 
     def _validate_layer_groups(self) -> None:
         """Validate ``layer_groups`` against ``num_layers``.
@@ -296,6 +379,15 @@ class ModelConfig:
         """
         if not self.layer_groups:
             return None
+        if self.has_pp_stage_layout:
+            # Each stage's layer_indices are stage-local (0..17, 0..19, ...),
+            # so bucketing them into one global range would merge every
+            # stage's layer 0. A member map only means something per stage:
+            # build_layer_member_map(pp_stage_layer_groups(p),
+            #                        pp_stage_num_layers_of(p)).
+            raise ValueError(
+                "layer_member_map is not defined under a single-node PP stage "
+                "layout; build it per PP stage instead")
         return build_layer_member_map(self.layer_groups, self.num_layers)
 
     def __setattr__(self, name: str, value) -> None:
@@ -453,6 +545,11 @@ class ModelConfig:
             f", layer_groups={len(self.layer_groups)}groups"
             if self.layer_groups else ""
         )
+        if self.has_pp_stage_layout:
+            layer_groups_str += (
+                f", pp_stage_layers={list(self.pp_stage_num_layers)}"
+                f", pp_stage_group_counts={list(self.pp_stage_group_counts)}"
+            )
         return (
             f"ModelConfig(num_layers={self.num_layers}, num_kv_heads={self.num_kv_heads}"
             f", head_size={self.head_size}, kv_dim={self.kv_dim}"

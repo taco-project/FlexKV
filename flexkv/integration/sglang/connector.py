@@ -865,8 +865,13 @@ class FlexKVConnector:
             )
             if not success:
                 n = 0
-        if self._sync_ctx.needs_sync:
-            self._sync_ctx.barrier()
+        if self._sync_ctx.needs_sync_without_pp:
+            # Barrier stays inside the PP stage (skip_pp): same per-request
+            # pipeline deadlock as the layerwise path. Only pp0 launches+waits
+            # the fan-out synchronous load; downstream stages consume their
+            # layers' KV only in their own forward pass, which the pipeline
+            # already orders strictly after pp0's wait() returns.
+            self._sync_ctx.barrier(skip_pp=True)
         return n
 
     def start_load_kv_layerwise(
@@ -1011,9 +1016,19 @@ class FlexKVConnector:
                 local_error = f"counter registration failed: {exc}"
 
         self._layerwise_generation = generation + 1
+        # Preflight agreement stays inside the PP stage (skip_pp). A blocking
+        # cross-stage reduction here deadlocks: this runs inside each stage's
+        # get_new_batch_prefill, but the scheduler forwards the request to the
+        # next stage only *after* that call returns, so pp0 would block waiting
+        # for stages that cannot arrive until pp0 moves on. Cross-stage
+        # agreement is unnecessary anyway -- only pp0 (is_sync_leader) launches
+        # the fan-out load, and its counter_id reaches every stage through the
+        # non-blocking LAYERWISE_MANIFEST scatter above. Each stage registers
+        # its own consumer counter before its own forward pass consumes the KV,
+        # which the pipeline already orders strictly after pp0's launch.
         all_ranks_ok = (
-            self._sync_ctx.all_reduce_min(local_ok)
-            if self._sync_ctx.needs_sync
+            self._sync_ctx.all_reduce_min(local_ok, skip_pp=True)
+            if self._sync_ctx.needs_sync_without_pp
             else local_ok
         )
         if all_ranks_ok == 0:
@@ -1032,8 +1047,8 @@ class FlexKVConnector:
                 cleanup_ok = 0
                 cleanup_error = str(exc)
             all_cleanup_ok = (
-                self._sync_ctx.all_reduce_min(cleanup_ok)
-                if self._sync_ctx.needs_sync
+                self._sync_ctx.all_reduce_min(cleanup_ok, skip_pp=True)
+                if self._sync_ctx.needs_sync_without_pp
                 else cleanup_ok
             )
             if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
@@ -1878,11 +1893,20 @@ class FlexKVConnector:
                         "ok": False,
                         "error": f"waiting for layerwise loads during reset failed: {exc}",
                     }
-        if self._sync_ctx.needs_sync:
+        # PP is deliberately skipped here (and for STORE_RESET below).
+        # ``reset()`` is reached from sglang's flush_cache, which is delivered
+        # only to the is_rank_zero scheduler (pp_rank == 0 and attn_tp_rank
+        # == 0 and attn_cp_rank == 0), so stages 1..N never call this and
+        # never post a matching recv. Scattering across PP would isend into
+        # the void and block the whole pipeline on wait(). The payload is
+        # also PP-local by nature: it reports the sync leader's own
+        # kv_manager drain, and the sync leader *is* pp_rank 0.
+        if self._sync_ctx.needs_sync_without_pp:
             load_reset_status = self._sync_ctx.scatter(
                 load_reset_status,
                 channel=FlexKVScatterChannel.RESET,
                 blocking=True,
+                skip_pp=True,
             )
         if not load_reset_status["ok"]:
             raise RuntimeError(f"[FlexKV] {load_reset_status['error']}")
@@ -1958,11 +1982,14 @@ class FlexKVConnector:
                         f"task_ids={unsafe}, error={wait_error or 'missing response'}"
                     ),
                 }
-        if self._sync_ctx.needs_sync:
+        # PP skipped for the same reason as the load status above: only
+        # pp_rank 0 ever runs reset().
+        if self._sync_ctx.needs_sync_without_pp:
             store_reset_status = self._sync_ctx.scatter(
                 store_reset_status,
                 channel=FlexKVScatterChannel.STORE_RESET,
                 blocking=True,
+                skip_pp=True,
             )
         if not store_reset_status["ok"]:
             raise RuntimeError(f"[FlexKV] {store_reset_status['error']}")
@@ -2502,6 +2529,68 @@ class FlexKVConnector:
             ),
         ]
 
+    def _uses_pp_stage_layout(self) -> bool:
+        """Several PP stages of this DP replica share one node's FlexKV."""
+        return (
+            int(self.model_config.pp_size) > 1
+            and int(self.model_config.nnodes) == 1
+        )
+
+    def _gather_pp_stage_layout(
+        self, layer_groups: List[LayerGroupSpec]
+    ) -> Dict[str, Any]:
+        """ModelConfig fields for this rank's layer groups.
+
+        Without single-node PP this is just ``layer_groups``. With it, every
+        PP stage leader contributes its own (possibly uneven, e.g. 18/20/20/20)
+        stage groups, and every rank builds the same config: the groups of all
+        stages concatenated in pp_rank order plus per-stage counts. That makes
+        block sizing, the KVManager and the FlexKV server agree on a block
+        that packs every local stage, while each stage still registers and
+        transfers only its own slice.
+        """
+        if not self._uses_pp_stage_layout():
+            return {"layer_groups": layer_groups}
+        if self._is_dsv4 or self._swa_kv_pool is not None:
+            raise NotImplementedError(
+                "single-node PP with FlexKV supports the standard/indexer KV "
+                "path only (no DSv4 or SWA pools)")
+        stage_num_layers = int(self.rank_info.num_layers_per_pp_stage)
+        gathered = self._sync_ctx.all_gather_pp(
+            {
+                "pp_rank": int(self.rank_info.pp_rank),
+                "num_layers": stage_num_layers,
+                "layer_groups": list(layer_groups),
+            }
+        )
+        for pp_rank, item in enumerate(gathered):
+            if int(item["pp_rank"]) != pp_rank:
+                raise RuntimeError(
+                    f"[FlexKV] PP stage layout out of order: slot {pp_rank} "
+                    f"holds pp_rank={item['pp_rank']}")
+        if gathered[self.rank_info.pp_rank]["layer_groups"] != list(layer_groups):
+            raise RuntimeError(
+                "[FlexKV] PP stage leader's layer groups differ from this rank's")
+        stage_groups = [list(item["layer_groups"]) for item in gathered]
+        num_layers = tuple(int(item["num_layers"]) for item in gathered)
+        logger.info(
+            "[FlexKV] single-node PP stage layout: stage_layers=%s "
+            "stage_groups=%s",
+            list(num_layers),
+            [[(g.num_layers, g.head_size) for g in groups] for groups in stage_groups],
+        )
+        return {
+            "layer_groups": [g for groups in stage_groups for g in groups],
+            "pp_stage_group_counts": tuple(len(groups) for groups in stage_groups),
+            "pp_stage_num_layers": num_layers,
+        }
+
+    def _stage_layer_groups(self) -> Optional[List[LayerGroupSpec]]:
+        """This rank's own PP stage groups (what it registers)."""
+        if self.model_config.layer_groups is None:
+            return None
+        return self.model_config.pp_stage_layer_groups(self.rank_info.pp_rank)
+
     def _apply_layer_groups_for_cache_sizing(
         self,
         kv_caches: List[torch.Tensor],
@@ -2516,12 +2605,24 @@ class FlexKVConnector:
                     kv_caches, indexer_group
                 )
             else:
+                if self._uses_pp_stage_layout():
+                    # The uniform single-layout path has no per-stage slice of
+                    # the CPU block: every stage would write the same bytes.
+                    raise NotImplementedError(
+                        "single-node PP with FlexKV currently requires a "
+                        "layer-group (indexer) KV layout; the uniform "
+                        "single-layout path would let PP stages overwrite "
+                        "each other's CPU blocks")
                 return
+
+            # Single-node PP: one CPU block packs every local stage, so the
+            # config carries all stages' groups (see _gather_pp_stage_layout).
+            config_fields = self._gather_pp_stage_layout(layer_groups)
 
             # FlexKV freezes ModelConfig at the end of its SGLang adapter.
             # Preserve that immutability contract by replacing the config
             # rather than mutating the frozen instance in place.
-            model_config = replace(self.model_config, layer_groups=layer_groups)
+            model_config = replace(self.model_config, **config_fields)
             model_config.freeze()
             self.model_config = model_config
             self.flexkv_config.model_config = model_config
@@ -2691,8 +2792,13 @@ class FlexKVConnector:
             self.tp_client.register_to_server(
                 kv_caches=list(kv_caches) + list(indexer_buffers),
                 kv_layout=gpu_layout,
-                layer_groups=self._build_indexer_layer_group_specs(
-                    kv_caches, indexer_group
+                # This stage's own groups -- exactly the slice the server's
+                # PP stage layout expects for this pp_rank.
+                layer_groups=(
+                    self._stage_layer_groups()
+                    or self._build_indexer_layer_group_specs(
+                        kv_caches, indexer_group
+                    )
                 ),
                 gpu_layouts=[gpu_layout, indexer_layout],
                 handles_per_group=[list(kv_caches), list(indexer_buffers)],

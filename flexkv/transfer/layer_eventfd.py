@@ -175,6 +175,15 @@ def receive_layer_eventfds(
                     (rank_key, tp_size_recv, recv_num_layers,
                      recv_num_counters) = struct.unpack("iiii", metadata[:16])
 
+                    if num_layers > 0 and recv_num_layers != num_layers:
+                        # The worker numbers its per-layer milestones in its
+                        # own PP stage's layer space; a consumer from another
+                        # (unevenly split) stage would get a mis-shaped table.
+                        raise ValueError(
+                            f"consumer effective_tp_rank={rank_key} sent "
+                            f"num_layers={recv_num_layers}, but this worker's "
+                            f"PP stage has {num_layers} layers")
+
                     if not all_rank_eventfds:
                         # First rank to arrive defines the table shape; the
                         # consumer's own count wins over ours because it is

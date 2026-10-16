@@ -167,6 +167,55 @@ def compile_host_regions(
     return tuple(regions)
 
 
+def compile_stage_host_regions(
+    all_layer_groups: Sequence[LayerGroupSpec],
+    stage_group_slice: slice,
+    host_layout: KVCacheLayout,
+    kv_dim: int,
+    default_dtype: torch.dtype,
+    *,
+    block_stride_bytes: Optional[int] = None,
+) -> Tuple[HostRegion, ...]:
+    """Host regions of one PP stage inside a block that packs every stage.
+
+    The block is compiled over ``all_layer_groups`` (every local stage's
+    groups, in pp_rank order), so this stage's regions keep the byte offsets
+    that place them after the earlier stages; ``group_index`` is renumbered
+    to be stage-local so it pairs with the stage's own GPU groups.
+    """
+    if host_layout.type != KVCacheLayoutType.BLOCKFIRST:
+        raise ValueError(
+            "a block packing several PP stages requires a BLOCKFIRST host "
+            f"layout, got {host_layout.type.value}")
+    regions = compile_host_regions(
+        all_layer_groups, host_layout, kv_dim, default_dtype,
+        block_stride_bytes=block_stride_bytes,
+    )
+    stage_regions = regions[stage_group_slice]
+    if not stage_regions:
+        raise ValueError(
+            f"PP stage group slice {stage_group_slice} selects no host region "
+            f"out of {len(regions)}")
+    end = stage_regions[-1].base_offset + stage_regions[-1].span_bytes
+    whole = sum(r.span_bytes for r in regions)
+    if end > whole:
+        raise ValueError(
+            f"PP stage regions end at {end} B past the {whole} B block slice")
+    return tuple(
+        HostRegion(
+            group_index=i,
+            num_layers=r.num_layers,
+            chunk_bytes=r.chunk_bytes,
+            kv_stride=r.kv_stride,
+            layer_stride=r.layer_stride,
+            block_stride=r.block_stride,
+            base_offset=r.base_offset,
+            span_bytes=r.span_bytes,
+        )
+        for i, r in enumerate(stage_regions)
+    )
+
+
 def gpu_strides_from_tensor(
     tensor: torch.Tensor,
     tokens_per_block: int,

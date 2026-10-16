@@ -39,7 +39,11 @@ from flexkv.transfer.region_batch import (
     rank_share_mode,
     region_batch_available,
 )
-from flexkv.transfer.template import compile_gpu_regions, compile_host_regions
+from flexkv.transfer.template import (
+    compile_gpu_regions,
+    compile_host_regions,
+    compile_stage_host_regions,
+)
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp, WorkerTransferOp
 from flexkv.transfer.workers.runtime import TransferWorkerBase
 
@@ -214,7 +218,16 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                  # fan-out, plus a per-layer eventfd post. WHOLE (the default)
                  # never opens the UDS and never records a marker.
                  completion: Union[str, CompletionContract, None] = None,
-                 layerwise_eventfd_socket: Optional[str] = None):
+                 layerwise_eventfd_socket: Optional[str] = None,
+                 # ---- single-node PP: one CPU block packs every stage -----
+                 # ``host_layer_groups`` is the whole block's group list (all
+                 # local stages, pp_rank order) and ``host_group_range`` the
+                 # [start, stop) of this worker's stage in it; ``layer_groups``
+                 # stays the stage's own list. ``num_original_layers`` is the
+                 # stage's layer count. All None = the block is one stage.
+                 host_layer_groups: Optional[List[LayerGroupSpec]] = None,
+                 host_group_range: Optional[Tuple[int, int]] = None,
+                 num_original_layers: Optional[int] = None):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
@@ -268,6 +281,34 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             cpu_kv_layout.num_layer if layer_groups is not None
             else self.num_layers
         )
+        # Single-node PP: the CPU block packs every local stage, so neither
+        # its layer count nor its group list describes this worker's stage.
+        if (host_layer_groups is None) != (host_group_range is None):
+            raise ValueError(
+                "host_layer_groups and host_group_range must be given together")
+        self._host_layer_groups = host_layer_groups
+        self._host_group_slice = (
+            slice(*host_group_range) if host_group_range is not None else None)
+        if host_layer_groups is not None:
+            if layer_groups is None:
+                raise ValueError("a PP stage slice requires layer_groups")
+            if num_original_layers is None:
+                raise ValueError("a PP stage slice requires num_original_layers")
+            stage_groups = list(host_layer_groups[self._host_group_slice])
+            if len(stage_groups) != len(layer_groups):
+                raise ValueError(
+                    f"PP stage slice {host_group_range} holds "
+                    f"{len(stage_groups)} groups, worker has {len(layer_groups)}")
+            for gi, (h, g) in enumerate(zip(stage_groups, layer_groups)):
+                if (h.num_layers, h.num_kv_heads, h.head_size, h.compress_ratio,
+                        list(h.layer_indices)) != (
+                        g.num_layers, g.num_kv_heads, g.head_size,
+                        g.compress_ratio, list(g.layer_indices)):
+                    raise ValueError(
+                        f"PP stage group {gi} disagrees with the CPU block's "
+                        f"group {host_group_range[0] + gi}")
+        if num_original_layers is not None:
+            self._num_original_layers = int(num_original_layers)
 
         self.transfer_num_cta_h2d = transfer_num_cta_h2d
         self.transfer_num_cta_d2h = transfer_num_cta_d2h
@@ -734,8 +775,20 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         dtype = self.dtype if dtype is None else dtype
         # Same host geometry as the non-TP worker: the CPU block layout does
         # not depend on how many GPUs write into it, only tp stride does.
-        host_regions = compile_host_regions(
-            layer_groups, cpu_kv_layout, self.kv_dim, dtype)
+        if pool_id is PoolId.FULL_KV and self._host_layer_groups is not None:
+            # This stage's slice of a block that packs every local PP stage.
+            host_regions = compile_stage_host_regions(
+                self._host_layer_groups, self._host_group_slice,
+                cpu_kv_layout, self.kv_dim, dtype)
+            flexkv_logger.info(
+                f"[worker {self.worker_id}] PP stage slice: groups="
+                f"{self._host_group_slice.start}..{self._host_group_slice.stop}, "
+                f"stage_base_offset={host_regions[0].base_offset} B, "
+                f"layers={self._num_original_layers}, "
+                f"block={cpu_kv_layout.get_block_stride()} B")
+        else:
+            host_regions = compile_host_regions(
+                layer_groups, cpu_kv_layout, self.kv_dim, dtype)
 
         tpb = cpu_kv_layout.tokens_per_block
         cpu_layout_type = cpu_kv_layout.type

@@ -124,7 +124,22 @@ class TransferManager:
                 f"intra_client_id (registered so far: "
                 f"{sorted(self.all_gpu_blocks)}).")
         else:
-            if (
+            if self.model_config.has_pp_stage_layout:
+                # One block packs every local PP stage; each stage registers
+                # its own (possibly uneven) groups, so compare per pp_rank.
+                expected = self.model_config.pp_stage_layer_groups(req.pp_rank)
+                if req.layer_groups is None or list(req.layer_groups) != expected:
+                    raise ValueError(
+                        "layer groups differ from the PP stage layout: "
+                        f"worker={registration_key}, pp_rank={req.pp_rank}, "
+                        f"expected={[(g.num_layers, g.head_size) for g in expected]}, "
+                        f"got={[(g.num_layers, g.head_size) for g in (req.layer_groups or [])]}"
+                    )
+                if getattr(req, "swa_handles", None) is not None:
+                    raise NotImplementedError(
+                        "SWA pools are not supported with a single-node PP "
+                        "stage layout")
+            elif (
                 req.layer_groups is not None
                 and self.model_config.layer_groups is not None
                 and self.model_config.layer_groups != req.layer_groups
@@ -421,7 +436,25 @@ class TransferManager:
             f"Expected {self.expected_gpus} GPU layouts, got {len(self.all_gpu_layouts)}"
         assert len(self.all_gpu_blocks) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
-        num_layers_per_pp_stage = next(iter(self.all_gpu_layouts.values())).num_layer
+        if self.model_config.has_pp_stage_layout:
+            # The CPU block holds every local PP stage (uneven splits too);
+            # each worker later picks its own stage slice and layer count.
+            num_layers_per_pp_stage = self.model_config.num_layers
+            for registration_key, layout in self.all_gpu_layouts.items():
+                pp_rank = self.gpu_worker_key_mapping[registration_key].pp_rank
+                stage_layers = self.model_config.pp_stage_num_layers_of(pp_rank)
+                if layout.num_layer != stage_layers:
+                    raise ValueError(
+                        f"GPU worker {registration_key} registered "
+                        f"{layout.num_layer} layers but PP stage {pp_rank} "
+                        f"has {stage_layers}")
+            flexkv_logger.info(
+                f"Single-node PP stage layout: stage_layers="
+                f"{list(self.model_config.pp_stage_num_layers)}, "
+                f"stage_group_counts="
+                f"{list(self.model_config.pp_stage_group_counts)}")
+        else:
+            num_layers_per_pp_stage = next(iter(self.all_gpu_layouts.values())).num_layer
 
         # Recompute block counts once layer_groups are known (heterogeneous /
         # multi-pool models).  Must match CacheEngine mempool sizing in the

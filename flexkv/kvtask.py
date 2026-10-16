@@ -470,6 +470,12 @@ class KVTaskManager:
                 # it's a cross-machine PP handle (different PP stages have
                 # different GPU block_ids).  Cross-machine TP handles share
                 # the same slot_mapping, so no clear is needed.
+                #
+                # Single-node PP never reaches here (no multi-node handle) and
+                # needs no copy either: the stages share one slot_mapping, the
+                # TransferEngine fans one op out to every PP-sibling worker,
+                # and each worker addresses its own byte range of the shared
+                # CPU block (see ModelConfig.pp_stage_group_counts).
                 if isinstance(transfer_handle._handle, TransferManagerMultiNodeHandle):
                     if self.model_config.nnodes > 1 and self.model_config.pp_size > 1:
                         # Cross-machine PP: each PP rank has different GPU blocks

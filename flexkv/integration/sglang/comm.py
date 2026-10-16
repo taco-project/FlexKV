@@ -110,6 +110,8 @@ class FlexKVComm:
     _TAG_PP_BARRIER = int.from_bytes(b"FxB2", byteorder="big")
     _TAG_PP_BARRIER_BCAST = int.from_bytes(b"FxB3", byteorder="big")
     _TAG_AR_BCAST = int.from_bytes(b"FxAR", byteorder="big")
+    _TAG_PP_GATHER = int.from_bytes(b"FxG2", byteorder="big")
+    _TAG_PP_GATHER_BCAST = int.from_bytes(b"FxG3", byteorder="big")
 
     # Adaptive async-work reaper. gloo's isend Work objects do not auto-
     # advance their "completed" state on poll, so a pure poll-based reaper
@@ -139,6 +141,13 @@ class FlexKVComm:
         self._reap_calls: int = 0
         self._reap_stuck_total: int = 0
         self._reap_drained_total: int = 0
+        # Upper bound for a blocking scatter's send drain. Generous: a real
+        # rendezvous only has to outlast one peer's scheduler tick, so
+        # anything this long means the peer is not coming. 0 restores the
+        # old unbounded wait.
+        self._blocking_scatter_timeout_s: float = float(
+            os.environ.get("FLEXKV_BLOCKING_SCATTER_TIMEOUT_S", "120")
+        )
 
         # Accept either GroupCoordinator wrappers (has ``.cpu_group``) or
         # raw ProcessGroups.
@@ -219,6 +228,15 @@ class FlexKVComm:
 
         self.needs_sync = (
             self.pp_size > 1 or self.attn_tp_size > 1 or self.attn_cp_size > 1
+        )
+        # Same question as ``needs_sync`` for the PP-less fan-out: is there
+        # anyone to talk to once the PP hop is dropped? Used by callers that
+        # only run on pp_rank==0 (see ``scatter(skip_pp=True)``); without it
+        # a pure-PP topology (attn_tp == attn_cp == 1, pp > 1) would still
+        # enter scatter, do nothing on every axis, and pay a pickle round
+        # trip for a payload that never leaves the rank.
+        self.needs_sync_without_pp = (
+            self.attn_tp_size > 1 or self.attn_cp_size > 1
         )
 
         self._world_cpu_group = self._resolve_world_cpu_group()
@@ -355,6 +373,7 @@ class FlexKVComm:
         *,
         channel: FlexKVScatterChannel,
         blocking: bool = False,
+        skip_pp: bool = False,
     ) -> Any:
         """Hierarchical fan-out: sync_leader → PP stage leaders →
         CP leaders → TP ranks. Returns the leader's payload on every rank.
@@ -368,10 +387,17 @@ class FlexKVComm:
         ``blocking=False`` queues isends and reaps later — fine for the
         hot path; ``True`` blocks until the leader's sends drain (used
         on shutdown / barriers).
+
+        ``skip_pp=True`` drops the PP hop. Required for any payload whose
+        caller is only invoked on ``pp_rank == 0``: sglang routes the
+        control-plane requests behind ``reset()`` to its ``is_rank_zero``
+        scheduler only (``pp_rank == 0 and attn_tp_rank == 0 and
+        attn_cp_rank == 0``), so stages 1..N never post a matching recv and
+        a PP isend here would block forever on ``wait()``.
         """
         channel = self._normalize_scatter_channel(channel)
         self._validate_scatter_payload(data, channel, source="local")
-        if self.pp_size > 1 and self.is_pp_stage_leader:
+        if not skip_pp and self.pp_size > 1 and self.is_pp_stage_leader:
             data = self._scatter_group(
                 data,
                 self._pp_stage_leader_ranks,
@@ -441,33 +467,98 @@ class FlexKVComm:
             blocking=False,
         )
 
-    def all_reduce_min(self, value: int) -> int:
+    def all_reduce_min(self, value: int, *, skip_pp: bool = False) -> int:
         """Hierarchical all_reduce(MIN) across TP, CP, PP.
 
         Used to align FlexKV block-count limits across all ranks that
         will register GPU buffers (each rank computes the maximum it can
         support, and we take the MIN to land on a value everyone can
         honor).
+
+        ``skip_pp=True`` keeps the reduction inside the local PP stage
+        (TP/CP only). The PP hop is a blocking P2P rendezvous between the
+        stage leaders; it is safe at startup, when every stage reaches it
+        in lockstep, but it DEADLOCKS on any per-request path. Under PP the
+        scheduler pipeline forwards a request to stage N+1 only after stage
+        N's ``get_new_batch_prefill`` returns, so a blocking cross-stage
+        reduction inside that call waits for downstream stages that cannot
+        arrive until it returns -- a circular wait. Per-request callers
+        therefore reduce only within their stage; cross-stage agreement for
+        the layerwise load is carried instead by the non-blocking
+        ``LAYERWISE_MANIFEST`` scatter (producer_id flows one-way from pp0).
         """
         tensor = torch.tensor(value, dtype=torch.int64)
         if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
             dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.attn_tp_cpu_group)
         if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
             dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.attn_cp_cpu_group)
-        if self.pp_size > 1 and self.is_pp_stage_leader:
+        if not skip_pp and self.pp_size > 1 and self.is_pp_stage_leader:
             self._pp_all_reduce_min_p2p(tensor)
-        if self.pp_size > 1:
+        if not skip_pp and self.pp_size > 1:
             self._bcast_to_stage_members(tensor, self._TAG_AR_BCAST)
         return int(tensor.item())
 
-    def barrier(self) -> None:
+    def all_gather_pp(self, obj: Any) -> List[Any]:
+        """Gather one picklable object per PP stage, in pp_rank order.
+
+        Each PP stage leader contributes its ``obj``; every rank of this
+        attention-DP replica (stage members included) returns the same list.
+        Startup-only: blocking P2P on the world CPU group. ``[obj]`` when
+        there is no PP.
+        """
+        if self.pp_size <= 1:
+            return [obj]
+        result: Optional[List[Any]] = None
+        if self.is_pp_stage_leader:
+            leaders = self._pp_stage_leader_ranks
+            root = leaders[0]
+            tag = self._TAG_PP_GATHER
+            if self.world_rank == root:
+                result = [obj]
+                for src in leaders[1:]:
+                    result.append(self._recv(src, tag, self._world_cpu_group))
+                for dst in leaders[1:]:
+                    for w in self._isend(dst, result, tag, self._world_cpu_group):
+                        w.wait()
+            else:
+                for w in self._isend(root, obj, tag, self._world_cpu_group):
+                    w.wait()
+                result = self._recv(root, tag, self._world_cpu_group)
+            for rank in self._pp_stage_member_ranks:
+                if rank != self.world_rank:
+                    for w in self._isend(
+                        rank, result, self._TAG_PP_GATHER_BCAST,
+                        self._world_cpu_group,
+                    ):
+                        w.wait()
+        else:
+            result = self._recv(
+                self._pp_stage_leader_ranks[self.pp_rank],
+                self._TAG_PP_GATHER_BCAST,
+                self._world_cpu_group,
+            )
+        if not isinstance(result, list) or len(result) != self.pp_size:
+            raise RuntimeError(
+                f"[FlexKV] all_gather_pp returned {type(result).__name__} of "
+                f"length {len(result) if isinstance(result, list) else '?'}, "
+                f"expected {self.pp_size} (rank={self.world_rank})")
+        return result
+
+    def barrier(self, *, skip_pp: bool = False) -> None:
+        """Cross-rank barrier across TP, CP, PP.
+
+        ``skip_pp=True`` keeps the barrier inside the local PP stage for the
+        same reason as :meth:`all_reduce_min`: the PP hop is a blocking
+        rendezvous between stage leaders and deadlocks on any per-request
+        path under pipeline ordering.
+        """
         if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
             dist.barrier(group=self.attn_tp_cpu_group)
         if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
             dist.barrier(group=self.attn_cp_cpu_group)
-        if self.pp_size > 1 and self.is_pp_stage_leader:
+        if not skip_pp and self.pp_size > 1 and self.is_pp_stage_leader:
             self._pp_barrier_p2p()
-        if self.pp_size > 1:
+        if not skip_pp and self.pp_size > 1:
             dummy = torch.tensor([0], dtype=torch.int64)
             self._bcast_to_stage_members(dummy, self._TAG_PP_BARRIER_BCAST)
 
@@ -491,8 +582,29 @@ class FlexKVComm:
             for dst in dsts:
                 works.extend(self._isend(dst, data, tag, self._world_cpu_group))
             if blocking:
-                for w in works:
-                    w.wait()
+                # A blocking drain is a rendezvous: it only returns once every
+                # dst has posted a matching recv. If one of them never does
+                # (a peer that is not invoked for this operation at all, or a
+                # hung peer), a bare wait() turns into an unbounded deadlock
+                # whose only symptom is that the caller's thread stops
+                # advancing. Bound it so the failure names itself.
+                timeout = self._blocking_scatter_timeout_s
+                for idx, w in enumerate(works):
+                    try:
+                        if timeout > 0:
+                            w.wait(timeout=timedelta(seconds=timeout))
+                        else:
+                            w.wait()
+                    except Exception as exc:  # noqa: BLE001
+                        raise RuntimeError(
+                            "[FlexKV] scatter(blocking=True) stalled: "
+                            f"rank={self.world_rank} tag={tag} "
+                            f"dsts={dsts} send_index={idx}/{len(works)} "
+                            f"wait={timeout}s. A destination rank is not "
+                            f"receiving on this tag/channel — check that "
+                            f"every rank in {group_ranks} runs this "
+                            f"operation (scatter channels are per-caller)."
+                        ) from exc
             else:
                 self._reap_completed_async_works()
                 self._async_works.extend(works)
