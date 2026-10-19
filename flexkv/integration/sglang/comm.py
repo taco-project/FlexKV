@@ -808,6 +808,170 @@ def send_fds(sock: socket.socket, fds: list, extra_data: bytes = b"x") -> None:
 # Layerwise transfer signaling (eventfd-backed)
 # ----------------------------------------------------------------------
 
+# Floor for the producer ring. A slot costs ``num_layers`` eventfds per rank
+# (plus the worker's dup of them): a few hundred bytes of kernel memory and one
+# fd each, so a generous ring is essentially free. Size it well past the PP
+# pipeline depth: pp0 can open up to ``pp_size + pp_async_batch_depth`` batches
+# before the last stage releases the oldest one. The release board below is
+# what makes reuse *safe*; the ring size only keeps that gate from firing.
+_MIN_LAYERWISE_NUM_COUNTERS = 16
+
+
+def resolve_layerwise_num_counters(pp_size: int = 1) -> int:
+    """Number of producer slots in the layerwise ring.
+
+    ``max(FLEXKV_LAYERWISE_NUM_COUNTERS, 16, 4 * pp_size)``: the env var can
+    only enlarge the ring. A smaller value is raised to the floor, with a
+    warning.
+    """
+    floor = max(_MIN_LAYERWISE_NUM_COUNTERS, 4 * max(1, int(pp_size)))
+    raw = os.environ.get("FLEXKV_LAYERWISE_NUM_COUNTERS", "").strip()
+    if not raw:
+        return floor
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "[FlexKV] Invalid FLEXKV_LAYERWISE_NUM_COUNTERS=%r; reset to %d",
+            raw,
+            floor,
+        )
+        return floor
+    if value < floor:
+        logger.warning(
+            "[FlexKV] FLEXKV_LAYERWISE_NUM_COUNTERS=%d is below the minimum "
+            "max(16, 4*pp_size)=%d (pp_size=%d); reset to %d",
+            value,
+            floor,
+            pp_size,
+            floor,
+        )
+        return floor
+    return value
+
+
+class LayerwiseReleaseBoard:
+    """Cross-rank record of which batch each rank has released, per slot.
+
+    Why it exists: only the sync leader (pp0) picks a producer slot and
+    launches the worker, but *every* rank of the DP replica -- including every
+    PP stage -- waits on its own copy of that slot's eventfds, and later
+    stages consume a batch long after pp0 has moved on. A slot is therefore
+    only reusable when every rank has released its previous batch. pp0's own
+    ``_finished`` flag cannot see that; reusing early lets the worker post the
+    new batch's signals into fds a lagging stage is still consuming, and that
+    stage's release-time drain then swallows them (lost wakeup, observed on
+    GLM-5.3 PP4 with a 3-slot ring).
+
+    Followers ``publish(slot, generation)`` when they release a slot, where
+    ``generation`` is the manifest generation of the batch that opened it.
+    The leader asks ``laggards(slot, generation)`` before reusing a slot. It
+    never blocks on the answer: a busy slot is skipped, see
+    ``FlexKVLayerDoneCounter.update_producer``.
+
+    Backed by the torch.distributed key-value store, so it works across
+    nodes. Leader-side reads are cached per rank, and only run when the ring
+    wraps around to a slot, so the cost is a couple of store round trips per
+    wrap.
+    """
+
+    _KEY_PREFIX = "flexkv/lw_release"
+
+    def __init__(
+        self,
+        store: Any,
+        *,
+        leader_rank: int,
+        my_rank: int,
+        peer_ranks: List[int],
+    ):
+        self._store = store
+        self.leader_rank = int(leader_rank)
+        self.my_rank = int(my_rank)
+        self.is_leader = self.my_rank == self.leader_rank
+        self.peer_ranks = sorted(int(r) for r in peer_ranks if int(r) != self.leader_rank)
+        self._seen: Dict[tuple, int] = {}
+
+    def _key(self, rank: int, slot: int) -> str:
+        return f"{self._KEY_PREFIX}/{self.leader_rank}/{rank}/{slot}"
+
+    def publish(self, slot: int, generation: int) -> None:
+        if self.is_leader or generation < 0:
+            return
+        try:
+            self._store.set(self._key(self.my_rank, slot), str(int(generation)))
+        except Exception as exc:  # noqa: BLE001
+            # Never fail the forward pass over this. The cost of a lost
+            # publish is that the leader keeps treating the slot as busy and
+            # loads that would land on it fall back to recompute.
+            logger.error(
+                "[FlexKV] Layerwise release publish failed: rank=%d slot=%d "
+                "generation=%d err=%s",
+                self.my_rank,
+                slot,
+                generation,
+                exc,
+            )
+
+    def _read(self, keys: List[str]) -> List[int]:
+        store = self._store
+        if hasattr(store, "multi_get") and store.check(keys):
+            return [int(v) for v in store.multi_get(keys)]
+        values = []
+        for key in keys:
+            values.append(int(store.get(key)) if store.check([key]) else -1)
+        return values
+
+    def laggards(self, slot: int, generation: int) -> List[tuple]:
+        """Ranks that have not yet released ``generation`` (or later) on
+        ``slot``, as ``(rank, released_generation)``. Empty means reusable."""
+        if generation < 0:
+            return []
+        pending = [
+            r
+            for r in self.peer_ranks
+            if self._seen.get((r, slot), -1) < generation
+        ]
+        if not pending:
+            return []
+        values = self._read([self._key(r, slot) for r in pending])
+        lagging = []
+        for rank, value in zip(pending, values):
+            self._seen[(rank, slot)] = value
+            if value < generation:
+                lagging.append((rank, value))
+        return lagging
+
+
+def build_layerwise_release_board(sync_ctx: Any) -> Optional[LayerwiseReleaseBoard]:
+    """Release board for the DP replica ``sync_ctx`` belongs to, or None when
+    the replica has a single rank (nothing to coordinate)."""
+    if not getattr(sync_ctx, "needs_sync", False):
+        return None
+    stage_leaders = list(getattr(sync_ctx, "_pp_stage_leader_ranks", []) or [])
+    if not stage_leaders:
+        return None
+    stride = int(sync_ctx.attn_tp_size) * int(sync_ctx.attn_cp_size)
+    members = [b + i for b in stage_leaders for i in range(stride)]
+    try:
+        from torch.distributed import distributed_c10d
+
+        store = distributed_c10d._get_default_store()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[FlexKV] No torch.distributed store for the layerwise release "
+            "board (%s). Cross-stage slot reuse is then guarded only by the "
+            "ring size (FLEXKV_LAYERWISE_NUM_COUNTERS).",
+            exc,
+        )
+        return None
+    return LayerwiseReleaseBoard(
+        store,
+        leader_rank=stage_leaders[0],
+        my_rank=sync_ctx.world_rank,
+        peer_ranks=members,
+    )
+
 
 class FlexKVLayerLoadingEvent:
     """One per producer slot. Holds ``num_layers`` semaphore eventfds —
@@ -815,8 +979,10 @@ class FlexKVLayerLoadingEvent:
     layer's H2D copy completes; the consumer (sglang's
     ``register_layer_transfer_counter`` hook) reads to wait for them."""
 
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, slot: int = -1, rank: int = -1):
         self._num_layers = num_layers
+        self.slot = slot
+        self.rank = rank
         # Semaphore mode so each read consumes exactly one signal. NONBLOCK
         # lets ``reset_for_new_transfer`` drain leftover counter values
         # without blocking; ``wait`` re-arms the fd to blocking before
@@ -827,20 +993,27 @@ class FlexKVLayerLoadingEvent:
         self._finished = True
         self._wait_started = False
         self.wait_remaining: List[int] = [0] * num_layers
+        # Manifest generation of the batch that opened this slot (-1: never
+        # used). Same value on every rank; it names the batch in the
+        # cross-rank release board.
+        self.open_generation: int = -1
 
-    def _drain(self) -> None:
+    def _drain(self) -> int:
         """Consume all pending eventfd signals without blocking."""
         import os
 
+        drained = 0
         for fd in self.load_event_fds:
             while True:
                 try:
                     if not os.read(fd, 8):
                         break
+                    drained += 1
                 except BlockingIOError:
                     break
                 except OSError:
                     break
+        return drained
 
     def arm_for_new_transfer(self) -> None:
         """Arm this slot WITHOUT draining the eventfds.
@@ -870,7 +1043,19 @@ class FlexKVLayerLoadingEvent:
         backend skipped. Doing it here rather than at acquire time is what
         makes late (post-launch) registration safe.
         """
-        self._drain()
+        drained = self._drain()
+        if drained:
+            # With the release gate in place only skipped layers can leave
+            # signals here. Anything else means another batch posted into this
+            # slot while it was still in use -- that batch will now hang.
+            logger.warning(
+                "[FlexKV] Layerwise release drained %d pending signal(s): "
+                "rank=%d slot=%d open_generation=%d",
+                drained,
+                self.rank,
+                self.slot,
+                self.open_generation,
+            )
 
     def reset_for_new_transfer(self) -> None:
         """Drain any leftover signals from prior transfers, then arm.
@@ -995,19 +1180,34 @@ class FlexKVLayerLoadingEvent:
 
 
 class FlexKVLayerDoneCounter:
-    """Triple-buffered slot-based layerwise counter.
+    """Ring of producer slots for layerwise loads, one batch per slot.
 
     The KV pool calls ``wait_until(layer_id)`` once per layer during forward.
     All restores collected while SGLang builds one prefill batch share a
     producer slot. The layer hook consumes one eventfd signal per restore for
     each layer. Producer rotation therefore happens per prefill batch, not per
-    request, and the fixed-size ring remains sufficient for large batches.
+    request.
+
+    Slot reuse is gated on *every* rank of the DP replica having released the
+    slot's previous batch (``release_board``), not just on this rank. Without
+    that gate a PP leader that runs a few batches ahead of the last stage
+    reuses a slot the last stage is still consuming; see
+    ``LayerwiseReleaseBoard``.
     """
 
-    def __init__(self, num_layers: int, num_counters: int = 3, world_rank: int = -1):
+    def __init__(
+        self,
+        num_layers: int,
+        num_counters: Optional[int] = None,
+        world_rank: int = -1,
+        release_board: Optional[LayerwiseReleaseBoard] = None,
+    ):
+        if num_counters is None:
+            num_counters = resolve_layerwise_num_counters()
         self.num_layers = num_layers
         self.num_counters = num_counters
         self.world_rank = world_rank
+        self.release_board = release_board
         timeout_raw = os.environ.get("FLEXKV_LAYERWISE_WAIT_TIMEOUT_S", "240")
         try:
             timeout_s = float(timeout_raw)
@@ -1019,12 +1219,28 @@ class FlexKVLayerDoneCounter:
             timeout_s = 240.0
         self.wait_timeout_s: Optional[float] = timeout_s if timeout_s > 0 else None
         self.events: List[FlexKVLayerLoadingEvent] = [
-            FlexKVLayerLoadingEvent(num_layers) for _ in range(num_counters)
+            FlexKVLayerLoadingEvent(num_layers, slot=slot, rank=world_rank)
+            for slot in range(num_counters)
         ]
         self.producer_index = -1
         self.consumer_index = -1
         self._task_to_producer: Dict[int, int] = {}
         self._consumer_task_ids: List[int] = []
+        logger.info(
+            "[FlexKV] Layerwise counter ring: rank=%d num_layers=%d "
+            "num_counters=%d release_gate=%d",
+            world_rank,
+            num_layers,
+            num_counters,
+            int(release_board is not None),
+        )
+
+    def _publish_release(self, slot: int) -> None:
+        """Tell the leader this rank no longer uses ``slot``'s current batch."""
+        board = self.release_board
+        if board is None:
+            return
+        board.publish(slot, self.events[slot].open_generation)
 
     def register_task(self, task_id: int, producer_id: int) -> None:
         if task_id in self._task_to_producer:
@@ -1080,12 +1296,13 @@ class FlexKVLayerDoneCounter:
         raise RuntimeError(f"Counter {counter_id} is still active on a previous batch")
 
     def register_task_with_explicit_counter_id(
-        self, task_id: int, counter_id: int
+        self, task_id: int, counter_id: int, generation: int = -1
     ) -> None:
         self.expected_transfer_count(counter_id)
         if task_id in self._task_to_producer:
             raise RuntimeError(f"Task {task_id} is already registered")
         event = self.events[counter_id]
+        armed = False
         if event._finished:
             # Arm WITHOUT draining: this is the PP-follower path, and the
             # worker has very likely already posted this transfer's signals
@@ -1093,20 +1310,77 @@ class FlexKVLayerDoneCounter:
             # the request downstream). Stale signals are cleared on release
             # instead. See ``arm_for_new_transfer``.
             event.arm_for_new_transfer()
+            event.open_generation = generation
         self._task_to_producer[task_id] = counter_id
 
     def update_producer(self) -> int:
+        """Leader only: pick the slot for the next batch.
+
+        A slot qualifies when this rank has finished with it AND every other
+        rank of the replica has released the batch that last used it. Slots
+        that fail either test are skipped, never waited for: blocking here
+        would deadlock, because a lagging PP stage can only advance once this
+        rank returns and hands it the next micro-batch. If no slot qualifies
+        this raises, which the connector turns into a consistent, all-rank
+        "no layerwise restore" (the tokens are recomputed).
+        """
         if self.consumer_index >= 0:
             event = self.events[self.consumer_index]
             if not event._finished and not event._wait_started:
                 return self.consumer_index
 
-        self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ]._finished, "Producer event should be finished before reuse"
-        self.events[self.producer_index].reset_for_new_transfer()
-        return self.producer_index
+        prev = self.producer_index
+        board = self.release_board
+        local_busy: List[int] = []
+        remote_busy: Dict[int, List[tuple]] = {}
+        chosen = -1
+        for step in range(1, self.num_counters + 1):
+            idx = (prev + step) % self.num_counters
+            event = self.events[idx]
+            if not event._finished:
+                local_busy.append(idx)
+                continue
+            if board is not None and event.open_generation >= 0:
+                lagging = board.laggards(idx, event.open_generation)
+                if lagging:
+                    remote_busy[idx] = lagging
+                    continue
+            chosen = idx
+            break
+
+        if chosen < 0:
+            raise RuntimeError(
+                "No FlexKV layerwise counter is released on every rank "
+                f"(num_counters={self.num_counters}, local_busy={local_busy}, "
+                f"remote_busy={remote_busy}); skipping layerwise restore"
+            )
+        if local_busy or remote_busy:
+            logger.warning(
+                "[FlexKV] Layerwise counter(s) still in use, skipped: rank=%d "
+                "prev_slot=%d slot=%d local_busy=%s remote_busy=%s",
+                self.world_rank,
+                prev,
+                chosen,
+                local_busy,
+                remote_busy,
+            )
+
+        self.producer_index = chosen
+        event = self.events[chosen]
+        # Leader path: reset_for_new_transfer DOES drain, unlike the follower's
+        # arm_for_new_transfer.
+        event.reset_for_new_transfer()
+        return chosen
+
+    def note_batch_opened(self, slot: int, generation: int) -> None:
+        """Leader only: record which batch now owns ``slot``.
+
+        Called once the manifest naming ``slot`` is going out without error,
+        i.e. once every follower is bound to arm the slot for ``generation``.
+        Reuse of the slot then waits for every follower to publish a release
+        of at least ``generation``.
+        """
+        self.events[slot].open_generation = generation
 
     def set_consumer(self, task_id: int) -> None:
         if task_id < 0:
@@ -1148,6 +1422,7 @@ class FlexKVLayerDoneCounter:
             if self.consumer_index == producer_id:
                 self.consumer_index = -1
             event.mark_reusable()
+            self._publish_release(producer_id)
 
     def abort_unregistered_selection(self, producer_id: int) -> None:
         """Release a freshly selected leader counter before registration."""
@@ -1206,12 +1481,15 @@ class FlexKVLayerDoneCounter:
             # layer the attention backend skipped. Clearing it *here* (rather
             # than when the slot is next armed) is what lets a PP follower
             # register after the worker has already posted -- see
-            # ``FlexKVLayerLoadingEvent.arm_for_new_transfer``. The producer
-            # ring guarantees the next batch uses a different counter, so this
-            # cannot swallow signals for an already-launched transfer.
+            # ``FlexKVLayerLoadingEvent.arm_for_new_transfer``. It cannot
+            # swallow a later batch's signals because the leader does not
+            # reuse this slot until the release published below reaches it
+            # (``update_producer`` / ``LayerwiseReleaseBoard``).
+            released_slot = self.consumer_index
             event.drain_leftovers()
             self.consumer_index = -1
             self._consumer_task_ids.clear()
+            self._publish_release(released_slot)
 
     def reset(self) -> None:
         # FlexKVConnector.reset() completely waits for every launched transfer
@@ -1223,6 +1501,8 @@ class FlexKVLayerDoneCounter:
         self.consumer_index = -1
         self._task_to_producer.clear()
         self._consumer_task_ids.clear()
+        for slot in range(self.num_counters):
+            self._publish_release(slot)
 
     def __del__(self) -> None:
         try:

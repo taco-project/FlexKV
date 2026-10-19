@@ -46,6 +46,8 @@ from flexkv.integration.sglang.comm import (
     FlexKVComm,
     FlexKVLayerDoneCounter,
     FlexKVScatterChannel,
+    build_layerwise_release_board,
+    resolve_layerwise_num_counters,
     send_fds,
 )
 
@@ -421,9 +423,15 @@ class FlexKVConnector:
         )
         self.layer_done_counter: Optional[FlexKVLayerDoneCounter] = None
         if self.enable_layerwise:
+            # Every rank of the replica must agree on the ring size: the worker
+            # takes it from the handshake and pp0 names slots by index.
             self.layer_done_counter = FlexKVLayerDoneCounter(
                 self.rank_info.num_layers_per_pp_stage,
+                num_counters=resolve_layerwise_num_counters(
+                    self.model_config.pp_size
+                ),
                 world_rank=world_rank,
+                release_board=build_layerwise_release_board(self._sync_ctx),
             )
             self._send_eventfds_to_worker()
         self._layerwise_generation = 0
@@ -918,6 +926,13 @@ class FlexKVConnector:
                     producer_id,
                     allow_unclaimed_active=selected_new_counter,
                 )
+                if selected_new_counter:
+                    # The manifest below goes out error-free, so every
+                    # follower will arm this slot for ``generation``; the slot
+                    # is not reused until all of them release it.
+                    self.layer_done_counter.note_batch_opened(
+                        producer_id, generation
+                    )
             except Exception as exc:  # noqa: BLE001
                 selection_error = str(exc)
 
@@ -998,7 +1013,7 @@ class FlexKVConnector:
                     self.layer_done_counter.register_task(fkv_task_id, producer_id)
                 else:
                     self.layer_done_counter.register_task_with_explicit_counter_id(
-                        fkv_task_id, producer_id
+                        fkv_task_id, producer_id, generation=generation
                     )
                 registered = True
                 self.layer_done_counter.set_consumer(fkv_task_id)
