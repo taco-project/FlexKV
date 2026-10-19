@@ -842,8 +842,43 @@ class FlexKVLayerLoadingEvent:
                 except OSError:
                     break
 
+    def arm_for_new_transfer(self) -> None:
+        """Arm this slot WITHOUT draining the eventfds.
+
+        For PP followers the worker may already have posted this transfer's
+        signals before the follower even reaches registration: only pp0
+        launches, and the pipeline hands a request to stage N+1 only after
+        stage N's forward, which is long after the H2D copies land. Draining
+        here would discard exactly those signals and the follower would then
+        block forever on a layer the worker has already finished (observed on
+        GLM-5.3 PP4: `counter_id=0 layer=0 wait_count=1` timing out after
+        240s while the transfer had completed 4 minutes earlier).
+
+        Staleness is instead handled on release -- see ``drain_leftovers`` --
+        so an armed slot is always clean before the producer can post to it.
+        """
+        self._finished = False
+        self._wait_started = False
+        self.wait_remaining = [0] * self._num_layers
+
+    def drain_leftovers(self) -> None:
+        """Discard signals the consumer never waited on, at release time.
+
+        Counterpart to ``arm_for_new_transfer``. Called once the consumer has
+        finished the last layer, when every registered transfer's signals have
+        been posted and the only values left are for layers the attention
+        backend skipped. Doing it here rather than at acquire time is what
+        makes late (post-launch) registration safe.
+        """
+        self._drain()
+
     def reset_for_new_transfer(self) -> None:
         """Drain any leftover signals from prior transfers, then arm.
+
+        Used by the producer-selecting rank (``update_producer``), which runs
+        strictly before the launch that lets the worker post, so draining here
+        cannot swallow a live signal. Followers must use
+        ``arm_for_new_transfer`` instead.
 
         Without this drain, a previous transfer that wrote N eventfd
         signals but only had N-K reads (e.g. because the attention
@@ -1052,7 +1087,12 @@ class FlexKVLayerDoneCounter:
             raise RuntimeError(f"Task {task_id} is already registered")
         event = self.events[counter_id]
         if event._finished:
-            event.reset_for_new_transfer()
+            # Arm WITHOUT draining: this is the PP-follower path, and the
+            # worker has very likely already posted this transfer's signals
+            # (only pp0 launches, and it launches before the pipeline hands
+            # the request downstream). Stale signals are cleared on release
+            # instead. See ``arm_for_new_transfer``.
+            event.arm_for_new_transfer()
         self._task_to_producer[task_id] = counter_id
 
     def update_producer(self) -> int:
@@ -1161,6 +1201,15 @@ class FlexKVLayerDoneCounter:
                 f"layer={threshold}, wait_count={wait_count}"
             ) from exc
         if threshold == self.num_layers - 1:
+            # Release point: every registered transfer has had all of its
+            # layers posted by now, so anything still pending belongs to a
+            # layer the attention backend skipped. Clearing it *here* (rather
+            # than when the slot is next armed) is what lets a PP follower
+            # register after the worker has already posted -- see
+            # ``FlexKVLayerLoadingEvent.arm_for_new_transfer``. The producer
+            # ring guarantees the next batch uses a different counter, so this
+            # cannot swallow signals for an already-launched transfer.
+            event.drain_leftovers()
             self.consumer_index = -1
             self._consumer_task_ids.clear()
 

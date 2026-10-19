@@ -1020,12 +1020,21 @@ class FlexKVConnector:
         # cross-stage reduction here deadlocks: this runs inside each stage's
         # get_new_batch_prefill, but the scheduler forwards the request to the
         # next stage only *after* that call returns, so pp0 would block waiting
-        # for stages that cannot arrive until pp0 moves on. Cross-stage
-        # agreement is unnecessary anyway -- only pp0 (is_sync_leader) launches
-        # the fan-out load, and its counter_id reaches every stage through the
-        # non-blocking LAYERWISE_MANIFEST scatter above. Each stage registers
-        # its own consumer counter before its own forward pass consumes the KV,
-        # which the pipeline already orders strictly after pp0's launch.
+        # for stages that cannot arrive until pp0 moves on.
+        #
+        # Dropping the PP hop means a follower now registers *after* pp0 has
+        # launched, so the worker may already have posted that stage's layer
+        # signals. That is safe only because registration arms the counter
+        # without draining it (FlexKVLayerDoneCounter ->
+        # FlexKVLayerLoadingEvent.arm_for_new_transfer); stale signals are
+        # cleared when the slot is released instead. Do not reintroduce a
+        # drain on the registration path -- it silently discards completed
+        # layers and the follower then blocks until the wait timeout.
+        #
+        # Cross-stage agreement is not otherwise needed: only pp0
+        # (is_sync_leader) launches the fan-out load, and its counter_id
+        # reaches every stage through the non-blocking LAYERWISE_MANIFEST
+        # scatter above.
         all_ranks_ok = (
             self._sync_ctx.all_reduce_min(local_ok, skip_pp=True)
             if self._sync_ctx.needs_sync_without_pp

@@ -624,3 +624,131 @@ def test_pp_skewed_layerwise_preflight_does_not_deadlock_live():
     for rank, status, *_ in results:
         assert status == "ok", f"rank {rank}: {status}"
 
+
+# ===========================================================================
+# Lost wakeup: a PP follower registers AFTER the worker already posted.
+# ===========================================================================
+# Consequence of dropping the PP hop above. Only pp0 launches the fan-out H2D
+# load, and it launches from inside its own get_new_batch_prefill -- long
+# before the pipeline hands the request to stage N+1. So by the time a
+# follower reaches start_load_kv_layerwise, the worker has often already
+# posted every one of that stage's per-layer eventfd signals.
+#
+# Registration used to call reset_for_new_transfer(), which drains the fds.
+# That discarded the completed layers and the follower then blocked until the
+# wait timeout. Observed live on GLM-5.3 PP4/DP2: the H2D fan-out finished in
+# 70 ms (all four stage slices, byte-exact), and PP1 still died 240 s later on
+# `counter_id=0 layer=0 wait_count=1`, taking the prefill instance down and
+# surfacing on the decode side as "Lost connection with prefill instance".
+#
+# Fix: arm without draining; drain when the slot is released instead.
+
+from flexkv.integration.sglang.comm import (  # noqa: E402
+    FlexKVLayerDoneCounter,
+    FlexKVLayerLoadingEvent,
+)
+
+
+def test_arm_for_new_transfer_preserves_already_posted_signals():
+    """The core invariant: arming must not swallow a live signal."""
+    event = FlexKVLayerLoadingEvent(num_layers=3)
+    event.mark_reusable()  # slot starts finished/clean
+
+    # Worker posts every layer before the follower registers.
+    for fd in event.load_event_fds:
+        os.write(fd, (1).to_bytes(8, "little"))
+
+    event.arm_for_new_transfer()
+    event.add_transfer()
+
+    # All three layers must be immediately satisfiable.
+    for layer in range(3):
+        event.wait(layer, 1, timeout_s=5.0)
+
+
+def test_reset_for_new_transfer_still_drains_for_the_producer():
+    """The leader path keeps its drain (it runs before the launch)."""
+    event = FlexKVLayerLoadingEvent(num_layers=2)
+    event.mark_reusable()
+    for fd in event.load_event_fds:
+        os.write(fd, (1).to_bytes(8, "little"))
+
+    event.reset_for_new_transfer()
+    event.add_transfer()
+
+    # Stale signals are gone, so the wait must now time out rather than
+    # return early on data the worker never produced.
+    with pytest.raises(TimeoutError):
+        event.wait(0, 1, timeout_s=0.2)
+
+
+def test_follower_registration_after_post_does_not_lose_the_wakeup():
+    """End-to-end on the counter: the exact live failure, deterministically.
+
+    Reproduces `counter_id=0 layer=0 wait_count=1` -- pre-fix this test hangs
+    for the full timeout and then raises.
+    """
+    counter = FlexKVLayerDoneCounter(num_layers=4, num_counters=3, world_rank=2)
+    counter.wait_timeout_s = 5.0
+
+    # pp0 chose counter 0 and broadcast it via the manifest.
+    leader_counter_id = 0
+    task_id = 2
+
+    # The worker completes the follower's slice and posts all four layers
+    # BEFORE the follower registers (pipeline ordering).
+    for fd in counter.events[leader_counter_id].load_event_fds:
+        os.write(fd, (1).to_bytes(8, "little"))
+
+    # Follower now registers against the leader's counter and consumes.
+    counter.register_task_with_explicit_counter_id(task_id, leader_counter_id)
+    counter.set_consumer(task_id)
+
+    for layer in range(4):
+        counter.wait_until(layer)  # must not raise
+
+    # Slot was released and drained, ready for the next batch.
+    assert counter.consumer_index == -1
+
+
+def test_release_drains_so_skipped_layers_do_not_leak_forward():
+    """Drain-on-release must still protect the next transfer.
+
+    A layer the attention backend never waited on leaves a pending signal;
+    it must not let the *next* transfer's wait return early.
+    """
+    counter = FlexKVLayerDoneCounter(num_layers=3, num_counters=3, world_rank=0)
+    counter.wait_timeout_s = 5.0
+
+    cid = 0
+    counter.register_task_with_explicit_counter_id(1, cid)
+    counter.set_consumer(1)
+    # Worker posts all 3 layers...
+    for fd in counter.events[cid].load_event_fds:
+        os.write(fd, (1).to_bytes(8, "little"))
+    # ...but the consumer only waits on layer 0 and the final layer, leaving
+    # layer 1's signal pending.
+    counter.wait_until(0)
+    counter.wait_until(2)  # final layer -> release + drain
+
+    # Next transfer on the same slot: layer 1 must NOT be pre-satisfied.
+    counter.register_task_with_explicit_counter_id(2, cid)
+    counter.set_consumer(2)
+    with pytest.raises(TimeoutError):
+        counter.wait_until(1)
+
+
+def test_registration_path_has_no_drain():
+    """Guard against reintroducing the drain on the follower path."""
+    src = inspect.getsource(
+        FlexKVLayerDoneCounter.register_task_with_explicit_counter_id
+    )
+    assert "arm_for_new_transfer" in src
+    assert "reset_for_new_transfer" not in src, (
+        "draining at registration discards signals the worker already posted"
+    )
+    # The producer-selecting path must keep its (safe, pre-launch) drain.
+    assert "reset_for_new_transfer" in inspect.getsource(
+        FlexKVLayerDoneCounter.update_producer
+    )
+
