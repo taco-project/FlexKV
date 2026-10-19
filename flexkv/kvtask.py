@@ -1242,6 +1242,23 @@ class KVTaskEngine(KVTaskManager):
             self._prefetch_backend.shutdown()
         super().shutdown()
 
+    # --------------------------------------------------- placement events
+    #
+    # Deliberately not @on_runtime: the queue carries its own lock and the
+    # eviction ring has a single reader, so neither needs the control thread.
+    # Routing them through it would cost the scheduler a cross-thread wait on
+    # every tick for nothing.
+
+    def start_kv_events(self) -> bool:
+        """Arm CPU-tier KV placement events. Only the radixshmem tier has
+        them; every other planner reports False and publishes nothing."""
+        start = getattr(self.cache_engine, "start_kv_events", None)
+        return bool(start()) if start is not None else False
+
+    def take_kv_events(self, max_hashes: int = 65536) -> List[Any]:
+        drain = getattr(self.cache_engine, "drain_kv_events", None)
+        return drain(max_hashes) if drain is not None else []
+
     @on_runtime
     def get_async(self,
                   token_ids: np.ndarray,
