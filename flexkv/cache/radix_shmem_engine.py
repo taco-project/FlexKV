@@ -272,22 +272,35 @@ class CacheEngineRadixShmem:
                  *,
                  component_mask: int = COMPONENT_MASK_FULL,
                  query_end: Optional[int] = None,
-                 timeout_ms: int = 30000) -> Any:
+                 timeout_ms: int = 30000,
+                 hash_start: int = 0,
+                 hash_end: Optional[int] = None) -> Any:
         """Start `pull_async` for the prefix; None when the region has no peers.
 
         The server pulls one peer's run into local slots and the client publishes
         it into the local tree on completion. `lock=False`: nothing stays pinned.
         `block=False`: a saturated client completes the job with the local hit.
+
+        ``hash_start`` / ``hash_end`` select a half-open block range for chunked
+        prefetch (defaults: whole ``hashes[:query_end]``). Job progress fields
+        are relative to that sub-range.
         """
         if not self.peer_enabled:
             return None
         hashes = self._hashes(sequence_meta, query_end)
-        job = self._client.pull_async(hashes, component_mask, lock=False,
-                                      timeout_ms=int(timeout_ms), block=False)
+        job = self._client.pull_async(
+            hashes,
+            component_mask,
+            lock=False,
+            timeout_ms=int(timeout_ms),
+            block=False,
+            start=int(hash_start),
+            end=None if hash_end is None else int(hash_end),
+        )
         flexkv_logger.debug(
             f"radixshmem prefetch on {self.shm_name}: mask={component_mask:#x} "
-            f"blocks={len(hashes)} local_hit={job.local_hit} "
-            f"planned_hit={job.planned_hit} job={job.job_id}")
+            f"blocks={len(hashes)} range=[{job.hash_start},{job.hash_end}) "
+            f"local_hit={job.local_hit} planned_hit={job.planned_hit} job={job.job_id}")
         return job
 
     def insert(self,

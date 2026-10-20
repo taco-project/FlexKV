@@ -1112,16 +1112,32 @@ class KVTaskEngine(KVTaskManager):
                  event_collector: Optional[KVEventCollector] = None,
                  ):
         if cache_config.enable_chunked_prefetch:
-            if (not cache_config.use_mooncake_store_backend or cache_config.enable_ssd
-                    or cache_config.enable_kv_sharing or model_config.nnodes > 1
-                    or model_config.use_trtllm_subprocess):
+            from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+            use_radix = bool(GLOBAL_CONFIG_FROM_ENV.enable_radixshmem)
+            use_mooncake = bool(cache_config.use_mooncake_store_backend)
+            if use_radix and use_mooncake:
                 raise ValueError(
-                    "chunked prefetch v1 requires node-local Mooncake + CPU, "
-                    "without SSD/P2P or TRT remote mode")
+                    "chunked prefetch cannot enable Mooncake and radixshmem backends together")
+            if use_mooncake:
+                if (cache_config.enable_ssd or cache_config.enable_kv_sharing
+                        or model_config.nnodes > 1 or model_config.use_trtllm_subprocess):
+                    raise ValueError(
+                        "chunked prefetch v1 requires node-local Mooncake + CPU, "
+                        "without SSD/P2P or TRT remote mode")
+            elif use_radix:
+                if (cache_config.enable_ssd or cache_config.enable_remote
+                        or cache_config.enable_kv_sharing):
+                    raise ValueError(
+                        "radixshmem chunked prefetch requires CPU-only radixshmem "
+                        "(no SSD/remote/kv_sharing)")
+            else:
+                raise ValueError(
+                    "chunked prefetch requires Mooncake store backend or "
+                    "FLEXKV_ENABLE_RADIXSHMEM=1")
             from flexkv.prefetch.types import PrefetchOptions
             from flexkv.prefetch.coordinator import PrefetchCoordinator
-            from flexkv.prefetch.planner import MooncakeChunkPlanner
-            self._prefetch_options = PrefetchOptions(**(cache_config.prefetch_options or {}))
+            self._prefetch_options = PrefetchOptions.from_mapping(
+                cache_config.prefetch_options or {})
             self._prefetch_options.validate()
             for name in ("prefetch_max_sessions", "prefetch_max_reserved_bytes", "prefetch_max_pinned_bytes"):
                 value = getattr(cache_config, name)
@@ -1132,13 +1148,26 @@ class KVTaskEngine(KVTaskManager):
                           cache_config.prefetch_max_pinned_bytes, cache_config.prefetch_result_ttl_s):
                 if not math.isfinite(limit) or limit <= 0:
                     raise ValueError("prefetch runtime limits must be finite and positive")
+            self._chunked_prefetch_backend = "radixshmem" if use_radix else "mooncake"
         super().__init__(model_config, cache_config, gpu_register_port, redis_meta, event_collector)
         self.tracer = FlexKVTracer()
         self.tracer.trace_config(model_config, cache_config, gpu_layout=None)
 
         self._runtime = None
         if cache_config.enable_chunked_prefetch:
-            self._prefetch_backend = MooncakeChunkPlanner(self, cache_config.prefetch_max_pinned_bytes)
+            if getattr(self, "_chunked_prefetch_backend", "mooncake") == "radixshmem":
+                from flexkv.prefetch.radixshmem_planner import RadixShmemChunkPlanner
+                from flexkv.server.shm_radix_bootstrap import chunk_transfer_timeout_ms
+                self._prefetch_backend = RadixShmemChunkPlanner(
+                    self,
+                    cache_config.prefetch_max_pinned_bytes,
+                    chunk_timeout_ms=chunk_transfer_timeout_ms(
+                        cache_config.prefetch_options or {}),
+                )
+            else:
+                from flexkv.prefetch.mooncake_planner import MooncakeChunkPlanner
+                self._prefetch_backend = MooncakeChunkPlanner(
+                    self, cache_config.prefetch_max_pinned_bytes)
             self._prefetch = PrefetchCoordinator(
                 self._prefetch_backend,
                 max_sessions=cache_config.prefetch_max_sessions,
@@ -1174,7 +1203,10 @@ class KVTaskEngine(KVTaskManager):
     def prefetch_capabilities(self) -> PrefetchCapabilities:
         if not hasattr(self, "_prefetch"):
             raise RuntimeError("chunked prefetch is not enabled")
-        return PrefetchCapabilities(partial_swa_checkpoints=True)
+        # Mooncake chunk planner can restore SWA checkpoints; radixshmem
+        # chunked sessions are Full-KV only (legacy whole-pull still does SWA).
+        swa_ok = getattr(self, "_chunked_prefetch_backend", "mooncake") != "radixshmem"
+        return PrefetchCapabilities(partial_swa_checkpoints=swa_ok)
 
     @on_runtime
     def start_prefetch(

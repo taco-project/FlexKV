@@ -901,6 +901,17 @@ def test_prefetch_backpressure_skips_the_peer_walk():
     assert engine.get_callback.prefetch_job is None  # type: ignore[attr-defined]
 
 
+def test_chunked_prefetch_skips_legacy_whole_pull():
+    """When enable_chunked_prefetch is on, peer pulls belong to PrefetchCoordinator."""
+    engine = _global_cache_engine()
+    engine.cache_config.enable_chunked_prefetch = True
+    _graph, ops, return_mask = _run_get(
+        engine, 4, _local_match([]), prefetch=True, prefetch_job=FakeJob(0, 4))
+    assert ops == {} and not bool(return_mask.any())
+    assert engine.prefetch_calls == []              # type: ignore[attr-defined]
+    assert engine.get_callback.prefetch_job is None  # type: ignore[attr-defined]
+
+
 def _bare_task_engine(cache_config):
     """A `KVTaskEngine` without transfer handles: enough of the task table for
     the job polling paths (the same `__new__` trick the fallback managers use)."""

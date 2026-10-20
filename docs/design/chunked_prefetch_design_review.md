@@ -312,7 +312,7 @@ chunk 结束在 checkpoint 时，向原 Full 图附加现有 SWA peer op，使�
 | 模块 | 主要实现入口 | 开发 / 评审重点 |
 |---|---|---|
 | 协议与策略 | [types.py](../../flexkv/prefetch/types.py)、[policy.py](../../flexkv/prefetch/policy.py) | 句柄、状态快照、配置验证和启动期策略注册 |
-| 控制与构图 | [coordinator.py](../../flexkv/prefetch/coordinator.py)、[planner.py](../../flexkv/prefetch/planner.py)、[runtime.py](../../flexkv/prefetch/runtime.py) | claim/seal 顺序、窗口公平性、连续发布、预算、失败所有权 |
+| 控制与构图 | [coordinator.py](../../flexkv/prefetch/coordinator.py)、[mooncake_planner.py](../../flexkv/prefetch/mooncake_planner.py)、[runtime.py](../../flexkv/prefetch/runtime.py) | claim/seal 顺序、窗口公平性、连续发布、预算、失败所有权 |
 | 前台与 RPC | [kvtask.py](../../flexkv/kvtask.py)、[kvmanager.py](../../flexkv/kvmanager.py)、[server](../../flexkv/server) | 完成通道单线程消费、wait 不阻塞控制、句柄和客户端归属 |
 | SGLang | [connector.py](../../flexkv/integration/sglang/connector.py)、[SGLang 适配源码](https://github.com/sgl-project/sglang/pull/31781) | 入队/demand/abort、TP 一致性、CPU-only LOOKUP、准入和两次 lease 交接 |
 | 回归与模型验收 | [prefetch tests](../../tests/prefetch)、[实机报告](chunked_prefetch_validation.md) | 部分读取、乱序完成、停止竞态、真实数据一致性及模型 checkpoint |

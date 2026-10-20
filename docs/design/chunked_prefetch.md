@@ -4,7 +4,7 @@
 
 传输仍走原来的 `REMOTE2H → CPU cache → H2D`。新增代码负责何时下发、何时停止、何时可以交付结果，原有 worker、kernel 和图协议保持原样。
 
-本文先说明行为和时序；完整接口、配置与异常约定见 [开发参考](chunked_prefetch_reference.md)。
+本文先说明行为和时序；完整接口、配置与异常约定见 [开发参考](chunked_prefetch_reference.md)。**radixshmem 后端**的三策略适配与前缀分段约束见 [radixshmem_chunked_prefetch.md](./radixshmem_chunked_prefetch.md)。
 
 ## 1. SGLang 服务路由与会话策略
 

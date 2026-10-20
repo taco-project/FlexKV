@@ -220,6 +220,20 @@ class FlexKVConnector:
             self, "_chunked_namespace_supported", False
         ) is True
 
+    @staticmethod
+    def _require_chunked_swa_support(caps: Any, *, wants_swa: bool) -> None:
+        """Reject SWA + chunked when the backend cannot restore SWA checkpoints.
+
+        Radixshmem chunked is Full-KV only (``partial_swa_checkpoints=False``).
+        Mooncake reports True and may proceed with ``swa_aware`` sessions.
+        """
+        if wants_swa and not getattr(caps, "partial_swa_checkpoints", False):
+            raise RuntimeError(
+                "chunked prefetch backend does not support SWA models; "
+                "use hicache_storage_prefetch_policy=wait_complete "
+                "or disable FLEXKV_ENABLE_CHUNKED_PREFETCH"
+            )
+
     def __init__(
         self,
         *,
@@ -258,8 +272,9 @@ class FlexKVConnector:
                 "policy",
                 getattr(server_args, "hicache_storage_prefetch_policy", "wait_complete"),
             )
-            self._chunked_prefetch_options = PrefetchOptions(**opts)
+            self._chunked_prefetch_options = PrefetchOptions.from_mapping(opts)
             self._chunked_prefetch_options.validate()
+            # Keep backend-only keys (e.g. chunk_timeout_ms) for radixshmem.
             self.cache_config.prefetch_options = opts
             # wait_complete needs the original whole-task path. Disable the
             # chunk runtime before KVManager is created, including its threads.
@@ -436,8 +451,18 @@ class FlexKVConnector:
                     caps = self.kv_manager.prefetch_capabilities()
                     if not caps.stop_and_drain or caps.protocol_version != 1:
                         raise RuntimeError("server lacks chunked prefetch stop/drain support")
-                    if self._swa_kv_pool is not None and not caps.partial_swa_checkpoints:
-                        raise RuntimeError("server lacks SWA checkpoint prefetch support")
+                    # Chunked sessions set swa_aware from the paged SWA pool.
+                    # Backends without partial_swa_checkpoints (radixshmem) cannot
+                    # serve SWA; fail at startup instead of soft-failing on first
+                    # prefetch or silently staging Full-KV only.
+                    self._require_chunked_swa_support(
+                        caps,
+                        wants_swa=bool(self._swa_kv_pool is not None)
+                        or bool(
+                            getattr(self, "_chunked_prefetch_options", None) is not None
+                            and self._chunked_prefetch_options.swa_aware
+                        ),
+                    )
                 except Exception as exc:
                     status["error"] = str(exc)
             if self._sync_ctx.needs_sync:
@@ -2118,10 +2143,6 @@ class FlexKVConnector:
         self, kvcache: Any
     ) -> Tuple[List[torch.Tensor], Optional[_IndexerBufferGroup]]:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
-        for attr in kvcache.__dict__:
-            print(f"attr: {attr}")
-            print(f"value: {getattr(kvcache, attr)}")
-            print("-"*100)
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
         if indexer_buffers:
             if self._deduplicate_indexer_group:

@@ -18,7 +18,7 @@ from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, LayerGroupSpec
 from flexkv.common.transfer import CompletedOp, DeviceType
 from flexkv.prefetch.coordinator import PrefetchCoordinator
-from flexkv.prefetch.planner import MooncakeChunkPlanner
+from flexkv.prefetch.mooncake_planner import MooncakeChunkPlanner
 from flexkv.prefetch.types import PrefetchOptions
 
 

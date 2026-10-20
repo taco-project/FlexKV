@@ -56,7 +56,7 @@ implementation does not change the existing storage key format or transcode KV.
 - `prefetch/policy.py`: startup policy registry; frozen when the first coordinator starts.
 - `prefetch/coordinator.py`: parent sessions, fair bounded admission, seal/drain,
   contiguous publication, leases, and terminal retention.
-- `prefetch/planner.py`: async full-chain hashing/metadata query, lazy detached CPU
+- `prefetch/mooncake_planner.py`: async full-chain hashing/metadata query, lazy detached CPU
   allocation, one existing REMOTE2H graph per chunk, and existing deferred-insert commit.
 - `prefetch/runtime.py`: a single owner thread for all task state/completions;
   one bounded sender outbox for each existing transfer handle.

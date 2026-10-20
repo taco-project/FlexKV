@@ -4,7 +4,7 @@ Only detached CPU staging is allocated, lazily per window. Full sequence hashes
 are constructed once. Completion and publication are deliberately separate.
 """
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from copy import copy
 from dataclasses import dataclass, field, replace
 import threading
@@ -19,11 +19,12 @@ from flexkv.cache.cache_engine import (
 )
 from flexkv.common.block import SequenceMeta
 from flexkv.common.transfer import DeviceType, TransferOp, TransferOpGraph, TransferType
+from flexkv.prefetch.base_planner import ChunkPlannerBase
 from flexkv.prefetch.types import PrefetchCapacityExhausted
 
 
 @dataclass
-class PrefetchContext:
+class MooncakePrefetchContext:
     tokens: np.ndarray
     namespace: Optional[list[str]]
     client_id: int
@@ -40,7 +41,7 @@ class PrefetchContext:
 
 
 @dataclass
-class PrefetchChunk:
+class MooncakePrefetchChunk:
     begin: int
     end: int
     nbytes: int
@@ -55,28 +56,23 @@ class PrefetchChunk:
     swa_completion: Any = None
 
 
-class MooncakeChunkPlanner:
+class MooncakeChunkPlanner(ChunkPlannerBase):
     def __init__(self, engine, max_pinned_bytes):
-        self.engine = engine
-        self.cache = engine.cache_engine
-        self.block_size = engine.cache_config.tokens_per_block
-        from flexkv.common.config import (
-            block_size_in_bytes_for_cache,
-            RankInfo,
-            GLOBAL_CONFIG_FROM_ENV,
-        )
-
-        self.block_bytes = block_size_in_bytes_for_cache(
-            engine.model_config, engine.cache_config, RankInfo(engine.model_config)
+        self._init_common(
+            engine,
+            max_pinned_bytes,
+            apply_kv_replicas=True,
+            executor_name="flexkv-prefetch-query",
         )
         # Full KV and its SWA/state sidecar use the same rank replication mode.
+        from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+
         replicas = 1
         if (
             engine.model_config.num_kv_heads == 1
             and GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode == "all_write"
         ):
             replicas = engine.model_config.effective_tp_size_per_node
-        self.block_bytes *= replicas
         swa = engine.cache_config.swa
         self.swa_slot_bytes = 0
         if swa is not None and swa.enabled:
@@ -90,22 +86,13 @@ class MooncakeChunkPlanner:
                     swa.num_swa_layers * self.block_size * swa.bytes_per_token_per_layer
                 )
             )
-        self.max_pinned_bytes = max_pinned_bytes
-        self.pinned_bytes = 0
-        self.executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="flexkv-prefetch-query"
-        )
         self._query_client = None
 
     def begin(self, tokens, namespace, client_id, options):
         if options.swa_aware and not self.cache.swa_op_constructor.enabled:
             raise ValueError("SWA prefetch requires enabled SWA storage and transfer")
-        tokens = np.asarray(tokens)
-        if tokens.ndim != 1 or tokens.dtype != np.int64:
-            raise ValueError("prefetch token_ids must be a one-dimensional int64 array")
-        if options.candidate_start_token > len(tokens):
-            raise ValueError("candidate_start_token exceeds request length")
-        context = PrefetchContext(
+        tokens = self.validate_prefetch_tokens(tokens, options.candidate_start_token)
+        context = MooncakePrefetchContext(
             tokens.copy(),
             list(namespace) if namespace else None,
             client_id,
@@ -114,7 +101,7 @@ class MooncakeChunkPlanner:
         context.future = self.executor.submit(self._query, context)
         return context
 
-    def _query(self, context: PrefetchContext) -> Tuple[Optional[SequenceMeta], int]:
+    def _query(self, context: MooncakePrefetchContext) -> Tuple[Optional[SequenceMeta], int]:
         # Hashing and network queries occur without the radix lock. The query
         # client belongs exclusively to this executor, not foreground GET/PUT.
         from flexkv.external.mooncake_store_keys import PoolKind
@@ -167,7 +154,7 @@ class MooncakeChunkPlanner:
             matched = checkpoints[len(checkpoints) - 1] // self.block_size if checkpoints else 0
         return sequence, matched
 
-    def resolve(self, context: PrefetchContext) -> Optional[Tuple[int, int]]:
+    def resolve(self, context: MooncakePrefetchContext) -> Optional[Tuple[int, int]]:
         if not context.future.done():
             return None
         context.sequence, matched = context.future.result()
@@ -189,7 +176,7 @@ class MooncakeChunkPlanner:
         return start, max(start, matched * self.block_size)
 
     def _pin_prefix(
-        self, context: PrefetchContext, end: int, reserved_to_release: int = 0
+        self, context: MooncakePrefetchContext, end: int, reserved_to_release: int = 0
     ) -> bool:
         cpu = self.cache.cpu_cache_engine
         prefix = copy(context.sequence)
@@ -316,7 +303,7 @@ class MooncakeChunkPlanner:
                         swa_anchor_block=end_block - 1,
                         swa_load_result=MooncakeLoadResult(),
                     )
-                return PrefetchChunk(
+                return MooncakePrefetchChunk(
                     begin,
                     end,
                     blocks * block_bytes + (snapshot_bytes if needs_snapshot else 0),
@@ -336,8 +323,7 @@ class MooncakeChunkPlanner:
         for handle in self.engine.transfer_handles:
             handle.submit_batch(graphs)
 
-    @staticmethod
-    def complete(chunk, completion):
+    def complete(self, chunk, completion):
         if completion.op_id == -1:
             chunk.done = True
             chunk.failed = completion.failed
@@ -386,17 +372,15 @@ class MooncakeChunkPlanner:
                 self.cache.cpu_cache_engine._free_swa_slot(chunk.pending.swa_slot)
             chunk.resolved = True
 
-    @staticmethod
-    def result_end(context: PrefetchContext, committed: int) -> int:
+    def result_end(self, context: MooncakePrefetchContext, committed: int) -> int:
         """Only a resident Full+SWA boundary can resume an SWA request."""
         return min(committed, context.reusable_end) if context.swa_aware else committed
 
-    def release(self, context: PrefetchContext) -> None:
+    def release(self, context: MooncakePrefetchContext) -> None:
         if context.released:
             return
         context.released = True
-        context.cancel_query.set()
-        context.future.cancel()
+        self.cancel_query(context)
         with self.cache._cache_tree_lock:
             if context.node is not None:
                 self.cache.cpu_cache_engine.unlock(context.node)
@@ -407,11 +391,3 @@ class MooncakeChunkPlanner:
                 context.swa_node = None
             self.pinned_bytes -= context.pinned_bytes
             context.pinned_bytes = 0
-
-    @staticmethod
-    def cancel_query(context: PrefetchContext) -> None:
-        context.cancel_query.set()
-        context.future.cancel()
-
-    def shutdown(self) -> None:
-        self.executor.shutdown(wait=True, cancel_futures=True)

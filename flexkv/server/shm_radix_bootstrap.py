@@ -33,6 +33,7 @@ strides of a plain tensor.
 from __future__ import annotations
 
 import dataclasses
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -56,6 +57,23 @@ READY_TIMEOUT_S = 600.0
 PREFETCH_TIMEOUT_MS = 5000
 PREFETCH_MAX_INFLIGHT = 128
 MAX_OUTSTANDING = 256
+
+
+def chunk_transfer_timeout_ms(prefetch_options: Optional[dict] = None) -> int:
+    """Per-chunk ``pull_async`` server deadline (ms).
+
+    Distinct from the session policy budget (``PrefetchOptions.budget``): this
+    only bounds one RDMA peer pull. Override via
+    ``prefetch_options["chunk_timeout_ms"]`` or
+    ``FLEXKV_RADIXSHMEM_CHUNK_TIMEOUT_MS``.
+    """
+    opts = prefetch_options or {}
+    if "chunk_timeout_ms" in opts:
+        return max(1, int(opts["chunk_timeout_ms"]))
+    env = os.getenv("FLEXKV_RADIXSHMEM_CHUNK_TIMEOUT_MS")
+    if env is not None and str(env).strip() != "":
+        return max(1, int(env))
+    return int(PREFETCH_TIMEOUT_MS)
 
 
 def radix_server_name() -> str:
