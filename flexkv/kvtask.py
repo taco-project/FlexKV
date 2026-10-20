@@ -1,5 +1,6 @@
 import logging
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional, List, Union, Tuple, Sequence
 import threading
 from enum import Enum
@@ -7,7 +8,6 @@ from dataclasses import dataclass, field, replace
 from typing import Callable
 import multiprocessing as mp
 import copy
-from expiring_dict import ExpiringDict
 import nvtx
 import numpy as np
 
@@ -104,6 +104,8 @@ class KVTask:
     prefetch_job: Optional[Any] = None
     prefetch_local_hit_blocks: int = 0
     prefetch_planned_hit_blocks: int = 0
+    cancel_requested: bool = False
+    prefetch_key: Optional[int] = None
 
     def is_completed(self) -> bool:
         return self.status in [TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED]
@@ -116,6 +118,8 @@ class KVTask:
         self.slot_mapping = None
         self.token_mask = None
         self.callback = None
+        self.op_callback_dict = {}
+        self.swa_slot_mapping = None
 
 TASK_STATUS_TO_RESPONSE_STATUS = {
     TaskStatus.COMPLETED: KVResponseStatus.SUCCESS,
@@ -228,10 +232,13 @@ class KVTaskManager:
             self.transfer_handles.append(remote_handle)
             remote_handle._handle.send_config_to_remotes()
 
-        self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(ttl=1800) # 30 minutes
+        # Active transfers own blocks and callbacks until graph completion.
+        # A TTL must never evict that ownership while DMA is still in flight.
+        self.tasks: Dict[int, KVTask] = {}
+        self._terminal_tasks: Dict[int, float] = OrderedDict()
 
         # hash(token_ids) -> task_id
-        self.prefetch_tasks: ExpiringDict[int, int] = ExpiringDict(ttl=1800) # 30 minutes
+        self.prefetch_tasks: Dict[int, int] = {}  # removed with the owning task
         self._gen_prefetch_key = lambda token_ids, namespace: hash_token(token_ids, namespace)
 
         self.graph_to_task: Dict[int, int] = {}
@@ -445,7 +452,9 @@ class KVTaskManager:
             task.prefetch_planned_hit_blocks = int(callback.prefetch_planned_hit_blocks)
             self.prefetch_jobs[task_id] = job
 
-        self.prefetch_tasks[self._gen_prefetch_key(token_ids, namespace)] = task_id
+        key = self._gen_prefetch_key(token_ids, namespace)
+        self.tasks[task_id].prefetch_key = key
+        self.prefetch_tasks[key] = task_id
 
         self.graph_to_task[graph.graph_id] = task_id
         self._log_task_created(self.tasks[task_id])
@@ -561,14 +570,6 @@ class KVTaskManager:
                     completed_op.xfer_ms,
                     completed_op.e2e_ms,
                 )
-            if task.status == TaskStatus.CANCELLED and task.callback is None:
-                # Cache was reset while this task was in flight: reset_cache()
-                # cleared its callbacks and freed the radix nodes / mempool blocks
-                flexkv_logger.warning(
-                    f"task {task_id}: transfer op {completed_op.op_id} completed "
-                    "after reset_cache(), callback no longer exists and will be skipped."
-                )
-                continue
             has_callback = completed_op.op_id in task.op_callback_dict
             if has_callback:
                 try:
@@ -589,6 +590,8 @@ class KVTaskManager:
                 self._mark_completed(task_id)
             elif completed_op.op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
+        if getattr(self, "_runtime", None) is None:
+            self._reap_completed_tasks()
 
     def _narrow_return_mask_to_prefix_blocks(
             self, task: "KVTask", num_success_blocks: int) -> None:
@@ -762,7 +765,8 @@ class KVTaskManager:
         flexkv_logger.error(f"[KVTaskEngine] task {task_id} FAILED: a transfer "
                             f"op of graph {task.graph.graph_id} failed")
         self._abort_task_plans(task)
-        task.status = TaskStatus.FAILED
+        task.status = TaskStatus.CANCELLED if task.cancel_requested else TaskStatus.FAILED
+        self._log_task_terminal(task, task.status)
         task.task_end_op_finished = True
         self.graph_to_task.pop(task.graph.graph_id, None)
         task.shed_heavy_resources()
@@ -772,12 +776,22 @@ class KVTaskManager:
             self._release_task(task_id)
 
     def _cancel_task(self, task_id: int) -> None:
-        if task_id not in self.tasks:
+        task = self.tasks.get(task_id)
+        if task is None:
             return
-        task = self.tasks[task_id]
-        job = getattr(self, "prefetch_jobs", {}).pop(task_id, None)
+        task.request_returned = True
+        job = getattr(self, "prefetch_jobs", {}).get(task_id)
+        job_only = job is not None and task.graph is not None and task.graph.num_ops == 0
+        if task.status == TaskStatus.RUNNING and not job_only:
+            # Cancellation cannot stop submitted DMA. Keep graph mappings,
+            # plan pins and allocations until every transfer handle drains.
+            task.cancel_requested = True
+            return
         if job is not None:
+            # RadixShmem owns the peer-pull buffers. Its empty graph has no
+            # submitted transfer handles or plan pins for this task to drain.
             job.cancel()
+            self.prefetch_jobs.pop(task_id, None)
             task.prefetch_job = None
         if not task.is_completed():
             # A task whose graph never launched still holds everything its
@@ -785,16 +799,12 @@ class KVTaskManager:
             # blocks that only a completion callback could mount on the tree.
             # Dropping the task without aborting leaks all of it -- the staging
             # blocks become unreachable (mempool exhaustion) and the pinned
-            # nodes stay unevictable. Abort rolls those back; RUNNING tasks
-            # keep the old behavior (their graph is in flight and completion
-            # callbacks will still fire).
-            if task.status in (TaskStatus.UNREADY, TaskStatus.READY):
-                self._abort_task_plans(task)
-            if task.status == TaskStatus.RUNNING and getattr(self, "_runtime", None) is not None:
-                task.request_returned = True
-                return
+            # nodes stay unevictable. Abort rolls those back. Submitted
+            # transfer graphs returned above and retain their ownership
+            # until the handles drain.
+            self._abort_task_plans(task)
             task.status = TaskStatus.CANCELLED
-            self._log_task_terminal(task, TaskStatus.CANCELLED)
+            self._log_task_terminal(task, task.status)
         self._release_task(task_id)
 
     def check_completed(self, task_id: int, completely: bool = False) -> bool:
@@ -811,7 +821,7 @@ class KVTaskManager:
         # A partial-capable backend may finish the data-path sink after already
         # reporting failed blocks. Wait for graph completion so cleanup runs and
         # the caller observes FAILED instead of an early RUNNING-as-success result.
-        if task.transfer_failed:
+        if task.transfer_failed or task.cancel_requested:
             return task.is_completed()
         # For tasks with callback (e.g., PUT tasks that need to call insert_and_publish),
         # we must wait until _mark_completed is called (i.e., is_completed() returns True)
@@ -876,10 +886,16 @@ class KVTaskManager:
 
     def _release_task(self, task_id: int) -> None:
         if task_id not in self.tasks:
+            # reset_cache() drops self.tasks wholesale; the reaper must still be
+            # able to retire the bookkeeping entry or it spins on a dead id.
+            if hasattr(self, "_terminal_tasks"):
+                self._terminal_tasks.pop(task_id, None)
             return
         task = self.tasks[task_id]
         if task.graph is not None:
             self.graph_to_task.pop(task.graph.graph_id, None)
+        if task.prefetch_key is not None and self.prefetch_tasks.get(task.prefetch_key) == task_id:
+            self.prefetch_tasks.pop(task.prefetch_key, None)
         self.tasks.pop(task_id, None)
         if hasattr(self, "_terminal_tasks"):
             self._terminal_tasks.pop(task_id, None)
@@ -897,7 +913,9 @@ class KVTaskManager:
         task = self.tasks[task_id]
         if task.is_completed():
             return
-        if task.callback:
+        if task.cancel_requested:
+            self._abort_task_plans(task)
+        elif task.callback:
             callbacks = (
                 task.callback if isinstance(task.callback, list)
                 else [task.callback]
@@ -917,9 +935,10 @@ class KVTaskManager:
         if task.task_type == TaskType.PREFETCH:
             self._finalize_prefetch_return_mask(task)
         task.status = (
+            TaskStatus.CANCELLED if task.cancel_requested else
             TaskStatus.FAILED if task.transfer_failed else TaskStatus.COMPLETED)
         task.task_end_op_finished = True
-        self._log_task_terminal(task, TaskStatus.COMPLETED)
+        self._log_task_terminal(task, task.status)
         self.graph_to_task.pop(task.graph.graph_id, None)
         task.shed_heavy_resources()
         if hasattr(self, "_terminal_tasks"):
@@ -1144,10 +1163,6 @@ class KVTaskEngine(KVTaskManager):
                 max_sessions=cache_config.prefetch_max_sessions,
                 max_reserved_bytes=cache_config.prefetch_max_reserved_bytes,
                 result_ttl_s=cache_config.prefetch_result_ttl_s)
-            # Active graph/callback ownership must never be evicted by TTL.
-            self.tasks = {}
-            from collections import OrderedDict
-            self._terminal_tasks = OrderedDict()
 
     def start(self) -> None:
         super().start()
@@ -1709,16 +1724,13 @@ class KVTaskEngine(KVTaskManager):
         Used after a weight update (e.g. verl RL rollout) so that KV computed
         against stale weights is never reused.
 
-        Chunked-prefetch mode seals admission and requires all transfers to
-        drain before clearing the tree; retry if the first call is still draining.
+        The caller must drain transfers first, in both chunked-prefetch and
+        legacy mode. Resetting a busy cache can recycle destinations while DMA
+        still writes to them; clearing Python callbacks cannot make that safe.
 
-        In legacy mode we do NOT drain or cancel in-flight transfers here. verl issues the
-        reset at a rollout/weight-update boundary where no new generation
-        requests are being served, so in practice no task is ongoing. If any
-        task IS still in flight we only warn: resetting the radix tree +
-        mempool is cheap and the stale-weight invalidation must not be blocked
-        on transfer completion. This mirrors vLLM's own reset_encoder_cache /
-        reset_mm_cache, which likewise only warn on has_unfinished_requests().
+        Chunked-prefetch mode additionally seals admission before the drain
+        check, so a retry after the first call makes progress rather than
+        racing newly admitted sessions.
         """
         coordinator = getattr(self, "_prefetch", None)
         if coordinator is not None:
@@ -1736,21 +1748,8 @@ class KVTaskEngine(KVTaskManager):
             coordinator.accepting = True
         ongoing = sum(1 for t in list(self.tasks.values()) if not t.is_completed())
         if ongoing:
-            flexkv_logger.warning(
-                f"reset_cache called while {ongoing} task(s) are still in flight; "
-                f"resetting anyway. In-flight transfers may target blocks that are "
-                f"being freed — ensure reset is issued at a quiesced boundary."
-            )
+            raise RuntimeError(f"reset_cache requires drained transfers; {ongoing} task(s) active")
 
-        # Invalidate in-flight tasks' callbacks BEFORE dropping the cache. The
-        # callback / op_callback_dict partials close over the exact radix nodes
-        # and mempool blocks we are about to free; if a late transfer fired them
-        # after reset they would unlock or mount onto a deleted node, or recycle a
-        # block into the freshly-emptied mempool (which raises "already free").
-        # Clear them here so the dispatch in _update_tasks has nothing to fire.
-        # Note: reset_cache() runs on the same thread as the callback dispatch
-        # (_update_tasks), so no lock is needed. We keep the graph_to_task
-        # mapping so a late-completing op still resolves to its task and warns.
         prefetch_jobs = getattr(self, "prefetch_jobs", {})
         for task_id, job in list(prefetch_jobs.items()):
             job.cancel()
@@ -1758,12 +1757,15 @@ class KVTaskEngine(KVTaskManager):
             if task is not None:
                 task.prefetch_job = None
         prefetch_jobs.clear()
-        for task_id, task in list(self.tasks.items()):
-            if task.is_completed():
-                continue  # already-fired callbacks are harmless
-            task.callback = None
-            task.op_callback_dict = {}
-            task.status = TaskStatus.CANCELLED
+        # Only terminal response metadata remains after the drain boundary.
+        self.tasks.clear()
+        if hasattr(self, "_terminal_tasks"):
+            self._terminal_tasks.clear()
+        self.prefetch_tasks.clear()
+        self.graph_to_task.clear()
+        self.uncompleted_ops.clear()
+        self.uncompleted_op_results.clear()
+        self.uncompleted_graphs.clear()
 
         # Drop index (radix tree) + mempool on every tier. CRadixTreeIndex (C++)
         # and the pure-Python RadixTreeIndex both expose reset(); GlobalCacheEngine
