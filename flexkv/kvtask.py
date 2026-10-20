@@ -1,5 +1,6 @@
 import logging
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional, List, Union, Tuple, Sequence
 import threading
 from enum import Enum
@@ -234,6 +235,7 @@ class KVTaskManager:
         # Active transfers own blocks and callbacks until graph completion.
         # A TTL must never evict that ownership while DMA is still in flight.
         self.tasks: Dict[int, KVTask] = {}
+        self._terminal_tasks: Dict[int, float] = OrderedDict()
 
         # hash(token_ids) -> task_id
         self.prefetch_tasks: Dict[int, int] = {}  # removed with the owning task
@@ -588,6 +590,8 @@ class KVTaskManager:
                 self._mark_completed(task_id)
             elif completed_op.op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
+        if getattr(self, "_runtime", None) is None:
+            self._reap_completed_tasks()
 
     def _narrow_return_mask_to_prefix_blocks(
             self, task: "KVTask", num_success_blocks: int) -> None:
@@ -795,9 +799,9 @@ class KVTaskManager:
             # blocks that only a completion callback could mount on the tree.
             # Dropping the task without aborting leaks all of it -- the staging
             # blocks become unreachable (mempool exhaustion) and the pinned
-            # nodes stay unevictable. Abort rolls those back. RUNNING already
-            # returned above: its graph is in flight and only the transfer
-            # handles draining can release what it owns.
+            # nodes stay unevictable. Abort rolls those back. Submitted
+            # transfer graphs returned above and retain their ownership
+            # until the handles drain.
             self._abort_task_plans(task)
             task.status = TaskStatus.CANCELLED
             self._log_task_terminal(task, task.status)
@@ -1159,10 +1163,6 @@ class KVTaskEngine(KVTaskManager):
                 max_sessions=cache_config.prefetch_max_sessions,
                 max_reserved_bytes=cache_config.prefetch_max_reserved_bytes,
                 result_ttl_s=cache_config.prefetch_result_ttl_s)
-            # Active graph/callback ownership must never be evicted by TTL.
-            self.tasks = {}
-            from collections import OrderedDict
-            self._terminal_tasks = OrderedDict()
 
     def start(self) -> None:
         super().start()
