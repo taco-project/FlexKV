@@ -2,10 +2,13 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from flexkv.integration.sglang.comm import FlexKVScatterChannel
 from flexkv.integration.sglang.connector import FlexKVConnector
+
+pytestmark = pytest.mark.unit
 
 
 def test_lookup_accepts_sglang_array_token_ids():
@@ -66,6 +69,34 @@ def test_idle_connector_polls_detached_tasks():
     manager.wait.assert_not_called()
 
 
+def test_single_launched_load_is_polled_until_fully_complete():
+    manager = MagicMock()
+    manager.wait.return_value = {}
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._sync_ctx = SimpleNamespace(is_sync_leader=True)
+    connector.kv_manager = manager
+    connector._launched_load_tids = [7]
+
+    connector.drain_launched_loads()
+
+    manager.wait.assert_called_once_with([7], timeout=0.0, completely=True)
+    assert connector._launched_load_tids == [7]
+
+
+def test_nonleader_does_not_poll_idle_or_launched_loads():
+    for task_ids in ([], [7]):
+        manager = MagicMock()
+        connector = SimpleNamespace(
+            _sync_ctx=SimpleNamespace(is_sync_leader=False),
+            kv_manager=manager,
+            _launched_load_tids=task_ids,
+        )
+
+        FlexKVConnector.drain_launched_loads(connector)
+
+        assert not manager.mock_calls
+
+
 def test_legacy_cancel_prefetch_cancels_lookup_and_prefetch_tasks():
     connector = FlexKVConnector.__new__(FlexKVConnector)
     connector._chunked_prefetch = False
@@ -80,6 +111,7 @@ def test_legacy_cancel_prefetch_cancels_lookup_and_prefetch_tasks():
     connector._log_cache_op = MagicMock()
 
     connector.cancel_prefetch("r")
+    connector.cancel_prefetch("r")  # Repeated cancellation must be harmless.
 
     assert [c.args[0] for c in connector.kv_manager.cancel.call_args_list] == [
         [11],
