@@ -28,6 +28,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -2567,14 +2568,18 @@ class FlexKVConnector:
 
     def _wait_kv_manager_ready(self, poll_interval: float = 10.0) -> None:
         assert self.kv_manager is not None
-        wait_count = 0
+        timeout = float(os.environ.get("FLEXKV_READY_TIMEOUT_S", "360"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("FLEXKV_READY_TIMEOUT_S must be finite and positive")
+        start = time.monotonic()
         while not self.kv_manager.is_ready():
-            time.sleep(poll_interval)
-            wait_count += 1
+            remaining = timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                raise TimeoutError(f"FlexKV did not become ready within {timeout}s {self._label}")
+            time.sleep(min(poll_interval, remaining))
             logger.info(
                 "[FlexKV] Waiting for FlexKV ready %s (waited %.0fs)",
-                self._label,
-                wait_count * poll_interval,
+                self._label, time.monotonic() - start,
             )
         logger.info("[FlexKV] FlexKV is ready %s", self._label)
 
