@@ -382,6 +382,16 @@ class TransferWorkerBase(ABC):
                     worker.shutdown()
                 except Exception as e:
                     flexkv_logger.error(f"[worker {worker_id}] final shutdown error: {e}")
+            # Multiprocessing may exit without C++ static destructors. Flush
+            # only this worker's diagnostic logger before the process exits.
+            try:
+                from flexkv import c_ext
+                shutdown_trace = getattr(c_ext, "ce_trace_shutdown", None)
+                if shutdown_trace is not None:
+                    shutdown_trace()
+            except Exception as e:
+                flexkv_logger.warning("CE trace shutdown failed: %s", e)
+
 
     def _transfer_impl(
         self,

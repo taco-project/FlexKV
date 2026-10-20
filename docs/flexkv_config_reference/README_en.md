@@ -206,3 +206,15 @@ Some configurations can only be set through environment variables.
 | Environment Variable | Type | Default | Description |
 |---------------------|------|---------|-------------|
 | `FLEXKV_ENABLE_COLLECTIVE_SYNC` | bool | 1 | Whether to enable cross-rank collective sync (scatter/barrier/all_reduce). This sync is primarily used for coordination between Pipeline Parallelism (PP) stages. Can be set to 0 to disable in non-PP deployments to reduce sync overhead and improve performance |
+
+## Worker startup deadlines
+
+- `FLEXKV_WORKER_SPAWN_TIMEOUT_S` (default `60`): bounds the TransferManager
+  subprocess start handshake.
+- `FLEXKV_READY_TIMEOUT_S` (default `360`): bounds the SGLang connector's wait
+  for FlexKV readiness after registration.
+
+Both values must be finite and positive. Initialization failures include the
+child traceback in the parent error. Health checks continue after readiness,
+including during completion waits. These settings do not shorten the existing
+transfer drain/shutdown timeout.

@@ -28,6 +28,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -1151,10 +1152,16 @@ class FlexKVConnector:
 
         return n, producer_id
 
-    def drain_launched_loads(self, threshold: int = 100) -> None:
+    def drain_launched_loads(self, threshold: int = 1) -> None:
         """Periodic non-blocking sweep on long-lived launched tasks so the
         FlexKV pipe doesn't accumulate. No-op on non-leader ranks."""
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
+            return
+        # Drive detached/cancelled prefetch completion even when no requests
+        # or stores remain. Otherwise the final graph can keep CPU blocks pinned
+        # until the next request happens to poll the engine.
+        if not self._launched_load_tids:
+            self.kv_manager.try_wait(task_ids=[])
             return
         if len(self._launched_load_tids) < threshold:
             return
@@ -1784,7 +1791,9 @@ class FlexKVConnector:
             self._prefetch_loaded_tokens.pop(rid, None)
             self.release_pending(rid)
             return
-        self._pending_lookups.pop(rid, None)
+        lookup_task = self._pending_lookups.pop(rid, None)
+        if lookup_task is not None and self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            self.kv_manager.cancel([lookup_task])
         lookup_context = getattr(self, "_pending_lookup_contexts", {}).pop(rid, None)
         if lookup_context is not None:
             lookup_context.operation = "load"
@@ -1794,9 +1803,11 @@ class FlexKVConnector:
                 "cancelled",
                 reason="caller_cancelled",
             )
-        # FlexKV doesn't currently support prefetch cancellation, but
-        # we still drop our tracking entry.
+        # Running tasks keep ownership until their graph drains (see
+        # KVTaskManager._cancel_task); unlaunched tasks roll back immediately.
         task_id = self._ongoing_prefetches.pop(rid, -1)
+        if task_id >= 0 and self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            self.kv_manager.cancel([task_id])
         self._prefetch_planned_tokens.pop(rid, None)
         self._prefetch_loaded_tokens.pop(rid, None)
         context = getattr(self, "_prefetch_contexts", {}).pop(rid, None)
@@ -1806,7 +1817,7 @@ class FlexKVConnector:
                 "complete",
                 "cancelled",
                 task_id=task_id,
-                reason="caller_cancelled_tracking",
+                reason="caller_cancelled",
             )
 
     # ------------------------------------------------------------------
@@ -2143,6 +2154,10 @@ class FlexKVConnector:
         self, kvcache: Any
     ) -> Tuple[List[torch.Tensor], Optional[_IndexerBufferGroup]]:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
+        for attr in kvcache.__dict__:
+            print(f"attr: {attr}")
+            print(f"value: {getattr(kvcache, attr)}")
+            print("-"*100)
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
         if indexer_buffers:
             if self._deduplicate_indexer_group:
@@ -2588,14 +2603,18 @@ class FlexKVConnector:
 
     def _wait_kv_manager_ready(self, poll_interval: float = 10.0) -> None:
         assert self.kv_manager is not None
-        wait_count = 0
+        timeout = float(os.environ.get("FLEXKV_READY_TIMEOUT_S", "360"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("FLEXKV_READY_TIMEOUT_S must be finite and positive")
+        start = time.monotonic()
         while not self.kv_manager.is_ready():
-            time.sleep(poll_interval)
-            wait_count += 1
+            remaining = timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                raise TimeoutError(f"FlexKV did not become ready within {timeout}s {self._label}")
+            time.sleep(min(poll_interval, remaining))
             logger.info(
                 "[FlexKV] Waiting for FlexKV ready %s (waited %.0fs)",
-                self._label,
-                wait_count * poll_interval,
+                self._label, time.monotonic() - start,
             )
         logger.info("[FlexKV] FlexKV is ready %s", self._label)
 
