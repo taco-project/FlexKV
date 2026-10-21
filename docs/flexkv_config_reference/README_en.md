@@ -134,6 +134,33 @@ Some configurations can only be set through environment variables.
 
 ---
 
+### CPU KV Pool NUMA Spreading
+
+> Note: This configuration can only be set through environment variables
+
+FlexKV's KVServer is launched by the `dp_client_id == 0` caller (e.g. the SGLang scheduler of GPU0), and the CPU KV pool shared by all GPUs is allocated in the TransferManager process it spawns. Linux mempolicy and CPU affinity are inherited across fork/exec, so when the inference engine binds each rank to its GPU's NUMA node (e.g. SGLang's default `SGLANG_AUTO_NUMA_BIND=1`, i.e. `numactl --cpunodebind=N --membind=N`), the whole CPU KV pool lands on GPU0's node, and Mooncake RDMA traffic only uses that node's NICs.
+
+When enabled (off by default; set `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`), FlexKV follows Mooncake's `allocate_buffer_numa_segments`:
+
+1. KVServer / TransferManager drop the inherited binding at startup: CPU affinity is reset to the CPUs of all participating nodes, and the task mempolicy becomes interleave across those nodes.
+2. The CPU KV pool (including the SWA pool) is split into one contiguous region per node, each set to its node with `mbind(MPOL_PREFERRED)`. Region boundaries are aligned to both the KV block and the page (and, for HugePages, to `FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES`), so no block straddles two regions.
+   - Default memory: the pool is a memfd (shmem). The per-region policy is set with `mbind` first, then TransferManager populates each region with parallel `fallocate` on that node's CPUs; the log prints `populated in Xs`. Without this, pages would be faulted lazily inside 16 workers' `cudaHostRegister` and Mooncake's `ibv_reg_mr` at the same time, which measured about 3x slower registration. This also removes the full copy the legacy path incurred when torch moved the private tensor into `/dev/shm`.
+   - HugePages (`FLEXKV_USE_HUGEPAGE_CPU_BUFFER=1`): mbind on hugetlbfs only applies to the current VMA, so TransferManager prefaults every HugePage with node-local threads first (as Mooncake does). If a node lacks free HugePages, a warning is logged and the excess spills to other nodes.
+3. The Mooncake Store backend registers one MR per region; each region still honours `FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES` / `FLEXKV_MOONCAKE_MR_SPLIT_POLICY` internally. Mooncake labels each MR `cpu:N` from the node of its first page, so RDMA reads and writes of every region use that node's local NICs.
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD` | int | 0 | Only `0` / `1` are accepted; other values fail at startup. `1`: enable the NUMA spreading above (reset inherited binding, split the CPU pool per node, register Mooncake MRs per region). `0`: legacy behaviour, memory follows the launcher's binding |
+| `FLEXKV_NUMA_NODES` | str | unset | Node list to spread over, e.g. `0,1` or `0-3`, intersected with the process's `Mems_allowed`. When unset, all nodes in `Mems_allowed` that have CPUs are used (memory-only CXL/HBM nodes are skipped). Nothing is done when fewer than 2 nodes remain |
+
+Notes:
+
+- A warning is logged and the pool is not split in these cases: the container forbids `mbind` / `set_mempolicy` (Docker needs `--cap-add SYS_NICE`), or `lcm(block size, page/mapping alignment)` is too coarse for an even split. This fallback is **not** the same as `0`: the binding KVServer / TransferManager inherited has already been reset (CPU affinity widened to all participating nodes; interleave mempolicy when `set_mempolicy` succeeded), so the pool follows the reset policy rather than the launcher's binding. Set `0` for the exact legacy behaviour.
+- Log markers: `[NUMA][TransferManager] ... reset inherited binding`, `[NUMA] CPU pool ... spread over nodes`, and `[MooncakeStoreBackend] registering external MRs: ... regions=[(ptr, size, 'cpu:0'), (ptr, size, 'cpu:1')]`. At runtime, `numastat -p <TransferManager pid>` or `numastat -m` shows per-node Shmem/HugePages usage.
+- The CPU pool is shared by every GPU, so any GPU may read or write any block, and about half of the H2D/D2H traffic still crosses NUMA nodes. This feature balances memory capacity and RDMA NIC load across nodes.
+
+---
+
 ### SSD I/O Optimization
 
 > Note: Setting `iouring_entries` to 0 disables iouring. Not recommended to set to 0.

@@ -55,6 +55,8 @@ sudo sysctl -w vm.nr_hugepages=4096
 default_hugepagesz=1G hugepagesz=1G hugepages=N
 ```
 
+多 NUMA 机器上开启 `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`（默认关闭）后，会把 CPU KV 池按节点均分，并在启动时逐节点预分配大页。因此每个节点都要预留足够的大页，可通过 `/sys/devices/system/node/node*/hugepages/hugepages-*/nr_hugepages` 按节点查看或设置。某节点不足时会打印告警，超出部分溢出到其他节点。详见 [配置指南 · CPU KV 池 NUMA 分布](../flexkv_config_reference/README_zh.md)。
+
 ### 3.2 宿主机已挂载 hugetlbfs
 
 FlexKV 默认使用 `/mnt/hugepages` 作为 hugetlbfs 挂载点。
