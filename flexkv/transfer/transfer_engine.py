@@ -56,6 +56,7 @@ from flexkv.transfer.layer_eventfd import build_layerwise_eventfd_socket_path
 from flexkv.transfer.worker_op import WorkerTransferResult
 from flexkv.common.config import (
     CacheConfig, LayerGroupSpec, ModelConfig, GLOBAL_CONFIG_FROM_ENV,
+    is_multi_group,
 )
 from flexkv.common.ring_buffer import SharedOpPool
 
@@ -230,6 +231,9 @@ class TransferEngine:
         # Ops with at least one failed replica: must be discarded, not
         # finalized, when their pending_count drains to zero.
         self._failed_parent_op_ids: Set[int] = set()
+        # GET inherit: skip-io DISK2H waits for prefetch DISK2H (graph_id, op_id).
+        self._completed_op_keys: Set[Tuple[int, int]] = set()
+        self._parked_skip_io: Dict[int, TransferOp] = {}
 
     # ---- multi-group worker kwargs -------------------------------------------
     # There used to be four of these (main/SWA x TP=1/TP>1).  They differed only
@@ -449,7 +453,13 @@ class TransferEngine:
             self._register_worker(_pool, TransferType.D2H, self.d2h_workers)
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
-            ssd_layer_groups = self.model_config.layer_groups
+            # GPU register may copy a Recsys identity group onto model_config.
+            # SSD workers must only see heterogeneous CPU/SSD packing.
+            ssd_layer_groups = (
+                self.model_config.layer_groups
+                if is_multi_group(
+                    self.model_config.layer_groups, self.model_config.num_layers)
+                else None)
             # DISK2H worker.
             #
             # Registered in layerwise mode too.  The layerwise worker is now an
@@ -478,6 +488,7 @@ class TransferEngine:
                 dtype=self._cpu_handle.dtype,
                 num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
                 cache_config=self._cache_config,
+                tp_group_size=self.model_config.effective_tp_size_per_node,
                 compressor=self._compressors["cpu_ssd"],
                 layer_groups=ssd_layer_groups,
             )
@@ -495,6 +506,7 @@ class TransferEngine:
                 dtype=self._cpu_handle.dtype,
                 num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
                 cache_config=self._cache_config,
+                tp_group_size=self.model_config.effective_tp_size_per_node,
                 compressor=self._compressors["cpu_ssd"],
                 layer_groups=ssd_layer_groups,
             )
@@ -655,6 +667,7 @@ class TransferEngine:
                     dtype=self._swa_cpu_handle.dtype,
                     num_blocks_per_file=self._swa_ssd_handle.num_blocks_per_file,
                     cache_config=self._cache_config,
+                    tp_group_size=self.model_config.effective_tp_size_per_node,
                     layer_groups=self._swa_layer_groups,
                 )
                 self._register_worker(PoolId.SWA, TransferType.H2DISK, swa_h2disk_worker)
@@ -670,6 +683,7 @@ class TransferEngine:
                     dtype=self._swa_cpu_handle.dtype,
                     num_blocks_per_file=self._swa_ssd_handle.num_blocks_per_file,
                     cache_config=self._cache_config,
+                    tp_group_size=self.model_config.effective_tp_size_per_node,
                     layer_groups=self._swa_layer_groups,
                 )
                 self._register_worker(PoolId.SWA, TransferType.DISK2H, swa_disk2h_worker)
@@ -1076,25 +1090,7 @@ class TransferEngine:
                 # Schedule next operations
                 nvtx_r3 = nvtx.start_range(message="transfer scheduler. schedule next ops", color="orange")
                 if finished_ops or new_graphs_num > 0:
-                    completed_graph_ids, next_ops = self.scheduler.schedule(finished_ops)
-                    # Distribute new ops to workers
-                    for op in next_ops:
-                        if op.transfer_type == TransferType.VIRTUAL:
-                            self.completed_queue.put(CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
-                        else:
-                            self.op_id_to_op[op.op_id] = op
-                            # Unified rule for both main-KV and SWA paths:
-                            # only register here when the resolved worker_map
-                            # entry is a single worker (no PP fan-out). For
-                            # dict-keyed entries (H2D/D2H), each replica is
-                            # registered inside _assign_op_to_worker /
-                            # _assign_swa_op_to_worker per PP sibling.
-                            if self._op_buffer_registered_here(op):
-                                register_op_to_buffer(op, self.pin_buffer)
-                            self._assign_op_to_worker(op)
-                    # Handle completed graphs
-                    for graph_id in completed_graph_ids:
-                        self.completed_queue.put(CompletedOp.completed_graph(graph_id))
+                    self._dispatch_scheduled_ops(finished_ops)
                 nvtx.end_range(nvtx_r3)
 
                 # Outside the dispatch block: a tick may consist solely of a
@@ -1118,6 +1114,64 @@ class TransferEngine:
         # Cleanup
         sel.close()
         flexkv_logger.info("TransferEngine scheduler loop stopped")
+
+    def _gates_satisfied(self, op: TransferOp) -> bool:
+        gates = getattr(op, "span_gate", ()) or ()
+        if not gates:
+            return True
+        return all(gate in self._completed_op_keys for gate in gates)
+
+    def _park_skip_io(self, op: TransferOp) -> None:
+        self._parked_skip_io[op.op_id] = op
+
+    def _take_unparked_skip_io(self) -> List[TransferOp]:
+        ready: List[TransferOp] = []
+        for op_id, op in list(self._parked_skip_io.items()):
+            if self._gates_satisfied(op):
+                ready.append(self._parked_skip_io.pop(op_id))
+        return ready
+
+    def _note_ops_completed(self, ops: List[TransferOp]) -> None:
+        for op in ops:
+            self._completed_op_keys.add((int(op.graph_id), int(op.op_id)))
+
+    def _assign_or_complete_op(self, op: TransferOp) -> Optional[TransferOp]:
+        """Dispatch one ready op. Returns skip-io ops that can complete now."""
+        if op.transfer_type == TransferType.VIRTUAL:
+            self.completed_queue.put(CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
+            return None
+        if getattr(op, "io_skipped", False):
+            if self._gates_satisfied(op):
+                self.completed_queue.put(
+                    CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
+                return op
+            self._park_skip_io(op)
+            return None
+        self.op_id_to_op[op.op_id] = op
+        if self._op_buffer_registered_here(op):
+            register_op_to_buffer(op, self.pin_buffer)
+        self._assign_op_to_worker(op)
+        return None
+
+    def _dispatch_scheduled_ops(self, finished_ops: List[TransferOp]) -> None:
+        """Schedule, complete skip-io DISK2H that inherited a finished prefetch span, dispatch the rest."""
+        self._note_ops_completed(finished_ops)
+        to_schedule = list(finished_ops) + self._take_unparked_skip_io()
+        # First pass always runs: new graphs are dirty even with no completions.
+        # Later passes only run when skip-io DISK2H can complete in this tick.
+        first = True
+        while first or to_schedule:
+            first = False
+            completed_graph_ids, next_ops = self.scheduler.schedule(to_schedule)
+            to_schedule = []
+            for op in next_ops:
+                done = self._assign_or_complete_op(op)
+                if done is not None:
+                    to_schedule.append(done)
+            self._note_ops_completed(to_schedule)
+            to_schedule.extend(self._take_unparked_skip_io())
+            for graph_id in completed_graph_ids:
+                self.completed_queue.put(CompletedOp.completed_graph(graph_id))
 
     def _op_buffer_registered_here(self, op: TransferOp) -> bool:
         """The 'unified rule' shared by dispatch, _finalize_op and
@@ -1339,6 +1393,12 @@ class TransferEngine:
                 swa_dst_block_ids_h2d=op.swa_dst_block_ids_h2d.copy(),
                 dp_client_id=op.dp_client_id,
                 counter_id=op.counter_id,
+                # Dropping the span makes every replica the whole-KV default
+                # (layer_id=0, layer_granularity=-1). The worker then copies
+                # every layer and posts every eventfd on the first H2D, so
+                # HSTU runs before that layer's DISK2H has reached the GPU.
+                layer_id=op.layer_id,
+                layer_granularity=op.layer_granularity,
             )
             replica.op_id = next(self._replica_op_id_counter)
             register_op_to_buffer(replica, self.pin_buffer)
@@ -1421,6 +1481,8 @@ class TransferEngine:
                     mooncake_store_swa_block_hashes=(
                         list(op.mooncake_store_swa_block_hashes)
                         if op.mooncake_store_swa_block_hashes is not None else None),
+                    layer_id=op.layer_id,
+                    layer_granularity=op.layer_granularity,
                 )
                 replica.op_id = next(self._replica_op_id_counter)
                 register_op_to_buffer(replica, self.pin_buffer)

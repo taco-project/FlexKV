@@ -4,9 +4,11 @@ Native engine is io_uring (``c_ext.SSDIOCTX`` + ``transfer_kv_blocks_ssd``); a
 ``StorageBackend`` replaces it wholesale when one is supplied.
 """
 
+import logging
 import time
+from dataclasses import replace
 from multiprocessing.connection import Connection
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.multiprocessing import Queue as MPQueue
@@ -17,9 +19,10 @@ from flexkv.common.config import (
     CacheConfig,
     GLOBAL_CONFIG_FROM_ENV,
     LayerGroupSpec,
+    is_multi_group,
 )
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.storage import KVCacheLayout
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferType
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 from flexkv.transfer.backends import StorageBackend
@@ -33,8 +36,35 @@ from flexkv.transfer.geometry import (
     EdgeGeometry,
     HostSide,
 )
+from flexkv.transfer.ssd_runs import partition_contiguous_ssd_runs_np
 from flexkv.transfer.worker_op import WorkerTransferOp
 from flexkv.transfer.workers.runtime import TransferWorkerBase
+
+# A contiguous SSD run is the as_batch=0 / per-user shape. The C++ kernel's
+# LAYERFIRST layer-major pread only fires when a thread slice is CPU+SSD
+# contiguous; 32-way splitting a run (or concatenating 8 users into one op)
+# fails that check. One thread per run restores the sequential path.
+_SSD_THREADS_PER_RUN = 1
+_SSD_THREADS_SCATTERED = 32
+
+
+def partition_contiguous_ssd_runs(
+    ssd_block_ids: torch.Tensor,
+    cpu_block_ids: torch.Tensor,
+    num_files_per_device: int = 1,
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Torch wrapper around :func:`partition_contiguous_ssd_runs_np`."""
+    device = ssd_block_ids.device
+    runs = partition_contiguous_ssd_runs_np(
+        ssd_block_ids.detach().cpu().numpy(),
+        cpu_block_ids.detach().cpu().numpy(),
+        num_files_per_device,
+    )
+    return [
+        (torch.from_numpy(cpu).to(device=device),
+         torch.from_numpy(ssd).to(device=device))
+        for cpu, ssd in runs
+    ]
 
 
 class CPUSSDDiskTransferWorker(TransferWorkerBase):
@@ -52,7 +82,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  cache_config: CacheConfig,
                  compressor: Optional[CompressionStrategy] = None,
                  layer_groups: Optional[List[LayerGroupSpec]] = None,
-                 backend: Optional[StorageBackend] = None):
+                 backend: Optional[StorageBackend] = None,
+                 tp_group_size: int = 1):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         self._pin_op_buffer()
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
@@ -62,6 +93,7 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
 
         self.num_layers = cpu_kv_layout.num_layer
         self.num_cpu_blocks = cpu_kv_layout.num_block
+        self.tp_group_size = tp_group_size
         self.round_robin = 1
 
         self.dtype = dtype
@@ -72,7 +104,20 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.kv_dim = cpu_kv_layout.kv_dim
         self.num_kv_heads = cpu_kv_layout.num_kv_heads
         self.cpu_layout_type = cpu_kv_layout.type
-        self.has_multi_group = layer_groups is not None
+        # Prefer the groups on the CPU/SSD layout over the constructor arg.
+        # Recsys layerwise registers an identity LayerGroupSpec for the GPU
+        # region; that must not flip SSD into whole-block blob I/O.
+        if getattr(cpu_kv_layout, "layer_groups", None) is not None:
+            layer_groups = cpu_kv_layout.layer_groups
+        self.has_multi_group = is_multi_group(
+            layer_groups, cpu_kv_layout.num_layer)
+        # Identity groups stay on the GPU register but must not disable
+        # uniform chunk/layer strides. Opaque packing is has_multi_group.
+        if not self.has_multi_group:
+            if getattr(cpu_kv_layout, "layer_groups", None) is not None:
+                cpu_kv_layout = replace(cpu_kv_layout, layer_groups=None, _kv_shape=None)
+            if getattr(ssd_kv_layout, "layer_groups", None) is not None:
+                ssd_kv_layout = replace(ssd_kv_layout, layer_groups=None, _kv_shape=None)
 
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
@@ -185,6 +230,87 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             f"block_stride={self.block_stride_in_bytes} bytes"
         )
 
+    def _num_files_per_device(self) -> int:
+        if not self.ssd_files:
+            return 1
+        first = next(iter(self.ssd_files.values()))
+        return max(len(first), 1)
+
+    def _issue_ssd_transfer(
+        self,
+        cpu_block_ids: torch.Tensor,
+        ssd_block_ids: torch.Tensor,
+        is_read: bool,
+        layer_id: int,
+        layer_end: int,
+        num_threads: int,
+    ) -> None:
+        """Copy logical layers across the TP slices of BLOCKFIRST storage."""
+        cpu_base_ptr = self.cpu_layer_ptrs[0].item()
+        if self.has_multi_group:
+            # CPU and SSD share an identical per-block byte layout in multi-group
+            # mode, so each block can be transferred as one opaque blob — no
+            # per-group / per-tp_rank loop needed. num_layers=1,
+            # layer_stride=chunk_size=block_stride, one KV region makes
+            # the kernel issue exactly one pread/pwrite of block_stride bytes
+            # per block, sidestepping the sub-4KiB chunk hazard for highly
+            # compressed groups (e.g. DSv4 indexer at compress_ratio=128).
+            #
+            # kv_dim=1 for the same reason: block_stride already covers K and V,
+            # and kv_stride is 0, so looping the kv axis would repeat the very
+            # same I/O.
+            one_layer_id = torch.tensor([0], dtype=torch.int32)
+            transfer_kv_blocks_ssd(
+                self.ioctx,
+                one_layer_id,
+                cpu_base_ptr,
+                ssd_block_ids,
+                cpu_block_ids,
+                self.block_stride_in_bytes,
+                0,
+                self.block_stride_in_bytes,
+                0,
+                self.block_stride_in_bytes,
+                self.block_stride_in_bytes,
+                is_read,
+                self.num_blocks_per_file,
+                self.round_robin,
+                num_threads,
+                1,  # kv_dim
+                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
+            )
+            return
+        tp_slices = 1
+        if (self.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST
+                and self.num_kv_heads > 1
+                and layer_end - layer_id < self.num_layers):
+            tp_slices = self.tp_group_size
+        for tp_rank in range(tp_slices):
+            layer_offset = tp_rank * self.num_layers
+            layer_id_list = torch.arange(
+                layer_offset + layer_id, layer_offset + layer_end,
+                dtype=torch.int32,
+            )
+            transfer_kv_blocks_ssd(
+                self.ioctx,
+                layer_id_list,
+                cpu_base_ptr,
+                ssd_block_ids,
+                cpu_block_ids,
+                self.cpu_layer_stride_in_bytes // tp_slices,
+                self.cpu_kv_stride_in_bytes // tp_slices,
+                self.ssd_layer_stride_in_bytes // tp_slices,
+                self.ssd_kv_stride_in_bytes // tp_slices,
+                self.chunk_size_in_bytes // tp_slices,
+                self.block_stride_in_bytes,
+                is_read,
+                self.num_blocks_per_file,
+                self.round_robin,
+                num_threads,
+                self.kv_dim,
+                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
+            )
+
     def _transfer_impl(
         self,
         src_block_ids: torch.Tensor,
@@ -206,61 +332,51 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             raise ValueError(f"Invalid transfer type: {transfer_type} for CPUSSDDiskTransferWorker")
 
         is_read = (transfer_type == TransferType.DISK2H)
-        cpu_base_ptr = self.cpu_layer_ptrs[0].item()
-
-        if self.has_multi_group:
-            # CPU and SSD share an identical per-block byte layout in multi-group
-            # mode, so each block can be transferred as one opaque blob — no
-            # per-group / per-tp_rank loop needed. num_layers=1,
-            # layer_stride=chunk_size=block_stride, one KV region makes
-            # the kernel issue exactly one pread/pwrite of block_stride bytes
-            # per block, sidestepping the sub-4KiB chunk hazard for highly
-            # compressed groups (e.g. DSv4 indexer at compress_ratio=128).
-            #
-            # kv_dim=1 for the same reason: block_stride already covers K and V,
-            # and kv_stride is 0, so looping the kv axis would repeat the very
-            # same I/O.
-            one_layer_id = torch.tensor([0], dtype=torch.int32)
-            transfer_kv_blocks_ssd(
-                self.ioctx,
-                one_layer_id,
-                cpu_base_ptr,
-                ssd_block_id_list,
-                cpu_block_id_list,
-                self.block_stride_in_bytes,
-                0,
-                self.block_stride_in_bytes,
-                0,
-                self.block_stride_in_bytes,
-                self.block_stride_in_bytes,
-                is_read,
-                self.num_blocks_per_file,
-                self.round_robin,
-                32,
-                1,  # kv_dim
-                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
-            )
+        layer_id = int(kwargs.get("layer_id", 0) or 0)
+        gran = kwargs.get("layer_granularity", -1)
+        if gran is None or int(gran) < 0:
+            layer_end = self.num_layers
         else:
-            layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
+            layer_end = min(layer_id + int(gran), self.num_layers)
+        if layer_end <= layer_id:
+            return
 
-            transfer_kv_blocks_ssd(
-                self.ioctx,
-                layer_id_list,
-                cpu_base_ptr,
-                ssd_block_id_list,
-                cpu_block_id_list,
-                self.cpu_layer_stride_in_bytes,
-                self.cpu_kv_stride_in_bytes,
-                self.ssd_layer_stride_in_bytes,
-                self.ssd_kv_stride_in_bytes,
-                self.chunk_size_in_bytes,
-                self.block_stride_in_bytes,
-                is_read,
-                self.num_blocks_per_file,
-                self.round_robin,
-                32,
-                self.kv_dim,
-                ssd_io_opt=GLOBAL_CONFIG_FROM_ENV.ssd_io_opt,
+        runs = partition_contiguous_ssd_runs(
+            ssd_block_id_list,
+            cpu_block_id_list,
+            self._num_files_per_device(),
+        )
+        if not runs:
+            return
+        # Fully scattered (every run is one block): keep the historical
+        # 32-thread one-shot instead of N kernel launches. Any contiguous
+        # run — including as_batch=0's one user, or as_batch=1's per-user
+        # slices after merge — goes through as one sequential pread.
+        max_run = max(int(cpu.numel()) for cpu, _ in runs)
+        if len(runs) > 1 and max_run == 1:
+            issue_runs = [(cpu_block_id_list, ssd_block_id_list)]
+            num_threads = _SSD_THREADS_SCATTERED
+        else:
+            issue_runs = runs
+            num_threads = _SSD_THREADS_PER_RUN
+        if flexkv_logger.is_enabled_for(logging.INFO):
+            n_blocks = int(ssd_block_id_list.numel())
+            n_runs = len(runs)
+            flexkv_logger.info(
+                "[FlexKV-IO] operation=transfer act=ssd_runs status=ok "
+                "direction=%s blocks=%d runs=%d avg_run_blocks=%.1f "
+                "layer_id=%d layer_end=%d threads_per_run=%d",
+                transfer_type.value,
+                n_blocks,
+                n_runs,
+                n_blocks / n_runs,
+                layer_id,
+                layer_end,
+                num_threads,
+            )
+        for cpu_ids, ssd_ids in issue_runs:
+            self._issue_ssd_transfer(
+                cpu_ids, ssd_ids, is_read, layer_id, layer_end, num_threads
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -269,6 +385,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
         if self.has_multi_group:
             # Multi-group (heterogeneous KV) path — compression not supported here.
+            # Opaque whole-block I/O cannot slice layers; keep the historical
+            # full-block transfer even when the op carries a span.
             start_time = time.time()
             self._transfer_impl(
                 src_block_ids,
