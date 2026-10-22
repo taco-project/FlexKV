@@ -3,7 +3,7 @@ import json
 import os
 import torch
 import tempfile
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
@@ -160,6 +160,26 @@ class FlexKVConfig:
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
     @staticmethod
+    def resolve_sglang_dp(server_args: object) -> Tuple[int, bool]:
+        """Return ``(dp_size, enable_dp_attention)`` in FlexKV's legacy meaning.
+
+        Newer SGLang spells DP attention ``--attn-dp-size N``, which resolves
+        to ``attn_dp_size=N, dp_size=1, enable_dp_attention=False``. Older
+        SGLang spells it ``--dp-size N --enable-dp-attention``. FlexKV treats
+        both as N DP shards with DP attention enabled. SGLang does not run DP
+        attention inside replicas, so at most one of the two widths is > 1.
+        """
+        dp_size = max(1, int(getattr(server_args, "dp_size", 1) or 1))
+        attn_dp_size = max(1, int(getattr(server_args, "attn_dp_size", 1) or 1))
+        if attn_dp_size > 1:
+            if dp_size > 1:
+                raise ValueError(
+                    "[FlexKV SGLang] dp_size and attn_dp_size cannot both be > 1 "
+                    f"(dp_size={dp_size}, attn_dp_size={attn_dp_size})")
+            return attn_dp_size, True
+        return dp_size, bool(getattr(server_args, "enable_dp_attention", False))
+
+    @staticmethod
     def get_sglang_node_local_dp_size(
         server_args: object,
     ) -> Optional[int]:
@@ -171,12 +191,12 @@ class FlexKVConfig:
 
         ``None`` keeps the existing cross-node TP/PP topology unchanged.
         """
-        dp_size = max(1, int(getattr(server_args, "dp_size", 1) or 1))
+        dp_size, enable_dp_attention = FlexKVConfig.resolve_sglang_dp(server_args)
         pp_size = max(1, int(getattr(server_args, "pp_size", 1)))
         nnodes = max(1, int(getattr(server_args, "nnodes", 1)))
 
         if (
-            not bool(getattr(server_args, "enable_dp_attention", False))
+            not enable_dp_attention
             or dp_size == 1
             or nnodes == 1
             or pp_size != 1
@@ -589,10 +609,10 @@ class FlexKVConfig:
         # Extract parallelism params from server_args
         sglang_tp_size = int(server_args.tp_size)  # raw sglang tp_size (composite)
         pp_size = int(server_args.pp_size)
-        sglang_dp_size = int(server_args.dp_size if server_args.dp_size is not None else 1)
+        # Accepts both `--attn-dp-size N` and legacy `--dp-size N --enable-dp-attention`.
+        sglang_dp_size, enable_dp_attention = self.resolve_sglang_dp(server_args)
         nnodes = server_args.nnodes
         node_rank = server_args.node_rank
-        enable_dp_attention = bool(server_args.enable_dp_attention)
         attn_cp_size = int(getattr(server_args, 'attn_cp_size', 1))
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
         local_dp_size = self.get_sglang_node_local_dp_size(server_args)
