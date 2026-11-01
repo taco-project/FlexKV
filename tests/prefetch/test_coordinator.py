@@ -98,6 +98,65 @@ def finish(coordinator, chunk, success=None):
     coordinator.on_completion(completion)
 
 
+def test_peer_io_holding_all_credits_is_not_a_permanent_cache_miss():
+    b = Backend(target=4)
+    c = PrefetchCoordinator(b, max_reserved_bytes=4)
+    options = PrefetchOptions(chunk_max_blocks=4)
+    first, second = [c.start(list(range(4)), options) for _ in range(2)]
+    c.tick()
+    assert len(b.sent) == 1 and c.reserved_bytes == 4
+    assert not c.snapshot(second).terminal
+    finish(c, b.sent[0])
+    c.tick()
+    assert c.snapshot(first).terminal and len(b.sent) == 2
+    finish(c, b.sent[1])
+    c.tick()
+    assert c.snapshot(second).loaded_tokens == 4
+    assert c.snapshot(second).outcome == "complete"
+
+
+def test_data_session_cap_keeps_slot_until_aborted_io_drains():
+    b = Backend(target=4)
+    c = PrefetchCoordinator(b, max_data_sessions=1)
+    first, second = [c.start(list(range(4))) for _ in range(2)]
+    c.tick()
+    assert len(b.sent) == 1
+    c.stop(first, "cancelled")
+    c.tick()
+    assert len(b.sent) == 1 and not c.snapshot(first).terminal
+    finish(c, b.sent[0])
+    c.tick()
+    assert c.snapshot(first).terminal and len(b.sent) == 2
+    finish(c, b.sent[1])
+    c.tick()
+    assert c.snapshot(second).outcome == "complete"
+    assert not c.graphs and not c.reserved_bytes
+
+
+@pytest.mark.parametrize("limit", [0, 1, 4])
+def test_data_waves_preserve_all_metadata_and_result_leases(limit):
+    b = Backend(target=4)
+    c = PrefetchCoordinator(b, max_data_sessions=limit, max_reserved_bytes=140, max_batch_graphs=35)
+    handles = [c.start(list(range(4))) for _ in range(35)]
+    completed = set()
+    for _ in range(36):
+        c.tick()
+        pending = [chunk for chunk in b.sent if chunk.graph.graph_id not in completed]
+        assert len(pending) <= (limit or 35)
+        for chunk in pending:
+            finish(c, chunk)
+            completed.add(chunk.graph.graph_id)
+    assert all(c.snapshot(h).outcome == "complete" for h in handles)
+    assert all(c.snapshot(h).lease_valid for h in handles)
+    assert len(b.sent) == 35 and not b.releases
+
+
+@pytest.mark.parametrize("limit", [-1, True, 1.5, "1"])
+def test_data_session_limit_rejects_invalid_configuration(limit):
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        PrefetchCoordinator(Backend(), max_data_sessions=limit)
+
+
 def test_wakeup_tracks_active_work_then_result_expiry():
     c, b, clock, h = setup()
     assert c.next_wakeup(0.002) == 0.002

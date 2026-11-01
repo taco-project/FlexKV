@@ -1,6 +1,7 @@
 """SDK contract tests; no Mooncake server or device transfer is started."""
 
 from types import SimpleNamespace
+from threading import Lock
 
 import pytest
 
@@ -22,6 +23,10 @@ def client(get_results=None, put_results=None, limit=8, exists=None):
 
     c = MooncakeStoreClient.__new__(MooncakeStoreClient)
     c._is_setup = True
+    c._get_lock = Lock()
+    c._get_closed = False
+    c._get_concurrency = 1
+    c._get_executor = None
     c._config = MooncakeStoreConfig(max_get_batch_bytes=limit, max_put_batch_bytes=limit)
     c._store = SimpleNamespace(
         batch_get_into=batch_get_into,

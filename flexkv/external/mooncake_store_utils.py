@@ -18,6 +18,8 @@ Three public objects are exposed:
 from __future__ import annotations
 
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional, Set, Union, Any, List, Tuple, TYPE_CHECKING
 
@@ -267,6 +269,21 @@ class MooncakeStoreClient:
 
     def __init__(self, config: MooncakeStoreConfig, query_only: bool = False) -> None:
         self._config = config
+        concurrency = int(os.getenv("FLEXKV_MOONCAKE_GET_CONCURRENCY", "1"))
+        if not 1 <= concurrency <= 8:
+            raise ValueError("FLEXKV_MOONCAKE_GET_CONCURRENCY must be in [1, 8]")
+        self._get_concurrency = 1 if query_only else concurrency
+        self._get_max_inflight_bytes = int(
+            os.getenv("FLEXKV_MOONCAKE_GET_MAX_INFLIGHT_BYTES", str(512 * 1024 * 1024))
+        )
+        if self._get_concurrency > 1 and self._get_max_inflight_bytes <= 0:
+            raise ValueError("parallel Get requires a positive aggregate byte budget")
+        self._get_lock = threading.Lock()
+        self._get_closed = False
+        self._get_executor = (
+            ThreadPoolExecutor(max_workers=self._get_concurrency, thread_name_prefix="flexkv-store-get")
+            if self._get_concurrency > 1 else None
+        )
         self._store = None  # created lazily in setup()
         self._is_setup = False
         self._query_only = query_only
@@ -607,16 +624,76 @@ class MooncakeStoreClient:
         """Read a KV block from the store."""
         return self.batch_get([key], [buffer_ptr], [buffer_size])[0]
 
+    def shutdown_get_workers(self) -> None:
+        """Drain readers before destination memory regions can be unregistered."""
+        with self._get_lock:
+            self._get_closed = True
+            if self._get_executor is not None:
+                self._get_executor.shutdown(wait=True)
+                self._get_executor = None
+
     def batch_get(
-        self,
-        key_strs: list[str],
-        buffer_ptrs: list[int],
-        buffer_sizes: list[int],
+        self, key_strs: list[str], buffer_ptrs: list[int], buffer_sizes: list[int]
     ) -> List[bool]:
-        """Read blocks, accepting only an exact byte count for each key."""
-        self._ensure_setup()
-        get_results = self.zero_copy_get_impl(key_strs, buffer_ptrs, buffer_sizes)
-        return [actual == expected for actual, expected in zip(get_results, buffer_sizes, strict=True)]
+        # The aggregate credit is per client, including concurrent outer callers.
+        with self._get_lock:
+            if self._get_closed:
+                raise RuntimeError("Mooncake Get workers are closed")
+            self._ensure_setup()
+            self._validate_buffers(key_strs, buffer_ptrs, buffer_sizes)
+            limit = self._config.max_get_batch_bytes
+            if limit and any(size > limit for size in buffer_sizes):
+                raise ValueError(f"Mooncake block exceeds the {limit}-byte batch limit")
+            if self._get_executor is None:
+                # Keep main's raw-byte batching contract and serial default.
+                raw = self.zero_copy_get_impl(key_strs, buffer_ptrs, buffer_sizes)
+                self._check_result_count(raw, len(key_strs), "batch_get_into")
+                return [actual == expected for actual, expected in zip(raw, buffer_sizes, strict=True)]
+            return self._parallel_get(key_strs, buffer_ptrs, buffer_sizes)
+
+    def _parallel_get(
+        self, keys: list[str], pointers: list[int], sizes: list[int]
+    ) -> List[bool]:
+        # Padding is an additional bound, not a reinterpretation of the existing
+        # raw-byte SDK batch limit. zero_copy_get_impl still enforces that limit.
+        share = self._get_max_inflight_bytes // self._get_concurrency
+        costs = [((size + 4095) // 4096) * 4096 + 8192 for size in sizes]
+        if share <= 0 or any(cost > share for cost in costs):
+            raise ValueError("A Mooncake Get object exceeds the parallel padded-byte share")
+        batches = []
+        start = 0
+        while start < len(keys):
+            end, cost = start, 0
+            while end < len(keys) and cost + costs[end] <= share:
+                cost += costs[end]
+                end += 1
+            batches.append((start, end))
+            start = end
+        results = []
+        for offset in range(0, len(batches), self._get_concurrency):
+            window = batches[offset:offset + self._get_concurrency]
+            futures, raw_window, error = [], [], None
+            try:
+                for a, b in window:
+                    futures.append(self._get_executor.submit(
+                        self.zero_copy_get_impl, keys[a:b], pointers[a:b], sizes[a:b]
+                    ))
+            except BaseException as exc:
+                error = exc
+            # Every accepted call must drain, even when a peer/submit fails.
+            # Destination buffers cannot be recycled or published before this.
+            for future in futures:
+                try:
+                    raw_window.append(future.result())
+                except BaseException as exc:
+                    if error is None:
+                        error = exc
+            if error is not None:
+                raise error
+            for (a, b), raw in zip(window, raw_window, strict=True):
+                self._check_result_count(raw, b - a, "batch_get_into")
+                results.extend(actual == expected for actual, expected in zip(raw, sizes[a:b], strict=True))
+        return results
 
     def batch_exists(self, keys_strs: list[str]) -> int:
         """
