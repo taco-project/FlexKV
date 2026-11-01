@@ -9,6 +9,8 @@ import pytest
 from flexkv.prefetch.coordinator import PrefetchCoordinator
 from flexkv.prefetch.types import PrefetchOptions, PrefetchHandle
 
+pytestmark = pytest.mark.unit
+
 
 class Clock:
     now = 0.0
