@@ -13,11 +13,12 @@ FlexKV currently exposes three HugePage-related configuration fields:
 
 The two HugePage switches are independent. They can be enabled separately or together.
 
-There is one important implementation constraint today:
+How the pool is shared today:
 
-- `use_hugepage_cpu_buffer` for the main CPU KV cache must use a `hugetlbfs`-backed file so the same HugePage mapping can be reopened inside `spawn` workers.
-- Anonymous `MAP_HUGETLB` is not sufficient for the main CPU cache path because once that tensor is sent into `TransferEngine` workers, PyTorch serializes ordinary CPU tensors into new shared-memory storage, which breaks the original HugePage backing.
-- `use_hugepage_tmp_buffer` does not have that cross-process sharing requirement, so it may still succeed through either anonymous HugePages or `hugetlbfs`.
+- `use_hugepage_cpu_buffer` allocates the main CPU KV cache in TransferManager as an anonymous hugetlb memfd (`memfd_create(MFD_HUGETLB)`). No hugetlbfs mount is needed and no file is created anywhere. `spawn` workers reopen the same memfd through `/proc/<TransferManager pid>/fd/<fd>` and mmap it, so they map the very same HugePages.
+- However a process exits (SIGKILL included), the kernel closes its fds and drops its mappings; once the last reference is gone the HugePages return to the pool. Nothing is left behind.
+- Anonymous `MAP_HUGETLB` is not used for the main CPU cache: once that tensor is sent into `TransferEngine` workers, PyTorch serializes ordinary CPU tensors into new shared-memory storage, which breaks the HugePage backing.
+- `use_hugepage_tmp_buffer` tries anonymous `MAP_HUGETLB` first and falls back to a hugetlb memfd; it is never shared across processes.
 
 ---
 
@@ -27,7 +28,7 @@ HugePage is recommended in the following situations:
 
 - The CPU KV cache is large and CPU-side page table or TLB overhead is non-trivial.
 - `enable_p2p_ssd=true` is enabled and you want to optimize the temporary staging buffer in the `SSD -> CPU -> GPU` path.
-- The host has already been prepared with reserved HugePages and a working hugetlbfs mount.
+- The host has already been prepared with reserved HugePages.
 
 HugePage is not recommended when the host has no HugePage reservation or when the target workload does not materially benefit from CPU cache or p2p SSD path optimization.
 
@@ -57,31 +58,16 @@ default_hugepagesz=1G hugepagesz=1G hugepages=N
 
 On multi-NUMA hosts, `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1` (off by default) splits the CPU KV pool evenly across nodes and prefaults its HugePages node by node at startup. Each node therefore needs enough reserved HugePages; check or set them per node via `/sys/devices/system/node/node*/hugepages/hugepages-*/nr_hugepages`. If a node runs short, a warning is logged and the excess spills to other nodes. See [Configuration Guide · CPU KV Pool NUMA Spreading](../flexkv_config_reference/README_en.md).
 
-### 3.2 hugetlbfs Must Be Mounted
+### 3.2 No hugetlbfs Mount Is Needed
 
-FlexKV uses `/mnt/hugepages` as the default hugetlbfs mount point.
+HugePages come straight from the kernel pool through `memfd_create(MFD_HUGETLB)`, with the page size given explicitly by `hugepage_size_bytes`. No hugetlbfs mount point is required; `FLEXKV_HUGETLBFS_DIR` from older versions is ignored.
 
-For `use_hugepage_cpu_buffer`, this is a hard requirement rather than a recommendation. If `FLEXKV_HUGETLBFS_DIR` points to a normal filesystem, FlexKV now rejects it and falls back instead of silently treating regular 4 KiB pages as HugePages.
+Requirements:
 
-Check the mount status:
+- Linux >= 4.14 (`MFD_HUGETLB` with an explicit page size) and Python >= 3.8 (`os.memfd_create`).
+- TransferManager and its transfer workers share a PID namespace and uid (true for parent/child processes), so workers can open `/proc/<pid>/fd/<fd>`.
 
-```bash
-mount | grep hugetlbfs
-ls -ld /mnt/hugepages
-```
-
-If hugetlbfs is not mounted yet:
-
-```bash
-sudo mkdir -p /mnt/hugepages
-sudo mount -t hugetlbfs none /mnt/hugepages
-```
-
-If your actual hugetlbfs mount point is different, set it explicitly:
-
-```bash
-export FLEXKV_HUGETLBFS_DIR=/path/to/hugetlbfs
-```
+An older FlexKV that was killed may have left `flexkv_hugepage_*` files under `/dev/hugepages` or `/mnt/hugepages`; remove them once their owning process is gone.
 
 ### 3.3 CUDA Runtime Is Required for the tmp Buffer Path
 
@@ -102,7 +88,7 @@ PY
 
 Note: `use_hugepage_cpu_buffer` does not depend on `cudaHostRegister`.
 
-Additional note: although `use_hugepage_cpu_buffer` does not require CUDA runtime, it does require a writable `hugetlbfs` mount because the main CPU KV cache must be reopened from the same HugePage-backed file inside spawned workers.
+Additional note: `use_hugepage_cpu_buffer` does not require CUDA runtime; spawned workers reopen the same hugetlb memfd through `/proc/<pid>/fd/<fd>`.
 
 ---
 
@@ -173,7 +159,7 @@ export FLEXKV_HUGEPAGE_SIZE_BYTES=1073741824
 
 For a first rollout, the recommended order is:
 
-1. Prepare 2 MiB HugePages on the host and confirm that hugetlbfs is mounted correctly.
+1. Prepare 2 MiB HugePages on the host.
 2. Enable `use_hugepage_cpu_buffer=true` first and verify that the main CPU KV cache works correctly.
 3. If you also need to validate the p2p SSD path, then enable `use_hugepage_tmp_buffer=true`.
 4. Only after the feature is stable should you evaluate switching to 1 GiB HugePages.
@@ -204,11 +190,13 @@ If the HugePage path for the tmp staging buffer fails and falls back, logs will 
 [PEER2CPUTransferWorker] HugePage allocation for tmp_cpu_buffer failed (...); falling back to torch.empty(pin_memory=True).
 ```
 
-If `use_hugepage_cpu_buffer=true` but the hugetlbfs mount is invalid, logs will contain a message similar to:
+If `use_hugepage_cpu_buffer=true` but the pool for the requested page size is unavailable (that size is not configured, or too few pages are free), logs will contain a message similar to:
 
 ```text
-HugePage allocation failed (HugePage: /path is not a hugetlbfs mount ...); falling back to regular CPU memory.
+HugePage allocation failed (HugePage: memfd_create(MFD_HUGETLB, page_size=...) failed: ...); falling back to regular CPU memory.
 ```
+
+While running, `ls -l /proc/<TransferManager pid>/fd | grep memfd:flexkv_hugepage` shows the memfd backing the pool.
 
 ### 6.2 Check HugePage Counters
 
@@ -250,8 +238,6 @@ Check the following items in order:
 
 - `enable_p2p_ssd=true` is actually enabled
 - The host has enough HugePages reserved
-- hugetlbfs is mounted
-- `FLEXKV_HUGETLBFS_DIR` points to the correct mount
 - CUDA runtime is available
 - `memlock` is not too small
 
@@ -263,8 +249,8 @@ FlexKV treats HugePage as a best-effort optimization with automatic fallback. Se
 
 Also distinguish the two common cases:
 
-- For `use_hugepage_cpu_buffer`, a writable `hugetlbfs` mount is mandatory even if the host has reserved HugePages.
-- For `use_hugepage_tmp_buffer`, anonymous HugePages may still work even without `hugetlbfs`.
+- For `use_hugepage_cpu_buffer`, the pool for `hugepage_size_bytes` must be configured with enough free pages; otherwise the memfd allocation or mmap fails and FlexKV falls back.
+- For `use_hugepage_tmp_buffer`, the same pool requirement applies.
 
 ### 7.3 1 GiB HugePages Do Not Work After Configuration
 
