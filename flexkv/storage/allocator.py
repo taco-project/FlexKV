@@ -223,7 +223,9 @@ class CPUAllocator(BaseStorageAllocator):
 # HugePage helpers (standalone, reusable outside of BaseStorageAllocator)
 # ---------------------------------------------------------------------------
 DEFAULT_HUGE_PAGE_SIZE = 2 * 1024 * 1024  # 2 MiB
-DEFAULT_HUGETLBFS_DIR = "/mnt/hugepages"
+
+_MFD_HUGETLB = getattr(os, "MFD_HUGETLB", 0x0004)
+_MFD_HUGE_SHIFT = 26
 
 _MAP_SHARED = 0x01
 _MAP_PRIVATE = 0x02
@@ -233,7 +235,6 @@ _MAP_HUGE_SHIFT = 26
 _PROT_READ = 0x1
 _PROT_WRITE = 0x2
 _MAP_FAILED = ctypes.c_void_p(-1).value  # (void*)-1
-_HUGETLBFS_MAGIC = 0x958458F6
 
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 _libc.mmap.restype = ctypes.c_void_p
@@ -247,36 +248,15 @@ _libc.mmap.argtypes = [
 ]
 _libc.munmap.restype = ctypes.c_int
 _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-_libc.ftruncate.restype = ctypes.c_int
-_libc.ftruncate.argtypes = [ctypes.c_int, ctypes.c_long]
 _libc.close.restype = ctypes.c_int
 _libc.close.argtypes = [ctypes.c_int]
 
-
-class _StatFS(ctypes.Structure):
-    _fields_ = [
-        ("f_type", ctypes.c_long),
-        ("f_bsize", ctypes.c_long),
-        ("f_blocks", ctypes.c_ulong),
-        ("f_bfree", ctypes.c_ulong),
-        ("f_bavail", ctypes.c_ulong),
-        ("f_files", ctypes.c_ulong),
-        ("f_ffree", ctypes.c_ulong),
-        ("f_fsid", ctypes.c_int * 2),
-        ("f_namelen", ctypes.c_long),
-        ("f_frsize", ctypes.c_long),
-        ("f_flags", ctypes.c_long),
-        ("f_spare", ctypes.c_long * 4),
-    ]
-
-
-_libc.statfs.restype = ctypes.c_int
-_libc.statfs.argtypes = [ctypes.c_char_p, ctypes.POINTER(_StatFS)]
 
 @dataclass
 class _HugePageMapping:
     finalizer: Any
     aligned: int
+    # ``/proc/<owner pid>/fd/<memfd>`` of a shareable mapping, None otherwise.
     path: str | None = None
 
 
@@ -285,6 +265,13 @@ _live_hugepage_mappings: "Dict[int, _HugePageMapping]" = {}
 
 @dataclass(frozen=True)
 class HugePageTensorHandle:
+    """Worker-side handle for a shareable HugePage pool.
+
+    ``path`` is ``/proc/<owner pid>/fd/<memfd>``: opening it reopens the
+    owner's anonymous hugetlb memfd, so the worker maps the same pages. The
+    owner must still be alive (it is: workers attach during their startup,
+    while the owning TransferManager holds the pool).
+    """
     path: str
     num_elements: int
     dtype: torch.dtype
@@ -299,82 +286,69 @@ class HugePageTensorHandle:
         )
 
 
-def _cleanup_hugepage_mapping(addr: int, aligned: int, fd: int,
-                              path: str | None, data_ptr: int) -> None:
+def _cleanup_hugepage_mapping(addr: int, aligned: int, fd: int, data_ptr: int) -> None:
     _munmap_huge(addr, aligned)
     if fd >= 0:
         _libc.close(fd)
-    if path is not None:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(path)
     _live_hugepage_mappings.pop(data_ptr, None)
 
 
-def _cleanup_hugepage_mmap(mm: mmap.mmap, path: str | None, data_ptr: int) -> None:
+def _cleanup_hugepage_mmap(mm: mmap.mmap, owner_fd: int, data_ptr: int) -> None:
     try:
         mm.close()
     finally:
-        if path is not None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(path)
+        if owner_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(owner_fd)
         _live_hugepage_mappings.pop(data_ptr, None)
 
 
-def _statfs_type(path: str) -> int:
-    statfs_buf = _StatFS()
-    if _libc.statfs(path.encode(), ctypes.byref(statfs_buf)) != 0:
-        err = ctypes.get_errno()
-        raise RuntimeError(
-            f"HugePage: statfs({path}) failed: {os.strerror(err)} (errno={err})"
+def _create_hugepage_memfd(aligned: int, page_size_bytes: int) -> int:
+    """Create an anonymous hugetlb memfd of ``aligned`` bytes.
+
+    Nothing appears on any filesystem, so there is nothing to unlink: the
+    pages return to the pool once the last fd and mapping go away, which the
+    kernel does on any process exit, SIGKILL included.
+    """
+    if not hasattr(os, "memfd_create"):
+        raise RuntimeError("HugePage: os.memfd_create is unavailable on this platform")
+    if page_size_bytes <= 0 or (page_size_bytes & (page_size_bytes - 1)) != 0:
+        raise ValueError(
+            f"HugePage: page_size_bytes must be a power of two, got {page_size_bytes}"
         )
-    return int(statfs_buf.f_type)
-
-
-def _ensure_hugetlbfs_mount(mnt_dir: str) -> None:
-    if not os.path.isdir(mnt_dir):
-        raise RuntimeError(f"HugePage: hugetlbfs directory does not exist: {mnt_dir}")
-    fs_type = _statfs_type(mnt_dir)
-    if fs_type != _HUGETLBFS_MAGIC:
-        raise RuntimeError(
-            f"HugePage: {mnt_dir} is not a hugetlbfs mount "
-            f"(f_type=0x{fs_type:x}, expected=0x{_HUGETLBFS_MAGIC:x})"
-        )
-
-
-def _create_hugetlbfs_file(aligned: int) -> tuple[str, int]:
-    mnt_dir = os.environ.get("FLEXKV_HUGETLBFS_DIR", DEFAULT_HUGETLBFS_DIR)
-    _ensure_hugetlbfs_mount(mnt_dir)
-    path = os.path.join(mnt_dir, f"flexkv_hugepage_{os.getpid()}_{id(object()):x}")
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_EXCL, 0o600)
+    page_shift = page_size_bytes.bit_length() - 1
+    flags = os.MFD_CLOEXEC | _MFD_HUGETLB | (page_shift << _MFD_HUGE_SHIFT)
     try:
-        ctypes.set_errno(0)
-        if _libc.ftruncate(fd, aligned) != 0:
-            err = ctypes.get_errno()
-            raise RuntimeError(
-                f"HugePage: ftruncate({path}, {aligned}) failed: "
-                f"{os.strerror(err)} (errno={err})"
-            )
-    except Exception:
+        fd = os.memfd_create("flexkv_hugepage", flags)
+    except OSError as e:
+        raise RuntimeError(
+            f"HugePage: memfd_create(MFD_HUGETLB, page_size={page_size_bytes}) failed: "
+            f"{e.strerror} (errno={e.errno}); is this page size configured?"
+        ) from e
+    try:
+        os.ftruncate(fd, aligned)
+    except OSError as e:
         os.close(fd)
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(path)
-        raise
-    return path, fd
+        raise RuntimeError(
+            f"HugePage: ftruncate(memfd, {aligned}) failed: {e.strerror} (errno={e.errno})"
+        ) from e
+    return fd
 
 
 def _wrap_mmap_tensor(mm: mmap.mmap,
                       aligned: int,
                       num_elements: int,
                       dtype: torch.dtype,
-                      cleanup_path: str | None) -> torch.Tensor:
+                      owner_fd: int = -1,
+                      share_path: str | None = None) -> torch.Tensor:
     num_bytes = num_elements * dtype.itemsize
     tensor = torch.frombuffer(mm, dtype=torch.uint8, count=num_bytes).view(dtype)[:num_elements]
     ptr = tensor.data_ptr()
-    finalizer = weakref.finalize(tensor, _cleanup_hugepage_mmap, mm, cleanup_path, ptr)
+    finalizer = weakref.finalize(tensor, _cleanup_hugepage_mmap, mm, owner_fd, ptr)
     _live_hugepage_mappings[ptr] = _HugePageMapping(
         finalizer=finalizer,
         aligned=aligned,
-        path=cleanup_path,
+        path=share_path,
     )
     return tensor
 
@@ -383,7 +357,13 @@ def _materialize_shareable_hugepage_tensor(path: str,
                                            num_elements: int,
                                            dtype: torch.dtype,
                                            aligned: int) -> torch.Tensor:
-    fd = os.open(path, os.O_RDWR)
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError as e:
+        raise RuntimeError(
+            f"HugePage: cannot reopen the owner's memfd through {path} ({e}); the "
+            "owning process must be alive and share this process's PID namespace"
+        ) from e
     try:
         mm = mmap.mmap(
             fd,
@@ -393,7 +373,7 @@ def _materialize_shareable_hugepage_tensor(path: str,
         )
     finally:
         os.close(fd)
-    return _wrap_mmap_tensor(mm, aligned, num_elements, dtype, cleanup_path=None)
+    return _wrap_mmap_tensor(mm, aligned, num_elements, dtype)
 
 
 @dataclass(frozen=True)
@@ -402,7 +382,7 @@ class SlotStoreTensorHandle:
 
     The pool is a POSIX shm (or hugetlbfs) mapping owned by the radix-server;
     a transfer worker attaches it by name in its own process and views it as a
-    tensor, the same way ``HugePageTensorHandle`` re-maps a hugetlbfs file. A
+    tensor, the same way ``HugePageTensorHandle`` re-maps the owner's hugetlb memfd. A
     tensor built over the mapping cannot be pickled to the worker (that would
     copy the bytes), hence the handle.
     """
@@ -538,7 +518,7 @@ def _mmap_huge(num_bytes: int, page_size_bytes: int) -> Tuple[int, int, int]:
     aligned = _align_to_page(num_bytes, page_size_bytes)
     page_shift = page_size_bytes.bit_length() - 1
 
-    # 1) Anonymous MAP_HUGETLB — no hugetlbfs mount needed.
+    # 1) Anonymous MAP_HUGETLB.
     free_pages = _read_hugepages_free(page_size_bytes)
     if free_pages and aligned > free_pages * page_size_bytes:
         flexkv_logger.warning(
@@ -554,13 +534,12 @@ def _mmap_huge(num_bytes: int, page_size_bytes: int) -> Tuple[int, int, int]:
     if ret is not None and ret != _MAP_FAILED:
         return int(ret), aligned, -1
 
-    # 2) Fallback: file-backed hugetlbfs. Reject non-hugetlbfs mounts so we
-    # never silently succeed on regular 4 KiB pages.
+    # 2) Fallback: anonymous hugetlb memfd. MFD_HUGETLB either yields huge
+    # pages of the requested size or fails, so this never silently succeeds
+    # on regular 4 KiB pages.
     fd = -1
     try:
-        path, fd = _create_hugetlbfs_file(aligned)
-        with contextlib.suppress(OSError):
-            os.unlink(path)
+        fd = _create_hugepage_memfd(aligned, page_size_bytes)
 
         ctypes.set_errno(0)
         ret = _libc.mmap(
@@ -574,7 +553,7 @@ def _mmap_huge(num_bytes: int, page_size_bytes: int) -> Tuple[int, int, int]:
         if ret is None or ret == _MAP_FAILED:
             err = ctypes.get_errno()
             raise RuntimeError(
-                f"HugePage: mmap({path}, {aligned}) failed: "
+                f"HugePage: mmap(memfd, {aligned}) failed: "
                 f"{os.strerror(err)} (errno={err})"
             )
         return int(ret), aligned, fd
@@ -622,7 +601,7 @@ def alloc_hugepage_tensor(num_elements: int,
                 f"logical_bytes={num_bytes}, mapped_bytes={aligned}, "
                 f"mapping_alignment={mapping_alignment}"
             )
-        path, fd = _create_hugetlbfs_file(aligned)
+        fd = _create_hugepage_memfd(aligned, page_size_bytes)
         mm = None
         try:
             mm = mmap.mmap(
@@ -631,17 +610,19 @@ def alloc_hugepage_tensor(num_elements: int,
                 flags=mmap.MAP_SHARED,
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
-            return _wrap_mmap_tensor(mm, aligned, num_elements, dtype, cleanup_path=path)
+            # Keep ``fd`` open for the pool's lifetime: workers reach the
+            # memfd through this /proc path. The finalizer closes it.
+            return _wrap_mmap_tensor(
+                mm, aligned, num_elements, dtype,
+                owner_fd=fd, share_path=f"/proc/{os.getpid()}/fd/{fd}",
+            )
         except Exception:
             try:
                 if mm is not None:
                     mm.close()
             finally:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(path)
+                os.close(fd)
             raise
-        finally:
-            os.close(fd)
 
     addr, aligned, fd = _mmap_huge(num_bytes, page_size_bytes)
 
@@ -657,7 +638,7 @@ def alloc_hugepage_tensor(num_elements: int,
 
     ptr = tensor.data_ptr()
     finalizer = weakref.finalize(tensor, _cleanup_hugepage_mapping,
-                                 addr, aligned, fd, None, ptr)
+                                 addr, aligned, fd, ptr)
     _live_hugepage_mappings[ptr] = _HugePageMapping(
         finalizer=finalizer,
         aligned=aligned,
@@ -703,8 +684,8 @@ def _spread_hugepage_pool_over_numa(tensor: torch.Tensor,
     """mbind a freshly mapped (still unpopulated) shareable HugePage pool per
     NUMA region and prefault it here, Mooncake-style.
 
-    hugetlbfs keeps the mbind policy on this process's VMA only, so the pages
-    must be faulted through it before any worker maps the file.
+    hugetlb keeps the mbind policy on this process's VMA only, so the pages
+    must be faulted through it before any worker maps the memfd.
     """
     nodes = flexkv_numa.get_spread_nodes()
     if not nodes:
@@ -737,10 +718,11 @@ def _spread_hugepage_pool_over_numa(tensor: torch.Tensor,
 
 
 class HugePageAllocator(BaseStorageAllocator):
-    """CPU KV-cache allocator backed by hugetlbfs HugePages.
+    """CPU KV-cache allocator backed by hugetlb HugePages.
 
     Unlike :class:`CPUAllocator` (which relies on ``torch.empty`` on top of 4KiB
-    pages), this allocator maps a hugetlbfs file and wraps the resulting buffer
+    pages), this allocator maps an anonymous hugetlb memfd (``MFD_HUGETLB``,
+    no hugetlbfs mount or file needed) and wraps the resulting buffer
     into a 1-D ``torch.Tensor`` (zero-copy).
 
     Benefits:

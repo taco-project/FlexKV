@@ -143,7 +143,7 @@ FlexKV 的 KVServer 由 `dp_client_id == 0` 的调用方拉起（例如 SGLang �
 1. KVServer / TransferManager 启动时丢弃继承的绑定：CPU 亲和性重置为所有参与节点的 CPU，进程内存策略改为在这些节点间 interleave。
 2. CPU KV 池（含 SWA 池）按节点数切成连续的若干段，每段对应一个节点，并用 `mbind(MPOL_PREFERRED)` 设到该节点。段边界同时对齐 KV block 和页（HugePage 时还对齐 `FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES`），不会有 block 跨段。
    - 默认内存：池子是一个 memfd（shmem）。先 `mbind` 设好段策略，再在 TransferManager 中每段用该节点的 CPU 并行 `fallocate` 预分配，日志中会打印 `populated in Xs`。如果不预分配，就要等 16 个 worker 的 `cudaHostRegister` 和 Mooncake 的 `ibv_reg_mr` 并发触发缺页，实测注册会慢约 3 倍。同时也省掉了旧路径里 torch 把私有 tensor 拷进 `/dev/shm` 的那一次全量拷贝。
-   - HugePage（`FLEXKV_USE_HUGEPAGE_CPU_BUFFER=1`）：hugetlbfs 的 mbind 只对当前 VMA 生效，因此会在 TransferManager 中先用各节点本地的线程预分配全部大页（与 Mooncake 相同）。若某节点空闲大页不足会打印告警，超出部分溢出到其他节点。
+   - HugePage（`FLEXKV_USE_HUGEPAGE_CPU_BUFFER=1`）：hugetlb 的 mbind 只对当前 VMA 生效，因此会在 TransferManager 中先用各节点本地的线程预分配全部大页（与 Mooncake 相同）。若某节点空闲大页不足会打印告警，超出部分溢出到其他节点。
 3. Mooncake Store 后端按段分别注册 MR（每段内部仍遵循 `FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES` / `FLEXKV_MOONCAKE_MR_SPLIT_POLICY`）。Mooncake 依据每个 MR 首页所在节点把它标记为 `cpu:N`，因此每一段的 RDMA 读写都会选用该节点的本地网卡。
 
 | 环境变量 | 类型 | 默认值 | 说明 |

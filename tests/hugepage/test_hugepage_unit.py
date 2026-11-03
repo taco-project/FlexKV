@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 
 import pytest
@@ -8,6 +9,7 @@ import torch
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import DeviceType
+from flexkv.storage import allocator
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.storage.allocator import (
     DEFAULT_HUGE_PAGE_SIZE,
@@ -59,32 +61,65 @@ def test_invalid_args() -> None:
         alloc_hugepage_tensor(1, torch.float32, page_size_bytes=PAGE + 1)
 
 
-def test_non_hugetlbfs_fallback_is_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    monkeypatch.setenv("FLEXKV_HUGETLBFS_DIR", str(tmp_path))
+def _fail_memfd(*_args, **_kwargs):
+    raise RuntimeError("HugePage: memfd_create(MFD_HUGETLB) failed: injected")
 
-    with pytest.raises(RuntimeError, match="is not a hugetlbfs mount"):
-        alloc_hugepage_tensor(1024, torch.float32, page_size_bytes=1024 * 1024 * 1024)
+
+def test_memfd_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(*_args, **_kwargs):
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    monkeypatch.setattr(allocator.os, "memfd_create", _raise)
+
+    with pytest.raises(RuntimeError, match="memfd_create"):
+        alloc_hugepage_tensor(1024, torch.float32, page_size_bytes=PAGE, shareable=True)
+
+
+def _alloc_shareable_or_skip(num_elements: int, dtype: torch.dtype) -> torch.Tensor:
+    try:
+        return alloc_hugepage_tensor(num_elements, dtype, PAGE, shareable=True)
+    except Exception as e:
+        pytest.skip(f"shareable hugepage allocation failed: {e}")
 
 
 def test_worker_hugepage_handle_round_trip() -> None:
-    tensor = alloc_hugepage_or_skip(1024 * 1024, torch.bfloat16, PAGE)
+    tensor = _alloc_shareable_or_skip(1024 * 1024, torch.bfloat16)
 
     try:
         handle = get_worker_hugepage_handle(tensor, tensor.numel(), tensor.dtype)
-        if handle is None:
-            pytest.skip("non-shareable hugepage allocation path on this host")
+        assert isinstance(handle, HugePageTensorHandle)
+        assert handle.path.startswith(f"/proc/{os.getpid()}/fd/")
 
         rebuilt = materialize_worker_tensor(handle)
         rebuilt.view(torch.int16)[0] = 0x1234
 
-        assert isinstance(handle, HugePageTensorHandle)
         assert int(tensor.view(torch.int16)[0].item()) == 0x1234
         free_hugepage_tensor(rebuilt)
     finally:
         free_hugepage_tensor(tensor)
 
 
-def test_hugepage_allocator_fallback() -> None:
+def test_shareable_pool_leaves_no_file_and_closes_owner_fd() -> None:
+    hugetlbfs_dirs = [d for d in ("/dev/hugepages", "/mnt/hugepages") if os.path.isdir(d)]
+    before = {d: set(os.listdir(d)) for d in hugetlbfs_dirs}
+    tensor = _alloc_shareable_or_skip(1024 * 1024, torch.bfloat16)
+    handle = get_worker_hugepage_handle(tensor, tensor.numel(), tensor.dtype)
+    assert handle is not None
+    owner_fd = int(handle.path.rsplit("/", 1)[1])
+
+    try:
+        os.fstat(owner_fd)
+        assert os.readlink(handle.path).startswith("/memfd:flexkv_hugepage")
+        for d in hugetlbfs_dirs:
+            assert set(os.listdir(d)) == before[d]
+    finally:
+        free_hugepage_tensor(tensor)
+
+    with pytest.raises(OSError):
+        os.fstat(owner_fd)
+
+
+def test_hugepage_allocator_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
         num_layer=2,
@@ -96,20 +131,12 @@ def test_hugepage_allocator_fallback() -> None:
         num_kv_heads=8,
     )
     dtype = torch.bfloat16
-    page_size = 1024 * 1024 * 1024
-    old_dir = os.environ.get("FLEXKV_HUGETLBFS_DIR")
-    os.environ["FLEXKV_HUGETLBFS_DIR"] = "/nonexistent/flexkv_hugetlbfs"
-    try:
-        handle = HugePageAllocator.allocate(
-            layout=layout,
-            dtype=dtype,
-            page_size_bytes=page_size,
-        )
-    finally:
-        if old_dir is None:
-            os.environ.pop("FLEXKV_HUGETLBFS_DIR", None)
-        else:
-            os.environ["FLEXKV_HUGETLBFS_DIR"] = old_dir
+    monkeypatch.setattr(allocator, "_create_hugepage_memfd", _fail_memfd)
+    handle = HugePageAllocator.allocate(
+        layout=layout,
+        dtype=dtype,
+        page_size_bytes=PAGE,
+    )
 
     tensor = handle.get_tensor()
     assert isinstance(tensor, torch.Tensor)
@@ -160,9 +187,6 @@ def test_host_buffer_release_is_idempotent() -> None:
 
 
 def test_storage_engine_cpu_cache_uses_hugepage_when_enabled() -> None:
-    if not os.path.isdir(os.environ.get("FLEXKV_HUGETLBFS_DIR", "/mnt/hugepages")):
-        pytest.skip("hugetlbfs mount not available")
-
     model_config = ModelConfig(
         num_layers=1,
         num_kv_heads=1,
@@ -207,9 +231,9 @@ def test_storage_engine_cpu_cache_falls_back_when_hugepage_unavailable(monkeypat
         num_cpu_blocks=8,
         tokens_per_block=16,
         use_hugepage_cpu_buffer=True,
-        hugepage_size_bytes=1024 * 1024 * 1024,
+        hugepage_size_bytes=PAGE,
     )
-    monkeypatch.setenv("FLEXKV_HUGETLBFS_DIR", "/nonexistent/flexkv_hugetlbfs")
+    monkeypatch.setattr(allocator, "_create_hugepage_memfd", _fail_memfd)
 
     storage_engine = StorageEngine(model_config, cache_config, model_config.num_layers)
     cpu_handle = storage_engine.get_storage_handle(DeviceType.CPU)
