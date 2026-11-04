@@ -7,6 +7,7 @@
  * selected by choose_path(). See ce_transfer.h and docs for the path taxonomy.
  */
 #include "ce_transfer.h"
+#include "host_dma.h"
 
 #include <algorithm>
 #include <array>
@@ -249,7 +250,7 @@ void ce_transfer_per_block(
             cpu_base + cpu_block_ids[b] * cpu_block_stride_int64;
         void *dst = is_host_to_device ? (void *)gpu_ptr_off : (void *)cpu_ptr_b;
         void *src = is_host_to_device ? (void *)cpu_ptr_b : (void *)gpu_ptr_off;
-        cudaMemcpyAsync(dst, src, chunk_size_in_bytes, kind, stream);
+        checked_host_memcpy_async(dst, src, chunk_size_in_bytes, kind, stream);
         FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, chunk_size_in_bytes);
       }
     }
@@ -286,7 +287,7 @@ void ce_transfer_contig_direct(
           is_host_to_device ? (void *)gpu_chunk_ptr : (void *)cpu_chunk_ptr;
       void *src =
           is_host_to_device ? (void *)cpu_chunk_ptr : (void *)gpu_chunk_ptr;
-      cudaMemcpyAsync(dst, src, big_size, kind, stream);
+      checked_host_memcpy_async(dst, src, big_size, kind, stream);
       FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, big_size);
     }
   }
@@ -322,7 +323,7 @@ void ce_transfer_segment_direct(
                                gpu_startoff_inside_chunks_int64;
         void *dst = is_host_to_device ? (void *)gpu_ptr_off : (void *)cpu_ptr;
         void *src = is_host_to_device ? (void *)cpu_ptr : (void *)gpu_ptr_off;
-        cudaMemcpyAsync(dst, src, seg_size, kind, stream);
+        checked_host_memcpy_async(dst, src, seg_size, kind, stream);
         FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, seg_size);
       }
     }
@@ -718,8 +719,9 @@ void ce_transfer_segment_scatter(
         size_t dpitch = is_host_to_device ? gpu_pitch : cpu_pitch;
         size_t spitch = is_host_to_device ? cpu_pitch : gpu_pitch;
 
-        cudaMemcpy2DAsync(dst, dpitch, src, spitch, chunk_size_in_bytes,
-                          seg.nr_blocks, kind, stream);
+        checked_host_memcpy2d_async(dst, dpitch, src, spitch,
+                                    chunk_size_in_bytes, seg.nr_blocks, kind,
+                                    stream);
         FLEXKV_GPU_CPU_TRANSFER(is_host_to_device,
                                 chunk_size_in_bytes * seg.nr_blocks);
       }
@@ -758,8 +760,8 @@ void ce_transfer_segment_scatter(
                                         j, gpu_block_ids[seg.start_k]);
         int64_t *gpu_ptr_off = reinterpret_cast<int64_t *>(gpu_ptr) +
                                gpu_startoff_inside_chunks_int64;
-        cudaMemcpyAsync((char *)buf + seg_offset, gpu_ptr_off, seg_size,
-                        cudaMemcpyDeviceToHost, stream);
+        checked_host_memcpy_async((char *)buf + seg_offset, gpu_ptr_off,
+                                  seg_size, cudaMemcpyDeviceToHost, stream);
         FLEXKV_GPU_CPU_TRANSFER(false, seg_size);
         seg_offset += seg_size;
       }
@@ -804,8 +806,8 @@ void ce_transfer_segment_scatter(
                                         j, gpu_block_ids[seg.start_k]);
         int64_t *gpu_ptr_off = reinterpret_cast<int64_t *>(gpu_ptr) +
                                gpu_startoff_inside_chunks_int64;
-        cudaMemcpyAsync(gpu_ptr_off, (char *)buf + off, seg_size,
-                        cudaMemcpyHostToDevice, stream);
+        checked_host_memcpy_async(gpu_ptr_off, (char *)buf + off, seg_size,
+                                  cudaMemcpyHostToDevice, stream);
         FLEXKV_GPU_CPU_TRANSFER(true, seg_size);
         off += seg_size;
       }
@@ -897,8 +899,8 @@ void ce_transfer_gather_scatter(
           chunk_size_in_bytes, stream, is_host_to_device);
       return;
     }
-    cudaMemcpyAsync(gpu_ids_raw, gpu_block_ids, ids_bytes,
-                    cudaMemcpyHostToDevice, stream);
+    checked_host_memcpy_async(gpu_ids_raw, gpu_block_ids, ids_bytes,
+                              cudaMemcpyHostToDevice, stream);
     gpu_ids_cuda = at::from_blob(gpu_ids_raw, {num_blocks}, i64_cuda);
 
     if (is_host_to_device) {
@@ -912,8 +914,8 @@ void ce_transfer_gather_scatter(
             chunk_size_in_bytes, stream, is_host_to_device);
         return;
       }
-      cudaMemcpyAsync(dst_ids_raw, gpu_block_ids, ids_bytes,
-                      cudaMemcpyHostToDevice, stream);
+      checked_host_memcpy_async(dst_ids_raw, gpu_block_ids, ids_bytes,
+                                cudaMemcpyHostToDevice, stream);
       dst_ids_cuda = at::from_blob(dst_ids_raw, {num_blocks}, i64_cuda);
     }
   }
@@ -1024,8 +1026,9 @@ void ce_transfer_gather_scatter(
           void *src = is_host_to_device ? cpu_ptr : gpu_ptr;
           size_t dpitch = is_host_to_device ? gpu_pitch : cpu_pitch;
           size_t spitch = is_host_to_device ? cpu_pitch : gpu_pitch;
-          cudaMemcpy2DAsync(dst, dpitch, src, spitch, chunk_size_in_bytes,
-                            (size_t)seg.nr_blocks, kind, stream);
+          checked_host_memcpy2d_async(dst, dpitch, src, spitch,
+                                      chunk_size_in_bytes,
+                                      (size_t)seg.nr_blocks, kind, stream);
           FLEXKV_GPU_CPU_TRANSFER(is_host_to_device,
                                   chunk_size_in_bytes * seg.nr_blocks);
         }
@@ -1044,9 +1047,9 @@ void ce_transfer_gather_scatter(
           void *cpu_dst = cpu_base + cb * cpu_block_stride_int64;
           void *src =
               (char *)d2h_src + (int64_t)seg.start_k * chunk_size_in_bytes;
-          cudaMemcpy2DAsync(cpu_dst, cpu_pitch, src, dev_pitch,
-                            chunk_size_in_bytes, (size_t)seg.nr_blocks, kind,
-                            stream);
+          checked_host_memcpy2d_async(cpu_dst, cpu_pitch, src, dev_pitch,
+                                      chunk_size_in_bytes,
+                                      (size_t)seg.nr_blocks, kind, stream);
           FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes * seg.nr_blocks);
         }
         cudaStreamSynchronize(stream);
@@ -1059,9 +1062,9 @@ void ce_transfer_gather_scatter(
           const int64_t *cpu_src = cpu_base + cb * cpu_block_stride_int64;
           void *dst =
               (char *)h2d_dst + (int64_t)seg.start_k * chunk_size_in_bytes;
-          cudaMemcpy2DAsync(dst, dev_pitch, cpu_src, cpu_pitch,
-                            chunk_size_in_bytes, (size_t)seg.nr_blocks, kind,
-                            stream);
+          checked_host_memcpy2d_async(dst, dev_pitch, cpu_src, cpu_pitch,
+                                      chunk_size_in_bytes,
+                                      (size_t)seg.nr_blocks, kind, stream);
           FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes * seg.nr_blocks);
         }
         cudaStreamSynchronize(stream);
@@ -1119,8 +1122,8 @@ void ce_transfer_gather_scatter(
                          j * cpu_kv_stride_int64 +
                          cpu_block_ids[0] * cpu_block_stride_int64 +
                          cpu_startoff_inside_chunks_int64);
-      cudaMemcpyAsync(dst_ptr, d2h_src, buf_bytes, cudaMemcpyDeviceToHost,
-                      stream);
+      checked_host_memcpy_async(dst_ptr, d2h_src, buf_bytes,
+                                cudaMemcpyDeviceToHost, stream);
       FLEXKV_GPU_CPU_TRANSFER(false, buf_bytes);
 
       if (pingpong_events) {
@@ -1176,8 +1179,8 @@ void ce_transfer_gather_scatter(
       } else {
         h2d_dst = dev_buf[idx].data_ptr();
       }
-      cudaMemcpyAsync(h2d_dst, h2d_src, buf_bytes, cudaMemcpyHostToDevice,
-                      stream);
+      checked_host_memcpy_async(h2d_dst, h2d_src, buf_bytes,
+                                cudaMemcpyHostToDevice, stream);
       FLEXKV_GPU_CPU_TRANSFER(true, buf_bytes);
 
       // Step 3: GPU scatter (if GPU dst non-contig — logical or physical)
@@ -1279,8 +1282,8 @@ void ce_transfer_gather_direct(
           chunk_size_in_bytes, stream, is_host_to_device);
       return;
     }
-    cudaMemcpyAsync(gpu_ids_raw, gpu_block_ids, ids_bytes,
-                    cudaMemcpyHostToDevice, stream);
+    checked_host_memcpy_async(gpu_ids_raw, gpu_block_ids, ids_bytes,
+                              cudaMemcpyHostToDevice, stream);
     gpu_ids_cuda = at::from_blob(gpu_ids_raw, {num_blocks}, i64_cuda);
   }
 
@@ -1342,8 +1345,8 @@ void ce_transfer_gather_direct(
                            cpu_startoff_inside_chunks_int64;
         void *src = (char *)dev_staging +
                     (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
-        cudaMemcpyAsync(cpu_dst, src, seg_bytes, cudaMemcpyDeviceToHost,
-                        stream);
+        checked_host_memcpy_async(cpu_dst, src, seg_bytes,
+                                  cudaMemcpyDeviceToHost, stream);
         FLEXKV_GPU_CPU_TRANSFER(false, seg_bytes);
       }
     } else {
@@ -1360,9 +1363,9 @@ void ce_transfer_gather_direct(
                              cpu_startoff_inside_chunks_int64;
           void *src = (char *)dev_staging +
                       (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
-          cudaMemcpy2DAsync(cpu_dst, spitch, src, width, width,
-                            (size_t)seg.nr_blocks, cudaMemcpyDeviceToHost,
-                            stream);
+          checked_host_memcpy2d_async(cpu_dst, spitch, src, width, width,
+                                      (size_t)seg.nr_blocks,
+                                      cudaMemcpyDeviceToHost, stream);
           FLEXKV_GPU_CPU_TRANSFER(false, width * seg.nr_blocks);
         }
       } else {
@@ -1373,7 +1376,8 @@ void ce_transfer_gather_direct(
                              cpu_startoff_inside_chunks_int64;
           void *src = (char *)dev_staging +
                       (int64_t)b * total_iters * chunk_size_in_bytes;
-          cudaMemcpyAsync(cpu_dst, src, width, cudaMemcpyDeviceToHost, stream);
+          checked_host_memcpy_async(cpu_dst, src, width, cudaMemcpyDeviceToHost,
+                                    stream);
           FLEXKV_GPU_CPU_TRANSFER(false, width);
         }
       }
@@ -1396,8 +1400,8 @@ void ce_transfer_gather_direct(
                            cpu_startoff_inside_chunks_int64;
         void *dst = (char *)dev_staging +
                     (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
-        cudaMemcpyAsync(dst, cpu_src, seg_bytes, cudaMemcpyHostToDevice,
-                        stream);
+        checked_host_memcpy_async(dst, cpu_src, seg_bytes,
+                                  cudaMemcpyHostToDevice, stream);
         FLEXKV_GPU_CPU_TRANSFER(true, seg_bytes);
       }
     } else {
@@ -1413,9 +1417,9 @@ void ce_transfer_gather_direct(
                                    cpu_startoff_inside_chunks_int64;
           void *dst = (char *)dev_staging +
                       (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
-          cudaMemcpy2DAsync(dst, width, cpu_src, spitch, width,
-                            (size_t)seg.nr_blocks, cudaMemcpyHostToDevice,
-                            stream);
+          checked_host_memcpy2d_async(dst, width, cpu_src, spitch, width,
+                                      (size_t)seg.nr_blocks,
+                                      cudaMemcpyHostToDevice, stream);
           FLEXKV_GPU_CPU_TRANSFER(true, width * seg.nr_blocks);
         }
       } else {
@@ -1426,7 +1430,8 @@ void ce_transfer_gather_direct(
                                    cpu_startoff_inside_chunks_int64;
           void *dst = (char *)dev_staging +
                       (int64_t)b * total_iters * chunk_size_in_bytes;
-          cudaMemcpyAsync(dst, cpu_src, width, cudaMemcpyHostToDevice, stream);
+          checked_host_memcpy_async(dst, cpu_src, width, cudaMemcpyHostToDevice,
+                                    stream);
           FLEXKV_GPU_CPU_TRANSFER(true, width);
         }
       }
