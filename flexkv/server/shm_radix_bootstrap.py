@@ -33,6 +33,7 @@ strides of a plain tensor.
 from __future__ import annotations
 
 import dataclasses
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,6 +54,7 @@ _MAX_SLOT_ALIGN = 4096
 
 DEFAULT_SERVER_NAME = "/flexkv"
 READY_TIMEOUT_S = 600.0
+SSD_READY_TIMEOUT_S = float(os.getenv("FLEXKV_RADIXSHMEM_SSD_READY_TIMEOUT_S", "3600"))
 PREFETCH_TIMEOUT_MS = 5000
 PREFETCH_MAX_INFLIGHT = 128
 MAX_OUTSTANDING = 256
@@ -113,7 +115,11 @@ def attach_ssd_index_client(cache_config: CacheConfig,
     if name is None:
         raise ValueError(f"{label}: FLEXKV_RADIXSHMEM_SSD_SERVER_NAME is not set")
     geometry = ssd_index_geometry(cache_config)
-    client = attach_radix_client(name, geometry=geometry, attach_index=attach_index, label=label)
+    # An index-only server joins its cluster only once this node's FlexKV
+    # configured it, and waits for every peer's FlexKV to do the same: allow
+    # for nodes that come up far apart (a slow model load on another node).
+    client = attach_radix_client(name, geometry=geometry, attach_index=attach_index,
+                                 timeout_s=SSD_READY_TIMEOUT_S, label=label)
     try:
         if client.info.data_plane:
             raise ValueError(
