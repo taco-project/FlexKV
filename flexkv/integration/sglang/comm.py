@@ -49,6 +49,7 @@ class FlexKVScatterChannel(str, Enum):
 
     LOOKUP = "lookup"
     LAYERWISE_MANIFEST = "layerwise_manifest"
+    LAYERWISE_BATCH = "layerwise_batch"
     STORE_COMPLETION = "store_completion"
     PREFETCH_START = "prefetch_start"
     PREFETCH_PROGRESS = "prefetch_progress"
@@ -68,6 +69,7 @@ _SCATTER_CHANNEL_OFFSETS = {
     FlexKVScatterChannel.STORE_START: 7,
     FlexKVScatterChannel.STORE_RESET: 8,
     FlexKVScatterChannel.STORE_READY: 9,
+    FlexKVScatterChannel.LAYERWISE_BATCH: 10,
 }
 _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.LOOKUP: dict,
@@ -79,6 +81,7 @@ _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.STORE_START: dict,
     FlexKVScatterChannel.STORE_RESET: dict,
     FlexKVScatterChannel.STORE_READY: list,
+    FlexKVScatterChannel.LAYERWISE_BATCH: dict,
 }
 
 
@@ -794,9 +797,10 @@ class FlexKVLayerDoneCounter:
 
     The KV pool calls ``wait_until(layer_id)`` once per layer during forward.
     All restores collected while SGLang builds one prefill batch share a
-    producer slot. The layer hook consumes one eventfd signal per restore for
-    each layer. Producer rotation therefore happens per prefill batch, not per
-    request, and the fixed-size ring remains sufficient for large batches.
+    producer slot. The layer hook consumes one eventfd signal per submitted
+    operation for each layer. The connector coalesces prepared request counts
+    to one before submitting a merged operation. Producer rotation happens per
+    prefill batch, and the fixed-size ring remains sufficient for large batches.
     """
 
     def __init__(self, num_layers: int, num_counters: int = 3, world_rank: int = -1):
@@ -938,6 +942,26 @@ class FlexKVLayerDoneCounter:
             if self.consumer_index == producer_id:
                 self.consumer_index = -1
             event.mark_reusable()
+
+    def validate_prepared_batch(self, task_ids: List[int], producer_id: int) -> None:
+        """Require one complete, unlaunched consumer batch before coalescing."""
+        if not task_ids or len(set(task_ids)) != len(task_ids):
+            raise RuntimeError("A layerwise batch needs distinct prepared tasks")
+        if self.consumer_index != producer_id:
+            raise RuntimeError("Layerwise batch is not the active consumer")
+        if self._consumer_task_ids != task_ids:
+            raise RuntimeError("Layerwise batch does not cover all prepared transfers")
+        if self.events[producer_id].pending_transfers() != len(task_ids):
+            raise RuntimeError("Layerwise batch transfer count differs from its members")
+
+    def coalesce_prepared_batch(self, task_ids: List[int], producer_id: int) -> None:
+        """One merged LAYERWISE op emits one signal per layer, not per child.
+
+        The connector must complete all-rank preflight first, and no member
+        may have been submitted to a transfer worker yet.
+        """
+        self.validate_prepared_batch(task_ids, producer_id)
+        self.events[producer_id].wait_remaining = [1] * self.num_layers
 
     def abort_unregistered_selection(self, producer_id: int) -> None:
         """Release a freshly selected leader counter before registration."""
