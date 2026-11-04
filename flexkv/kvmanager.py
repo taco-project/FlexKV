@@ -67,10 +67,12 @@ class KVManager:
                 "radix_shmem and enable_remote (3rd-party remote storage) "
                 "cannot be enabled at the same time"
             )
-        if self.enable_radixshmem and cache_config.enable_ssd:
+        if (self.enable_radixshmem and cache_config.enable_ssd
+                and not GLOBAL_CONFIG_FROM_ENV.radixshmem_ssd_server_name):
             raise ValueError(
-                "radix_shmem backs the CPU tier only (index + SlotStore + peer "
-                "pull); set ssd_cache_gb=0 / enable_ssd=False"
+                "radix_shmem with the SSD tier needs FLEXKV_RADIXSHMEM_SSD_SERVER_NAME "
+                "(this node's index-only SSD radix-server); otherwise set "
+                "ssd_cache_gb=0 / enable_ssd=False"
             )
         if self.enable_radixshmem and (cache_config.enable_p2p_cpu
                                      or cache_config.enable_p2p_ssd):

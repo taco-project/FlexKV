@@ -56,15 +56,26 @@ def _empty_i64() -> np.ndarray:
 class ShmRadixMatch:
     """One local prefix query, pinned until `release()`.
 
-    `local_slots[i]` holds block `i` of the `num_matched_blocks`-block hit. On
-    a `FULL|SWA` query the hit is the joint one and `swa_slots` cover
-    `[swa_start, num_matched_blocks)`; both are empty otherwise.
+    `local_slots[i]` holds block `i` of the hit. A local-only match covers the
+    whole `num_matched_blocks`-block hit with them; a cluster-wide one
+    (`match(local_only=False)`) may end in a peer's run: `remote_slots` are
+    peer `remote_rank`'s slots for blocks `[len(local_slots),
+    num_matched_blocks)`. On a `FULL|SWA` query the hit is the joint one and
+    `swa_slots` cover `[swa_start, num_matched_blocks)` on `swa_rank`'s
+    pool; both are empty otherwise.
     """
     num_matched_blocks: int = 0
     local_slots: np.ndarray = field(default_factory=_empty_i64)
     swa_start: int = 0
     swa_slots: np.ndarray = field(default_factory=_empty_i64)
     finalize: Optional[Callable[[], None]] = None
+    remote_rank: int = -1
+    remote_slots: np.ndarray = field(default_factory=_empty_i64)
+    swa_rank: int = -1
+
+    @property
+    def num_local_blocks(self) -> int:
+        return len(self.local_slots)
 
     def local_range(self, first: int, last: int) -> np.ndarray:
         """Slots of block range [first, last), clipped to the hit."""
@@ -102,15 +113,20 @@ class StagedRadixInsert:
         self._holds = list(holds)
         self._component = component
         self._settled = False
+        self.landed = 0  # blocks the publish actually put on the tree
+
+    @property
+    def path_end(self) -> int:
+        return self._path_end
 
     def publish(self) -> None:
         if self._settled:
             return
         self._settled = True
         try:
-            self._engine.insert(self._sequence_meta, self._slots,
-                                num_insert_blocks=self._path_end,
-                                component=self._component)
+            self.landed = self._engine.insert(self._sequence_meta, self._slots,
+                                              num_insert_blocks=self._path_end,
+                                              component=self._component)
         except Exception as e:
             flexkv_logger.error(
                 f"radixshmem {self._label}: insert of {len(self._slots)} "
@@ -155,7 +171,9 @@ class CacheEngineRadixShmem:
                  peer_enabled: Optional[bool] = None,
                  swa_config: Optional[SWAPoolConfig] = None,
                  event_collector: Optional[KVEventCollector] = None,
-                 metrics_collector=None):
+                 metrics_collector=None,
+                 client: Any = None,
+                 device_type: DeviceType = DeviceType.CPU):
         """`server_name` is the radix-server's ``--name``; the server is the
         operator's process, running but not necessarily ready. With
         `geometry` (FlexKV's `RadixGeometry` or a `radixshmem.Geometry`) the
@@ -163,22 +181,29 @@ class CacheEngineRadixShmem:
         come up. `peer_enabled` None = follow the region: peer reuse whenever
         the server is part of a cluster; False switches it off.
         `num_total_blocks` is FlexKV's expectation; the region's capacity is
-        authoritative."""
+        authoritative. `client` is an already attached `RadixClient` (the SSD
+        tier's index-only server, see `attach_ssd_index_client`);
+        `device_type` the FlexKV tier this index backs (CPU or SSD)."""
         from flexkv.server.shm_radix_bootstrap import attach_radix_client, register_chunk_blocks
 
-        self.event_collector = event_collector
+        self.device_type = device_type
+        self.medium = device_type.name
+        self.event_collector = event_collector if device_type == DeviceType.CPU else None
         self._metrics_collector = metrics_collector
-        cpu_swa = swa_config.for_cache_tier(DeviceType.CPU) if swa_config is not None else None
-        self.swa_enabled = cpu_swa is not None and cpu_swa.num_slots > 0
+        tier_swa = swa_config.for_cache_tier(device_type) if swa_config is not None else None
+        self.swa_enabled = tier_swa is not None and tier_swa.num_slots > 0
 
-        self._client = attach_radix_client(server_name, geometry=geometry, attach_index=True,
-                                           label="CacheEngineRadixShmem")
+        if client is None:
+            client = attach_radix_client(server_name, geometry=geometry, attach_index=True,
+                                         label="CacheEngineRadixShmem")
+        self._client = client
         self._tree = self._client  # index ops pass through the client
         self.shm_name = self._client.info.index_name  # node-suffixed when distributed
         self.is_distributed = bool(self._client.is_distributed())
         if peer_enabled is None:
             peer_enabled = self.is_distributed
         self.peer_enabled = bool(peer_enabled) and self.is_distributed
+        self.rank = int(self._client.info.rank) if self.is_distributed else 0
         if peer_enabled and not self.is_distributed:
             flexkv_logger.warning(
                 f"radixshmem peer reuse is enabled for {self.shm_name} but the "
@@ -198,7 +223,7 @@ class CacheEngineRadixShmem:
         if num_total_blocks > 0 and capacity != int(num_total_blocks):
             flexkv_logger.warning(
                 f"radix-server {self.shm_name} has {capacity} FULL slots, FlexKV "
-                f"expected {num_total_blocks}; the index is authoritative")
+                f"expected {num_total_blocks} {self.medium} blocks; the index is authoritative")
         self.num_total_blocks = capacity
 
     @property
@@ -228,38 +253,64 @@ class CacheEngineRadixShmem:
               sequence_meta: SequenceMeta,
               *,
               component_mask: int = COMPONENT_MASK_FULL,
-              query_end: Optional[int] = None) -> ShmRadixMatch:
-        """Pinned local prefix match. `query_end` caps the queried path so the
-        SWA window ends where the caller's restore will."""
+              query_end: Optional[int] = None,
+              local_only: bool = True) -> ShmRadixMatch:
+        """Pinned prefix match. `query_end` caps the queried path so the SWA
+        window ends where the caller's restore will. `local_only=False` (a
+        cluster member only) lets the hit continue on one peer: the local run
+        `[0, a)` plus that peer's run `[a, common_hit)`, both pinned until
+        `release()` (the peer's with RDMA FAA, so it cannot evict them)."""
         hashes = self._hashes(sequence_meta, query_end)
+        local_only = local_only or not self.peer_enabled
         qr = self._tree.query(hashes, mask=component_mask,
-                              local_only=True, lock=True)
+                              local_only=local_only, lock=True)
         common_hit = int(qr.common_hit)
 
-        fragments = list(qr.full_fragments)  # local_only: at most one
-        if len(fragments) > 1:
+        local_slots = _empty_i64()
+        remote_slots = _empty_i64()
+        remote_rank = -1
+        covered = 0
+        for rank, offset, slots in list(qr.full_fragments):
+            rank, offset = int(rank), int(offset)
+            slots = np.asarray(slots, dtype=np.int64)
+            if offset != covered:
+                self._finalize_and_raise(
+                    qr, f"radixshmem {self.medium} query fragments are not contiguous: "
+                        f"a run starts at {offset}, expected {covered}")
+            if rank == self.rank and remote_rank < 0 and offset == 0:
+                local_slots = slots
+            elif remote_rank < 0 and not local_only:
+                remote_rank, remote_slots = rank, slots
+            else:
+                self._finalize_and_raise(
+                    qr, f"radixshmem {self.medium} query returned an unexpected run "
+                        f"(rank={rank}, offset={offset}, local_only={local_only})")
+            covered += len(slots)
+        if covered != common_hit:
             self._finalize_and_raise(
-                qr, f"radixshmem local query returned {len(fragments)} fragments; "
-                    f"a local_only query yields at most one")
-        local_slots = (np.asarray(fragments[0][2], dtype=np.int64)
-                       if fragments else _empty_i64())
-        if len(local_slots) != common_hit:
-            self._finalize_and_raise(
-                qr, f"radixshmem local query covers {len(local_slots)} blocks "
+                qr, f"radixshmem {self.medium} query covers {covered} blocks "
                     f"of a {common_hit}-block hit")
 
         swa_slots = np.asarray(qr.swa_slots, dtype=np.int64)
         swa_start = int(qr.swa_start) if len(swa_slots) > 0 else 0
-        if len(swa_slots) > 0 and swa_start + len(swa_slots) != common_hit:
-            self._finalize_and_raise(
-                qr, f"radixshmem returned {len(swa_slots)} SWA slots at "
-                    f"swa_start={swa_start} for a {common_hit}-block joint hit")
+        swa_rank = -1
+        if len(swa_slots) > 0:
+            if swa_start + len(swa_slots) != common_hit:
+                self._finalize_and_raise(
+                    qr, f"radixshmem returned {len(swa_slots)} SWA slots at "
+                        f"swa_start={swa_start} for a {common_hit}-block joint hit")
+            swa_rank = int(getattr(qr, "swa_source_rank", self.rank))
+            if swa_rank < 0:
+                swa_rank = self.rank
 
         return ShmRadixMatch(num_matched_blocks=common_hit,
                              local_slots=local_slots,
                              swa_start=swa_start,
                              swa_slots=swa_slots,
-                             finalize=qr.finalize)
+                             finalize=qr.finalize,
+                             remote_rank=remote_rank,
+                             remote_slots=remote_slots,
+                             swa_rank=swa_rank)
 
     @staticmethod
     def _finalize_and_raise(qr, message: str) -> None:
@@ -294,17 +345,18 @@ class CacheEngineRadixShmem:
                sequence_meta: SequenceMeta,
                physical_block_ids: np.ndarray,
                num_insert_blocks: int,
-               component: radixshmem.ComponentType = COMPONENT_FULL) -> None:
+               component: radixshmem.ComponentType = COMPONENT_FULL) -> int:
         """Attach transferred slots: `physical_block_ids[i]` is block
         `num_insert_blocks - len(physical_block_ids) + i`. Ownership passes to
-        radixshmem (`auto_recycle=True`); do not recycle these slots again."""
+        radixshmem (`auto_recycle=True`); do not recycle these slots again.
+        Returns how many of them landed on the tree."""
         sequence_meta.gen_hashes()
         hashes = sequence_meta.block_hashes.view(np.uint64)
 
         slots = np.ascontiguousarray(physical_block_ids, dtype=np.int32)
         num_slots = len(slots)
         if num_slots == 0:
-            return
+            return 0
 
         path_end = min(int(num_insert_blocks), len(hashes))
         start = path_end - num_slots
@@ -329,7 +381,7 @@ class CacheEngineRadixShmem:
                 f"{result.error}: {landed}/{num_slots} blocks landed at "
                 f"start={start} (unused slots were auto-recycled)")
         if landed <= 0:
-            return
+            return 0
 
         if self.peer_enabled and component == COMPONENT_FULL:
             try:
@@ -340,11 +392,13 @@ class CacheEngineRadixShmem:
                     f"locally but the cluster-wide publish failed: {e}")
 
         if (self.event_collector is not None and component == COMPONENT_FULL
-                and result.error == radixshmem.InsertError.OK):
+                and result.error == radixshmem.InsertError.OK
+                and self.device_type == DeviceType.CPU):
             self.event_collector.publish_stored(
                 block_hashes=sequence_meta.block_hashes[path_end - landed:path_end],
                 block_size=self.tokens_per_block,
                 medium="CPU")
+        return landed
 
     def take(self,
              num_required_blocks: int,
@@ -371,7 +425,7 @@ class CacheEngineRadixShmem:
             return _empty_i64()
         if (self._metrics_collector is not None and len(slots) > 0
                 and component == COMPONENT_FULL):  # SWA has its own pool
-            self._metrics_collector.record_allocation("cpu", len(slots))
+            self._metrics_collector.record_allocation(self.medium.lower(), len(slots))
         return slots
 
     def _pool_total(self, component: radixshmem.ComponentType) -> Optional[int]:

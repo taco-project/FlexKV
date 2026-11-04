@@ -872,6 +872,14 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     enable_radixshmem=bool(int(os.getenv('FLEXKV_ENABLE_RADIXSHMEM', 0))),
     radixshmem_server_name=os.getenv('FLEXKV_RADIXSHMEM_SERVER_NAME', '') or '/flexkv',
+    # Index-only radix-server of the SSD tier (slot id = FlexKV SSD block id).
+    # Empty = no SSD tier in radixshmem mode.
+    radixshmem_ssd_server_name=os.getenv('FLEXKV_RADIXSHMEM_SSD_SERVER_NAME', ''),
+    # Reader of a peer's SSD blocks for PEERSSD2H: "module:factory"; empty = the
+    # shared-filesystem reader (flexkv.transfer.workers.peer_ssd).
+    remote_ssd_reader=os.getenv('FLEXKV_REMOTE_SSD_READER', ''),
+    # Where every node's TE publishes its SSD file manifest for that reader.
+    peer_ssd_manifest_dir=os.getenv('FLEXKV_PEER_SSD_MANIFEST_DIR', ''),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),

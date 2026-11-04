@@ -549,6 +549,12 @@ class TransferManager:
          if self.storage_engine.has_storage_handle(DeviceType.REMOTE, pool_id=PoolId.SWA)
          else None
          )
+        if (GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and ssd_handle is not None
+                and GLOBAL_CONFIG_FROM_ENV.radixshmem_ssd_server_name):
+            # Peers read this node's SSD blocks by the radixshmem SSD index:
+            # tell them where the files are.
+            from flexkv.transfer.workers.peer_ssd import publish_ssd_manifest
+            publish_ssd_manifest(self.cache_config, ssd_handle, swa_ssd_handle)
 
         self.transfer_engine = TransferEngine(
             gpu_handles=grouped_gpu_handles,

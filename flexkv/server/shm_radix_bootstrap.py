@@ -69,6 +69,74 @@ def radix_server_name() -> str:
     return name
 
 
+def radix_ssd_server_name() -> Optional[str]:
+    """The ``--name`` of this node's index-only SSD radix-server
+    (``FLEXKV_RADIXSHMEM_SSD_SERVER_NAME``), or None when the SSD tier is not
+    indexed by radixshmem."""
+    name = str(GLOBAL_CONFIG_FROM_ENV.radixshmem_ssd_server_name or "")
+    if not name:
+        return None
+    if not name.startswith("/") or len(name) < 2 or any(c.isspace() for c in name):
+        raise ValueError(
+            f"FLEXKV_RADIXSHMEM_SSD_SERVER_NAME={name!r} must be a shm name that starts with '/'")
+    if name == radix_server_name():
+        raise ValueError(
+            f"FLEXKV_RADIXSHMEM_SSD_SERVER_NAME={name!r} is the CPU tier's radix-server; the SSD "
+            f"tier needs its own index-only server")
+    return name
+
+
+def ssd_index_geometry(cache_config: CacheConfig) -> "radixshmem.Geometry":
+    """Geometry of the index-only SSD server: slot id == FlexKV SSD block id, so
+    the counts are FlexKV's SSD block / SWA slot counts and the bytes are 0 (the
+    data lives in FlexKV's SSD files)."""
+    _ensure_radixshmem()
+    swa = swa_pool_config(cache_config)
+    swa_slots = int(swa.num_ssd_slots) if swa is not None else 0
+    return radixshmem.Geometry(
+        block_size=int(cache_config.tokens_per_block),
+        full_slots=int(cache_config.num_ssd_blocks),
+        swa_slots=swa_slots,
+        swa_window_blocks=int(swa.window_blocks) if swa_slots > 0 else 0,
+    )
+
+
+def attach_ssd_index_client(cache_config: CacheConfig,
+                            *,
+                            attach_index: bool = True,
+                            label: str = "radixshmem-ssd") -> "radixshmem.RadixClient":
+    """A ready client on this node's index-only SSD radix-server, configured with
+    FlexKV's SSD counts. Fails closed when the server has a data plane (its
+    slots would not be FlexKV's SSD blocks) or published other counts (another
+    FlexKV configured it with a different SSD size)."""
+    name = radix_ssd_server_name()
+    if name is None:
+        raise ValueError(f"{label}: FLEXKV_RADIXSHMEM_SSD_SERVER_NAME is not set")
+    geometry = ssd_index_geometry(cache_config)
+    client = attach_radix_client(name, geometry=geometry, attach_index=attach_index, label=label)
+    try:
+        if client.info.data_plane:
+            raise ValueError(
+                f"{label}: radix-server {name} has a data plane (--data-bytes); the SSD tier "
+                f"needs an index-only server (slot ids are FlexKV's SSD blocks)")
+        pools = _published_geometry(client, label)["pools"]
+        diffs = []
+        if int(pools["full"]["num_slots"]) != int(cache_config.num_ssd_blocks):
+            diffs.append(f"FULL slots server={pools['full']['num_slots']} "
+                         f"flexkv={cache_config.num_ssd_blocks}")
+        want_swa = int(geometry.swa_slots)
+        have_swa = int((pools.get("swa") or {}).get("num_slots", 0))
+        if want_swa != have_swa:
+            diffs.append(f"SWA slots server={have_swa} flexkv={want_swa}")
+        if diffs:
+            raise ValueError(
+                f"{label}: radix-server {name} indexes another SSD layout: " + "; ".join(diffs))
+    except BaseException:
+        client.close()
+        raise
+    return client
+
+
 def cpu_sizing_notice(cache_config: CacheConfig, server_name: str) -> Tuple[str, str]:
     """(log level, text) telling the operator at start-up that ``cpu_cache_gb``
     does not size the CPU tier in radixshmem mode: the radix-server's budget

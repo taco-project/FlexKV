@@ -41,6 +41,7 @@ from flexkv.transfer.workers import (
     GDSTransferWorker,
     PEER2CPUTransferWorker,
 )
+from flexkv.transfer.workers.peer_ssd import PeerSSDReadWorker
 # NIXL / PCFS / mooncake-store are I/O *engines*, not edges: each plugs into
 # the worker that already owns its edge. See flexkv/transfer/backends.py.
 from flexkv.transfer.backends import (
@@ -169,6 +170,10 @@ class TransferEngine:
         self.gpu_handle_groups = gpu_handles  # WorkerKey -> list of GPU handles for that TP group
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
+        # radixshmem SSD index: a peer's SSD blocks reach this CPU as PEERSSD2H.
+        self._radix_ssd_server = (
+            GLOBAL_CONFIG_FROM_ENV.radixshmem_ssd_server_name
+            if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and ssd_handle is not None else "")
         self._remote_handle = remote_handle
         self._gpu_blocks_per_group = gpu_blocks_per_group
         self._gpu_layouts_per_group = gpu_layouts_per_group
@@ -511,6 +516,27 @@ class TransferEngine:
                 layer_groups=ssd_layer_groups,
             )
             self._register_worker(PoolId.FULL_KV, TransferType.H2DISK, self.cpussd_write_worker)
+
+            if self._radix_ssd_server:
+                # A peer's SSD -> this CPU (radixshmem SSD index cluster).
+                self.peer_ssd_read_worker: WorkerHandle = PeerSSDReadWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                    ssd_files=self._ssd_handle.get_file_list(),
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    ssd_kv_layout=self._ssd_handle.kv_layout,
+                    dtype=self._cpu_handle.dtype,
+                    num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                    cache_config=self._cache_config,
+                    tp_group_size=self.model_config.effective_tp_size_per_node,
+                    layer_groups=ssd_layer_groups,
+                    pool_id=PoolId.FULL_KV,
+                    ssd_server_name=self._radix_ssd_server,
+                )
+                self._register_worker(PoolId.FULL_KV, TransferType.PEERSSD2H,
+                                      self.peer_ssd_read_worker)
         if self._remote_handle is not None and self._cpu_handle is not None:
             self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
@@ -687,6 +713,24 @@ class TransferEngine:
                     layer_groups=self._swa_layer_groups,
                 )
                 self._register_worker(PoolId.SWA, TransferType.DISK2H, swa_disk2h_worker)
+                if self._radix_ssd_server:
+                    swa_peer_ssd_worker = PeerSSDReadWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
+                        ssd_files=self._swa_ssd_handle.get_file_list(),
+                        cpu_kv_layout=self._swa_cpu_handle.kv_layout,
+                        ssd_kv_layout=self._swa_ssd_handle.kv_layout,
+                        dtype=self._swa_cpu_handle.dtype,
+                        num_blocks_per_file=self._swa_ssd_handle.num_blocks_per_file,
+                        cache_config=self._cache_config,
+                        tp_group_size=self.model_config.effective_tp_size_per_node,
+                        layer_groups=self._swa_layer_groups,
+                        pool_id=PoolId.SWA,
+                        ssd_server_name=self._radix_ssd_server,
+                    )
+                    self._register_worker(PoolId.SWA, TransferType.PEERSSD2H, swa_peer_ssd_worker)
                 flexkv_logger.info("TransferEngine: swa CPU<->SSD workers initialized")
 
 

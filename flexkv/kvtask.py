@@ -105,6 +105,9 @@ class KVTask:
     prefetch_job: Optional[Any] = None
     prefetch_local_hit_blocks: int = 0
     prefetch_planned_hit_blocks: int = 0
+    # A prefetch carrying both a peer pull job and a graph (radixshmem SSD
+    # reads) completes once both are done; set when the graph finished first.
+    prefetch_graph_done: bool = False
     cancel_requested: bool = False
     prefetch_key: Optional[int] = None
 
@@ -334,6 +337,8 @@ class KVTaskManager:
             token_ids: np.ndarray,
             namespace: Optional[List[str]] = None,
     ) -> Optional[KVTask]:
+        if not getattr(self.cache_engine, "supports_prefetch_inherit", True):
+            return None
         prefetch_id = self.prefetch_tasks.get(
             self._gen_prefetch_key(token_ids, namespace), None)
         if prefetch_id is None:
@@ -651,6 +656,8 @@ class KVTaskManager:
                         exc_info=True,
                     )
             if completed_op.is_graph_completed():
+                if self._prefetch_job_pending(task_id):
+                    continue
                 # _mark_completed runs deferred commit first, then (for
                 # prefetch) finalizes return_mask from the Full REMOTE2H
                 # success bitmap — report "how much remote this task pulled".
@@ -1026,11 +1033,29 @@ class KVTaskManager:
                 return
             self._mark_completed(task_id)
 
+    def _prefetch_job_pending(self, task_id: int) -> bool:
+        """The graph of a job-backed prefetch completed. Its staged SSD reads
+        are published at completion, after the peer pull's run (the insert
+        needs that prefix), so the task finishes with the job: now if it is
+        done, else from `_poll_prefetch_jobs`. False for any other task."""
+        job = getattr(self, "prefetch_jobs", {}).get(task_id)
+        if job is None:
+            return False
+        self.tasks[task_id].prefetch_graph_done = True
+        if job.done():
+            self._complete_prefetch_job(task_id)
+        return True
+
     def _poll_prefetch_jobs(self) -> None:
         jobs = getattr(self, "prefetch_jobs", None)
         if not jobs:
             return
         for task_id in [tid for tid, job in jobs.items() if job.done()]:
+            task = self.tasks.get(task_id)
+            if (task is not None and not task.is_completed()
+                    and task.graph is not None and task.graph.num_ops > 0
+                    and not task.prefetch_graph_done):
+                continue  # its SSD reads are still running
             self._complete_prefetch_job(task_id)
 
     def _complete_prefetch_job(self, task_id: int) -> None:
@@ -1059,6 +1084,9 @@ class KVTaskManager:
                 hi = min(int(result.common_hit), task.prefetch_planned_hit_blocks) * tpb
                 if hi > lo:
                     mask[lo:hi] = True
+        # Completion publishes this prefetch's staged SSD reads (radixshmem):
+        # read how far they landed off the plan handle before the task sheds it.
+        handle = task.callback
         if result is not None:
             result.finalize()   # lock=False job: nothing pinned, harmless
             planned = task.prefetch_planned_hit_blocks - task.prefetch_local_hit_blocks
@@ -1075,6 +1103,10 @@ class KVTaskManager:
                     TransferType.PEERH2H.value, int(result.remote_blocks),
                     int(result.remote_bytes), "get")
         self._mark_completed(task_id)
+        ssd_end = getattr(handle, "prefetch_ssd_end", lambda: 0)()
+        if ssd_end > 0 and isinstance(mask, np.ndarray):
+            lo = task.prefetch_local_hit_blocks * tpb
+            mask[lo:min(ssd_end * tpb, mask.shape[0])] = True
 
     def _get_completed_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         results = []
