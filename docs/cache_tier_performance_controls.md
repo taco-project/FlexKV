@@ -93,11 +93,16 @@ torchrun --standalone --nproc-per-node=4 tests/run_gloo_async_reap_distributed.p
 ## CE copies with chunked host registration
 
 `FLEXKV_CUDAHOST_CHUNK_SIZE_GB` divides host registration into separate CUDA
-allocations. A single CUDA DMA cannot span those registrations, even when their
+allocations. CUDA can reject a DMA spanning those registrations, even when their
 virtual addresses are adjacent. The CE path records the exact registration
 base, size, and chunk size, then splits linear or pitched copies at those
 boundaries. Pitched rows that cross a boundary are split within the row;
 consecutive rows within one registration retain a single 2D copy.
+
+Partial BlockFirst H2D transfers with a bounded number of contiguous runs use
+direct pitched copies when 2D CE copies are enabled. This avoids a device staging
+buffer and a D2D transpose. Full-block, D2H, and highly fragmented cases keep
+their existing path selection.
 
 Rebuild the native extension when updating this path. An older extension
 rejects the chunked CE configuration before host registration. Unregister uses

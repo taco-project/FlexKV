@@ -83,6 +83,11 @@ CEPath choose_path(const CEAnalysis &ce_analysis,
   // BF + !cpu_phys_contig + GPU contig
   if (ce_config.is_blockfirst && !ce_analysis.cpu_phys_contig &&
       ce_analysis.gpu_phys_contig) {
+    // A partial H2D block already has one contiguous destination per row.
+    // Copy its CPU runs directly instead of staging and transposing on GPU.
+    if (is_host_to_device && !is_full_block && ce_config.enable_memcpy2d &&
+        ce_analysis.num_segments <= ce_config.segment_threshold)
+      return CEPath::SEGMENT_SCATTER;
     if (!is_host_to_device && ce_config.num_kv_heads == 1) {
       if (ce_analysis.num_segments > ce_config.segment_threshold)
         return (chunk_size_in_bytes > 0 &&
