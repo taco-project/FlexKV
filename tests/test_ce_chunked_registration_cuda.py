@@ -1,5 +1,8 @@
 """CE and SM copies span several separately registered host chunks."""
 import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,6 +13,7 @@ import torch
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import LayerwiseTransferOp, TransferOp, TransferType
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp, WorkerTransferOp
+from flexkv.transfer.ce_replay import load_trace
 from flexkv.transfer.workers import gpu_cpu
 from flexkv.transfer.workers.gpu_cpu import GPUCPUTransferWorker
 
@@ -64,3 +68,25 @@ def test_pitched_copy_across_registered_chunks(monkeypatch, use_ce, completion):
         worker.shutdown()
         for fd in fds:
             os.close(fd)
+
+
+def test_partial_h2d_selects_direct_pitched_copy(tmp_path):
+    prefix = tmp_path / "direct-h2d"
+    script = '''
+import pytest
+from flexkv import c_ext
+from test_ce_chunked_registration_cuda import test_pitched_copy_across_registered_chunks
+with pytest.MonkeyPatch.context() as patch:
+    test_pitched_copy_across_registered_chunks(patch, True, "per_layer")
+assert c_ext.ce_trace_shutdown() == 0
+'''
+    env = dict(os.environ, OMP_NUM_THREADS="2", FLEXKV_CE_TRACE="1",
+               FLEXKV_CE_TRACE_FILE=str(prefix), FLEXKV_CE_TRACE_MAX_BLOCKS="0")
+    env["PYTHONPATH"] = os.pathsep.join([str(Path(__file__).parent), str(Path(__file__).parents[1])])
+    result = subprocess.run([sys.executable, "-c", script], env=env,
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    entries = [entry.record for path in tmp_path.glob("direct-h2d.*.jsonl")
+               for entry in load_trace(path) if entry.record["direction"] == "H2D"]
+    assert entries
+    assert all(entry["ce_path_id"] == 2 for entry in entries)
