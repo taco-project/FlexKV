@@ -16,8 +16,11 @@ def failure_probe(tmp_path_factory):
     (directory / "cuda_runtime.h").write_text(r'''
 #pragma once
 #include <atomic>
+#include <algorithm>
 #include <cstddef>
-struct FakeStream { std::atomic<int> pending{0}, syncs{0}; };
+#include <mutex>
+#include <vector>
+struct FakeStream { std::atomic<int> pending{0}, syncs{0}; int device=-1; };
 using cudaStream_t = FakeStream*;
 using cudaError_t = int;
 constexpr int cudaSuccess=0;
@@ -27,16 +30,31 @@ inline thread_local int last_error=0;
 inline std::atomic<int> copies{0};
 inline int reject_copy=0;
 inline bool reject_sync=false;
+inline std::mutex streams_mutex;
+inline std::vector<cudaStream_t> streams;
 inline int cudaGetDevice(int* p) {*p=device;return 0;}
 inline int cudaSetDevice(int d) {device=d;return 0;}
-inline int cudaStreamCreate(cudaStream_t* s) {*s=new FakeStream;return 0;}
-inline int cudaStreamDestroy(cudaStream_t s) {delete s;return 0;}
+inline int cudaStreamCreate(cudaStream_t* s) {
+  std::lock_guard<std::mutex> lock(streams_mutex);
+  *s=new FakeStream;(*s)->device=device;streams.push_back(*s);return 0;
+}
+inline int cudaStreamDestroy(cudaStream_t s) {
+  std::lock_guard<std::mutex> lock(streams_mutex);
+  streams.erase(std::remove(streams.begin(),streams.end(),s),streams.end());
+  delete s;return 0;
+}
 inline int cudaGetLastError() {int result=last_error;last_error=0;return result;}
 inline const char* cudaGetErrorString(int) {return "injected CUDA failure";}
 inline int cudaStreamSynchronize(cudaStream_t s) {
   ++s->syncs;
   if(reject_sync) return 1;
   s->pending=0;return 0;
+}
+inline int cudaDeviceSynchronize() {
+  if(reject_sync) return 1;
+  std::lock_guard<std::mutex> lock(streams_mutex);
+  for(auto stream:streams) if(stream->device==device) cudaStreamSynchronize(stream);
+  return 0;
 }
 inline int cudaMemcpyAsync(void*,const void*,size_t,cudaMemcpyKind,cudaStream_t s) {
   if(++copies==reject_copy) {last_error=1;return 1;}
@@ -59,6 +77,8 @@ int main(int argc,char** argv) {
   rlimit limit{0,0};setrlimit(RLIMIT_CORE,&limit);
   assert(argc==2);std::string mode=argv[1];
   if(mode=="pool" || mode=="fatal-pool") {
+    DeviceThreadPool previous_group({0,1});
+    previous_group.run_on_all([&](int i){++previous_group.stream(i)->pending;},"earlier group");
     DeviceThreadPool pool({0,1});
     pool.run_on_all([&](int i){++pool.stream(i)->pending;},"successful launch");
     for(int i=0;i<2;++i) {
@@ -83,6 +103,7 @@ int main(int argc,char** argv) {
     for(int i=0;i<2;++i) {
       assert(pool.stream(i)->pending==0); // failed rank AND successful peer
       assert(pool.stream(i)->syncs==1);
+      assert(previous_group.stream(i)->pending==0); // other pools' accepted DMA
     }
     pool.run_on_all([&](int i){
       assert(cudaGetLastError()==0);
