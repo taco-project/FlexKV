@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cuda_stream_lifetime.h"
 #include "host_registration.h"
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -13,11 +14,11 @@ inline void check_host_dma_status(cudaError_t status) {
                              cudaGetErrorString(status));
 }
 
-inline void checked_host_memcpy2d_async(void *dst, size_t dpitch,
-                                        const void *src, size_t spitch,
-                                        size_t width, size_t height,
-                                        cudaMemcpyKind kind,
-                                        cudaStream_t stream) {
+inline void checked_host_memcpy2d_async_impl(void *dst, size_t dpitch,
+                                             const void *src, size_t spitch,
+                                             size_t width, size_t height,
+                                             cudaMemcpyKind kind,
+                                             cudaStream_t stream) {
   const bool h2d = kind == cudaMemcpyHostToDevice;
   const bool d2h = kind == cudaMemcpyDeviceToHost;
   const uintptr_t host = reinterpret_cast<uintptr_t>(h2d ? src : dst);
@@ -47,9 +48,9 @@ inline void checked_host_memcpy2d_async(void *dst, size_t dpitch,
   }
 }
 
-inline void checked_host_memcpy_async(void *dst, const void *src, size_t bytes,
-                                      cudaMemcpyKind kind,
-                                      cudaStream_t stream) {
+inline void checked_host_memcpy_async_impl(void *dst, const void *src,
+                                           size_t bytes, cudaMemcpyKind kind,
+                                           cudaStream_t stream) {
   const bool h2d = kind == cudaMemcpyHostToDevice;
   const bool d2h = kind == cudaMemcpyDeviceToHost;
   const uintptr_t host = reinterpret_cast<uintptr_t>(h2d ? src : dst);
@@ -66,6 +67,31 @@ inline void checked_host_memcpy_async(void *dst, const void *src, size_t bytes,
                            (h2d ? slice.host_offset : slice.device_offset);
     check_host_dma_status(
         cudaMemcpyAsync(part_dst, part_src, slice.width, kind, stream));
+  }
+}
+
+inline void checked_host_memcpy2d_async(void *dst, size_t dpitch,
+                                        const void *src, size_t spitch,
+                                        size_t width, size_t height,
+                                        cudaMemcpyKind kind,
+                                        cudaStream_t stream) {
+  try {
+    checked_host_memcpy2d_async_impl(dst, dpitch, src, spitch, width, height,
+                                     kind, stream);
+  } catch (...) {
+    drain_stream_or_abort(stream, "CE host DMA");
+    throw;
+  }
+}
+
+inline void checked_host_memcpy_async(void *dst, const void *src, size_t bytes,
+                                      cudaMemcpyKind kind,
+                                      cudaStream_t stream) {
+  try {
+    checked_host_memcpy_async_impl(dst, src, bytes, kind, stream);
+  } catch (...) {
+    drain_stream_or_abort(stream, "CE host DMA");
+    throw;
   }
 }
 

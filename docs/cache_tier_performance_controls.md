@@ -108,6 +108,11 @@ Rebuild the native extension when updating this path. An older extension
 rejects the chunked CE configuration before host registration. Unregister uses
 the original chunk size even if the environment changes after registration.
 
+A rejected CE copy drains previously submitted DMA before raising, including
+work on peer rank streams. If CUDA cannot establish stream quiescence, the
+transfer process terminates rather than reporting a recoverable failure that
+would let the caller recycle blocks still in use.
+
 ```sh
 pytest tests/test_host_registration_metadata.py tests/test_host_registration_plan.py
 pytest tests/test_ce_chunked_registration_cuda.py

@@ -62,6 +62,10 @@ public:
   // cudaStreamSynchronize on every device, from that device's own thread.
   void sync_all_streams();
 
+  // Error recovery drains every rank, including peers whose launch succeeded.
+  // A failed drain is fatal: it must not become a recyclable failed transfer.
+  void drain_all_streams_on_error();
+
 private:
   std::vector<int> device_ids_;
   std::vector<cudaStream_t> streams_;

@@ -382,6 +382,7 @@ void TPTransferThreadGroup::tp_group_transfer(
   }
 
   if (failed) {
+    pool_->drain_all_streams_on_error();
     std::string msg;
     {
       std::lock_guard<std::mutex> lk(error_mtx);

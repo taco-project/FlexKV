@@ -327,6 +327,7 @@ cpp_sources = [
 hpp_sources = [
     "csrc/host_registration.h",
     "csrc/host_dma.h",
+    "csrc/cuda_stream_lifetime.h",
     "csrc/logging.h",
     "csrc/ce_trace.h",
     "csrc/cache_utils.h",
