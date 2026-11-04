@@ -87,6 +87,19 @@ _INFO_STATUSES = {"hit", "miss", "skipped", "success"}
 _WARNING_STATUSES = {"cancelled", "failed", "missing", "not_found", "timeout"}
 # Minimum gap between idle engine nudges in non-chunked mode (seconds).
 _IDLE_DRIVE_INTERVAL_S = 0.1
+# Arrival lookups (L2-only): the leader issues the admission GET when the
+# request is queued, so admission does not pay one synchronous get_match RPC
+# per request on the serial scheduler path. Unconsumed positive GETs pin CPU
+# blocks, so outstanding lookups are bounded in count and age.
+_ARRIVAL_LOOKUP_TTL_S = float(os.getenv("FLEXKV_ARRIVAL_LOOKUP_TTL_S", "120"))
+_ARRIVAL_LOOKUP_MAX = int(os.getenv("FLEXKV_ARRIVAL_LOOKUP_MAX", "64"))
+_ARRIVAL_LOOKUP_WAIT_S = 30.0
+
+
+def _arrival_lookup_opt_in(prefetch_enabled: bool) -> bool:
+    # Opt-in: an admission that never reaches lookup_kv (full L1 hit)
+    # leaves its held GET pinning CPU blocks until TTL expiry.
+    return not prefetch_enabled and os.getenv("FLEXKV_ARRIVAL_LOOKUP", "0") == "1"
 
 
 @dataclass
@@ -309,6 +322,12 @@ class FlexKVConnector:
         self._prefetch_sessions = {}
         self._prefetch_result_sessions = {}
         self._prepared_lookups: Dict[str, _PrefetchLookup] = {}
+        # Leader-only: rid -> (issue time, first masked token, arrival GET).
+        self._arrival_lookups: Dict[str, Tuple[float, int, _PrefetchLookup]] = {}
+        self._arrival_retirements: List[Future] = []
+        # Leader-only: store rid -> (namespace, tokens, page-aligned length) for
+        # stores that may still commit blocks an arrival GET could not see.
+        self._arrival_store_guard: Dict[str, Tuple[Optional[Tuple[str, ...]], Any, int]] = {}
         self._prefetch_loaded_spans = {}
         self._queued_prefetch = (
             self._chunked_prefetch or self.model_config.dp_size > 1
@@ -514,6 +533,9 @@ class FlexKVConnector:
             or (GLOBAL_CONFIG_FROM_ENV.enable_radixshmem
                 and _radixshmem_distributed(self.model_config, self.cache_config))
         )
+        # With a lower tier, prefetch must finish before a lookup can see its
+        # blocks, so the early GET is only valid for an L2-only deployment.
+        self._arrival_lookup_enabled = _arrival_lookup_opt_in(self._prefetch_enabled)
         self._shutdown_done = False
 
         # Keep FlexKV lifecycle self-contained (avoid scattering hooks in
@@ -701,18 +723,34 @@ class FlexKVConnector:
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             tids_np = np.asarray(token_ids, dtype=np.int64)
             mask_np = self._as_numpy_mask(token_mask)
+            arrival = self._pop_arrival_lookup(rid)
             try:
                 prepared = getattr(self, "_prepared_lookups", {}).get(rid)
-                if prepared is not None and (
-                    prepared.namespace == (tuple(namespace) if namespace is not None else None)
-                    and np.array_equal(prepared.token_ids, tids_np)
-                    and np.array_equal(prepared.token_mask, mask_np)
+                if prepared is not None and self._lookup_identity_matches(
+                    prepared, tids_np, mask_np, namespace,
                 ):
                     # Consume the speculative match here, waiting only if it
                     # has not finished. It must not add an admission gate that
                     # leaves a runnable prefill batch underfilled.
-                    self._prepared_lookups.pop(rid)
-                    res = prepared.future.result()
+                    try:
+                        res = prepared.future.result(timeout=_ARRIVAL_LOOKUP_WAIT_S)
+                    except Exception:
+                        # A late GET may still hold CPU blocks: retire it
+                        # together with its prefetch lease, never drop it.
+                        self._release_prefetch_result(rid)
+                        raise
+                    self._prepared_lookups.pop(rid, None)
+                elif arrival is not None and self._lookup_identity_matches(
+                    arrival, tids_np, mask_np, namespace,
+                ):
+                    # Same query as a synchronous GET now: L1 prefix unchanged
+                    # and no overlapping store could commit since issue.
+                    lookup, arrival = arrival, None
+                    try:
+                        res = lookup.future.result(timeout=_ARRIVAL_LOOKUP_WAIT_S)
+                    except Exception:
+                        self._retire_arrival_lookup(lookup)
+                        raise
                 else:
                     if prepared is not None:
                         self._release_prefetch_result(rid)
@@ -727,6 +765,9 @@ class FlexKVConnector:
             except Exception as exc:  # noqa: BLE001
                 lookup_error = exc
                 res = None
+            if arrival is not None:
+                # Superseded (identity changed or a prepared lookup won).
+                self._retire_arrival_lookup(arrival)
             if res is None:
                 fkv_task_id = -1
                 hit_length = 0
@@ -814,6 +855,199 @@ class FlexKVConnector:
         if rid is not None:
             self._release_prefetch_result(rid)
         return fkv_task_id, hit_length
+
+    def sync_load_ready(self, local_ready: bool) -> bool:
+        """Agree on GPU allocation before any rank enters a restore launch."""
+        if self._sync_ctx.needs_sync:
+            return bool(self._sync_ctx.all_reduce_min(int(local_ready)))
+        return bool(local_ready)
+
+    @staticmethod
+    def _lookup_identity_matches(lookup, token_ids, token_mask, namespace) -> bool:
+        return (
+            lookup.namespace == (tuple(namespace) if namespace is not None else None)
+            and np.array_equal(lookup.token_ids, token_ids)
+            and np.array_equal(lookup.token_mask, token_mask)
+        )
+
+    # ---- arrival lookups (leader-only, L2-only deployments) ----------------
+    #
+    # Correctness: an arrival GET returns what a synchronous GET at admission
+    # would, provided (a) the admission query is identical (checked in
+    # lookup_kv: same tokens, L1 prefix/mask and namespace) and (b) no block
+    # in the masked range was committed in between. Positive hits are pinned
+    # by the held GET, so (b) only concerns stores, and a store can only add
+    # a hit if it covers the first masked page with the same tokens. Such a
+    # store is either live at issue time (issue skipped) or submitted later
+    # (pending arrival GETs invalidated in _prepare_store_batch).
+
+    def _issue_arrival_lookup(self, rid, token_ids, namespace, start) -> None:
+        if self.kv_manager is None:
+            return
+        self._drop_arrival_lookup(rid)
+        now = time.monotonic()
+        self._expire_arrival_lookups(now)
+        self._reap_arrival_retirements()
+        if len(self._arrival_lookups) >= _ARRIVAL_LOOKUP_MAX:
+            return
+        start = int(start)
+        if start < 0 or start % self.page_size or start >= len(token_ids):
+            return
+        tokens = np.array(token_ids, dtype=np.int64, copy=True, order="C")
+        ns = tuple(namespace) if namespace is not None else None
+        if self._live_store_covers(ns, tokens, start):
+            return
+        tokens.setflags(write=False)
+        mask = np.zeros(tokens.size, dtype=np.bool_)
+        mask[start:] = True
+        mask.setflags(write=False)
+        lookup = _PrefetchLookup(tokens, mask, ns, Future())
+        try:
+            future = self.kv_manager.get_match_async(
+                token_ids=tokens,
+                token_mask=mask,
+                cpu_only=getattr(self, "_chunked_prefetch", False),
+                swa_aware=self._swa_kv_pool is not None,
+                namespace=list(ns) if ns is not None else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[FlexKV] arrival lookup not issued rid=%s: %s", rid, exc)
+            return
+        future.add_done_callback(
+            lambda done, target=lookup.future: self._finish_prefetch_lookup(target, done)
+        )
+        self._arrival_lookups[rid] = (now, start, lookup)
+
+    def _pop_arrival_lookup(self, rid) -> Optional[_PrefetchLookup]:
+        lookups = getattr(self, "_arrival_lookups", None)
+        if not lookups or rid is None:
+            return None
+        entry = lookups.pop(rid, None)
+        return None if entry is None else entry[2]
+
+    def _drop_arrival_lookup(self, rid) -> None:
+        lookup = self._pop_arrival_lookup(rid)
+        if lookup is not None:
+            self._retire_arrival_lookup(lookup)
+
+    def _expire_arrival_lookups(self, now: float) -> None:
+        lookups = self._arrival_lookups
+        while lookups:
+            rid, (issued, _, lookup) = next(iter(lookups.items()))
+            if now - issued < _ARRIVAL_LOOKUP_TTL_S:
+                break
+            del lookups[rid]
+            self._retire_arrival_lookup(lookup)
+
+    def _retire_arrival_lookup(self, lookup: _PrefetchLookup) -> None:
+        """Cancel the held task of an unconsumed GET once it is admitted.
+
+        Runs from completion callbacks: no scheduler state or collectives.
+        """
+        retired = Future()
+        manager = self.kv_manager
+
+        def cancelled(future):
+            try:
+                future.result()
+                retired.set_result(None)
+            except Exception as exc:  # noqa: BLE001
+                retired.set_exception(exc)
+
+        def admitted(future):
+            try:
+                result = future.result()
+            except Exception:  # noqa: BLE001
+                result = None  # Failed admission created no held task.
+            if result is not None:
+                task_id, mask = result
+                if task_id >= 0 and mask is not None and np.any(mask):
+                    try:
+                        manager.cancel_async([task_id]).add_done_callback(cancelled)
+                    except Exception as exc:  # noqa: BLE001
+                        retired.set_exception(exc)
+                    return
+            # Zero-hit GETs are already complete and must not be cancelled.
+            retired.set_result(None)
+
+        lookup.future.add_done_callback(admitted)
+        self._arrival_retirements.append(retired)
+
+    def _reap_arrival_retirements(self) -> None:
+        pending = []
+        for future in self._arrival_retirements:
+            if not future.done():
+                pending.append(future)
+            elif future.exception() is not None:
+                logger.warning(
+                    "[FlexKV] arrival lookup cancel failed: %s", future.exception()
+                )
+        self._arrival_retirements = pending
+
+    def _drain_arrival_lookups(self, timeout: float = 30.0) -> None:
+        lookups = getattr(self, "_arrival_lookups", None)
+        if lookups is None:
+            return
+        while lookups:
+            _, (_, _, lookup) = lookups.popitem()
+            self._retire_arrival_lookup(lookup)
+        self._arrival_store_guard.clear()
+        retirements, self._arrival_retirements = self._arrival_retirements, []
+        for future in retirements:
+            future.result(timeout=timeout)
+
+    def _live_store_covers(self, ns, tokens: np.ndarray, start: int) -> bool:
+        guard = self._arrival_store_guard
+        if not guard:
+            return False
+        live = set(self._inflight_stores)
+        pending = getattr(self, "_pending_store_batch", None)
+        if pending is not None:
+            live.update(store["rid"] for store in pending.stores)
+        end = start + self.page_size
+        page = tokens[start:end]
+        covered = False
+        for rid in list(guard):
+            if rid not in live:
+                del guard[rid]  # Completed (committed) or abandoned.
+                continue
+            store_ns, store_tokens, n = guard[rid]
+            if (
+                not covered and store_ns == ns and n >= end
+                and np.array_equal(np.asarray(store_tokens[start:end], dtype=np.int64), page)
+            ):
+                covered = True
+        return covered
+
+    def _guard_arrival_lookups(self, stores, prepared) -> None:
+        """Record new stores and invalidate arrival GETs they could stale."""
+        lookups = self._arrival_lookups
+        guard = self._arrival_store_guard
+        # Only one admission is pending at a time and none is set yet, so a
+        # guarded store that is not inflight has committed or been abandoned.
+        # Prune here too: issue-time pruning stops when lookups are saturated.
+        for rid in [rid for rid in guard if rid not in self._inflight_stores]:
+            del guard[rid]
+        starts = {start for _, start, _ in lookups.values()}
+        for store, (_, _, n) in zip(stores, prepared):
+            if not n:
+                continue
+            ns = store.get("namespace")
+            ns = tuple(ns) if ns is not None else None
+            tokens = store["token_ids"]
+            self._arrival_store_guard[store["rid"]] = (ns, tokens, n)
+            for start in starts:
+                end = start + self.page_size
+                if n < end:
+                    continue
+                page = np.asarray(tokens[start:end], dtype=np.int64)
+                for rid, (_, lookup_start, lookup) in list(lookups.items()):
+                    if (
+                        lookup_start == start and lookup.namespace == ns
+                        and np.array_equal(lookup.token_ids[start:end], page)
+                    ):
+                        del lookups[rid]
+                        self._retire_arrival_lookup(lookup)
 
     def release_pending(self, rid: str) -> None:
         """Cancel the task held by an earlier ``lookup_kv(rid=...)`` that
@@ -1195,7 +1429,9 @@ class FlexKVConnector:
             # scheduler calls this every idle tick, which would otherwise be
             # thousands of synchronous RPCs per second. Chunked prefetch runs
             # the TaskRuntime thread, which already drains graphs on its own.
-            if not getattr(self, "_chunked_prefetch", False) and not getattr(self, "_queued_prefetch", False):
+            # Queued (server-mode) legacy prefetch has no TaskRuntime either:
+            # its server only self-drives while a release is draining.
+            if not getattr(self, "_chunked_prefetch", False):
                 now = time.monotonic()
                 last = getattr(self, "_last_idle_drive_ts", None)
                 if last is None or now - last >= _IDLE_DRIVE_INTERVAL_S:
@@ -1277,7 +1513,10 @@ class FlexKVConnector:
             payload = self._sync_ctx.scatter(
                 payload, channel=FlexKVScatterChannel.STORE_READY,
             )
-            if require_all_ranks:
+            # An empty leader queue makes the MIN below necessarily 0. Every
+            # rank decides from the same scattered payload, so the collective
+            # sequence stays aligned while idle ticks skip a redundant reduce.
+            if require_all_ranks and payload:
                 common = 0
                 for local, leader in zip(ready_rids, payload):
                     if local != leader:
@@ -1328,6 +1567,8 @@ class FlexKVConnector:
         The owner only processes retained CPU token and slot snapshots, never
         reads GPU storage or enters a distributed collective. Callers retain
         source locks through native transfer completion or successful reset.
+        ``ValueError`` means every rank rejected the batch before any
+        reservation, so callers may release its sources immediately.
         """
         batch = self._prepare_store_batch(stores)
         self._pending_store_batch = batch
@@ -1389,6 +1630,8 @@ class FlexKVConnector:
             valid = int(not local_error)
         if not valid:
             raise ValueError(local_error or "another rank rejected the store batch")
+        if getattr(self, "_arrival_lookup_enabled", False) and self._sync_ctx.is_sync_leader:
+            self._guard_arrival_lookups(stores, prepared)
         return _StoreAdmission(
             list(stores), prepared, contexts,
             [i for i, p in enumerate(prepared) if p[2]], [],
@@ -1749,6 +1992,11 @@ class FlexKVConnector:
         *, candidate_start_token: int = 0,
     ) -> int:
         if not self._prefetch_enabled or not rid:
+            if (
+                rid and getattr(self, "_arrival_lookup_enabled", False)
+                and self._sync_ctx.is_sync_leader
+            ):
+                self._issue_arrival_lookup(rid, token_ids, namespace, candidate_start_token)
             return -1
         if self._uses_queued_prefetch():
             return self._start_chunked_prefetch(rid, token_ids, candidate_start_token, namespace)
@@ -2186,6 +2434,7 @@ class FlexKVConnector:
         return int(self._prefetch_loaded_tokens.pop(rid, 0))
 
     def cancel_prefetch(self, rid: str) -> None:
+        self._drop_arrival_lookup(rid)
         if self._uses_queued_prefetch():
             entry = self._prefetch_sessions.pop(rid, None)
             if entry is not None and self._sync_ctx.is_sync_leader:
@@ -2312,6 +2561,14 @@ class FlexKVConnector:
         # is required: an early task-end response is not sufficient to prove
         # that the worker has stopped writing layer completion eventfds.
         load_reset_status = {"ok": True, "error": ""}
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            try:
+                self._drain_arrival_lookups()
+            except Exception as exc:  # noqa: BLE001
+                load_reset_status = {
+                    "ok": False,
+                    "error": f"releasing arrival lookups during reset failed: {exc}",
+                }
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             launched = list(dict.fromkeys(self._launched_load_tids))
             if launched:

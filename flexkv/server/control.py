@@ -13,6 +13,10 @@ from flexkv.common.request import StoreReservationError
 from flexkv.server.request import ControlRequest
 from flexkv.server.utils import get_zmq_socket
 
+# A dropped reply (server SNDTIMEO) must not strand every queued Future. The
+# bound exceeds the server's longest control action (close: ~60s of drains).
+_REPLY_TIMEOUT_MS = int(float(os.getenv("FLEXKV_CONTROL_REPLY_TIMEOUT_S", "180")) * 1000)
+
 
 class ControlTransportError(RuntimeError):
     """The server may have acted without delivering a trustworthy response."""
@@ -92,6 +96,10 @@ class ControlClient:
                     {"calls": [(action, payload) for _, action, payload in current]},
                     request_id=sequence,
                 ))
+                if not reply.poll(_REPLY_TIMEOUT_MS):
+                    raise TimeoutError(
+                        "control reply timed out; server outcome is unknown"
+                    )
                 response = reply.recv_pyobj()
                 if response.request_id != sequence:
                     raise RuntimeError("control response sequence mismatch")

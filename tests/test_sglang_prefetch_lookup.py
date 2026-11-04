@@ -496,3 +496,92 @@ def test_nonterminal_progress_does_not_publish_a_miss_or_lose_later_get():
     assert not manager.leases
     connector.release_pending("r")
     assert not manager.pins
+
+
+def test_prepared_get_timeout_is_a_miss_and_late_get_releases_its_source(monkeypatch):
+    import flexkv.integration.sglang.connector as connector_module
+
+    monkeypatch.setattr(connector_module, "_ARRIVAL_LOOKUP_WAIT_S", 0.05)
+    manager = _Manager()
+    connector = _connector(manager)
+    tokens = _prepare(connector)
+    assert connector.check_prefetch_progress("r")
+    # The prepared GET never answers within the bound: lookup must not block.
+    assert connector.lookup_kv(
+        tokens, np.array([False, False, True, True]), rid="r",
+    ) == (-1, 0)
+    assert not connector._prepared_lookups
+    assert not connector._prefetch_result_sessions
+    assert manager.leases == {1}  # Late GET may still pin: keep the source.
+    manager.complete_lookup()
+    manager.cancel_async.assert_called_once_with([41])
+    manager.complete_cancel()
+    assert not manager.pins and not manager.leases
+
+
+@pytest.mark.parametrize("env, prefetch_enabled, expected", [
+    (None, False, False), ("0", False, False), ("1", False, True), ("1", True, False),
+])
+def test_arrival_lookup_is_opt_in(monkeypatch, env, prefetch_enabled, expected):
+    from flexkv.integration.sglang.connector import _arrival_lookup_opt_in
+
+    if env is None:
+        monkeypatch.delenv("FLEXKV_ARRIVAL_LOOKUP", raising=False)
+    else:
+        monkeypatch.setenv("FLEXKV_ARRIVAL_LOOKUP", env)
+    assert _arrival_lookup_opt_in(prefetch_enabled) is expected
+
+
+def test_default_l2_only_prefetch_issues_no_arrival_get(monkeypatch):
+    from flexkv.integration.sglang.connector import _arrival_lookup_opt_in
+
+    monkeypatch.delenv("FLEXKV_ARRIVAL_LOOKUP", raising=False)
+    manager = _Manager()
+    connector = _connector(manager)
+    connector._prefetch_enabled = False
+    connector._arrival_lookup_enabled = _arrival_lookup_opt_in(False)
+    assert connector.prefetch_async(
+        "r", array("q", [1, 2, 3, 4]), candidate_start_token=2,
+    ) == -1
+    manager.get_match_async.assert_not_called()
+    assert not manager.pins
+
+
+def test_store_guard_prunes_finished_stores_when_recording_new_ones():
+    connector = _connector(_Manager())
+    connector._arrival_lookups = {}
+    connector._arrival_store_guard = {
+        "done": (None, np.arange(4), 4), "live": (None, np.arange(4), 4),
+    }
+    connector._inflight_stores = {"live": 7}
+    connector._guard_arrival_lookups(
+        [dict(rid="new", token_ids=np.arange(4), namespace=None)], [(None, None, 4)],
+    )
+    assert set(connector._arrival_store_guard) == {"live", "new"}
+
+
+def test_control_owner_fails_queued_futures_when_reply_is_lost(monkeypatch):
+    import uuid
+
+    import zmq
+
+    import flexkv.server.control as control
+
+    monkeypatch.setattr(control, "_REPLY_TIMEOUT_MS", 100)
+    context = zmq.Context()
+    port = f"ipc:///tmp/flexkv-test-{uuid.uuid4().hex}"
+    server = context.socket(zmq.PULL)  # Receives, never replies.
+    server.bind(port)
+    client = control.ControlClient(port, client_id=0)
+    try:
+        future = client.submit("progress", handles=[])
+        with pytest.raises(control.ControlTransportError, match="timed out"):
+            future.result(timeout=5)
+        assert server.poll(1000)  # The request did reach the server.
+        with pytest.raises(RuntimeError, match="closed or failed"):
+            client.submit("progress", handles=[])
+        client.thread.join(timeout=5)
+        assert not client.thread.is_alive()
+    finally:
+        server.close(linger=0)
+        context.term()
