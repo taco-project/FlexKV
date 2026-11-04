@@ -45,3 +45,32 @@ not establish live RDMA, GPU/model correctness, or production acceptance.
 Model-level validation and measurements must record the exact source heads,
 workload, hardware, and matched native GPU-cache baseline. Data-path completion
 and throughput do not establish model-output correctness.
+
+## Admitted layerwise restore batches
+
+Serving integrations can prepare each admitted request with
+`start_load_kv_layerwise(..., defer_launch=True)` and call
+`flush_layerwise_loads(request_keys)` once, before preparing the forward batch.
+Immediate launch remains the default. The request keys must preserve the
+integration's complete request identity, including retry/attempt information.
+
+All ranks must agree on successful destination allocation with
+`sync_load_ready(local_ready)` before entering a restore collective. A failed
+vote requires successful peers to release their allocations and cancel their
+held lookups. Integrations without this API retain their existing behavior.
+
+Preparation retains the destination mappings and producer counter without
+submitting DMA. Flush validates the same admitted members on every rank and
+merges their transfers into one operation, with one completion signal per
+layer. Cancel unlaunched members with `release_pending(request_key)`. An
+unacknowledged launch retains ownership and rejects reset, because accepted
+DMA may still be active.
+
+The companion SGLang integration enables this protocol with
+`FLEXKV_BATCH_LAYERWISE_RESTORE=1`; it defaults to off and falls back to
+immediate launch when the connector lacks the batching API.
+
+```sh
+pytest tests/test_sglang_layerwise_batch.py tests/test_sglang_comm_async_reap.py
+torchrun --standalone --nproc-per-node=4 tests/run_gloo_async_reap_distributed.py
+```
