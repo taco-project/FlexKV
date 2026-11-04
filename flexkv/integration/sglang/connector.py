@@ -773,6 +773,12 @@ class FlexKVConnector:
             self._release_prefetch_result(rid)
         return fkv_task_id, hit_length
 
+    def sync_load_ready(self, local_ready: bool) -> bool:
+        """Agree on allocation before any rank prepares a restore collective."""
+        if self._sync_ctx.needs_sync:
+            return bool(self._sync_ctx.all_reduce_min(int(local_ready)))
+        return bool(local_ready)
+
     def release_pending(self, rid: str) -> None:
         """Cancel the task held by an earlier ``lookup_kv(rid=...)`` that
         won't be followed by a ``retrieve_kv`` (e.g. allocation failed)."""

@@ -59,6 +59,18 @@ def consume(c, producer):
     assert c.layer_done_counter.consumer_index == -1
 
 
+@pytest.mark.parametrize("local_ready", [False, True])
+@pytest.mark.parametrize("needs_sync", [False, True])
+def test_allocation_readiness_votes_before_restore(connector, local_ready, needs_sync):
+    connector._sync_ctx.needs_sync = needs_sync
+    connector._sync_ctx.all_reduce_min = MagicMock(return_value=0)
+    assert connector.sync_load_ready(local_ready) is (False if needs_sync else local_ready)
+    if needs_sync:
+        connector._sync_ctx.all_reduce_min.assert_called_once_with(int(local_ready))
+    else:
+        connector._sync_ctx.all_reduce_min.assert_not_called()
+
+
 def test_admitted_batch_launches_once_and_consumes_one_signal_per_layer(connector):
     c = connector
     for round_id in range(5):  # rotate through the counter ring more than once
