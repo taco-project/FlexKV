@@ -32,7 +32,6 @@ import pickle
 import socket
 import struct
 import time
-from datetime import timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -114,15 +113,12 @@ class FlexKVComm:
     _TAG_PP_BARRIER_BCAST = int.from_bytes(b"FxB3", byteorder="big")
     _TAG_AR_BCAST = int.from_bytes(b"FxAR", byteorder="big")
 
-    # Adaptive async-work reaper. gloo's isend Work objects do not auto-
-    # advance their "completed" state on poll, so a pure poll-based reaper
-    # leaks. We actively wait() the oldest works with a tiny timeout;
-    # the watermark grows on stuck reaps (slow / asymmetric peer) and
-    # shrinks back on clean reaps.
+    # Gloo P2P Work completion is advanced by wait(), not by polling.
+    # A short wait(timeout) expiry aborts the shared Gloo transport. Bound
+    # retained work by applying backpressure to the oldest send using the
+    # normal process-group timeout, and propagate actual communication errors.
     _REAP_HIGH_BASE = 1024
-    _REAP_HIGH_MAX = 32768
     _REAP_MAX_DRAIN = 512
-    _REAP_PROBE = timedelta(milliseconds=1)
     _REAP_LOG_EVERY = 64
 
     def __init__(
@@ -140,7 +136,6 @@ class FlexKVComm:
         self._async_works: List = []
         self._reap_high: int = self._REAP_HIGH_BASE
         self._reap_calls: int = 0
-        self._reap_stuck_total: int = 0
         self._reap_drained_total: int = 0
 
         # Accept either GroupCoordinator wrappers (has ``.cpu_group``) or
@@ -434,48 +429,23 @@ class FlexKVComm:
             return
 
         drained = 0
-        stuck = False
         for _ in range(self._REAP_MAX_DRAIN):
             if not self._async_works:
                 break
             w = self._async_works[0]
-            try:
-                w.wait(self._REAP_PROBE)
-            except RuntimeError:
-                stuck = True
-                break
+            w.wait()
             self._async_works.pop(0)
             drained += 1
 
         self._reap_calls += 1
         self._reap_drained_total += drained
-        if stuck:
-            self._reap_stuck_total += 1
-
-        prev_high = self._reap_high
-        if stuck:
-            self._reap_high = min(self._REAP_HIGH_MAX, self._reap_high * 2)
-        else:
-            self._reap_high = max(self._REAP_HIGH_BASE, self._reap_high // 2)
-        if self._reap_high != prev_high:
-            logger.debug(
-                "[FlexKV] reap watermark rank=%d %d->%d "
-                "(stuck=%s drained=%d backlog=%d)",
-                self.world_rank,
-                prev_high,
-                self._reap_high,
-                stuck,
-                drained,
-                n,
-            )
         if self._reap_calls % self._REAP_LOG_EVERY == 0:
             logger.debug(
-                "[FlexKV] reap stats rank=%d calls=%d drained=%d stuck=%d "
+                "[FlexKV] reap stats rank=%d calls=%d drained=%d "
                 "backlog=%d high=%d",
                 self.world_rank,
                 self._reap_calls,
                 self._reap_drained_total,
-                self._reap_stuck_total,
                 len(self._async_works),
                 self._reap_high,
             )
