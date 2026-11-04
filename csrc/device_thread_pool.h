@@ -62,7 +62,8 @@ public:
   // cudaStreamSynchronize on every device, from that device's own thread.
   void sync_all_streams();
 
-  // Error recovery drains every rank, including peers whose launch succeeded.
+  // Error recovery drains every rank's device context, including peers and
+  // earlier per-group launches on other pools whose launch succeeded.
   // A failed drain is fatal: it must not become a recyclable failed transfer.
   void drain_all_streams_on_error();
 

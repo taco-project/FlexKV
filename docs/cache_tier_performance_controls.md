@@ -109,7 +109,8 @@ rejects the chunked CE configuration before host registration. Unregister uses
 the original chunk size even if the environment changes after registration.
 
 A rejected CE copy drains previously submitted DMA before raising, including
-work on peer rank streams. If CUDA cannot establish stream quiescence, the
+work on peer ranks and earlier per-group streams in the transfer process's
+device contexts. If CUDA cannot establish stream quiescence, the
 transfer process terminates rather than reporting a recoverable failure that
 would let the caller recycle blocks still in use.
 

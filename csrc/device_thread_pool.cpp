@@ -164,8 +164,11 @@ void DeviceThreadPool::drain_all_streams_on_error() {
   std::vector<std::future<void>> futures;
   futures.reserve(device_ids_.size());
   for (int i = 0; i < size(); ++i) {
-    futures.emplace_back(enqueue(i, [this, i]() {
-      drain_stream_or_abort(streams_[i], "transfer error recovery");
+    futures.emplace_back(enqueue(i, []() {
+      // The fallback per-group launcher may already have submitted an earlier
+      // group on another pool's streams. Drain this device's whole context,
+      // not only this pool, before its shared operation can release blocks.
+      drain_device_or_abort("transfer error recovery");
     }));
   }
   for (auto &future : futures) {
