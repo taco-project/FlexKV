@@ -49,7 +49,13 @@ class TaskRuntime:
     def call(self, fn, *args, **kwargs):
         if self.is_owner:
             return fn(*args, **kwargs)
+        return self.submit(fn, *args, **kwargs).result()
+
+    def submit(self, fn, *args, **kwargs):
+        """Enqueue without making the caller wait for the state owner."""
         future = Future()
+        # Session cancellation releases the eventual handle, not the Future.
+        future.set_running_or_notify_cancel()
         # Atomically check liveness and enqueue against the final drain.
         with self.state_lock:
             if self.error:
@@ -60,7 +66,7 @@ class TaskRuntime:
                 raise RuntimeError("FlexKV task runtime is stopped")
             self.commands.put_nowait((future, fn, args, kwargs))
             self.wake.set()
-        return future.result()
+        return future
 
     def _run(self):
         try:

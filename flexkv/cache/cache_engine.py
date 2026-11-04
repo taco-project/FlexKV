@@ -1395,7 +1395,7 @@ class GlobalCacheEngine:
             dp_client_id=dp_client_id,
             staged_predecessors=skip_ops,
         )
-        return transfer_graph, h2d_ops[-1].op_id, cpu_blocks
+        return transfer_graph, h2d_ops[len(h2d_ops) - 1].op_id, cpu_blocks
 
     @staticmethod
     def _build_get_h2d_ops(transfer_graph: TransferOpGraph,
@@ -3575,15 +3575,16 @@ class GlobalCacheEngine:
                          namespace: Optional[List[str]]) -> RequestWindow:
         """Shared GET/PUT prologue.
 
-        Validates the arrays, drops the trailing partial block (``token_mask``
-        is cleared past the aligned length in place) and resolves the masked
-        block window. ``block_end_idx == 0`` means nothing is left to plan.
+        Validates the arrays and resolves the masked whole-block window without
+        modifying the caller's query. ``block_end_idx == 0`` means nothing is
+        left to plan; trailing partial-block tokens are excluded by the view.
         """
         self._check_input(token_ids, token_mask, slot_mapping)
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
         aligned_token_ids = token_ids[:aligned_length]
-        token_mask[aligned_length:] = False
-        block_start_idx, block_end_idx = self._get_block_range(token_mask)
+        block_start_idx, block_end_idx = self._get_block_range(
+            token_mask[:aligned_length]
+        )
         # block_end_idx is the block just past the LAST True in token_mask. On the
         # plain path the caller marks every non-resident token up to the aligned
         # end, so this equals aligned_length // tokens_per_block. On the SWA-aware
@@ -3630,5 +3631,5 @@ class GlobalCacheEngine:
         if len(mask_idx) == 0:
             return 0, 0
         start_idx = mask_idx[0].item() // self.tokens_per_block
-        end_idx = mask_idx[-1].item() // self.tokens_per_block
+        end_idx = mask_idx[len(mask_idx) - 1].item() // self.tokens_per_block
         return start_idx, end_idx + 1

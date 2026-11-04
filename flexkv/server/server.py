@@ -42,8 +42,8 @@ from flexkv.server.request import (
     ResetRequest,
     CheckRunningRequest,
     PrefetchRequest,
-    PrefetchControlRequest,
-    PrefetchControlResponse,
+    ControlRequest,
+    ControlResponse,
 )
 import contextlib
 
@@ -257,11 +257,11 @@ class KVServer:
                     env.update(child_env)
             else:
                 env = child_env or {}
-                # Always propagate FLEXKV_* env vars to child process so that
-                # runtime config overrides (e.g. FLEXKV_REBUILD_INTERVAL_MS)
-                # are visible when config.py is re-imported in the subprocess.
+                # Keep cache and transport settings in the separate owner.
+                # Dropping Mooncake's hugepage settings can allocate its large
+                # segment from ordinary RAM instead of the reserved pool.
                 for key, val in os.environ.items():
-                    if key.startswith("FLEXKV_") and key not in env:
+                    if key.startswith(("FLEXKV_", "MC_", "MOONCAKE_")) and key not in env:
                         env[key] = val
                 for key in ("PYTHONPATH", "LD_LIBRARY_PATH", "PATH"):
                     if key in os.environ and key not in env:
@@ -325,18 +325,30 @@ class KVServer:
             raise TypeError(f"Received RequestType: {type(req)} from DP client "
                             f"dp_client_id={req.dp_client_id} before the start request")
         self._running = True
-        self.request_handlers[PrefetchControlRequest] = self._handle_prefetch_control
+        self.request_handlers[ControlRequest] = self._handle_control
         while self._running:
             try:
                 self._drain_pending_waits()
-                if self._pending_waits and not self.recv_from_client.poll(2):
+                draining = getattr(self, "_legacy_prefetch_draining", set())
+                if draining:
+                    self.kv_task_engine.try_wait([])
+                    runtime = getattr(self.kv_task_engine, "_runtime", None)
+                    live = runtime.call(lambda: set(self.kv_task_engine.tasks)) if runtime else self.kv_task_engine.tasks
+                    for task_id in list(draining):
+                        if task_id not in live:
+                            draining.remove(task_id)
+                            self._prefetch_legacy_clients.pop(task_id, None)
+                if (self._pending_waits or draining) and not self.recv_from_client.poll(2):
                     continue
                 flexkv_logger.debug("start waiting for req")
                 req = self.recv_from_client.recv_pyobj()
                 # TryWait is a non-blocking poll issued from scheduler ticks;
                 # logging it at INFO floods the log at thousands of lines/s.
-                log_recv = (flexkv_logger.debug if isinstance(req, TryWaitRequest)
-                            else flexkv_logger.info)
+                log_recv = (
+                    flexkv_logger.debug
+                    if isinstance(req, (TryWaitRequest, ControlRequest))
+                    else flexkv_logger.info
+                )
                 log_recv(f"recv req: {type(req)} from DP client "
                          f"(dp_client_id={req.dp_client_id})")
 
@@ -363,6 +375,9 @@ class KVServer:
         flexkv_logger.info("Server shutting down, cleaning up...")
         if hasattr(self, 'kv_task_engine'):
             self.kv_task_engine.shutdown()
+        for reply in getattr(self, "_control_replies", {}).values():
+            reply.close(linger=0)
+        getattr(self, "_control_replies", {}).clear()
         flexkv_logger.info("Server shutdown complete")
 
 
@@ -475,69 +490,228 @@ class KVServer:
             swa_aware=req.swa_aware,
         )
 
-    def _handle_prefetch_control(self, req):
-        # IPC protocol is local, just like existing KVServer RPC. Never connect
-        # to arbitrary network endpoints supplied as a reply address.
-        if not re.fullmatch(r"ipc:///tmp/flexkv-prefetch-[0-9a-f]{32}", req.reply_port):
-            flexkv_logger.error("Invalid prefetch control reply endpoint")
+    def _handle_control(self, req):
+        # Endpoints are local IPC and owned for this client's entire lifetime.
+        if not re.fullmatch(r"ipc:///tmp/flexkv-control-[0-9a-f]{32}", req.reply_port):
+            flexkv_logger.error("Invalid control reply endpoint")
             return
-        result = None
-        error = None
+        if not hasattr(self, "_control_replies"):
+            self._control_replies = {}
+            self._prefetch_endpoints = {}
+            self._prefetch_legacy_clients = {}
+            self._legacy_prefetch_draining = set()
+            self._control_store_tasks = {}
+        key = (req.dp_client_id, req.reply_port)
+        reply = self._control_replies.get(key)
+        if reply is None:
+            reply = get_zmq_socket(self.context, zmq.PUSH, req.reply_port, False)
+            reply.setsockopt(zmq.SNDTIMEO, 1000)
+            self._control_replies[key] = reply
+        result, error = None, None
+        closing = False
         try:
             if req.protocol_version != 1:
-                raise ValueError("unsupported prefetch protocol version")
+                raise ValueError("unsupported control protocol version")
             if req.dp_client_id not in self.client_manager.client_dict:
-                raise ValueError("unregistered prefetch client")
-            # Retain ownership only while the bounded coordinator ledger does.
-            runtime = self.kv_task_engine._runtime
-            live = runtime.call(
-                lambda: set(self.kv_task_engine._prefetch.sessions)
-                | set(self.kv_task_engine._prefetch.expired)
-            ) if runtime else set()
-            self._prefetch_clients = {h: cid for h, cid in self._prefetch_clients.items() if h in live}
-            payload = dict(req.payload)
-            for handle in list(payload.get("handles", ())) + list(payload.get("demand_handles", ())):
-                if self._prefetch_clients.get(handle) != req.dp_client_id:
-                    raise ValueError("prefetch handle belongs to another client")
-            if "handle" in payload and self._prefetch_clients.get(payload["handle"]) != req.dp_client_id:
-                raise ValueError("unknown prefetch handle or client")
-            if req.action == "capabilities":
-                result = self.kv_task_engine.prefetch_capabilities()
-            elif req.action == "start":
-                result = self.kv_task_engine.start_prefetch(dp_client_id=req.dp_client_id, **payload)
-                self._prefetch_clients[result] = req.dp_client_id
-            elif req.action == "progress":
-                result = self.kv_task_engine.progress_prefetch(**payload)
-            elif req.action == "stop":
-                result = self.kv_task_engine.stop_prefetch(**payload)
-            elif req.action == "release":
-                result = self.kv_task_engine.release_prefetch(**payload)
-            else:
-                raise ValueError("unknown prefetch control action")
+                raise ValueError("unregistered control client")
+            runtime = getattr(self.kv_task_engine, "_runtime", None)
+            if runtime:
+                live = runtime.call(
+                    lambda: set(self.kv_task_engine._prefetch.sessions)
+                    | set(self.kv_task_engine._prefetch.expired)
+                )
+                self._prefetch_clients = {
+                    h: cid for h, cid in self._prefetch_clients.items() if h in live
+                }
+                self._prefetch_endpoints = {
+                    h: port for h, port in self._prefetch_endpoints.items() if h in live
+                }
+            calls = req.payload["calls"] if req.action == "batch" else [(req.action, req.payload)]
+            result = []
+            for action, payload in calls:
+                try:
+                    value = self._dispatch_control(req, action, payload)
+                    result.append(ControlResponse(result=value))
+                except Exception as exc:
+                    cleanup_task_ids = getattr(exc, "task_ids", None)
+                    if action == "put_match_batch" and cleanup_task_ids:
+                        self._control_store_tasks.update(
+                            (tid, (req.dp_client_id, req.reply_port))
+                            for tid in cleanup_task_ids
+                        )
+                    result.append(ControlResponse(
+                        error=f"{type(exc).__name__}: {exc}",
+                        cleanup_task_ids=cleanup_task_ids,
+                    ))
+                closing = closing or action == "close"
+            if req.action != "batch":
+                result, error = result[0].result, result[0].error
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-        reply = get_zmq_socket(self.context, zmq.SocketType.PUSH, req.reply_port, False)
         try:
-            reply.setsockopt(zmq.SNDTIMEO, 100)
-            reply.send_pyobj(PrefetchControlResponse(result, error))
+            reply.send_pyobj(ControlResponse(result, error, req.request_id))
         finally:
-            reply.close(linger=100)
+            if closing:
+                self._control_replies.pop(key).close(linger=1000)
+
+    def _dispatch_control(self, req, action, payload):
+        engine = self.kv_task_engine
+        if action == "get_match":
+            match = engine.get_match(dp_client_id=req.dp_client_id, **payload)
+            # Misses have no held transfer graph. Positive hits share the
+            # existing control reservation ledger and close/launch lifecycle.
+            if match[1].any():
+                self._control_store_tasks[int(match[0])] = (
+                    req.dp_client_id, req.reply_port,
+                )
+            return match
+        if action == "launch":
+            task_ids = payload["task_ids"]
+            if any(
+                self._control_store_tasks.get(tid) != (req.dp_client_id, req.reply_port)
+                for tid in task_ids
+            ):
+                raise ValueError("held task belongs to another control client")
+            # Keep reservation IDs stable, including after a partial launch.
+            result = engine.launch_tasks(as_batch=False, **payload)
+            # Launch may fail after native submission: retain the reservation
+            # ledger on every exception so cancellation/close can still drain.
+            for tid in task_ids:
+                self._control_store_tasks.pop(tid, None)
+            return result
+        if action == "cancel":
+            task_ids = payload["task_ids"]
+            if any(
+                self._control_store_tasks.get(tid) != (req.dp_client_id, req.reply_port)
+                for tid in task_ids
+            ):
+                raise ValueError("held task belongs to another control client")
+            engine.cancel_tasks(task_ids)
+            for tid in task_ids:
+                self._control_store_tasks.pop(tid, None)
+            return None
+        if action == "put_match_batch":
+            matches = engine.put_match_batch(
+                payload["requests"], dp_client_id=req.dp_client_id,
+            )
+            self._control_store_tasks.update(
+                (int(match[0]), (req.dp_client_id, req.reply_port))
+                for match in matches
+            )
+            return matches
+        for handle in list(payload.get("handles", ())) + list(payload.get("demand_handles", ())):
+            if self._prefetch_clients.get(handle) != req.dp_client_id:
+                raise ValueError("prefetch handle belongs to another client")
+        if "handle" in payload and self._prefetch_clients.get(payload["handle"]) != req.dp_client_id:
+            raise ValueError("unknown prefetch handle or client")
+        if action == "capabilities":
+            return engine.prefetch_capabilities()
+        if action == "start":
+            handle = engine.start_prefetch(dp_client_id=req.dp_client_id, **payload)
+            self._prefetch_clients[handle] = req.dp_client_id
+            self._prefetch_endpoints[handle] = req.reply_port
+            return handle
+        if action == "progress":
+            return engine.progress_prefetch(**payload)
+        if action == "stop":
+            return engine.stop_prefetch(**payload)
+        if action == "release":
+            return engine.release_prefetch(**payload)
+        if action == "legacy_start":
+            task_id = engine.prefetch_async(dp_client_id=req.dp_client_id, **payload)
+            self._prefetch_legacy_clients[task_id] = (req.dp_client_id, req.reply_port)
+            return task_id
+        if action in ("legacy_progress", "legacy_release"):
+            task_ids = payload["task_ids"]
+            if any(self._prefetch_legacy_clients.get(tid, (None,))[0] != req.dp_client_id for tid in task_ids):
+                raise ValueError("prefetch task belongs to another client")
+            if action == "legacy_progress":
+                return engine.wait(task_ids, timeout=0, completely=True)
+            engine.cancel_tasks(task_ids)
+            self._legacy_prefetch_draining.update(task_ids)
+            return None
+        if action == "drained":
+            def drained():
+                for handle, session in getattr(getattr(engine, "_prefetch", None), "sessions", {}).items():
+                    if self._prefetch_clients.get(handle) == req.dp_client_id and session.chunks:
+                        return False
+                return all(
+                    tid not in engine.tasks or engine.tasks[tid].is_completed()
+                    for tid, owner in self._prefetch_legacy_clients.items()
+                    if owner[0] == req.dp_client_id
+                )
+            runtime = getattr(engine, "_runtime", None)
+            if runtime:
+                return runtime.call(drained)
+            engine.try_wait([])
+            return drained()
+        if action == "close":
+            from flexkv.common.request import KVResponseStatus
+
+            reservations = [
+                tid for tid, owner in self._control_store_tasks.items()
+                if owner == (req.dp_client_id, req.reply_port)
+            ]
+            if reservations:
+                engine.cancel_tasks(reservations)
+                responses = engine.wait(reservations, timeout=30, completely=True)
+                if any(
+                    tid not in responses
+                    or responses[tid].status not in (
+                        KVResponseStatus.SUCCESS, KVResponseStatus.CANCELLED,
+                        KVResponseStatus.FAILED, KVResponseStatus.NOTFOUND,
+                    )
+                    for tid in reservations
+                ):
+                    raise TimeoutError("reservation close drain timed out; resources retained")
+                for tid in reservations:
+                    self._control_store_tasks.pop(tid, None)
+            for handle, port in list(self._prefetch_endpoints.items()):
+                if port == req.reply_port and self._prefetch_clients.get(handle) == req.dp_client_id:
+                    engine.release_prefetch(handle)
+                    self._prefetch_endpoints.pop(handle, None)
+            task_ids = [tid for tid, owner in self._prefetch_legacy_clients.items()
+                        if owner == (req.dp_client_id, req.reply_port)]
+            if task_ids:
+                engine.cancel_tasks(task_ids)
+                self._legacy_prefetch_draining.update(task_ids)
+            deadline = time.monotonic() + 30
+            while not self._dispatch_control(req, "drained", {}):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("prefetch close drain timed out; resources retained")
+                time.sleep(0.002)
+            return None
+        raise ValueError("unknown control action")
 
     def _handle_launch_task_request(self, req: LaunchTaskRequest) -> None:
         """Handle LaunchTask request"""
-        self.kv_task_engine.launch_tasks(
-            task_ids=req.task_ids,
-            slot_mappings=req.slot_mappings,
-            swa_slot_mappings=req.swa_slot_mappings,
-            as_batch=req.as_batch,
-            batch_id=req.batch_id,
-            layerwise_transfer=req.layerwise_transfer,
-            counter_id=req.counter_id,
-        )
+        error = None
+        try:
+            self.kv_task_engine.launch_tasks(
+                task_ids=req.task_ids,
+                slot_mappings=req.slot_mappings,
+                swa_slot_mappings=req.swa_slot_mappings,
+                as_batch=req.as_batch,
+                batch_id=req.batch_id,
+                layerwise_transfer=req.layerwise_transfer,
+                counter_id=req.counter_id,
+            )
+            for tid in req.task_ids:
+                getattr(self, "_control_store_tasks", {}).pop(tid, None)
+        except Exception as exc:
+            if not req.confirm_launch:
+                raise
+            error = f"{type(exc).__name__}: {exc}"
+        if req.confirm_launch:
+            self.client_manager.get_zmq(req.dp_client_id).send_pyobj(
+                Response(dp_client_id=req.dp_client_id, error_msg=error),
+            )
 
     def _handle_cancel_task_request(self, req: CancelTaskRequest) -> None:
         """Handle CancelTask request"""
         self.kv_task_engine.cancel_tasks(req.task_ids)
+        for tid in req.task_ids:
+            getattr(self, "_control_store_tasks", {}).pop(tid, None)
 
     def _handle_wait_request(self, req: WaitRequest) -> None:
         """Handle Wait request"""
@@ -607,6 +781,15 @@ class KVServer:
                     self._prefetch_clients.pop(handle, None)
         self._pending_waits = [entry for entry in self._pending_waits
                                if entry[0].dp_client_id != req.dp_client_id]
+        for key, reply in list(getattr(self, "_control_replies", {}).items()):
+            if key[0] == req.dp_client_id:
+                self._control_replies.pop(key)
+                reply.close(linger=0)
+        task_ids = [tid for tid, owner in getattr(self, "_prefetch_legacy_clients", {}).items()
+                    if owner[0] == req.dp_client_id]
+        if task_ids:
+            self.kv_task_engine.cancel_tasks(task_ids)
+            self._legacy_prefetch_draining.update(task_ids)
         self.client_manager.delete_dp_client(req.dp_client_id)
 
     def _handle_reset_request(self, req: ResetRequest) -> None:

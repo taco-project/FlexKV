@@ -628,7 +628,7 @@ class TransferManagerOnRemote(TransferManager):
         self._active_graphs_lock = threading.Lock()
 
         self._pending_graphs: Dict[int, Tuple[TransferOpGraph, int]] = {}
-        self._pending_slot_mappings: Dict[int, np.ndarray] = {}
+        self._pending_slot_mappings: Dict[int, Tuple[np.ndarray, Optional[np.ndarray]]] = {}
         self._pending_lock = threading.Lock()
 
         self._worker_thread: threading.Thread | None = None
@@ -703,14 +703,20 @@ class TransferManagerOnRemote(TransferManager):
                             elif msg_type == 'submit_batch':
                                 graphs = message.get('graphs', [])
                                 for graph in graphs:
-                                    graph_id = graph.graph_id
-                                    with self._active_graphs_lock:
-                                        self._active_graphs[graph_id] = -1
-                                    self.submit(graph)
+                                    if (message.get('stage_local_mapping', False)
+                                            and hasattr(graph, 'stage_local_task_id')):
+                                        self._handle_submit(graph)
+                                    else:
+                                        graph_id = graph.graph_id
+                                        with self._active_graphs_lock:
+                                            self._active_graphs[graph_id] = -1
+                                        self.submit(graph)
                             elif msg_type == 'set_slot_mapping':
                                 task_id = message.get('task_id')
                                 slot_mapping = message.get('slot_mapping')
-                                self._handle_set_slot_mapping(task_id, slot_mapping)
+                                self._handle_set_slot_mapping(
+                                    task_id, slot_mapping, message.get('swa_slot_mapping'),
+                                )
                             else:
                                 flexkv_logger.warning(f"Unexpected command message: {message}")
                         else:
@@ -767,7 +773,10 @@ class TransferManagerOnRemote(TransferManager):
         poller.unregister(self.query_socket)
         poller.unregister(self.gpu_control_socket)
 
-    def _handle_set_slot_mapping(self, task_id: int, slot_mapping: np.ndarray) -> None:
+    def _handle_set_slot_mapping(
+        self, task_id: int, slot_mapping: np.ndarray,
+        swa_slot_mapping: Optional[np.ndarray] = None,
+    ) -> None:
         """Handle set_slot_mapping message from FlexKVConnector.
 
         When the graph (with cleared GPU blocks) arrived earlier, we can immediately
@@ -780,14 +789,14 @@ class TransferManagerOnRemote(TransferManager):
             if task_id in self._pending_graphs:
                 # Graph already arrived, set GPU blocks and prepare for submit
                 graph, task_end_op_id = self._pending_graphs.pop(task_id)
-                graph.set_gpu_blocks(slot_mapping)
+                graph.set_gpu_blocks(slot_mapping, swa_slot_mapping)
                 flexkv_logger.debug(
                     f"[TransferManagerOnRemote] set_slot_mapping: "
                     f"graph for task_id={task_id} submitted (graph arrived first)"
                 )
             else:
                 # Graph not yet arrived, store slot_mapping for later matching
-                self._pending_slot_mappings[task_id] = slot_mapping
+                self._pending_slot_mappings[task_id] = (slot_mapping, swa_slot_mapping)
                 flexkv_logger.debug(
                     f"[TransferManagerOnRemote] set_slot_mapping: "
                     f"slot_mapping stored for task_id={task_id}, waiting for graph"
@@ -805,12 +814,12 @@ class TransferManagerOnRemote(TransferManager):
         If slot_mapping already arrived, set_gpu_blocks and submit immediately.
         Otherwise, store graph in pending_graphs for later matching.
         """
-        task_id = graph.graph_id  # Use graph_id as task_id for matching
+        task_id = getattr(graph, "stage_local_task_id", graph.graph_id)
         with self._pending_lock:
             if task_id in self._pending_slot_mappings:
                 # slot_mapping already arrived, set GPU blocks and submit
-                slot_mapping = self._pending_slot_mappings.pop(task_id)
-                graph.set_gpu_blocks(slot_mapping)
+                slot_mapping, swa_slot_mapping = self._pending_slot_mappings.pop(task_id)
+                graph.set_gpu_blocks(slot_mapping, swa_slot_mapping)
                 flexkv_logger.debug(
                     f"[TransferManagerOnRemote] submit: "
                     f"graph for task_id={task_id} submitted (slot_mapping arrived first)"
@@ -1234,7 +1243,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             flexkv_logger.error(f"Failed to initialize transfer manager process: {e}", exc_info=True)
             init_failed = True
             # Bound encoded bytes so even non-ASCII tracebacks fit the pipe.
-            message = traceback.format_exc().encode("utf-8")[-4096:].decode("utf-8", errors="replace")
+            encoded = traceback.format_exc().encode("utf-8")
+            message = encoded[max(0, len(encoded) - 4096):].decode("utf-8", errors="replace")
             with contextlib.suppress(BrokenPipeError, EOFError, OSError):
                 error_conn.send(message)
         finally:
@@ -1548,7 +1558,10 @@ class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
         try:
             message = {
                 'type': 'submit_batch',
-                'graphs': transfer_graphs
+                'graphs': transfer_graphs,
+                'stage_local_mapping': (
+                    self.model_config.nnodes > 1 and self.model_config.pp_size > 1
+                ),
             }
             self.command_socket.send_pyobj(message)
 

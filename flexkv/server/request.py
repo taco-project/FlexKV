@@ -13,18 +13,21 @@ RegistrationKey = Tuple[int, int]
 
 
 @dataclass
-class PrefetchControlRequest:
+class ControlRequest:
     dp_client_id: int
     reply_port: str
     action: str
     payload: dict = field(default_factory=dict)
     protocol_version: int = 1
+    request_id: int = 0
 
 
 @dataclass
-class PrefetchControlResponse:
+class ControlResponse:
     result: object = None
     error: Optional[str] = None
+    request_id: int = 0
+    cleanup_task_ids: Optional[List[int]] = None
 
 
 @dataclass
@@ -131,6 +134,7 @@ class LaunchTaskRequest:
     layerwise_transfer: bool = False
     counter_id: int = 0  # Counter set index for triple buffering eventfd notification
     swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None
+    confirm_launch: bool = False
 
 
 @dataclass

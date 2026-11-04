@@ -15,6 +15,7 @@
 
 import os
 import subprocess
+from concurrent.futures import Future
 from typing import Optional, Tuple, List, Dict, Union, Iterable, Sequence
 import time
 
@@ -273,6 +274,47 @@ class KVManager:
             )
         return task_id, mask
 
+    def get_match_async(self,
+                        token_ids: Union[torch.Tensor, np.ndarray],
+                        token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
+                        cpu_only: bool = False,
+                        namespace: Optional[List[str]] = None,
+                        swa_aware: bool = False) -> Future:
+        """Reserve an ordinary held GET on the existing state owner.
+
+        Inputs must remain immutable until completion. Consume the eventual
+        result even after abandoning the lookup: positive hits own resources
+        until launch or cancellation, just like ``get_match``.
+        """
+        try:
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.numpy()
+            if isinstance(token_mask, torch.Tensor):
+                token_mask = token_mask.numpy()
+            if self.server_client_mode:
+                return self.dp_client.get_match_async(
+                    token_ids, token_mask, cpu_only=cpu_only,
+                    namespace=namespace, swa_aware=swa_aware,
+                )
+            engine = self.kv_task_engine
+            kwargs = dict(
+                token_ids=token_ids, token_mask=token_mask, cpu_only=cpu_only,
+                namespace=namespace, swa_aware=swa_aware,
+                dp_client_id=self.dp_client_id,
+            )
+            runtime = getattr(engine, "_runtime", None)
+            if runtime is not None:
+                return runtime.submit(engine.get_match, **kwargs)
+            # Legacy native mode retains scheduler-thread tree ownership.
+            result = engine.get_match(**kwargs)
+        except Exception as exc:
+            future = Future()
+            future.set_exception(exc)
+            return future
+        future = Future()
+        future.set_result(result)
+        return future
+
     def put_async(self,
                   token_ids: Union[torch.Tensor, np.ndarray],
                   slot_mapping: Union[torch.Tensor, np.ndarray],
@@ -319,6 +361,47 @@ class KVManager:
             )
         return task_id, mask
 
+    def put_match_batch(self, requests: Sequence[dict]):
+        """Match ordered PUT metadata in one IPC/runtime command."""
+        return self._put_match_batch(requests, asynchronous=False)
+
+    def put_match_batch_async(self, requests: Sequence[dict]) -> Future:
+        """Reserve on the existing owner, never a new tree-mutating thread."""
+        return self._put_match_batch(requests, asynchronous=True)
+
+    def _put_match_batch(self, requests: Sequence[dict], *, asynchronous: bool):
+        prepared = [
+            dict(
+                request,
+                token_ids=(
+                    request["token_ids"].numpy()
+                    if isinstance(request["token_ids"], torch.Tensor)
+                    else request["token_ids"]
+                ),
+            )
+            for request in requests
+        ]
+        if self.server_client_mode:
+            if asynchronous:
+                return self.dp_client.put_match_batch_async(prepared)
+            return self.dp_client.put_match_batch(prepared)
+        engine = self.kv_task_engine
+        if not asynchronous:
+            return engine.put_match_batch(prepared, dp_client_id=self.dp_client_id)
+        runtime = getattr(engine, "_runtime", None)
+        if runtime is not None:
+            return runtime.submit(
+                engine.put_match_batch, prepared, dp_client_id=self.dp_client_id,
+            )
+        # Legacy native mode has no background tree owner. Preserve its
+        # scheduler-thread ownership rather than introducing a competing one.
+        future = Future()
+        try:
+            future.set_result(engine.put_match_batch(prepared, dp_client_id=self.dp_client_id))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
     def prefetch_async(self,
                        token_ids: np.ndarray,
                        namespace: Optional[List[str]] = None,
@@ -350,9 +433,27 @@ class KVManager:
             )
         return task_id
 
+    def prefetch_control_async(self, action: str, **payload):
+        """Submit to the existing state owner; never move tree work to IPC threads."""
+        if self.server_client_mode:
+            return self.dp_client.control_async(action, **payload)
+        engine = self.kv_task_engine
+        runtime = engine._runtime
+        if runtime is None:
+            raise RuntimeError("asynchronous prefetch control requires a server or task runtime")
+        if action == "start":
+            return runtime.submit(engine.start_prefetch, **payload)
+        if action == "progress":
+            return runtime.submit(engine.progress_prefetch, **payload)
+        if action == "release":
+            return runtime.submit(engine.release_prefetch, **payload)
+        if action == "drained":
+            return runtime.submit(lambda: engine._prefetch.drained)
+        raise ValueError(f"unknown native prefetch action: {action}")
+
     def prefetch_capabilities(self) -> PrefetchCapabilities:
         if self.server_client_mode:
-            return self.dp_client.prefetch_control("capabilities")
+            return self.dp_client.control("capabilities")
         return self.kv_task_engine.prefetch_capabilities()
 
     def start_prefetch(
@@ -362,7 +463,7 @@ class KVManager:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if self.server_client_mode:
-            return self.dp_client.prefetch_control(
+            return self.dp_client.control(
                 "start", token_ids=token_ids, options=options, namespace=namespace)
         return self.kv_task_engine.start_prefetch(token_ids, options, namespace)
 
@@ -370,7 +471,7 @@ class KVManager:
         self, handles: Sequence[PrefetchHandle], demand_handles: Sequence[PrefetchHandle] = (),
     ) -> Dict[PrefetchHandle, PrefetchSnapshot]:
         if self.server_client_mode:
-            return self.dp_client.prefetch_control("progress", handles=handles, demand_handles=demand_handles)
+            return self.dp_client.control("progress", handles=handles, demand_handles=demand_handles)
         return self.kv_task_engine.progress_prefetch(handles, demand_handles)
 
     def poll_prefetch(
@@ -385,12 +486,12 @@ class KVManager:
 
     def stop_prefetch(self, handle: PrefetchHandle, reason: str = "request_abort") -> PrefetchSnapshot:
         if self.server_client_mode:
-            return self.dp_client.prefetch_control("stop", handle=handle, reason=reason)
+            return self.dp_client.control("stop", handle=handle, reason=reason)
         return self.kv_task_engine.stop_prefetch(handle, reason)
 
     def release_prefetch(self, handle: PrefetchHandle) -> None:
         if self.server_client_mode:
-            return self.dp_client.prefetch_control("release", handle=handle)
+            return self.dp_client.control("release", handle=handle)
         return self.kv_task_engine.release_prefetch(handle)
 
     def wait_prefetch(self, handle: PrefetchHandle, timeout_s: float = 20.0) -> PrefetchSnapshot:
@@ -411,7 +512,8 @@ class KVManager:
                ] = None,
                as_batch: bool = False,
                layerwise_transfer: bool = False,
-               counter_id: int = 0) -> List[int]:
+               counter_id: int = 0,
+               confirm_launch: bool = False) -> List[int]:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
         if not isinstance(slot_mappings, List):
@@ -435,6 +537,7 @@ class KVManager:
                 as_batch=as_batch,
                 layerwise_transfer=layerwise_transfer,
                 counter_id=counter_id,
+                confirm_launch=confirm_launch,
             )
         else:
             return self.kv_task_engine.launch_tasks(
@@ -446,6 +549,62 @@ class KVManager:
                 counter_id=counter_id,
             )
 
+    def launch_async(
+        self,
+        task_ids: Union[int, List[int]],
+        slot_mappings: Union[np.ndarray, List[np.ndarray], torch.Tensor, List[torch.Tensor]],
+        swa_slot_mappings: Optional[
+            Union[np.ndarray, List[Optional[np.ndarray]], torch.Tensor, List[Optional[torch.Tensor]]]
+        ] = None,
+        layerwise_transfer: bool = False,
+        counter_id: int = 0,
+    ) -> Future[List[int]]:
+        """Enqueue launch on the existing owner, including from its callbacks.
+
+        Completion confirms native launch acceptance, not transfer completion.
+        Keep mappings immutable until completion and retain transfer ownership
+        until the returned task IDs finish. Tasks remain independent, preserving
+        their reservation IDs even on partial launch failure. Legacy native mode
+        without a runtime executes synchronously and returns a completed Future.
+        """
+        try:
+            if isinstance(task_ids, int):
+                task_ids = [task_ids]
+            if not isinstance(slot_mappings, list):
+                slot_mappings = [slot_mappings]
+            slot_mappings = [
+                sm.numpy() if isinstance(sm, torch.Tensor) else sm
+                for sm in slot_mappings
+            ]
+            if swa_slot_mappings is not None:
+                if not isinstance(swa_slot_mappings, list):
+                    swa_slot_mappings = [swa_slot_mappings]
+                swa_slot_mappings = [
+                    sm.numpy() if isinstance(sm, torch.Tensor) else sm
+                    for sm in swa_slot_mappings
+                ]
+            kwargs = dict(
+                task_ids=task_ids,
+                slot_mappings=slot_mappings,
+                swa_slot_mappings=swa_slot_mappings,
+                layerwise_transfer=layerwise_transfer,
+                counter_id=counter_id,
+            )
+            if self.server_client_mode:
+                return self.dp_client.launch_tasks_async(**kwargs)
+            engine = self.kv_task_engine
+            runtime = getattr(engine, "_runtime", None)
+            if runtime is not None:
+                return runtime.submit(engine.launch_tasks, as_batch=False, **kwargs)
+            result = engine.launch_tasks(as_batch=False, **kwargs)
+        except Exception as exc:
+            future = Future()
+            future.set_exception(exc)
+            return future
+        future = Future()
+        future.set_result(result)
+        return future
+
     def cancel(self, task_ids: Union[int, List[int]]) -> None:
         if isinstance(task_ids, int):
             task_ids = [task_ids]
@@ -453,6 +612,30 @@ class KVManager:
             self.dp_client.cancel_tasks(task_ids)
         else:
             self.kv_task_engine.cancel_tasks(task_ids)
+
+    def cancel_async(self, task_ids: Union[int, List[int]]) -> Future:
+        """Enqueue held-task cleanup, including from an owner Future callback.
+
+        Completion acknowledges cancellation; failed cleanup remains an error
+        and must not be treated as permission to release source ownership.
+        """
+        try:
+            if isinstance(task_ids, int):
+                task_ids = [task_ids]
+            if self.server_client_mode:
+                return self.dp_client.cancel_async(task_ids)
+            engine = self.kv_task_engine
+            runtime = getattr(engine, "_runtime", None)
+            if runtime is not None:
+                return runtime.submit(engine.cancel_tasks, task_ids)
+            engine.cancel_tasks(task_ids)
+        except Exception as exc:
+            future = Future()
+            future.set_exception(exc)
+            return future
+        future = Future()
+        future.set_result(None)
+        return future
 
     def wait(self,
              task_ids: Union[int, List[int]],

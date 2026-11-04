@@ -21,6 +21,11 @@ Modes:
     is fired with ``layerwise_transfer=True`` and the per-layer hook
     registered via ``register_layer_transfer_counter`` blocks each
     forward layer on its own eventfd.
+
+Queued prefetch retains its result lease while an exact, immutable CPU query
+prepares a held GET on the existing state owner. Scheduler-thread progress
+publishes readiness without waiting for that GET; lookup consumes it only if
+tokens, namespace and the complete GPU-prefix mask still match.
 """
 
 from __future__ import annotations
@@ -34,7 +39,8 @@ import signal
 import socket
 import struct
 import time
-from contextlib import nullcontext, suppress
+from concurrent.futures import Future
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -90,6 +96,37 @@ class _CacheOpContext:
     start_ns: int
     task_id: int = -1
 
+
+@dataclass
+class _StoreAdmission:
+    """Owned CPU snapshots retained through reservation, launch, and reset."""
+
+    stores: List[dict]
+    prepared: list
+    contexts: List[_CacheOpContext]
+    positions: list
+    requests: list
+    future: Optional[Future] = None
+    matches: Optional[list] = None
+    starts: Optional[list] = None
+    asynchronous: bool = False
+    launch_started: bool = False
+    resetting: bool = False
+    result: Optional[List[int]] = None
+    error: str = ""
+    retain_slots: bool = False
+    reset: bool = False
+
+
+
+@dataclass(frozen=True)
+class _PrefetchLookup:
+    """Packed query identity and its unlaunched, asynchronously admitted GET."""
+
+    token_ids: np.ndarray
+    token_mask: np.ndarray
+    namespace: Optional[Tuple[str, ...]]
+    future: Future
 
 @dataclass(frozen=True)
 class _IndexerBufferGroup:
@@ -271,7 +308,13 @@ class FlexKVConnector:
                 self.cache_config.enable_chunked_prefetch = False
         self._prefetch_sessions = {}
         self._prefetch_result_sessions = {}
+        self._prepared_lookups: Dict[str, _PrefetchLookup] = {}
         self._prefetch_loaded_spans = {}
+        self._queued_prefetch = (
+            self._chunked_prefetch or self.model_config.dp_size > 1
+            or self.model_config.instance_num > 1
+            or GLOBAL_CONFIG_FROM_ENV.server_client_mode
+        )
         self._label = f"[model_config={self.model_config}, rank_info={self.rank_info}]"
 
         # 2. Cross-rank sync context.
@@ -407,9 +450,6 @@ class FlexKVConnector:
         self.enable_layerwise = bool(
             int(os.environ.get("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "0"))
         )
-        self._profile_store_stages = os.getenv(
-            "FLEXKV_PROFILE_STORE_STAGES", "0"
-        ).strip().lower() in {"1", "true", "yes", "on"}
         self._layerwise_socket = build_layerwise_eventfd_socket_path(
             dp_client_id=self.rank_info.dp_client_id,
             pp_rank=self.rank_info.pp_rank,
@@ -461,6 +501,7 @@ class FlexKVConnector:
         # Stores
         self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
         self._inflight_store_contexts: Dict[str, _CacheOpContext] = {}
+        self._pending_store_batch: Optional[_StoreAdmission] = None
         # Prefetches
         self._ongoing_prefetches: Dict[str, int] = {}  # rid -> fkv_task_id
         self._prefetch_contexts: Dict[str, _CacheOpContext] = {}
@@ -661,15 +702,28 @@ class FlexKVConnector:
             tids_np = np.asarray(token_ids, dtype=np.int64)
             mask_np = self._as_numpy_mask(token_mask)
             try:
-                # A DSv4 prefix is reusable only when the same host node also
-                # owns its SWA window and compress-state sidecars.
-                res = self.kv_manager.get_match(
-                    token_ids=tids_np,
-                    token_mask=mask_np,
-                    cpu_only=getattr(self, "_chunked_prefetch", False),
-                    swa_aware=self._swa_kv_pool is not None,
-                    namespace=namespace,
-                )
+                prepared = getattr(self, "_prepared_lookups", {}).get(rid)
+                if prepared is not None and (
+                    prepared.namespace == (tuple(namespace) if namespace is not None else None)
+                    and np.array_equal(prepared.token_ids, tids_np)
+                    and np.array_equal(prepared.token_mask, mask_np)
+                ):
+                    # Consume the speculative match here, waiting only if it
+                    # has not finished. It must not add an admission gate that
+                    # leaves a runnable prefill batch underfilled.
+                    self._prepared_lookups.pop(rid)
+                    res = prepared.future.result()
+                else:
+                    if prepared is not None:
+                        self._release_prefetch_result(rid)
+                    # A DSv4 prefix must own its SWA/compress-state sidecars.
+                    res = self.kv_manager.get_match(
+                        token_ids=tids_np,
+                        token_mask=mask_np,
+                        cpu_only=getattr(self, "_chunked_prefetch", False),
+                        swa_aware=self._swa_kv_pool is not None,
+                        namespace=namespace,
+                    )
             except Exception as exc:  # noqa: BLE001
                 lookup_error = exc
                 res = None
@@ -805,7 +859,7 @@ class FlexKVConnector:
         # the TransferManagerOnRemote so the remote side knows where to
         # land the H2D copies on its own GPUs.
         if self._sync_ctx.should_send_slot_mapping_to_remote:
-            self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
+            self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu, swa_slot_mapping)
 
         n = slot_mapping_cpu.numel()
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
@@ -982,7 +1036,7 @@ class FlexKVConnector:
         # rank reports that it is ready to consume the leader's counter.
         if local_ok and self._sync_ctx.should_send_slot_mapping_to_remote:
             try:
-                self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
+                self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu, swa_slot_mapping)
             except Exception as exc:  # noqa: BLE001
                 local_ok = 0
                 local_error = f"remote slot metadata failed: {exc}"
@@ -1141,7 +1195,7 @@ class FlexKVConnector:
             # scheduler calls this every idle tick, which would otherwise be
             # thousands of synchronous RPCs per second. Chunked prefetch runs
             # the TaskRuntime thread, which already drains graphs on its own.
-            if not getattr(self, "_chunked_prefetch", False):
+            if not getattr(self, "_chunked_prefetch", False) and not getattr(self, "_queued_prefetch", False):
                 now = time.monotonic()
                 last = getattr(self, "_last_idle_drive_ts", None)
                 if last is None or now - last >= _IDLE_DRIVE_INTERVAL_S:
@@ -1205,237 +1259,368 @@ class FlexKVConnector:
 
     @property
     def supports_async_store_slot_mapping(self) -> bool:
-        """Whether a leader-only pinned slot copy is valid for this topology.
+        """Whether the ordinary adapter's leader-only pinned copy is safe.
 
-        PP stages need their own stage-local mapping, and SWA needs a GPU-side
-        full-to-SWA translation. Keep those paths on the synchronous
-        implementation until they have an explicit sideband.
+        Hybrid stores carry explicit per-rank Full/SWA snapshots through
+        store_kv_batch; the ordinary adapter still stages only the leader.
         """
-        # TODO: add stage-local mapping sidebands for PP and carry
-        # the GPU full-to-SWA translation in the asynchronous store protocol.
         return not bool(getattr(self._sync_ctx, "is_pp_active", False)) and (
             self._swa_kv_pool is None
         )
 
-    def sync_ready_store_rids(self, ready_rids: List[str]) -> List[str]:
-        """Fan out the leader's ready pinned-copy set to every cache rank."""
+    def sync_ready_store_rids(
+        self, ready_rids: List[str], *, require_all_ranks: bool = False,
+    ) -> List[str]:
+        """Select the identical ready queue prefix, optionally on every rank."""
         payload = list(ready_rids) if self._sync_ctx.is_sync_leader else []
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
-                payload,
-                channel=FlexKVScatterChannel.STORE_READY,
+                payload, channel=FlexKVScatterChannel.STORE_READY,
             )
+            if require_all_ranks:
+                common = 0
+                for local, leader in zip(ready_rids, payload):
+                    if local != leader:
+                        break
+                    common += 1
+                payload = payload[:self._sync_ctx.all_reduce_min(common)]
         return list(payload)
 
     def store_kv(
         self,
         rid: str,
-        token_ids: List[int],
+        token_ids: Sequence[int],
         kv_indices: torch.Tensor,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
     ) -> int:
-        """Schedule a write back from GPU into FlexKV.
+        """Ordinary adapter entry point; snapshot before the shared batch path."""
+        swa_indices = None
+        if getattr(self, "_swa_kv_pool", None) is not None:
+            translate = getattr(self._kvcache, "translate_loc_from_full_to_swa", None)
+            if translate is not None:
+                swa_indices = self._to_cpu_int64(translate(kv_indices))
+        return self.store_kv_batch([dict(
+            rid=rid, token_ids=token_ids,
+            kv_indices=self._to_cpu_int64(kv_indices),
+            swa_indices=swa_indices, sglang_req_id=sglang_req_id,
+            namespace=namespace,
+        )])[0]
 
-        The sync leader runs ``put_match`` and ``launch``. Its result is
-        fanned out to every PP/CP/TP rank so every rank retains ownership
-        of the source GPU slots until the store completes. A remote PP
-        stage leader also forwards its local slot mapping.
+    def store_kv_batch(self, stores: Sequence[dict]) -> List[int]:
+        """Synchronously reserve and launch using the shared admission protocol."""
+        if not stores:
+            return []
+        batch = self._prepare_store_batch(stores)
+        self._pending_store_batch = batch
+        self._match_store_batch(batch, asynchronous=False)
+        try:
+            return self._complete_store_batch(batch)
+        except Exception:
+            if not batch.retain_slots:
+                self._pending_store_batch = None
+            raise
 
-        Returns the FlexKV task id of the in-flight store, or -1 if
-        nothing needed to be written.
+    def submit_store_kv_batch(self, stores: Sequence[dict]) -> _StoreAdmission:
+        """Queue CPU reservation and launch without blocking on their RPCs.
+
+        All ranks call submit/poll in the same order on the scheduler thread.
+        The owner only processes retained CPU token and slot snapshots, never
+        reads GPU storage or enters a distributed collective. Callers retain
+        source locks through native transfer completion or successful reset.
         """
-        context = self._new_op_context("store", rid, sglang_req_id)
-        with self._store_profile_scope("flexkv.connector.store.tokens_to_numpy"):
-            token_ids_np = np.asarray(token_ids, dtype=np.int64)
-        n = len(token_ids_np)
-        if n != len(kv_indices):
-            raise ValueError(
-                f"store_kv: token_ids has {n} entries but kv_indices "
-                f"has {len(kv_indices)} entries"
-            )
+        batch = self._prepare_store_batch(stores)
+        self._pending_store_batch = batch
+        self._match_store_batch(batch, asynchronous=True)
+        return batch
 
-        # Page-align inputs *before* put_match so the FlexKV allocator
-        # only reserves slots that line up with the slot_mapping we send.
-        if self.page_size > 1:
-            aligned_len = (n // self.page_size) * self.page_size
-            if aligned_len == 0:
-                self._log_cache_op(
-                    context,
-                    "complete",
-                    "skipped",
-                    direction="D2H",
-                    reason="partial_block",
-                    tokens=0,
+    def poll_store_kv_batch(self, batch: _StoreAdmission) -> Optional[List[int]]:
+        """Return None while reservation is pending; otherwise finalize once."""
+        if batch.reset:
+            raise RuntimeError("[FlexKV] store admission was reset")
+        if batch.result is not None:
+            return batch.result
+        if batch is not getattr(self, "_pending_store_batch", None):
+            raise ValueError("store admission does not belong to this connector")
+        ready = (
+            int(batch.future.done()) if self._sync_ctx.is_sync_leader else 1
+        )
+        if self._sync_ctx.needs_sync:
+            ready = self._sync_ctx.all_reduce_min(ready)
+        if not ready:
+            return None
+        return self._complete_store_batch(batch)
+
+    def _prepare_store_batch(self, stores: Sequence[dict]) -> _StoreAdmission:
+        contexts = []
+        prepared = []
+        local_error = ""
+        try:
+            if getattr(self, "_pending_store_batch", None) is not None:
+                raise ValueError("a store admission is already pending")
+            seen = set()
+            for store in stores:
+                if store.get("validation_error"):
+                    raise ValueError(store["validation_error"])
+                rid = store["rid"]
+                if rid in seen or rid in self._inflight_stores:
+                    raise ValueError(f"duplicate inflight store rid: {rid!r}")
+                seen.add(rid)
+                tokens, slots = store["token_ids"], store["kv_indices"]
+                swa = store.get("swa_indices")
+                if len(tokens) != len(slots):
+                    raise ValueError("store token and slot lengths differ")
+                for mapping in (slots, swa):
+                    if mapping is not None and (
+                        mapping.device.type != "cpu" or mapping.dtype != torch.int64
+                        or mapping.ndim != 1 or len(mapping) != len(slots)
+                    ):
+                        raise ValueError("store sidebands must be equal-length CPU int64 vectors")
+                n = len(tokens) // self.page_size * self.page_size
+                prepared.append((slots[:n], None if swa is None else swa[:n], n))
+                contexts.append(self._new_op_context(
+                    "store", rid, store.get("sglang_req_id", _SGLANG_REQ_ID_UNSET),
+                ))
+        except Exception as exc:
+            local_error = str(exc)
+        if self._sync_ctx.needs_sync:
+            valid = self._sync_ctx.all_reduce_min(int(not local_error))
+        else:
+            valid = int(not local_error)
+        if not valid:
+            raise ValueError(local_error or "another rank rejected the store batch")
+        return _StoreAdmission(
+            list(stores), prepared, contexts,
+            [i for i, p in enumerate(prepared) if p[2]], [],
+        )
+
+    def _match_store_batch(self, batch: _StoreAdmission, *, asynchronous: bool) -> None:
+        if not self._sync_ctx.is_sync_leader:
+            return
+        batch.future = Future()
+        batch.asynchronous = asynchronous
+        batch.starts = [
+            dict(rid=s["rid"], task_id=-1, active=False, slot_count=p[2],
+                 unmatched_count=0, unmatched_mask=[])
+            for s, p in zip(batch.stores, batch.prepared)
+        ]
+        try:
+            batch.requests = [
+                dict(
+                    token_ids=np.ascontiguousarray(
+                        batch.stores[i]["token_ids"], dtype=np.int64,
+                    )[:batch.prepared[i][2]],
+                    token_mask=None, namespace=batch.stores[i].get("namespace"),
                 )
-                return -1
-            if aligned_len < n:
-                token_ids_np = token_ids_np[:aligned_len]
-                kv_indices = kv_indices[:aligned_len]
-                n = aligned_len
-
-        store_start = {
-            "rid": rid,
-            "task_id": -1,
-            "active": False,
-            "slot_count": n,
-            "unmatched_count": 0,
-            "unmatched_mask": [],
-            "error": "",
-        }
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            match_error: Optional[Exception] = None
-            try:
-                with self._store_profile_scope("flexkv.connector.store.put_match"):
-                    res = self.kv_manager.put_match(
-                        token_ids=token_ids_np, token_mask=None, namespace=namespace
-                    )
-            except Exception as exc:  # noqa: BLE001
-                match_error = exc
-                res = None
-            if res is None:
-                self._log_cache_op(
-                    context,
-                    "complete",
-                    "failed",
-                    direction="D2H",
-                    stage="put_match",
-                    reason="no_response" if match_error is None else None,
-                    error=str(match_error) if match_error is not None else None,
+                for i in batch.positions
+            ]
+            if not batch.requests or self.kv_manager is None:
+                batch.future.set_result([])
+            elif asynchronous:
+                reservation = self.kv_manager.put_match_batch_async(batch.requests)
+                reservation.add_done_callback(
+                    lambda done: self._continue_store_batch(batch, done)
                 )
             else:
-                fkv_task_id, unmatched_mask = res
-                # TP/CP followers only need the task id to retain their local
-                # radix-node ownership.  Broadcasting one Python bool per
-                # prompt token made the common TP-only write-through path
-                # serialize/deserialise tens of thousands of objects per
-                # request.  Only cross-node PP receivers need the mask to
-                # construct their stage-local slot mapping.
-                needs_remote_mask = bool(
-                    getattr(self._sync_ctx, "is_cross_node_pp", False)
+                batch.future.set_result(self.kv_manager.put_match_batch(batch.requests))
+        except Exception as exc:
+            batch.future.set_exception(exc)
+
+    def _prepare_store_launch(self, batch: _StoreAdmission):
+        if len(batch.matches) != len(batch.positions):
+            raise RuntimeError("store batch match response length mismatch")
+        task_ids, mappings, swa_mappings, active_positions, skipped = [], [], [], [], []
+        for i, (task_id, mask, needs_transfer) in zip(batch.positions, batch.matches):
+            slots, swa, n = batch.prepared[i]
+            mask = np.asarray(mask, dtype=np.bool_)
+            if mask.ndim != 1 or len(mask) != n:
+                raise ValueError("store match mask length mismatch")
+            count = int(np.count_nonzero(mask))
+            if not needs_transfer:
+                skipped.append(int(task_id))
+                continue
+            mappings.append(slots.numpy()[mask])
+            swa_mappings.append(
+                None if swa is None else self._trim_swa_slot_mapping(
+                    swa.numpy()[mask] if count else swa.numpy()
                 )
-                unmatched_count = int(np.count_nonzero(unmatched_mask))
-                mask_list = (
-                    unmatched_mask.tolist()
-                    if needs_remote_mask and hasattr(unmatched_mask, "tolist")
-                    else list(unmatched_mask)
-                    if needs_remote_mask
-                    else []
-                )
-                store_start.update(
-                    task_id=int(fkv_task_id),
-                    unmatched_count=unmatched_count,
-                    unmatched_mask=mask_list,
-                )
-                context.task_id = int(fkv_task_id)
-                if unmatched_count > 0:
-                    with self._store_profile_scope(
-                        "flexkv.connector.store.filter_slot_mapping"
-                    ):
-                        filtered = kv_indices[unmatched_mask]
-                    with self._store_profile_scope(
-                        "flexkv.connector.store.slot_mapping_to_cpu"
-                    ):
-                        slot_mapping_cpu = self._to_cpu_int64(filtered)
-                        swa_slot_mapping = self._build_swa_slot_mapping(filtered)
-                    swa_slots = (
-                        0
-                        if swa_slot_mapping is None
-                        else int(swa_slot_mapping.numel())
+            )
+            # An empty Full mask can still own L2->L3 work and a SWA snapshot.
+            task_ids.append(int(task_id))
+            active_positions.append(i)
+            batch.starts[i].update(
+                task_id=int(task_id), unmatched_count=count,
+                unmatched_mask=mask if getattr(self._sync_ctx, "is_cross_node_pp", False) else [],
+            )
+        return task_ids, mappings, swa_mappings, active_positions, skipped
+
+    def _continue_store_batch(self, batch: _StoreAdmission, reservation: Future) -> None:
+        # Owner callbacks only touch this batch's retained CPU snapshots. No
+        # distributed operation or scheduler-owned bookkeeping runs here.
+        try:
+            batch.matches = reservation.result()
+            if batch.resetting:
+                batch.future.set_result(batch.matches)
+                return
+            task_ids, mappings, swa_mappings, active_positions, skipped = (
+                self._prepare_store_launch(batch)
+            )
+
+            def launched(done):
+                try:
+                    done.result()
+                    for i in active_positions:
+                        batch.starts[i]["active"] = True
+                    batch.future.set_result(batch.matches)
+                except Exception as exc:
+                    batch.future.set_exception(exc)
+
+            def launch():
+                try:
+                    if batch.resetting or not task_ids:
+                        batch.future.set_result(batch.matches)
+                        return
+                    batch.launch_started = True
+                    self.kv_manager.launch_async(
+                        task_ids=task_ids, slot_mappings=mappings,
+                        swa_slot_mappings=swa_mappings,
+                        layerwise_transfer=False,
+                    ).add_done_callback(launched)
+                except Exception as exc:
+                    batch.future.set_exception(exc)
+
+            def retired(done):
+                try:
+                    done.result()
+                    launch()
+                except Exception as exc:
+                    batch.future.set_exception(exc)
+
+            if skipped:
+                self.kv_manager.cancel_async(skipped).add_done_callback(retired)
+            else:
+                launch()
+        except Exception as exc:
+            batch.future.set_exception(exc)
+
+    def _complete_store_batch(self, batch: _StoreAdmission) -> List[int]:
+        if batch.error:
+            raise RuntimeError(f"[FlexKV] store batch failed: {batch.error}")
+        try:
+            result = self._finalize_store_batch(batch)
+        except Exception as exc:
+            if not batch.error:
+                # Failure after launch/publication cannot be retried as a
+                # second launch. Keep the snapshots until reset proves drain.
+                batch.error = str(exc)
+                batch.retain_slots = True
+            raise
+        batch.result = result
+        self._pending_store_batch = None
+        return result
+
+    def _finalize_store_batch(self, batch: _StoreAdmission) -> List[int]:
+        stores, prepared, contexts = batch.stores, batch.prepared, batch.contexts
+
+        starts = batch.starts if batch.starts is not None else [
+            dict(rid=s["rid"], task_id=-1, active=False, slot_count=p[2],
+                 unmatched_count=0, unmatched_mask=[])
+            for s, p in zip(stores, prepared)
+        ]
+        payload = {"stores": starts, "error": ""}
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            try:
+                batch.matches = batch.future.result()
+                if not batch.asynchronous:
+                    task_ids, mappings, swa_mappings, active_positions, skipped = (
+                        self._prepare_store_launch(batch)
                     )
+                    if skipped:
+                        self.kv_manager.cancel(skipped)
+                    if task_ids:
+                        batch.launch_started = True
+                        self.kv_manager.launch(
+                            task_ids=task_ids, slot_mappings=mappings,
+                            swa_slot_mappings=swa_mappings, as_batch=False,
+                            layerwise_transfer=False, confirm_launch=True,
+                        )
+                        for i in active_positions:
+                            starts[i]["active"] = True
+            except Exception as exc:
+                payload["error"] = str(exc)
+                allocated = [int(match[0]) for match in batch.matches or ()]
+                recovery_task_ids = getattr(exc, "task_ids", None)
+                if recovery_task_ids:
+                    allocated = list(recovery_task_ids)
+                    batch.matches = [(tid, None, None) for tid in allocated]
+                if getattr(exc, "retain_slots", False):
+                    payload["retain_slots"] = True
+                if allocated:
                     try:
-                        with self._store_profile_scope(
-                            "flexkv.connector.store.kvmanager_launch"
-                        ):
-                            self.kv_manager.launch(
-                                task_ids=[fkv_task_id],
-                                slot_mappings=[slot_mapping_cpu],
-                                swa_slot_mappings=[swa_slot_mapping],
-                                as_batch=False,
-                                layerwise_transfer=False,
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        store_start["error"] = str(exc)
-                        self._log_cache_op(
-                            context,
-                            "complete",
-                            "failed",
-                            direction="D2H",
-                            transfer_mode="no-layerwise",
-                            stage="launch",
-                            error=str(exc),
-                        )
-                    else:
-                        store_start["active"] = True
-                        self._log_cache_op(
-                            context,
-                            "launch",
-                            "running",
-                            direction="D2H",
-                            transfer_mode="no-layerwise",
-                            tokens=unmatched_count,
-                            slots=int(slot_mapping_cpu.numel()),
-                            swa_slots=swa_slots,
-                        )
-                else:
-                    self._log_cache_op(
-                        context,
-                        "complete",
-                        "skipped",
-                        direction="D2H",
-                        reason="already_cached",
-                        tokens=0,
-                    )
-
+                        self.kv_manager.cancel(allocated)
+                        if batch.launch_started or recovery_task_ids:
+                            responses = self.kv_manager.wait(
+                                allocated, timeout=30.0, completely=True,
+                            ) or {}
+                            if any(
+                                tid not in responses
+                                or not _is_terminal_status(_status_value(responses[tid]))
+                                for tid in allocated
+                            ):
+                                raise RuntimeError("store launch drain incomplete; retain GPU slots")
+                    except Exception as cleanup_error:
+                        payload["error"] += f"; cleanup failed: {cleanup_error}"
+                        payload["retain_slots"] = True
         if self._sync_ctx.needs_sync:
-            with self._store_profile_scope("flexkv.connector.store.scatter_start"):
-                store_start = self._sync_ctx.scatter(
-                    store_start,
-                    channel=FlexKVScatterChannel.STORE_START,
+            payload = self._sync_ctx.scatter(
+                payload, channel=FlexKVScatterChannel.STORE_START,
+            )
+        if payload["error"]:
+            batch.error = payload["error"]
+            batch.retain_slots = bool(payload.get("retain_slots"))
+            if payload.get("retain_slots"):
+                for start, context in zip(payload["stores"], contexts):
+                    if start["task_id"] >= 0:
+                        context.task_id = start["task_id"]
+                        self._inflight_stores[start["rid"]] = start["task_id"]
+                        self._inflight_store_contexts[start["rid"]] = context
+            raise RuntimeError(f"[FlexKV] store batch failed: {payload['error']}")
+        starts = payload["stores"]
+        if len(starts) != len(stores):
+            raise RuntimeError("[FlexKV] store-start batch length mismatch")
+        result = []
+        for store, prepared_store, context, start in zip(stores, prepared, contexts, starts):
+            rid = store["rid"]
+            slots, swa, n = prepared_store
+            if start["rid"] != rid or start["slot_count"] != n:
+                raise RuntimeError("[FlexKV] store-start rid/slot mismatch")
+            if not start["active"]:
+                self._log_cache_op(
+                    context, "complete", "skipped", direction="D2H",
+                    reason="already_cached" if n else "partial_block", tokens=0,
                 )
-        if store_start.get("rid") != rid:
-            raise RuntimeError(
-                "[FlexKV] store-start rid mismatch: "
-                f"local={rid!r}, leader={store_start.get('rid')!r}"
-            )
-        if store_start.get("error"):
-            raise RuntimeError(
-                f"[FlexKV] store launch failed: {store_start['error']}"
-            )
-        if not store_start.get("active"):
-            return -1
-
-        fkv_task_id = int(store_start["task_id"])
-        slot_count = int(store_start.get("slot_count", -1))
-        mask_list = store_start.get("unmatched_mask", [])
-        if fkv_task_id < 0 or slot_count != len(kv_indices):
-            raise RuntimeError(
-                "[FlexKV] invalid store-start payload: "
-                f"task_id={fkv_task_id}, slot_count={slot_count}, "
-                f"slot_len={len(kv_indices)}"
-            )
-
-        # Cross-node PP needs the local PP stage's physical slot mapping.
-        if self._sync_ctx.should_send_slot_mapping_to_remote:
-            if len(mask_list) != len(kv_indices):
-                raise RuntimeError(
-                    "[FlexKV] invalid cross-node store mask: "
-                    f"mask_len={len(mask_list)}, slot_len={len(kv_indices)}"
+                result.append(-1)
+                continue
+            task_id = int(start["task_id"])
+            if task_id < 0:
+                raise RuntimeError("[FlexKV] invalid store task id")
+            if self._sync_ctx.should_send_slot_mapping_to_remote:
+                mask = np.asarray(start["unmatched_mask"], dtype=np.bool_)
+                if len(mask) != n:
+                    raise RuntimeError("[FlexKV] invalid cross-node store mask")
+                swa_mapping = None if swa is None else self._trim_swa_slot_mapping(
+                    swa[mask] if start["unmatched_count"] else swa
                 )
-            unmatched_mask = torch.as_tensor(
-                mask_list, dtype=torch.bool, device=kv_indices.device
+                self._send_slot_mapping_to_remote(task_id, slots[mask], swa_mapping)
+            context.task_id = task_id
+            self._inflight_stores[rid] = task_id
+            self._inflight_store_contexts[rid] = context
+            self._log_cache_op(
+                context, "launch", "running", direction="D2H",
+                transfer_mode="no-layerwise", tokens=start["unmatched_count"],
             )
-            filtered = kv_indices[unmatched_mask]
-            self._send_slot_mapping_to_remote(
-                fkv_task_id, self._to_cpu_int64(filtered)
-            )
-
-        # This is deliberately done on every rank. SGLang uses the returned
-        # positive task id to keep radix-node locks (and GPU slots) alive.
-        context.task_id = fkv_task_id
-        self._inflight_stores[rid] = fkv_task_id
-        self._inflight_store_contexts[rid] = context
-        return fkv_task_id
+            result.append(task_id)
+        return result
 
     def check_completed_stores(self) -> List[str]:
         """Return rids whose stores have completed since the last call."""
@@ -1558,14 +1743,14 @@ class FlexKVConnector:
     def prefetch_async(
         self,
         rid: str,
-        token_ids: List[int],
+        token_ids: Sequence[int],
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
         *, candidate_start_token: int = 0,
     ) -> int:
         if not self._prefetch_enabled or not rid:
             return -1
-        if getattr(self, "_chunked_prefetch", False):
+        if self._uses_queued_prefetch():
             return self._start_chunked_prefetch(rid, token_ids, candidate_start_token, namespace)
         context = self._new_op_context("prefetch", rid, sglang_req_id)
         task_id = -1
@@ -1623,7 +1808,7 @@ class FlexKVConnector:
         return task_id
 
     def check_prefetch_progress(self, rid: str) -> bool:
-        if getattr(self, "_chunked_prefetch", False):
+        if self._uses_queued_prefetch():
             return self._check_chunked_prefetch(rid)
         if not self._prefetch_enabled:
             return True
@@ -1693,67 +1878,303 @@ class FlexKVConnector:
             )
         return done
 
+    def _uses_queued_prefetch(self):
+        return bool(getattr(self, "_queued_prefetch", getattr(self, "_chunked_prefetch", False)))
+
     def _start_chunked_prefetch(self, rid, token_ids, candidate_start_token=0, namespace=None):
         if rid in self._prefetch_sessions:
-            return self._prefetch_sessions[rid].session_id
+            return self._prefetch_sessions[rid]["ticket"]
         self._release_prefetch_result(rid)
-        payload = {"handle": None, "error": None}
+        ticket = getattr(self, "_next_prefetch_ticket", 0)
+        self._next_prefetch_ticket = ticket + 1
+        entry = dict(ticket=ticket, admission=None, handle=None, progress=None,
+                     demand=False, error=None, lookup=None,
+                     candidate_start_token=candidate_start_token)
+        payload = {"ticket": ticket, "error": None}
         if self._sync_ctx.is_sync_leader:
             try:
-                payload["handle"] = self.kv_manager.start_prefetch(
-                    np.asarray(token_ids, dtype=np.int64),
-                    replace(
+                # One packed snapshot owns the caller's mutable array. Both
+                # admissions reuse this same read-only NumPy buffer.
+                tokens = np.array(token_ids, dtype=np.int64, copy=True, order="C")
+                tokens.setflags(write=False)
+                entry["token_ids"] = tokens
+                entry["namespace"] = tuple(namespace) if namespace is not None else None
+                kwargs = dict(
+                    token_ids=tokens,
+                    namespace=list(entry["namespace"]) if namespace is not None else None,
+                )
+                if self._chunked_prefetch:
+                    kwargs["options"] = replace(
                         self._chunked_prefetch_options,
                         candidate_start_token=candidate_start_token,
                         swa_aware=self._swa_kv_pool is not None,
-                    ),
-                    namespace=namespace,
+                    )
+                else:
+                    kwargs["swa_aware"] = self._swa_kv_pool is not None
+                entry["admission"] = self.kv_manager.prefetch_control_async(
+                    "start" if self._chunked_prefetch else "legacy_start", **kwargs,
                 )
             except Exception as exc:
                 payload["error"] = str(exc)
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
-                payload, channel=FlexKVScatterChannel.PREFETCH_START
+                payload, channel=FlexKVScatterChannel.PREFETCH_START,
             )
         if payload["error"]:
-            logger.warning("[FlexKV] prefetch admission failed: %s", payload["error"])
-            return -1
-        handle = payload["handle"]
-        self._prefetch_sessions[rid] = handle
-        return handle.session_id
+            raise RuntimeError("FlexKV prefetch submission failed: " + payload["error"])
+        entry["ticket"] = payload["ticket"]
+        self._prefetch_sessions[rid] = entry
+        # A ticket represents pending admission, not a cache miss. No scheduler
+        # thread waits for the server to assign the actual handle.
+        return entry["ticket"]
+
+    @staticmethod
+    def _finish_prefetch_lookup(target, completed):
+        try:
+            result = completed.result()
+        except Exception as exc:
+            target.set_exception(exc)
+        else:
+            target.set_result(result)
+
+    def _prepare_completed_prefetch_lookups(self, progress, lookups):
+        # Run on completion, not the next scheduler tick. These immutable
+        # records own every possible late GET before cancellation can retire
+        # its prefetch lease. No scheduler dictionaries or collectives here.
+        try:
+            snapshots = progress.result()
+        except Exception as exc:
+            for _, lookup in lookups:
+                lookup.future.set_exception(exc)
+            return
+        for handle, lookup in lookups:
+            try:
+                if not self._queued_prefetch_terminal(snapshots.get(handle)):
+                    lookup.future.set_result(None)
+                    continue
+                future = self.kv_manager.get_match_async(
+                    token_ids=lookup.token_ids,
+                    token_mask=lookup.token_mask,
+                    cpu_only=self._chunked_prefetch,
+                    swa_aware=self._swa_kv_pool is not None,
+                    namespace=list(lookup.namespace) if lookup.namespace is not None else None,
+                )
+                future.add_done_callback(
+                    lambda done, target=lookup.future: self._finish_prefetch_lookup(target, done)
+                )
+            except Exception as exc:
+                lookup.future.set_exception(exc)
+
+    def _poll_queued_prefetch(self):
+        for entry in self._prefetch_sessions.values():
+            admission = entry["admission"]
+            if entry["handle"] is None and not entry["error"] and admission.done():
+                try:
+                    entry["handle"] = admission.result()
+                except Exception as exc:
+                    entry["error"] = str(exc)
+        pending = getattr(self, "_prefetch_progress_batch", None)
+        if pending is not None:
+            future, entries = pending
+            if not future.done():
+                return
+            try:
+                snapshots = future.result()
+                for entry in entries:
+                    entry["progress"] = snapshots.get(entry["handle"])
+            except Exception as exc:
+                for entry in entries:
+                    entry["error"] = str(exc)
+            self._prefetch_progress_batch = None
+        entries = [
+            entry for entry in self._prefetch_sessions.values()
+            if entry["handle"] is not None and not entry["error"]
+            and not self._queued_prefetch_terminal(entry["progress"])
+        ]
+        if entries:
+            handles = [entry["handle"] for entry in entries]
+            if self._chunked_prefetch:
+                kwargs = dict(
+                    handles=handles,
+                    demand_handles=[e["handle"] for e in entries if e["demand"]],
+                )
+            else:
+                kwargs = dict(task_ids=handles)
+            lookups = []
+            for entry in entries:
+                previous = entry["lookup"]
+                if previous is None:
+                    mask = np.ones(entry["token_ids"].size, dtype=np.bool_)
+                    mask[:entry["candidate_start_token"]] = False
+                    mask.setflags(write=False)
+                else:
+                    mask = previous.token_mask
+                lookup = _PrefetchLookup(
+                    entry["token_ids"], mask, entry["namespace"], Future(),
+                )
+                entry["lookup"] = lookup
+                lookups.append((entry["handle"], lookup))
+            try:
+                future = self.kv_manager.prefetch_control_async(
+                    "progress" if self._chunked_prefetch else "legacy_progress", **kwargs,
+                )
+            except Exception as exc:
+                for _, lookup in lookups:
+                    lookup.future.set_exception(exc)
+                raise
+            self._prefetch_progress_batch = (future, entries)
+            future.add_done_callback(
+                lambda done: self._prepare_completed_prefetch_lookups(done, lookups)
+            )
+        self._reap_prefetch_retirements()
+
+    def _queued_prefetch_terminal(self, snapshot):
+        if snapshot is None:
+            return False
+        return (
+            snapshot.terminal if self._chunked_prefetch
+            else _is_terminal_status(_status_value(snapshot))
+        )
 
     def _check_chunked_prefetch(self, rid):
-        handle = self._prefetch_sessions.get(rid)
-        if handle is None:
+        entry = self._prefetch_sessions.get(rid)
+        if entry is None:
             return True
-        payload = {"snapshot": None, "error": None}
+        entry["demand"] = True
+        payload = dict(done=False, error=None, handle=None, loaded_tokens=0, spans=())
         if self._sync_ctx.is_sync_leader:
             try:
-                payload["snapshot"] = self.kv_manager.progress_prefetch(
-                    [handle], demand_handles=[handle]
-                )[handle]
+                self._poll_queued_prefetch()
+                payload["error"] = entry["error"]
+                snapshot = entry["progress"]
+                if (
+                    self._queued_prefetch_terminal(snapshot)
+                    and entry["lookup"] is not None
+                ):
+                    payload.update(done=True, handle=entry["handle"])
+                    if self._chunked_prefetch:
+                        if snapshot.lease_valid:
+                            payload.update(loaded_tokens=snapshot.loaded_tokens, spans=snapshot.l3_loaded_spans)
+                    elif _status_value(snapshot) == KVResponseStatus.SUCCESS.value:
+                        mask = getattr(snapshot, "return_mask", None)
+                        payload["loaded_tokens"] = (
+                            sum(int(np.count_nonzero(m)) for m in mask)
+                            if isinstance(mask, list) else int(np.count_nonzero(mask))
+                        )
             except Exception as exc:
                 payload["error"] = str(exc)
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
-                payload, channel=FlexKVScatterChannel.PREFETCH_PROGRESS
+                payload, channel=FlexKVScatterChannel.PREFETCH_PROGRESS,
             )
         if payload["error"]:
-            # Do not let any rank compute with a stale/incomplete prefix.
             raise RuntimeError("FlexKV prefetch progress failed: " + payload["error"])
-        snapshot = payload["snapshot"]
-        if not snapshot.terminal:
+        if not payload["done"]:
             return False
         self._prefetch_sessions.pop(rid)
-        self._prefetch_result_sessions[rid] = handle
-        self._prefetch_loaded_tokens[rid] = snapshot.loaded_tokens if snapshot.lease_valid else 0
-        self._prefetch_loaded_spans[rid] = snapshot.l3_loaded_spans if snapshot.lease_valid else ()
+        if self._sync_ctx.is_sync_leader:
+            self._prepared_lookups[rid] = entry["lookup"]
+        self._prefetch_result_sessions[rid] = payload["handle"]
+        self._prefetch_loaded_tokens[rid] = payload["loaded_tokens"]
+        self._prefetch_loaded_spans[rid] = payload["spans"]
         return True
 
+    def _retire_prefetch_admission(self, admission, lookup=None):
+        """Drain late GET admission/cancellation before releasing its source.
+
+        Completion callbacks only enqueue work on the existing state owner;
+        they never call a synchronous manager API or a rank collective.
+        """
+        retired = Future()
+        manager, chunked = self.kv_manager, self._chunked_prefetch
+
+        def released(future):
+            try:
+                future.result()
+                retired.set_result(None)
+            except Exception as exc:
+                retired.set_exception(exc)
+
+        def admitted(future):
+            try:
+                handle = future.result()
+            except Exception:
+                retired.set_result(None)  # No session was created.
+                return
+            try:
+                release = manager.prefetch_control_async(
+                    "release" if chunked else "legacy_release",
+                    **({"handle": handle} if chunked else {"task_ids": [handle]}),
+                )
+                release.add_done_callback(released)
+            except Exception as exc:
+                retired.set_exception(exc)
+
+        def lookup_cancelled(future):
+            try:
+                future.result()
+            except Exception as exc:
+                # Retain the source lease if held-GET cleanup is not proven.
+                retired.set_exception(exc)
+                return
+            admission.add_done_callback(admitted)
+
+        def lookup_admitted(future):
+            try:
+                result = future.result()
+            except Exception:
+                result = None  # Failed admission created no held task.
+            if result is not None:
+                task_id, mask = result
+                if task_id >= 0 and mask is not None and np.any(mask):
+                    try:
+                        manager.cancel_async([task_id]).add_done_callback(lookup_cancelled)
+                    except Exception as exc:
+                        retired.set_exception(exc)
+                    return
+            # Zero-hit GETs are already complete and must not be cancelled.
+            admission.add_done_callback(admitted)
+
+        if lookup is None:
+            admission.add_done_callback(admitted)
+        else:
+            lookup.future.add_done_callback(lookup_admitted)
+        self._prefetch_retirements = [
+            future for future in getattr(self, "_prefetch_retirements", ())
+            if not future.done() or future.exception() is not None
+        ]
+        self._prefetch_retirements.append(retired)
+
+    def _reap_prefetch_retirements(self):
+        pending = []
+        for future in getattr(self, "_prefetch_retirements", ()):
+            if future.done():
+                future.result()
+            else:
+                pending.append(future)
+        self._prefetch_retirements = pending
+
     def _release_prefetch_result(self, rid):
+        lookup = getattr(self, "_prepared_lookups", {}).pop(rid, None)
         handle = getattr(self, "_prefetch_result_sessions", {}).pop(rid, None)
         if handle is not None and self._sync_ctx.is_sync_leader:
-            self.kv_manager.release_prefetch(handle)
+            admission = Future()
+            admission.set_result(handle)
+            self._retire_prefetch_admission(admission, lookup)
+
+    def _drain_queued_prefetch(self):
+        for future in getattr(self, "_prefetch_retirements", ()):
+            future.result(timeout=30)
+        self._prefetch_retirements = []
+        pending = getattr(self, "_prefetch_progress_batch", None)
+        if pending is not None:
+            pending[0].result(timeout=30)
+            self._prefetch_progress_batch = None
+        deadline = time.monotonic() + 30
+        while not self.kv_manager.prefetch_control_async("drained").result(timeout=30):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("prefetch reset drain timed out; resources retained")
+            time.sleep(0.002)
 
     def pop_prefetch_loaded_span(self, rid):
         spans = getattr(self, "_prefetch_loaded_spans", {}).pop(rid, ())
@@ -1765,12 +2186,10 @@ class FlexKVConnector:
         return int(self._prefetch_loaded_tokens.pop(rid, 0))
 
     def cancel_prefetch(self, rid: str) -> None:
-        if getattr(self, "_chunked_prefetch", False):
-            handle = self._prefetch_sessions.pop(rid, None)
-            if handle is not None and self._sync_ctx.is_sync_leader:
-                # release seals the session, whose resource ledger survives
-                # this request-facing tracking entry until every graph drains.
-                self.kv_manager.release_prefetch(handle)
+        if self._uses_queued_prefetch():
+            entry = self._prefetch_sessions.pop(rid, None)
+            if entry is not None and self._sync_ctx.is_sync_leader:
+                self._retire_prefetch_admission(entry["admission"], entry["lookup"])
             self._release_prefetch_result(rid)
             self._prefetch_loaded_spans.pop(rid, None)
             self._prefetch_loaded_tokens.pop(rid, None)
@@ -1825,13 +2244,68 @@ class FlexKVConnector:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _drain_pending_store_batch(self) -> None:
+        batch = getattr(self, "_pending_store_batch", None)
+        if batch is None:
+            return
+        batch.resetting = True
+        status = {"ok": True, "error": ""}
+        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            try:
+                try:
+                    # Reservation may already have filled matches while launch
+                    # is still queued. Fence the complete owner pipeline first.
+                    batch.matches = batch.future.result(timeout=30)
+                except Exception as exc:
+                    if not batch.future.done() or getattr(exc, "retain_slots", False):
+                        raise
+                    if batch.matches is None:
+                        batch.matches = [
+                            (tid, None, None) for tid in getattr(exc, "task_ids", ())
+                        ]
+                task_ids = [int(match[0]) for match in batch.matches]
+                if task_ids:
+                    self.kv_manager.cancel(task_ids)
+                    responses = self.kv_manager.wait(
+                        task_ids, timeout=30.0, completely=True,
+                    ) or {}
+                    if any(
+                        tid not in responses
+                        or not _is_terminal_status(_status_value(responses[tid]))
+                        for tid in task_ids
+                    ):
+                        raise RuntimeError("store reservation drain incomplete; retain GPU slots")
+            except Exception as exc:
+                status = {"ok": False, "error": str(exc)}
+        if self._sync_ctx.needs_sync:
+            status = self._sync_ctx.scatter(
+                status, channel=FlexKVScatterChannel.STORE_RESET, blocking=True,
+            )
+        if not status["ok"]:
+            raise RuntimeError("[FlexKV] store admission reset failed: " + status["error"])
+        batch.reset = True
+        self._pending_store_batch = None
+
     def reset(self) -> None:
-        if getattr(self, "_chunked_prefetch", False):
+        self._drain_pending_store_batch()
+        if self._uses_queued_prefetch():
             for rid in list(self._prefetch_sessions):
                 self.cancel_prefetch(rid)
             for rid in list(self._prefetch_result_sessions):
                 self._release_prefetch_result(rid)
             self._prefetch_loaded_spans.clear()
+            prefetch_reset = {"ok": True, "error": ""}
+            if self._sync_ctx.is_sync_leader:
+                try:
+                    self._drain_queued_prefetch()
+                except Exception as exc:
+                    prefetch_reset = {"ok": False, "error": str(exc)}
+            if self._sync_ctx.needs_sync:
+                prefetch_reset = self._sync_ctx.scatter(
+                    prefetch_reset, channel=FlexKVScatterChannel.RESET, blocking=True,
+                )
+            if not prefetch_reset["ok"]:
+                raise RuntimeError("FlexKV prefetch reset failed: " + prefetch_reset["error"])
         # Layerwise launch merges the lookup task into a new batch task. Wait
         # for those returned batch task IDs before the scheduler clears GPU
         # slot ownership or the eventfd producer ring is reused. ``completely``
@@ -2555,17 +3029,17 @@ class FlexKVConnector:
         if translate is None:
             return None
         swa_indices = translate(full_indices).to(device="cpu", dtype=torch.int64)
-        mapped = swa_indices > 0
-        if not bool(mapped.any()):
-            return None
-        unmapped = (~mapped).nonzero(as_tuple=False)
-        if unmapped.numel() > 0:
-            swa_indices = swa_indices[int(unmapped[-1].item()) + 1 :]
-        if swa_indices.numel() == 0:
-            return None
-        if not bool((swa_indices > 0).all()):
-            raise RuntimeError("SWA slot mapping contains the reserved slot 0")
-        return swa_indices
+        return self._trim_swa_slot_mapping(swa_indices)
+
+    @staticmethod
+    def _trim_swa_slot_mapping(
+        swa_indices: torch.Tensor | np.ndarray,
+    ) -> Optional[torch.Tensor | np.ndarray]:
+        """Keep the mapped CPU suffix without dispatching Torch operations."""
+        unmapped = np.flatnonzero(np.asarray(swa_indices) <= 0)
+        if unmapped.size:
+            swa_indices = swa_indices[int(unmapped[unmapped.size - 1]) + 1 :]
+        return swa_indices if len(swa_indices) else None
 
     @staticmethod
     def _as_numpy_mask(mask) -> np.ndarray:
@@ -2580,11 +3054,6 @@ class FlexKVConnector:
         if tensor.is_cuda:
             tensor = tensor.cpu()
         return tensor.to(torch.int64)
-
-    def _store_profile_scope(self, name: str):
-        if not getattr(self, "_profile_store_stages", False):
-            return nullcontext()
-        return torch.profiler.record_function(name)
 
     def _wait_kv_manager_ready(self, poll_interval: float = 10.0) -> None:
         assert self.kv_manager is not None
@@ -2890,10 +3359,16 @@ class FlexKVConnector:
         )
 
     def _send_slot_mapping_to_remote(
-        self, task_id: int, slot_mapping_cpu: torch.Tensor
+        self, task_id: int, slot_mapping_cpu: torch.Tensor,
+        swa_slot_mapping: Optional[torch.Tensor] = None,
     ) -> None:
-        np_arr = slot_mapping_cpu.numpy()
-        self.tp_client.set_slot_mapping(task_id, np_arr)
+        block_size = self.cache_config.tokens_per_block
+        full_blocks = slot_mapping_cpu.numpy()[::block_size] // block_size
+        swa_blocks = (
+            None if swa_slot_mapping is None
+            else swa_slot_mapping.numpy()[::block_size] // block_size
+        )
+        self.tp_client.set_slot_mapping(task_id, full_blocks, swa_blocks)
 
     def _send_eventfds_to_worker(self, retry_interval: float = 1.0) -> None:
         """UDS handshake with the FlexKV layerwise transfer worker.

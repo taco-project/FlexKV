@@ -1,7 +1,6 @@
 import time
 import os
-from contextlib import suppress
-import uuid
+import threading
 from multiprocessing import Lock, Queue
 from multiprocessing.connection import Connection
 from queue import Queue as ThreadQueue
@@ -40,6 +39,8 @@ from flexkv.server.request import (
 )
 
 class KVDPClient:
+    _control_owner_lock = threading.Lock()
+
     def __init__(
         self,
         server_recv_port: str,
@@ -65,32 +66,23 @@ class KVDPClient:
         self._rpc_lock = Lock()
         flexkv_logger.info(f"KVDPClient Initialized! [DP Client ID]: {self.dp_client_id}")
 
-    def prefetch_control(self, action, **payload):
-        """Isolated control RPC; a legacy wait never owns this reply socket.
+    def control_async(self, action, **payload):
+        from flexkv.server.control import ControlClient
+        with self._control_owner_lock:
+            owner = getattr(self, "_control_owner", None)
+            if owner is None:
+                owner = ControlClient(self.server_recv_port, self.dp_client_id)
+                self._control_owner = owner
+        return owner.submit(action, **payload)
 
-        Each call owns its sockets in the calling thread. Only a local IPC
-        endpoint is accepted by the server. Progress calls can be batched.
-        """
-        from flexkv.server.request import PrefetchControlRequest
-        context = zmq.Context.instance()
-        path = os.path.join("/tmp", "flexkv-prefetch-" + uuid.uuid4().hex)
-        reply_port = "ipc://" + path
-        reply = get_zmq_socket(context, zmq.SocketType.PULL, reply_port, True)
-        send = get_zmq_socket(context, zmq.SocketType.PUSH, self.server_recv_port, False)
-        try:
-            send.setsockopt(zmq.SNDTIMEO, 1000)
-            send.send_pyobj(PrefetchControlRequest(self.dp_client_id, reply_port, action, payload))
-            if not reply.poll(30000):
-                raise TimeoutError("prefetch control RPC timed out; submission outcome may be unknown")
-            response = reply.recv_pyobj()
-            if response.error:
-                raise RuntimeError(response.error)
-            return response.result
-        finally:
-            send.close(linger=0)
-            reply.close(linger=0)
-            with suppress(FileNotFoundError):
-                os.unlink(path)
+    def control(self, action, **payload):
+        """Synchronous compatibility API backed by the isolated control owner."""
+        return self.control_async(action, **payload).result(timeout=30)
+
+    def close_control(self):
+        owner = getattr(self, "_control_owner", None)
+        if owner is not None:
+            owner.close()
 
     def _get_task_id(self) -> int:
         with self._task_id_lock:
@@ -144,9 +136,14 @@ class KVDPClient:
         finished resetting. Only ONE client needs to call this — the cache is
         global to the server process.
         """
+        # Fence the separate control stream before cache invalidation. Closing
+        # rejects new submissions and drains even starts whose replies are late.
+        self.close_control()
         req = ResetRequest(self.dp_client_id)
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
+        with self._control_owner_lock:
+            self._control_owner = None
         if response.error_msg:
             raise RuntimeError(f"flexkv reset failed on server: {response.error_msg}")
 
@@ -188,6 +185,16 @@ class KVDPClient:
         else:
             flexkv_logger.error(f"put_match failed, error_msg: {response.error_msg}")
             return None
+
+    def put_match_batch(self, requests):
+        return self.put_match_batch_async(requests).result()
+
+    def put_match_batch_async(self, requests):
+        """Reserve on the server owner while the scheduler continues."""
+        requests = [
+            dict(request, task_id=self._get_task_id()) for request in requests
+        ]
+        return self.control_async("put_match_batch", requests=requests)
 
     def prefetch_async(
         self,
@@ -248,6 +255,21 @@ class KVDPClient:
             flexkv_logger.error(f"get_match failed, error_msg: {response.error_msg}")
             return None
 
+    def get_match_async(
+        self,
+        token_ids: np.ndarray,
+        token_mask: Optional[np.ndarray] = None,
+        cpu_only: bool = False,
+        namespace: Optional[List[str]] = None,
+        swa_aware: bool = False,
+    ):
+        """Reserve through the same persistent control owner as prefetch."""
+        return self.control_async(
+            "get_match", token_ids=token_ids, token_mask=token_mask,
+            cpu_only=cpu_only, namespace=namespace, swa_aware=swa_aware,
+            task_id=self._get_task_id(),
+        )
+
     def launch_tasks(
         self,
         task_ids: List[int],
@@ -256,6 +278,7 @@ class KVDPClient:
         layerwise_transfer: bool = False,
         counter_id: int = 0,
         swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None,
+        confirm_launch: bool = False,
     ) -> List[int]:
         with self._rpc_lock:
             batch_id = -1
@@ -270,9 +293,32 @@ class KVDPClient:
                 batch_id=batch_id,
                 layerwise_transfer=layerwise_transfer,
                 counter_id=counter_id,
+                confirm_launch=confirm_launch,
             )
             self.send_to_server.send_pyobj(req)
+            if confirm_launch:
+                response = self.recv_from_server.recv_pyobj()
+                if response.error_msg:
+                    raise RuntimeError(response.error_msg)
             return [batch_id] if as_batch else task_ids
+
+    def launch_tasks_async(
+        self,
+        task_ids: List[int],
+        slot_mappings: List[np.ndarray],
+        layerwise_transfer: bool = False,
+        counter_id: int = 0,
+        swa_slot_mappings: Optional[List[Optional[np.ndarray]]] = None,
+    ):
+        """Acknowledge native launch through the persistent control owner."""
+        return self.control_async(
+            "launch",
+            task_ids=task_ids,
+            slot_mappings=slot_mappings,
+            swa_slot_mappings=swa_slot_mappings,
+            layerwise_transfer=layerwise_transfer,
+            counter_id=counter_id,
+        )
 
     def cancel_tasks(
         self,
@@ -280,6 +326,10 @@ class KVDPClient:
     ) -> None:
         req = CancelTaskRequest(self.dp_client_id, task_ids)
         self.send_to_server.send_pyobj(req)
+
+    def cancel_async(self, task_ids: List[int]):
+        """Enqueue cancellation without waiting on the control owner's thread."""
+        return self.control_async("cancel", task_ids=task_ids)
 
     def wait(
         self,
@@ -318,11 +368,13 @@ class KVDPClient:
             return None
 
     def shutdown(self) -> None:
+        self.close_control()
         req = ShutdownRequest(self.dp_client_id)
         self.send_to_server.send_pyobj(req)
 
     def unregister(self) -> None:
         """Detach this client without stopping the shared KVServer."""
+        self.close_control()
         req = UnregisterDPClientRequest(self.dp_client_id)
         self.send_to_server.send_pyobj(req)
 
@@ -361,7 +413,10 @@ class KVTPClient:
             f"dp_client_id={dp_client_id}, pp_rank={pp_rank}, "
             f"intra_client_id={intra_client_id})")
 
-    def set_slot_mapping(self, task_id: int, slot_mapping: np.ndarray) -> None:
+    def set_slot_mapping(
+        self, task_id: int, slot_mapping: np.ndarray,
+        swa_slot_mapping: Optional[np.ndarray] = None,
+    ) -> None:
         """Send set_slot_mapping message to TransferManagerOnRemote via existing ZMQ channel.
 
         Reuses the same PUSH socket (send_to_server) that connects to
@@ -371,6 +426,7 @@ class KVTPClient:
             'type': 'set_slot_mapping',
             'task_id': task_id,
             'slot_mapping': slot_mapping,
+            'swa_slot_mapping': swa_slot_mapping,
         }
         try:
             self.send_to_server.send_pyobj(message, flags=zmq.NOBLOCK)

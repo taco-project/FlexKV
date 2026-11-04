@@ -6,6 +6,14 @@ import torch
 import numpy as np
 
 
+class StoreReservationError(RuntimeError):
+    """A failed PUT match whose rollback still owns the listed tasks."""
+
+    def __init__(self, message: str, task_ids: List[int]):
+        super().__init__(message)
+        self.task_ids = task_ids
+
+
 class KVRequestType(Enum):
     GET = "get"
     PUT = "put"

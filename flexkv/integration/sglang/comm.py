@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import io
 import logging
 import os
 import pickle
@@ -80,6 +81,10 @@ _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.STORE_READY: list,
 }
 
+_CONTROL_FRAME_SIZE = 4096
+_CONTROL_HEADER = struct.Struct("<q")
+_CONTROL_INLINE_SIZE = _CONTROL_FRAME_SIZE - _CONTROL_HEADER.size
+
 
 class FlexKVComm:
     """3-axis (PP × CP × TP) hierarchical sync for the FlexKV connector.
@@ -133,6 +138,7 @@ class FlexKVComm:
         model_config = rank_info.model_config
         self.world_rank = world_rank
         self._world_group = world_group
+        # Each entry owns its tensor view until the corresponding send drains.
         self._async_works: List = []
         self._reap_high: int = self._REAP_HIGH_BASE
         self._reap_calls: int = 0
@@ -400,13 +406,22 @@ class FlexKVComm:
         if not group_ranks or self.world_rank not in group_ranks:
             return data
         if is_leader:
-            dsts = [r for r in group_ranks if r != self.world_rank]
+            if len(group_ranks) == 1:
+                return data
+            # Serialize once per fan-out. Each view pins the BytesIO buffer;
+            # queued works retain those views until the sends have drained.
+            frames = self._encode_control_frames(data)
             works = []
-            for dst in dsts:
-                works.extend(self._isend(dst, data, tag, self._world_cpu_group))
+            for dst in group_ranks:
+                if dst != self.world_rank:
+                    for frame in frames:
+                        work = dist.isend(
+                            frame, dst=dst, tag=tag, group=self._world_cpu_group,
+                        )
+                        works.append((work, frame))
             if blocking:
-                for w in works:
-                    w.wait()
+                for work, _frame in works:
+                    work.wait()
             else:
                 self._reap_completed_async_works()
                 self._async_works.extend(works)
@@ -423,7 +438,7 @@ class FlexKVComm:
         for _ in range(self._REAP_MAX_DRAIN):
             if not self._async_works:
                 break
-            w = self._async_works[0]
+            w, _frame = self._async_works[0]
             try:
                 w.wait(self._REAP_PROBE)
             except RuntimeError:
@@ -469,27 +484,42 @@ class FlexKVComm:
     # Low-level send / recv on the world cpu group
     # ------------------------------------------------------------------
 
-    def _isend(self, dst: int, data: Any, tag: int = 0, group=None) -> list:
-        serialized = bytearray(pickle.dumps(data))
-        t_size = torch.tensor([len(serialized)], dtype=torch.long)
-        t_data = torch.frombuffer(serialized, dtype=torch.uint8)
-        return [
-            dist.isend(t_size, dst=dst, tag=tag, group=group),
-            dist.isend(t_data, dst=dst, tag=tag, group=group),
-        ]
+    @staticmethod
+    def _encode_control_frames(data: Any) -> List[torch.Tensor]:
+        # Reserve a zero-filled inline frame and pickle directly after its
+        # signed length header. Large objects grow the same backing buffer.
+        buffer = io.BytesIO(bytes(_CONTROL_FRAME_SIZE))
+        buffer.seek(_CONTROL_HEADER.size)
+        pickle.dump(data, buffer)
+        size = buffer.tell() - _CONTROL_HEADER.size
+        view = buffer.getbuffer()
+        _CONTROL_HEADER.pack_into(view, 0, size)
+        tensor = torch.frombuffer(view, dtype=torch.uint8)
+        frames = [tensor[:_CONTROL_FRAME_SIZE]]
+        if size > _CONTROL_INLINE_SIZE:
+            frames.append(tensor[_CONTROL_FRAME_SIZE:])
+        return frames
 
     def _recv(self, src: int, tag: int = 0, group=None) -> Any:
-        t_size = torch.tensor([0], dtype=torch.long)
-        dist.irecv(t_size, src=src, tag=tag, group=group).wait()
-        size = int(t_size.item())
+        frame = torch.empty(_CONTROL_FRAME_SIZE, dtype=torch.uint8)
+        dist.irecv(frame, src=src, tag=tag, group=group).wait()
+        view = memoryview(frame.numpy())
+        size = _CONTROL_HEADER.unpack_from(view)[0]
         if size <= 0:
             raise RuntimeError(
                 "[FlexKV] received invalid serialized payload size: "
                 f"rank={self.world_rank} src={src} tag={tag} size={size}"
             )
-        t_data = torch.empty(size, dtype=torch.uint8)
-        dist.irecv(t_data, src=src, tag=tag, group=group).wait()
-        return pickle.loads(t_data.numpy().tobytes())
+        if size <= _CONTROL_INLINE_SIZE:
+            return pickle.loads(view[_CONTROL_HEADER.size:_CONTROL_HEADER.size + size])
+        payload = torch.empty(size, dtype=torch.uint8)
+        # Only the inline prefix needs copying; receive the exact remainder
+        # directly into the final payload, then unpickle its buffer view.
+        payload[:_CONTROL_INLINE_SIZE].copy_(frame[_CONTROL_HEADER.size:])
+        dist.irecv(
+            payload[_CONTROL_INLINE_SIZE:], src=src, tag=tag, group=group,
+        ).wait()
+        return pickle.loads(memoryview(payload.numpy()))
 
     def _send_tensor(
         self, tensor: torch.Tensor, dst: int, tag: int = 0, group=None

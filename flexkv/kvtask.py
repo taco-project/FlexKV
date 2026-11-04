@@ -33,7 +33,7 @@ from flexkv.cache.cache_engine import (
     CPUONLY_CACHE_STRATEGY,
 )
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
-from flexkv.common.request import KVResponseStatus, KVResponse
+from flexkv.common.request import KVResponseStatus, KVResponse, StoreReservationError
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics.collector import get_global_collector
@@ -676,7 +676,7 @@ class KVTaskManager:
         if true_idx.size == 0:
             return
         start = int(true_idx[0])
-        orig_end = int(true_idx[-1]) + 1
+        orig_end = int(true_idx[true_idx.size - 1]) + 1
         tpb = self.cache_config.tokens_per_block
         end = min(start + num_success_blocks * tpb, orig_end, mask.shape[0])
         new_mask = np.zeros_like(mask, dtype=np.bool_)
@@ -1571,25 +1571,58 @@ class KVTaskEngine(KVTaskManager):
                   token_mask: Optional[np.ndarray] = None,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+        return self.put_match_batch([dict(
+            token_ids=token_ids, token_mask=token_mask, task_id=task_id,
+            namespace=namespace,
+        )], dp_client_id=dp_client_id)[0][:2]
+
+    @on_runtime
+    def put_match_batch(self, requests: List[dict], dp_client_id: int = 0):
+        """Reserve a batch atomically with respect to task ownership.
+
+        Prefix hashing, namespace matching, allocator and plan callbacks remain
+        the ordinary PUT path. No graph is launched until all matches succeed.
+        """
         self._update_tasks(timeout=0)
-        fake_slot_mapping = np.zeros_like(token_ids)
-        result_task_id, return_mask = self._put_match_impl(token_ids,
-                                                           fake_slot_mapping,
-                                                           is_fake_slot_mapping=True,
-                                                           token_mask=token_mask,
-                                                           dp_client_id=dp_client_id,
-                                                           task_id=task_id,
-                                                           namespace=namespace)
-        # trace put match request
-        self.tracer.trace_request(
-            request_type="PUT_MATCH",
-            request_id=result_task_id,
-            token_ids=token_ids,
-            slot_mapping=fake_slot_mapping,
-            token_mask=token_mask,
-            dp_client_id=dp_client_id
-        )
-        return result_task_id, return_mask
+        allocated = []
+        results = []
+        try:
+            for request in requests:
+                task_id = request.get("task_id", -1)
+                if task_id < 0:
+                    task_id = self._gen_task_id()
+                if task_id in self.tasks:
+                    raise ValueError(f"Task ID {task_id} already exists")
+                allocated.append(task_id)
+                tokens = request["token_ids"]
+                mask = request.get("token_mask")
+                slots = np.zeros_like(tokens)
+                result = self._put_match_impl(
+                    tokens, slots, is_fake_slot_mapping=True,
+                    token_mask=mask, dp_client_id=dp_client_id,
+                    task_id=task_id, namespace=request.get("namespace"),
+                )
+                graph = self.tasks[result[0]].graph
+                results.append((*result, graph is not None and graph.num_ops > 0))
+                self.tracer.trace_request(
+                    request_type="PUT_MATCH", request_id=result[0],
+                    token_ids=tokens, slot_mapping=slots, token_mask=mask,
+                    dp_client_id=dp_client_id,
+                )
+        except Exception as exc:
+            failed = []
+            for task_id in allocated:
+                try:
+                    self._cancel_task(task_id)
+                except Exception as cleanup_error:
+                    failed.append((task_id, str(cleanup_error)))
+            if failed:
+                raise StoreReservationError(
+                    f"{exc}; reservation rollback failed: {failed}",
+                    [task_id for task_id, _ in failed],
+                ) from exc
+            raise
+        return results
 
     def _put_match_impl(self,
                         token_ids: np.ndarray,
@@ -1765,6 +1798,11 @@ class KVTaskEngine(KVTaskManager):
             for task_id in task_ids:
                 transfer_graph = self.check_task_ready(task_id)
                 if transfer_graph is not None and transfer_graph.num_ops > 0:
+                    if all_put and not as_batch:
+                        # PP store sidebands address the reservation, not the
+                        # independently numbered transfer graph. Merged loads
+                        # keep their existing producer/manifest protocol.
+                        transfer_graph.stage_local_task_id = task_id
                     transfer_graphs.append(transfer_graph)
 
         # Submit all graphs in batch to reduce IPC overhead

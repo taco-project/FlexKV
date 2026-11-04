@@ -46,9 +46,9 @@ Keep the model, weights, dtype, TP size, and KV layout consistent for a shared
 Mooncake pool. The existing BLOCKFIRST payload is partitioned by TP, but its key
 does not fingerprint that layout. H20 validation reproduced incorrect output
 when TP2 consumed TP1-written KV. Use separate stores (or namespaces with the
-direct API) when changing these settings; the SGLang adapter currently needs a
-separate store because its foreground path does not propagate namespaces. This
-implementation does not change the existing storage key format or transcode KV.
+direct API) when changing these settings. SGLang forwards request cache namespaces
+through prefetch, GET and PUT; the namespace must distinguish incompatible
+deployments. This does not change the storage key format or transcode KV.
 
 ## Components and ownership
 
@@ -63,11 +63,67 @@ implementation does not change the existing storage key format or transcode KV.
 - `kvtask.py`: dispatches foreground GET/PUT/match/launch/cancel and completions to
   that owner when enabled. Active tasks have no TTL; only terminal legacy results
   retain the old bounded expiry behavior.
-- `kvmanager.py` / `server/*`: equivalent direct and server/client APIs; independent
-  per-call local ZMQ control sockets, ownership checks, and nonblocking legacy wait
-  registration so a pending wait does not prevent stop/progress RPCs.
+- `kvmanager.py` / `server/*`: equivalent direct and server/client APIs, ownership
+  checks, and nonblocking legacy wait registration. `server/control.py` owns one
+  persistent socket on a dedicated worker; queued calls are batched with sequence
+  IDs. Native asynchronous control uses the existing task-runtime owner rather
+  than introducing a second owner of task/tree state.
 - `integration/sglang/connector.py`: leader submits/progresses; ranks receive the
-  same handle/terminal snapshot; a held foreground GET takes over the result lease.
+  same handle/terminal snapshot; an asynchronously prepared held GET takes over
+  the result lease when foreground lookup consumes it.
+
+SGLang admission returns a pending ticket before the control reply arrives.
+Demand and cancellation remain attached to that ticket; pending does not mean
+miss, and cancellation must release the eventual handle. Connector reset
+quiesces outstanding admission/control calls before resetting native resources.
+Distributed collectives remain on the scheduler thread.
+
+Rank fanout serializes once into a zero-padded 4096-byte inline frame, including
+an 8-byte signed payload length. Larger payloads send only the remaining bytes
+as a second frame. Queued sends retain their tensor views until completion.
+PP/CP/TP routing and independent P2P channel tags are unchanged; channels need
+not be consumed in the same order. All participating ranks must use the matching
+connector wire format.
+
+The terminal progress completion callback submits `get_match_async` using
+immutable tokens, mask and namespace, without waiting for the scheduler's next
+poll. Each lookup promise is registered before progress submission, so abort or
+reset owns even a GET admitted after cancellation begins. Nonterminal progress
+does not submit a GET. This speculative work does not delay prefetch readiness.
+Foreground lookup reuses the result only for an identical complete query, waiting if it is
+still pending; a changed query cancels the reservation and performs normal
+lookup. Abort/reset also retires late GET admissions before releasing the source
+lease. Cancellation failure retains ownership and makes reset fail closed.
+Native request preparation treats the caller's mask as read-only and ignores
+an incomplete trailing block through a bounded view rather than mutating it.
+
+### Batched SGLang store admission
+
+`FlexKVConnector.submit_store_kv_batch(stores)` returns an opaque admission
+handle after rank-symmetric validation. Each ordered store supplies its request
+identity, complete token hash chain, CPU FULL mapping, optional CPU SWA mapping,
+and namespace. The leader reserves all PUT graphs in one asynchronous command,
+then owner callbacks filter the CPU FULL/SWA mappings, cancel empty graphs, and
+queue `launch_async` without waiting on the scheduler thread.
+`poll_store_kv_batch(handle)` returns `None` until launch acceptance, then
+publishes ordered task IDs through the rank-symmetric protocol; `-1` marks an
+empty graph. Acceptance does not imply transfer completion. An empty GPU-to-host
+mask does not discard a graph that still has host-to-storage work. Independent
+reservation IDs remain valid for cancellation after partial launch failure.
+
+Only one admission is outstanding per connector. All ranks submit and poll in
+the same order. Ready results use the existing STORE_START and mapping protocol,
+with the same unmatched mask applied to FULL and SWA. No worker thread executes
+a distributed collective or reads GPU mappings. The synchronous
+`store_kv_batch` API shares the same validation/reservation/launch implementation.
+
+Callers retain source receipts, token snapshots and CPU mappings until completion
+or successful reset. Abort cannot free a pending or launched store's sources.
+Reset fences the entire reservation-to-launch chain, even if match results are
+already available while launch acknowledgement is pending. A reset preceding
+launch skips submission and retires the held reservations. Once launch starts,
+reset must wait for its acknowledgement and cancel/drain the native tasks before
+releasing sources. An uncertain launch or failed reset retains those sources.
 
 The transfer handle still receives `submit_batch(List[TransferOpGraph])`.
 Receiver-created GPU replicas use internal op IDs below `-1`, disjoint from the

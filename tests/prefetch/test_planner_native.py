@@ -295,7 +295,7 @@ def test_metadata_query_is_outside_cache_lock_and_stops_between_batches(env):
     assert env.sent == []
 
 
-def _cpu_pipe_worker(command, result, shared, allow):
+def _cpu_pipe_worker(command, result, shared, allow, shutdown_ack):
     """Independent CPU byte worker using the unchanged graph/result wire format."""
     data = np.frombuffer(shared, dtype=np.uint8).reshape(64, 16)
     while True:
@@ -321,6 +321,7 @@ def _cpu_pipe_worker(command, result, shared, allow):
             )
     command.close()
     result.close()
+    shutdown_ack.set()
 
 
 def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
@@ -334,20 +335,18 @@ def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
     from flexkv.prefetch.runtime import TaskRuntime, QueuedTransferHandle
 
     ctx = mp.get_context("spawn")
-    commands, worker_commands = ctx.Pipe()
-    results, worker_results = ctx.Pipe()
+    ipc = TransferManagerInterProcessHandle(
+        env.engine.model_config, env.engine.cache_config, "inproc://cpu-byte-test"
+    )
     shared = ctx.RawArray("B", 64 * 16)
     allow = ctx.Event()
+    shutdown_ack = ctx.Event()
     worker = ctx.Process(
-        target=_cpu_pipe_worker, args=(worker_commands, worker_results, shared, allow)
+        target=_cpu_pipe_worker,
+        args=(ipc.command_child_conn, ipc.result_child_conn, shared, allow, shutdown_ack),
     )
     worker.start()
-    ipc = TransferManagerInterProcessHandle.__new__(TransferManagerInterProcessHandle)
-    ipc.command_parent_conn, ipc.result_parent_conn, ipc.process = (
-        commands,
-        results,
-        worker,
-    )
+    ipc.process = worker
     handle = TransferManagerHandle.__new__(TransferManagerHandle)
     handle._handle = ipc
     queued = QueuedTransferHandle(handle)
@@ -403,7 +402,7 @@ def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
     finally:
         allow.set()
         engine.shutdown()
-    assert worker.exitcode == 0
+    assert shutdown_ack.is_set()
     assert not engine.transfer_handles[0].thread.is_alive()
 
 
