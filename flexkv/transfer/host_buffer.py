@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import time
+import threading
 import weakref
 from dataclasses import dataclass
 from typing import Optional, List
@@ -18,6 +19,18 @@ from flexkv.storage.allocator import (
 
 _cudart = None
 _cudart_load_error: Optional[OSError] = None
+_registered_ranges = {}
+_registered_ranges_lock = threading.Lock()
+
+
+def _host_region_api():
+    try:
+        from flexkv import c_ext
+    except ImportError:
+        return None
+    register = getattr(c_ext, "_register_host_region", None)
+    unregister = getattr(c_ext, "_unregister_host_region", None)
+    return (register, unregister) if register is not None and unregister is not None else None
 
 
 def _get_cudart():
@@ -75,6 +88,24 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
     total_size = tensor.numel() * tensor.element_size()
     flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED
     chunk_size = _get_cudahost_chunk_bytes()
+    api = _host_region_api()
+    if chunk_size and api is None and any(
+        os.getenv(name, "0") == "1"
+        for name in ("FLEXKV_USE_CE_TRANSFER_H2D", "FLEXKV_USE_CE_TRANSFER_D2H")
+    ):
+        raise RuntimeError("Rebuild the FlexKV extension for CE with chunked host registration")
+
+    def record_registration():
+        try:
+            if api is not None:
+                api[0](ptr_base, total_size, chunk_size)
+        except BaseException:
+            step = chunk_size or total_size
+            for offset in range(0, total_size, step):
+                cudart.cudaHostUnregister(ctypes.c_void_p(ptr_base + offset))
+            raise
+        with _registered_ranges_lock:
+            _registered_ranges[ptr_base] = (total_size, chunk_size, api)
 
     if chunk_size == 0 or total_size <= chunk_size:
         ret = cudart.cudaHostRegister(
@@ -82,6 +113,7 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
         )
         if ret != 0:
             raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+        record_registration()
         return
 
     for offset in range(0, total_size, chunk_size):
@@ -96,26 +128,31 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
             raise RuntimeError(
                 f"cudaHostRegister failed at offset={offset} bytes with error code {ret}"
             )
+    record_registration()
 
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
     """Unregister a CPU tensor from CUDA, matching the chunked register layout."""
     cudart = _get_cudart()
     ptr_base = tensor.data_ptr()
-    total_size = tensor.numel() * tensor.element_size()
-    chunk_size = _get_cudahost_chunk_bytes()
-
-    if chunk_size == 0 or total_size <= chunk_size:
-        cudart.cudaHostUnregister(ctypes.c_void_p(ptr_base))
-        return
-
-    for offset in range(0, total_size, chunk_size):
+    with _registered_ranges_lock:
+        recorded = _registered_ranges.get(ptr_base)
+    total_size, chunk_size, api = recorded or (
+        tensor.numel() * tensor.element_size(), _get_cudahost_chunk_bytes(), None)
+    all_unregistered = True
+    for offset in range(0, total_size, chunk_size or total_size):
         ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr_base + offset))
         if ret != 0:
+            all_unregistered = False
             flexkv_logger.warning(
                 f"cudaHostUnregister failed at offset={offset} bytes, "
                 f"error code {ret} (ignored)"
             )
+    if all_unregistered:
+        if api is not None:
+            api[1](ptr_base)
+        with _registered_ranges_lock:
+            _registered_ranges.pop(ptr_base, None)
 
 def safe_cuda_host_unregister(tensor: torch.Tensor, label: str = "") -> None:
     """Best-effort unregister; never raises (idempotent shutdown helper)."""

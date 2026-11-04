@@ -74,3 +74,26 @@ immediate launch when the connector lacks the batching API.
 pytest tests/test_sglang_layerwise_batch.py tests/test_sglang_comm_async_reap.py
 torchrun --standalone --nproc-per-node=4 tests/run_gloo_async_reap_distributed.py
 ```
+
+## CE copies with chunked host registration
+
+`FLEXKV_CUDAHOST_CHUNK_SIZE_GB` divides host registration into separate CUDA
+allocations. A single CUDA DMA cannot span those registrations, even when their
+virtual addresses are adjacent. The CE path records the exact registration
+base, size, and chunk size, then splits linear or pitched copies at those
+boundaries. Pitched rows that cross a boundary are split within the row;
+consecutive rows within one registration retain a single 2D copy.
+
+Rebuild the native extension when updating this path. An older extension
+rejects the chunked CE configuration before host registration. Unregister uses
+the original chunk size even if the environment changes after registration.
+
+```sh
+pytest tests/test_host_registration_metadata.py tests/test_host_registration_plan.py
+pytest tests/test_ce_chunked_registration_cuda.py
+```
+
+The planner properties and mocked registration lifecycle run on CPU. The last
+test requires CUDA and checks bytes in both directions, including pitched rows
+that cross registrations and per-layer completion. These checks do not replace
+model-level output validation.
