@@ -1089,7 +1089,10 @@ class KVTaskManager:
         handle = task.callback
         if result is not None:
             result.finalize()   # lock=False job: nothing pinned, harmless
-            planned = task.prefetch_planned_hit_blocks - task.prefetch_local_hit_blocks
+            # The pull's own plan: a radixshmem prefetch also stages an SSD tail
+            # past it, which the task's planned hit includes.
+            planned = int(getattr(job, "planned_hit", task.prefetch_planned_hit_blocks)) \
+                - int(getattr(job, "local_hit", task.prefetch_local_hit_blocks))
             flexkv_logger.info(
                 "[FlexKV-IO] operation=prefetch act=peer_pull status=%s "
                 "flexkv_task_id=%d job=%d source_rank=%d planned_blocks=%d "
