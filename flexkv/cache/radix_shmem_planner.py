@@ -35,6 +35,8 @@ the radix-servers instead (on whenever they are part of a cluster).
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -211,6 +213,53 @@ def _check_cache_config(cache_config: CacheConfig) -> None:
             "enable_p2p_cpu / enable_p2p_ssd must be off")
 
 
+class _AttachedSegments:
+    """Identity (inode) of the radix-servers' shm segments this FlexKV mapped.
+
+    A radix-server that dies and is started again creates new segments under
+    the same names, while this process keeps the old ones mapped: its index
+    lookups and H2D would read the dead server's tree and slots, while pulls
+    it requests over RPC land in the new server's slots -- KV that looks valid
+    and is not. So once a segment is replaced (or gone) the tiers are off for
+    good; the node's FlexKV must be restarted against the new server."""
+
+    CHECK_EVERY_S = 0.2
+
+    def __init__(self, clients: List[Any], shm_dir: str = "/dev/shm"):
+        self._inodes: Dict[str, int] = {}
+        for client in clients:
+            info = getattr(client, "info", None)
+            for name in (getattr(info, "index_name", ""), getattr(info, "data_name", "")):
+                path = os.path.join(shm_dir, str(name).lstrip("/")) if name else ""
+                if path and os.path.exists(path):
+                    self._inodes[path] = os.stat(path).st_ino
+        self._next = 0.0
+        self.lost: Optional[str] = None
+
+    def replaced(self) -> Optional[str]:
+        """The first segment found replaced or removed, sticky; None while all
+        still are the ones mapped. Checked at most every CHECK_EVERY_S."""
+        if self.lost is not None or not self._inodes:
+            return self.lost
+        now = time.monotonic()
+        if now < self._next:
+            return None
+        self._next = now + self.CHECK_EVERY_S
+        for path, ino in self._inodes.items():
+            try:
+                if os.stat(path).st_ino == ino:
+                    continue
+            except FileNotFoundError:
+                pass
+            self.lost = path
+            flexkv_logger.error(
+                f"radixshmem segment {path} was replaced or removed (its radix-server restarted?); "
+                f"this FlexKV still maps the old one, so its CPU/SSD tiers are off from now on "
+                f"(every GET misses, every PUT is skipped). Restart this node's FlexKV.")
+            break
+        return self.lost
+
+
 class RadixShmemCacheEngine(GlobalCacheEngine):
     """`GlobalCacheEngine` whose CPU (and SSD) tiers are radix-servers. See the
     module docstring for what differs from the built-in planners."""
@@ -227,6 +276,9 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         _check_cache_config(cache_config)
         self._prefetch_jobs: List[Any] = []
         super().__init__(cache_config, model_config, redis_meta, event_collector)
+        self._segments = _AttachedSegments(
+            [getattr(e, "client", None) for e in (self.cpu_cache_engine, getattr(self, "ssd_cache_engine", None))
+             if e is not None])
 
     def _build_cpu_cache_engine(self,
                                 cache_config: CacheConfig,
@@ -301,6 +353,8 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             namespace: Optional[List[str]] = None,
             swa_aware: bool = False) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
+        if self._segments.replaced():
+            return self._empty_result(token_mask)
         req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
         if req.block_end_idx == 0:
             return self._empty_result(token_mask)
@@ -349,6 +403,8 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
+        if self._segments.replaced():
+            return self._empty_result(token_mask)
         req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
         assert req.block_start_idx == 0
         assert not temp_cache_strategy.ignore_gpu

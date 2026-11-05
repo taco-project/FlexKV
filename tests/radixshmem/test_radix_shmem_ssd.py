@@ -5,7 +5,8 @@ Drives `RadixShmemCacheEngine` on real in-process servers (standalone, so the
 SSD matches are local; a peer's SSD run is forced through a synthetic match):
 PUT writes through (D2H -> H2DISK, each tier published by its own writers),
 GET falls back to the local SSD, PREFETCH stages the SSD tail into the CPU
-tree, SWA rides along, a stale index is cleared at attach; plus the
+tree, SWA rides along, a stale index is cleared at attach, a replaced server
+segment turns the tiers off; plus the
 `KVTaskEngine` side of a prefetch carrying both a pull job and a graph.
 Skipped without radixshmem or `flexkv.c_ext`.
 """
@@ -333,6 +334,27 @@ def test_stale_ssd_index_is_cleared_at_attach():
         engine.ssd_cache_engine = None
         with _engine(reuse_ssd_server=ssd_server, tag="b") as (engine2, _):
             assert _hit(engine2.ssd_cache_engine, tok) == 0
+
+
+def test_a_replaced_radix_server_segment_turns_the_tiers_off():
+    """A radix-server restarted under a live FlexKV recreates its segments; the
+    old mapping must not be used for GET or PUT any more."""
+    with _engine() as (engine, _):
+        tok, mask, sm = _request(6)
+        _put(engine, tok, mask, sm)
+        assert int(_get(engine, tok, mask, sm)[1].sum()) == 6 * TPB
+        path = "/dev/shm/" + engine.cpu_cache_engine.shm_name.lstrip("/")
+        os.rename(path, path + ".old")               # what a restarted server leaves behind
+        try:
+            with open(path, "wb"):
+                pass
+            engine._segments._next = 0.0
+            assert int(_get(engine, tok, mask, sm)[1].sum()) == 0
+            tok2, mask2, sm2 = _request(4, base=10_000)
+            assert int(_put(engine, tok2, mask2, sm2)[1].sum()) == 0
+            assert _hit(engine.cpu_cache_engine, tok2) == 0
+        finally:
+            os.replace(path + ".old", path)
 
 
 def _bare_task_engine():
