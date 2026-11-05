@@ -31,6 +31,7 @@ from flexkv.cache.cache_engine import (
     GlobalCacheEngine,
     CacheStrategy,
     DEFAULT_CACHE_STRATEGY,
+    FULL_ONLY_PUT_STRATEGY,
     CPUONLY_CACHE_STRATEGY,
 )
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
@@ -447,6 +448,7 @@ class KVTaskManager:
                         token_mask: Optional[np.ndarray] = None,
                         is_fake_slot_mapping: bool = False,
                         namespace: Optional[List[str]] = None,
+                        temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
@@ -456,6 +458,7 @@ class KVTaskManager:
             token_mask=token_mask,
             slot_mapping=slot_mapping,
             dp_client_id=dp_client_id,
+            temp_cache_strategy=temp_cache_strategy,
             namespace=namespace)
         self.tasks[task_id] = KVTask(
             task_id=task_id,
@@ -1610,7 +1613,9 @@ class KVTaskEngine(KVTaskManager):
                   dp_client_id: int = 0,
                   token_mask: Optional[np.ndarray] = None,
                   task_id: int = -1,
-                  namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                  namespace: Optional[List[str]] = None,
+                  swa: bool = True) -> Tuple[int, np.ndarray]:
+        """``swa=False`` stores Full KV only (no SWA/state snapshot)."""
         self._update_tasks(timeout=0)
         fake_slot_mapping = np.zeros_like(token_ids)
         result_task_id, return_mask = self._put_match_impl(token_ids,
@@ -1619,7 +1624,8 @@ class KVTaskEngine(KVTaskManager):
                                                            token_mask=token_mask,
                                                            dp_client_id=dp_client_id,
                                                            task_id=task_id,
-                                                           namespace=namespace)
+                                                           namespace=namespace,
+                                                           swa=swa)
         # trace put match request
         self.tracer.trace_request(
             request_type="PUT_MATCH",
@@ -1638,7 +1644,8 @@ class KVTaskEngine(KVTaskManager):
                         is_fake_slot_mapping: bool = False,
                         token_mask: Optional[np.ndarray] = None,
                         task_id: int = -1,
-                        namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                        namespace: Optional[List[str]] = None,
+                        swa: bool = True) -> Tuple[int, np.ndarray]:
         if token_mask is None:
             token_mask = np.ones_like(token_ids)
         if task_id == -1:
@@ -1650,7 +1657,9 @@ class KVTaskEngine(KVTaskManager):
                              dp_client_id=dp_client_id,
                              token_mask=token_mask,
                              is_fake_slot_mapping=is_fake_slot_mapping,
-                             namespace=namespace)
+                             namespace=namespace,
+                             temp_cache_strategy=(DEFAULT_CACHE_STRATEGY if swa
+                                                  else FULL_ONLY_PUT_STRATEGY))
         self._process_empty_graph(task_id)
         nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask

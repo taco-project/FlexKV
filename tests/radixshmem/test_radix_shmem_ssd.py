@@ -413,3 +413,27 @@ def test_task_engine_waits_for_both_the_job_and_the_graph(graph_first):
     assert task.status == TaskStatus.COMPLETED and published == [1]
     assert not bool(task.return_mask[:TPB].any())
     assert bool(task.return_mask[TPB:4 * TPB].all())
+
+
+def test_full_only_put_skips_the_swa_window():
+    """An intermediate (FULL-only) PUT stores Full KV in CPU and SSD with no
+    SWA op and no SWA slot; the final PUT, one block longer, adds the window."""
+    from flexkv.cache.cache_engine import FULL_ONLY_PUT_STRATEGY
+    with _engine(swa=True) as (engine, _):
+        cpu, ssd = engine.cpu_cache_engine, engine.ssd_cache_engine
+        tok, mask, sm = _request(9)
+        graph, _, cb, op_cbs, _ = engine.put(request_id=1, token_ids=tok, token_mask=mask,
+                                             slot_mapping=sm, dp_client_id=0,
+                                             temp_cache_strategy=FULL_ONLY_PUT_STRATEGY)
+        assert all(op.pool_id != PoolId.SWA for op in graph._op_map.values())
+        for op_id in sorted(op_cbs):
+            op_cbs[op_id]()
+        cb()
+        assert _hit(cpu, tok) == 9 and _hit(ssd, tok) == 9
+        assert _hit(cpu, tok, JOINT_MASK) == 0          # no window yet
+        tok2, mask2, sm2 = _request(10)
+        graph, _, _, _ = _put(engine, tok2, mask2, sm2, rid=2)
+        ops = _ops(graph)
+        assert len(ops[(TransferType.D2H, PoolId.FULL_KV)][0].dst_block_ids) == 1
+        assert (TransferType.D2H, PoolId.SWA) in ops
+        assert _hit(cpu, tok2, JOINT_MASK) == 10 and _hit(ssd, tok2, JOINT_MASK) == 10

@@ -357,7 +357,8 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
 
         plan = self._plan_put(request_id, req.sequence_meta, req.block_start_idx,
                               req.block_end_idx, req.gpu_block_ids, dp_client_id,
-                              use_ssd=not temp_cache_strategy.ignore_ssd)
+                              use_ssd=not temp_cache_strategy.ignore_ssd,
+                              use_swa=not temp_cache_strategy.ignore_swa)
 
         transfer_graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
             plan.transfer_graph, plan.finished_ops_ids, dp_client_id)
@@ -771,7 +772,8 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                   block_mask_end: int,
                   gpu_block_ids: np.ndarray,
                   dp_client_id: int,
-                  use_ssd: bool = True) -> RadixPutPlan:
+                  use_ssd: bool = True,
+                  use_swa: bool = True) -> RadixPutPlan:
         """PUT: local only, like every PUT; written through to the local SSD.
 
         The difference from ``GlobalCacheEngine._put_impl_cpu_ssd`` is WHEN the
@@ -823,7 +825,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         ssd_new: Optional[np.ndarray] = None
         ssd_swa_new: Optional[np.ndarray] = None
         try:
-            if self.swa_op_constructor.enabled:
+            if self.swa_op_constructor.enabled and use_swa:
                 k = min(block_mask_end, self.cache_config.swa.window_blocks)
                 swa_take = cpu_engine.take(num_required_blocks=k, component=COMPONENT_SWA)
                 if len(swa_take) == k:

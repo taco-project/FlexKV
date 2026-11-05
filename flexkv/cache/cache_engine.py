@@ -926,8 +926,12 @@ class CacheStrategy:
     ignore_remote: bool = False
     # if True, will not use GDS
     ignore_gds: bool = False
+    # if True, a PUT stores Full KV only (no SWA/state snapshot): an
+    # intermediate store whose window would never be resumed from
+    ignore_swa: bool = False
 
 DEFAULT_CACHE_STRATEGY = CacheStrategy()
+FULL_ONLY_PUT_STRATEGY = CacheStrategy(ignore_swa=True)
 
 CPUONLY_CACHE_STRATEGY = CacheStrategy(ignore_gpu=False, ignore_ssd=True, ignore_remote=True, ignore_gds=True)
 
@@ -2359,7 +2363,7 @@ class GlobalCacheEngine:
         remote_swa_slot = -1
         mooncake_swa_tail_hash: Optional[str] = None
 
-        if self.swa_op_constructor.enabled:
+        if self.swa_op_constructor.enabled and not temp_cache_strategy.ignore_swa:
             cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
                 cpu_matched_result.last_node)
             if cpu_swa_slot >= 0 and put_to_ssd:
@@ -2689,7 +2693,7 @@ class GlobalCacheEngine:
         cpu_swa_slot = -1
         ssd_swa_slot = -1
 
-        if self.swa_op_constructor.enabled:
+        if self.swa_op_constructor.enabled and not temp_cache_strategy.ignore_swa:
             cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
                 cpu_matched_result.last_node)
             if cpu_swa_slot >= 0 and fragment2_num_blocks > 0:

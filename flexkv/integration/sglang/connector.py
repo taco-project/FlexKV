@@ -1367,8 +1367,12 @@ class FlexKVConnector:
         kv_indices: torch.Tensor,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
+        swa: bool = True,
     ) -> int:
         """Schedule a write back from GPU into FlexKV.
+
+        ``swa=False`` stores Full KV only, without the SWA/state snapshot
+        (an intermediate store whose window nobody would resume from).
 
         The sync leader runs ``put_match`` and ``launch``. Its result is
         fanned out to every PP/CP/TP rank so every rank retains ownership
@@ -1421,7 +1425,8 @@ class FlexKVConnector:
             try:
                 with self._store_profile_scope("flexkv.connector.store.put_match"):
                     res = self.kv_manager.put_match(
-                        token_ids=token_ids_np, token_mask=None, namespace=namespace
+                        token_ids=token_ids_np, token_mask=None, namespace=namespace,
+                        **({} if swa else {"swa": False}),
                     )
             except Exception as exc:  # noqa: BLE001
                 match_error = exc
@@ -1470,7 +1475,9 @@ class FlexKVConnector:
                         "flexkv.connector.store.slot_mapping_to_cpu"
                     ):
                         slot_mapping_cpu = self._to_cpu_int64(filtered)
-                        swa_slot_mapping = self._build_swa_slot_mapping(filtered)
+                        swa_slot_mapping = (
+                            self._build_swa_slot_mapping(filtered) if swa else None
+                        )
                     swa_slots = (
                         0
                         if swa_slot_mapping is None

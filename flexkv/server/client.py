@@ -173,6 +173,7 @@ class KVDPClient:
         token_ids: np.ndarray,
         token_mask: Optional[np.ndarray],
         namespace: Optional[List[str]] = None,
+        swa: bool = True,
     ) -> Optional[Tuple[int, np.ndarray]]:
         req = PutMatchRequest(
             dp_client_id=self.dp_client_id,
@@ -180,6 +181,7 @@ class KVDPClient:
             token_mask=token_mask if token_mask is not None else None,
             task_id=self._get_task_id(),
             namespace=namespace,
+            swa=swa,
         )
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()

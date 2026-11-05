@@ -459,6 +459,7 @@ class KVServer:
             dp_client_id=req.dp_client_id,
             task_id=req.task_id,
             namespace=req.namespace,
+            swa=getattr(req, "swa", True),
         )
         response = Response(dp_client_id=req.dp_client_id,
                             task_id=req_id, mask=mask)

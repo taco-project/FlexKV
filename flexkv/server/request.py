@@ -105,6 +105,8 @@ class PutMatchRequest:
     token_mask: Optional[np.ndarray]
     task_id: int = -1
     namespace: Optional[List[str]] = None
+    # False: store Full KV only (no SWA/state snapshot).
+    swa: bool = True
 
 
 @dataclass
