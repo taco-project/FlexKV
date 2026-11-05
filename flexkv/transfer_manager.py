@@ -33,6 +33,7 @@ from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.pool import PoolId
 from flexkv.common.transfer import DeviceType
 from flexkv.common.storage import KVCacheLayout
+from flexkv.server.aoti_protocol import decode_request
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.server.utils import get_zmq_socket
@@ -375,7 +376,7 @@ class TransferManager:
                         f"legitimately slower than this.")
                 try:
                     # Recv from: flexkv.server.client.KVTPClient.register_to_server
-                    req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
+                    req, _ = decode_request(self.recv_from_client.recv(zmq.NOBLOCK))
                 except zmq.Again:
                     # Periodically log waiting status for debugging
                     if now - last_log_time >= 5.0:
