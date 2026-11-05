@@ -23,6 +23,7 @@ This file provides:
 
 from __future__ import annotations
 
+import collections
 import ctypes
 import errno
 import io
@@ -31,8 +32,8 @@ import os
 import pickle
 import socket
 import struct
+import threading
 import time
-from datetime import timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -86,6 +87,147 @@ _CONTROL_HEADER = struct.Struct("<q")
 _CONTROL_INLINE_SIZE = _CONTROL_FRAME_SIZE - _CONTROL_HEADER.size
 
 
+def _control_send_timeout_s() -> Optional[float]:
+    raw = os.environ.get("FLEXKV_CONTROL_SEND_TIMEOUT_S", "1200")
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "[FlexKV] Invalid FLEXKV_CONTROL_SEND_TIMEOUT_S=%r; using 1200s", raw
+        )
+        value = 1200.0
+    return value if value > 0 else None
+
+
+class _AsyncSendReaper:
+    """Retire gloo ``isend`` works on a daemon thread.
+
+    A gloo ``SendWork`` only becomes complete after the peer posts the
+    matching receive, and ``Work.is_completed()`` does not advance until
+    ``wait()`` is called.  ``wait(timeout)`` is not a probe: when it expires,
+    gloo signals every pair in the context and closes the whole process group.
+    This thread therefore uses an untimed ``wait()``, which releases the GIL
+    and returns as soon as the peer receives.  Each queued entry keeps its
+    frame tensor alive until the send has drained.
+
+    Hang detection is done on the caller side instead: when the oldest send
+    has waited longer than ``timeout_s``, the next ``submit`` raises.  Waiting
+    for backpressure is bounded by the same deadline.
+    """
+
+    def __init__(
+        self, world_rank: int, max_pending: int, timeout_s: Optional[float]
+    ):
+        self._world_rank = world_rank
+        self._max_pending = max_pending
+        self._timeout_s = timeout_s
+        # Entries: (work, frame, dst, tag, enqueued_monotonic).
+        self._pending: collections.deque = collections.deque()
+        self._cv = threading.Condition()
+        self._error: Optional[BaseException] = None
+        self._thread: Optional[threading.Thread] = None
+        self._backpressure_logged = False
+
+    def submit(self, works: List, tag: int) -> None:
+        if not works:
+            return
+        with self._cv:
+            self._raise_if_failed_locked()
+            self._check_oldest_locked()
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name=f"flexkv-send-reaper-{self._world_rank}",
+                    daemon=True,
+                )
+                self._thread.start()
+            if len(self._pending) >= self._max_pending:
+                if not self._backpressure_logged:
+                    self._backpressure_logged = True
+                    logger.warning(
+                        "[FlexKV] rank=%d has %d undrained control sends; "
+                        "waiting for slow followers to receive",
+                        self._world_rank,
+                        len(self._pending),
+                    )
+                while (
+                    self._error is None
+                    and len(self._pending) >= self._max_pending
+                ):
+                    self._cv.wait(self._remaining_locked())
+                    self._check_oldest_locked()
+                self._raise_if_failed_locked()
+            now = time.monotonic()
+            self._pending.extend(
+                (work, frame, dst, tag, now) for work, frame, dst in works
+            )
+            self._cv.notify_all()
+
+    def pending(self) -> int:
+        with self._cv:
+            return len(self._pending)
+
+    def _remaining_locked(self) -> Optional[float]:
+        if self._timeout_s is None or not self._pending:
+            return None
+        age = time.monotonic() - self._pending[0][4]
+        return max(0.0, self._timeout_s - age)
+
+    def _check_oldest_locked(self) -> None:
+        if self._error is not None:
+            self._raise_if_failed_locked()
+        if self._timeout_s is None or not self._pending:
+            return
+        _work, _frame, dst, tag, enqueued = self._pending[0]
+        age = time.monotonic() - enqueued
+        if age <= self._timeout_s:
+            return
+        self._error = TimeoutError(
+            f"[FlexKV] control send from rank={self._world_rank} to "
+            f"rank={dst} (tag={tag}) not received for {age:.1f}s "
+            f"(> FLEXKV_CONTROL_SEND_TIMEOUT_S={self._timeout_s:g}); "
+            f"{len(self._pending)} sends pending. The receiver is hung or "
+            f"the scatter sequence diverged across ranks."
+        )
+        logger.error("%s", self._error)
+        self._cv.notify_all()
+        self._raise_if_failed_locked()
+
+    def _raise_if_failed_locked(self) -> None:
+        if self._error is not None:
+            raise RuntimeError(
+                f"[FlexKV] control send failed on rank={self._world_rank}: "
+                f"{self._error}"
+            ) from self._error
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                self._cv.wait_for(lambda: bool(self._pending))
+                work, _frame, dst, tag, _enqueued = self._pending[0]
+            try:
+                work.wait()
+            except BaseException as exc:  # noqa: BLE001
+                logger.error(
+                    "[FlexKV] control send from rank=%d to rank=%d (tag=%d) "
+                    "failed: %s",
+                    self._world_rank,
+                    dst,
+                    tag,
+                    exc,
+                )
+                with self._cv:
+                    if self._error is None:
+                        self._error = exc
+                    self._cv.notify_all()
+                return
+            with self._cv:
+                self._pending.popleft()
+                if len(self._pending) < self._max_pending:
+                    self._backpressure_logged = False
+                self._cv.notify_all()
+
+
 class FlexKVComm:
     """3-axis (PP × CP × TP) hierarchical sync for the FlexKV connector.
 
@@ -115,16 +257,9 @@ class FlexKVComm:
     _TAG_PP_BARRIER_BCAST = int.from_bytes(b"FxB3", byteorder="big")
     _TAG_AR_BCAST = int.from_bytes(b"FxAR", byteorder="big")
 
-    # Adaptive async-work reaper. gloo's isend Work objects do not auto-
-    # advance their "completed" state on poll, so a pure poll-based reaper
-    # leaks. We actively wait() the oldest works with a tiny timeout;
-    # the watermark grows on stuck reaps (slow / asymmetric peer) and
-    # shrinks back on clean reaps.
-    _REAP_HIGH_BASE = 1024
-    _REAP_HIGH_MAX = 32768
-    _REAP_MAX_DRAIN = 512
-    _REAP_PROBE = timedelta(milliseconds=1)
-    _REAP_LOG_EVERY = 64
+    # Upper bound on undrained non-blocking sends. Beyond it the sender waits
+    # for followers to catch up instead of growing without bound.
+    _MAX_PENDING_SENDS = 32768
 
     def __init__(
         self,
@@ -138,12 +273,9 @@ class FlexKVComm:
         model_config = rank_info.model_config
         self.world_rank = world_rank
         self._world_group = world_group
-        # Each entry owns its tensor view until the corresponding send drains.
-        self._async_works: List = []
-        self._reap_high: int = self._REAP_HIGH_BASE
-        self._reap_calls: int = 0
-        self._reap_stuck_total: int = 0
-        self._reap_drained_total: int = 0
+        self._send_reaper = _AsyncSendReaper(
+            world_rank, self._MAX_PENDING_SENDS, _control_send_timeout_s()
+        )
 
         # Accept either GroupCoordinator wrappers (has ``.cpu_group``) or
         # raw ProcessGroups.
@@ -418,67 +550,14 @@ class FlexKVComm:
                         work = dist.isend(
                             frame, dst=dst, tag=tag, group=self._world_cpu_group,
                         )
-                        works.append((work, frame))
+                        works.append((work, frame, dst))
             if blocking:
-                for work, _frame in works:
+                for work, _frame, _dst in works:
                     work.wait()
             else:
-                self._reap_completed_async_works()
-                self._async_works.extend(works)
+                self._send_reaper.submit(works, tag)
             return data
         return self._recv(group_ranks[0], tag, self._world_cpu_group)
-
-    def _reap_completed_async_works(self) -> None:
-        n = len(self._async_works)
-        if n <= self._reap_high:
-            return
-
-        drained = 0
-        stuck = False
-        for _ in range(self._REAP_MAX_DRAIN):
-            if not self._async_works:
-                break
-            w, _frame = self._async_works[0]
-            try:
-                w.wait(self._REAP_PROBE)
-            except RuntimeError:
-                stuck = True
-                break
-            self._async_works.pop(0)
-            drained += 1
-
-        self._reap_calls += 1
-        self._reap_drained_total += drained
-        if stuck:
-            self._reap_stuck_total += 1
-
-        prev_high = self._reap_high
-        if stuck:
-            self._reap_high = min(self._REAP_HIGH_MAX, self._reap_high * 2)
-        else:
-            self._reap_high = max(self._REAP_HIGH_BASE, self._reap_high // 2)
-        if self._reap_high != prev_high:
-            logger.debug(
-                "[FlexKV] reap watermark rank=%d %d->%d "
-                "(stuck=%s drained=%d backlog=%d)",
-                self.world_rank,
-                prev_high,
-                self._reap_high,
-                stuck,
-                drained,
-                n,
-            )
-        if self._reap_calls % self._REAP_LOG_EVERY == 0:
-            logger.debug(
-                "[FlexKV] reap stats rank=%d calls=%d drained=%d stuck=%d "
-                "backlog=%d high=%d",
-                self.world_rank,
-                self._reap_calls,
-                self._reap_drained_total,
-                self._reap_stuck_total,
-                len(self._async_works),
-                self._reap_high,
-            )
 
     # ------------------------------------------------------------------
     # Low-level send / recv on the world cpu group
