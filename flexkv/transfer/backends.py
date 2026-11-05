@@ -75,7 +75,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from flexkv.transfer.workers import TransferWorkerBase
 
 
-def op_layer_range(op: WorkerTransferOp, num_layers: int) -> Tuple[int, int]:
+def op_layer_range(op: "WorkerTransferOp", num_layers: int) -> Tuple[int, int]:
     """``(layer_id, layer_granularity)`` for an op, defaulting to all layers.
 
     ``-1`` is the unset sentinel: CacheConfig.layer_granularity ``<= 0`` and
@@ -112,8 +112,8 @@ class StorageBackend(ABC):
     #: engine had attached -- the one direction a backend must not push in.
     bytes_per_block: int = 0
 
-    def attach(  # noqa: B027 - optional lifecycle hook with a no-op default
-        self, worker: TransferWorkerBase, geometry: EdgeGeometry
+    def attach(
+        self, worker: "TransferWorkerBase", geometry: "EdgeGeometry"
     ) -> None:
         """Open sessions / register memory.  Called once, at worker init.
 
@@ -144,8 +144,8 @@ class StorageBackend(ABC):
     @abstractmethod
     def transfer(
         self,
-        worker: TransferWorkerBase,
-        op: WorkerTransferOp,
+        worker: "TransferWorkerBase",
+        op: "WorkerTransferOp",
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> int:
@@ -160,8 +160,8 @@ class StorageBackend(ABC):
 
     def transfer_blocks(
         self,
-        worker: TransferWorkerBase,
-        op: WorkerTransferOp,
+        worker: "TransferWorkerBase",
+        op: "WorkerTransferOp",
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> Tuple[Tuple[bool, ...], int]:
@@ -177,7 +177,7 @@ class StorageBackend(ABC):
             f"{type(self).__name__} sets reports_block_results but does not "
             "implement transfer_blocks")
 
-    def shutdown(self) -> None:  # noqa: B027 - optional lifecycle hook with a no-op default
+    def shutdown(self) -> None:
         """Release whatever ``attach`` took.  Must tolerate a failed attach."""
 
 
@@ -243,7 +243,7 @@ class NixlFileBackend(StorageBackend):
         self._session: Any = None
 
     def attach(
-        self, worker: TransferWorkerBase, geometry: EdgeGeometry
+        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
     ) -> None:
         from flexkv.transfer.nixlutil import NixlAgentSession
 
@@ -321,7 +321,7 @@ class NixlFileBackend(StorageBackend):
             raise RuntimeError("NIXL: prepare_vram_gpu failed")
 
     def _attach_cpu(
-        self, worker: TransferWorkerBase, geometry: EdgeGeometry
+        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
     ) -> None:
         """POSIX / HF3FS: bind to the edge's CPU pool."""
         cpu = geometry.require_cpu(f"NIXL {self.nixl_backend}")
@@ -362,8 +362,8 @@ class NixlFileBackend(StorageBackend):
 
     def transfer(
         self,
-        worker: TransferWorkerBase,
-        op: WorkerTransferOp,
+        worker: "TransferWorkerBase",
+        op: "WorkerTransferOp",
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> int:
@@ -505,7 +505,7 @@ class PcfsRemoteBackend(StorageBackend):
         self.pcfs: Any = None
 
     def attach(
-        self, worker: TransferWorkerBase, geometry: EdgeGeometry
+        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
     ) -> None:
         from flexkv import c_ext
         # Deliberately the ``worker`` façade, not ``workers``: this is a c_ext
@@ -616,8 +616,8 @@ class PcfsRemoteBackend(StorageBackend):
 
     def transfer(
         self,
-        worker: TransferWorkerBase,
-        op: WorkerTransferOp,
+        worker: "TransferWorkerBase",
+        op: "WorkerTransferOp",
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> int:
@@ -934,7 +934,7 @@ class MooncakeStoreBackend(StorageBackend):
             getattr(cache_config, 'mooncake_store_total_layers', 0) or 0)
 
     def attach(
-        self, worker: TransferWorkerBase, geometry: EdgeGeometry
+        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
     ) -> None:
         from flexkv.external.mooncake_store_utils import (
             MooncakeStoreClient,
@@ -1053,7 +1053,7 @@ class MooncakeStoreBackend(StorageBackend):
 
     def _keys_and_ptrs(
         self,
-        op: WorkerTransferOp,
+        op: "WorkerTransferOp",
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> Tuple[List[int], List[int], List[str]]:
@@ -1099,8 +1099,8 @@ class MooncakeStoreBackend(StorageBackend):
 
     def transfer(
         self,
-        worker: TransferWorkerBase,
-        op: WorkerTransferOp,
+        worker: "TransferWorkerBase",
+        op: "WorkerTransferOp",
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> int:
@@ -1110,8 +1110,8 @@ class MooncakeStoreBackend(StorageBackend):
 
     def transfer_blocks(
         self,
-        worker: TransferWorkerBase,
-        op: WorkerTransferOp,
+        worker: "TransferWorkerBase",
+        op: "WorkerTransferOp",
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> Tuple[Tuple[bool, ...], int]:

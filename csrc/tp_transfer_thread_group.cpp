@@ -21,8 +21,8 @@
 #ifdef FLEXKV_ENABLE_NVCOMP
 #include "compression/ans/nvcomp_ans_tp.h"
 #endif
-#include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <stdexcept>
 #include <type_traits>
 
@@ -30,16 +30,16 @@ namespace flexkv {
 
 TPTransferThreadGroup::TPTransferThreadGroup(
     int num_gpus, const std::vector<int64_t> &gpu_block_ptrs_flat,
-    int num_tensors_per_gpu, int64_t cpu_blocks_ptr, int num_layers,
-    const std::vector<int64_t> &gpu_kv_strides_in_bytes,
+    int num_tensors_per_gpu, int64_t cpu_blocks_ptr,
+    int num_layers, const std::vector<int64_t> &gpu_kv_strides_in_bytes,
     const std::vector<int64_t> &gpu_block_strides_in_bytes,
     const std::vector<int64_t> &gpu_layer_strides_in_bytes,
     const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
-    const std::vector<int64_t> &gpu_device_ids, bool enable_nvcomp,
-    int nvcomp_batch_size, int nvcomp_data_type, CETransferConfig ce_config)
+    const std::vector<int64_t> &gpu_device_ids,
+    bool enable_nvcomp, int nvcomp_batch_size, int nvcomp_data_type,
+    CETransferConfig ce_config)
     : ce_config_(ce_config) {
-  const c10::cuda::CUDAGuard restore_device_on_exit(
-      c10::cuda::current_device());
+  const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
 
   num_gpus_ = num_gpus;
   num_tensors_per_gpu_ = num_tensors_per_gpu;
@@ -105,14 +105,15 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     init_nvcomp(nvcomp_batch_size, nvcomp_data_type);
   }
 #endif
+
 }
 
 void TPTransferThreadGroup::update_gpu_block_ptrs(
     const std::vector<int64_t> &gpu_block_ptrs_flat) {
-  const size_t expected = static_cast<size_t>(num_gpus_) * num_tensors_per_gpu_;
+  const size_t expected =
+      static_cast<size_t>(num_gpus_) * num_tensors_per_gpu_;
   if (gpu_block_ptrs_flat.size() != expected) {
-    throw std::invalid_argument(
-        "GPU pointer count does not match transfer group");
+    throw std::invalid_argument("GPU pointer count does not match transfer group");
   }
   for (int i = 0; i < num_gpus_; ++i) {
     cudaError_t err = cudaSetDevice(gpu_device_ids_[i]);
@@ -132,8 +133,7 @@ void TPTransferThreadGroup::update_gpu_block_ptrs(
 }
 
 TPTransferThreadGroup::~TPTransferThreadGroup() {
-  const c10::cuda::CUDAGuard restore_device_on_exit(
-      c10::cuda::current_device());
+  const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
   // CUDAGuard only restores c10's view of the current device; the raw
   // cudaSetDevice calls below bypass that cache, so snapshot and restore the
   // driver-level device explicitly as well.
@@ -171,10 +171,11 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_kv_stride_in_bytes,
     const int64_t cpu_layer_stride_in_bytes,
     const int64_t cpu_block_stride_in_bytes,
-    const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
+    const int64_t cpu_tp_stride_in_bytes,     const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
     const int layer_id, const int layer_granularity, const int kv_dim,
-    const int num_kv_heads, const std::string &kv_shared_across_ranks_mode,
+    const int num_kv_heads,
+    const std::string &kv_shared_across_ranks_mode,
     const int designated_rank, const bool sync) {
 
   std::atomic<bool> failed{false};
@@ -196,12 +197,10 @@ void TPTransferThreadGroup::tp_group_transfer(
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
-  // Validate kv_shared_across_ranks_mode parameter (only meaningful for shared
-  // KV)
+  // Validate kv_shared_across_ranks_mode parameter (only meaningful for shared KV)
   std::string mode = kv_shared_across_ranks_mode;
-  if (num_kv_heads == 1 && mode != "sharded" && mode != "all_write" &&
-      mode != "rank0_only" && mode != "layer_parallel" &&
-      mode != "rank_rotate") {
+  if (num_kv_heads == 1 && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
+      && mode != "layer_parallel" && mode != "rank_rotate") {
     FLEXKV_LOG_WARNING(
         "operation=transfer_config act=fallback status=degraded "
         "field=kv_shared_across_ranks_mode value=\"%s\" fallback=sharded",
@@ -213,25 +212,20 @@ void TPTransferThreadGroup::tp_group_transfer(
   // the per-rank transfer size and the stride between ranks. If chunk_size
   // is not divisible by num_gpus_, the integer division drops trailing bytes,
   // leaving a hole in the assembled KV on CPU.
-  // All ranks share the same chunk_size (num_kv_heads==1 = identical KV), so
-  // check [0] once.
-  if (num_kv_heads == 1 && !is_host_to_device && mode == "sharded" &&
-      num_gpus_ > 1) {
+  // All ranks share the same chunk_size (num_kv_heads==1 = identical KV), so check [0] once.
+  if (num_kv_heads == 1 && !is_host_to_device && mode == "sharded" && num_gpus_ > 1) {
     if (gpu_chunk_sizes_in_bytes_[0] % num_gpus_ != 0) {
       throw std::runtime_error(
-          "sharded kv_shared_across_ranks D2H mode requires gpu_chunk_size "
-          "divisible by "
+          "sharded kv_shared_across_ranks D2H mode requires gpu_chunk_size divisible by "
           "num_gpus, but chunk_size=" +
-          std::to_string(gpu_chunk_sizes_in_bytes_[0]) +
-          " and num_gpus=" + std::to_string(num_gpus_) +
-          ". Use 'all_write' or 'rank0_only' "
+          std::to_string(gpu_chunk_sizes_in_bytes_[0]) + " and num_gpus=" +
+          std::to_string(num_gpus_) + ". Use 'all_write' or 'rank0_only' "
           "mode, or adjust head_dim/tokens_per_block so chunk_size is "
           "divisible.");
     }
   }
 
-  // rank_rotate: resolve designated rank from round-robin counter, treat as
-  // rank0_only.
+  // rank_rotate: resolve designated rank from round-robin counter, treat as rank0_only.
   int eff_designated_rank = designated_rank;
   if (num_kv_heads == 1 && !is_host_to_device && mode == "rank_rotate") {
     eff_designated_rank = rotate_counter_;
@@ -239,11 +233,9 @@ void TPTransferThreadGroup::tp_group_transfer(
   }
 
   for (int i = 0; i < num_gpus_; ++i) {
-    // For rank0_only / rank_rotate mode in D2H: only the designated rank
-    // performs transfer
-    if (num_kv_heads == 1 && !is_host_to_device &&
-        (mode == "rank0_only" || mode == "rank_rotate") &&
-        i != eff_designated_rank) {
+    // For rank0_only / rank_rotate mode in D2H: only the designated rank performs transfer
+    if (num_kv_heads == 1 && !is_host_to_device && (mode == "rank0_only" || mode == "rank_rotate")
+        && i != eff_designated_rank) {
       // Skip D2H transfer for non-designated GPUs
       futures.emplace_back(enqueue_for_gpu(i, [i]() {
         // Empty task - non-designated GPUs do nothing in rank0_only D2H mode
@@ -256,9 +248,8 @@ void TPTransferThreadGroup::tp_group_transfer(
       int L_rotate = layer_granularity, N_rotate = num_gpus_;
       int layers_per_rank_rotate = L_rotate / N_rotate;
       int remainder_rotate = L_rotate % N_rotate;
-      int my_count_rotate = (i < remainder_rotate)
-                                ? (layers_per_rank_rotate + 1)
-                                : layers_per_rank_rotate;
+      int my_count_rotate = (i < remainder_rotate) ? (layers_per_rank_rotate + 1)
+                                           : layers_per_rank_rotate;
       if (my_count_rotate == 0) {
         futures.emplace_back(enqueue_for_gpu(i, [i]() {}));
         continue;
@@ -288,16 +279,13 @@ void TPTransferThreadGroup::tp_group_transfer(
           chunk_size = shard;
         } else if (mode == "all_write") {
           // per-rank full-KV region
-          cpu_startoff_inside_chunks =
-              i * num_blocks * cpu_block_stride_in_bytes;
+          cpu_startoff_inside_chunks = i * num_blocks * cpu_block_stride_in_bytes;
         }
-
-        // Effective layer range: round_robin assigns subset; else full
-        // (layer_id, layer_granularity).
+        
+        // Effective layer range: round_robin assigns subset; else full (layer_id, layer_granularity).
         int eff_start_layer = layer_id;
         int eff_num_layers = layer_granularity;
-        if (num_kv_heads == 1 && !is_host_to_device &&
-            mode == "layer_parallel") {
+        if (num_kv_heads == 1 && !is_host_to_device && mode == "layer_parallel") {
           int L_rotate = layer_granularity, N_rotate = num_gpus_;
           int layers_per_rank_rotate = L_rotate / N_rotate;
           int remainder_rotate = L_rotate % N_rotate;
@@ -306,11 +294,11 @@ void TPTransferThreadGroup::tp_group_transfer(
             my_start_rotate = i * (layers_per_rank_rotate + 1);
           } else {
             my_start_rotate = remainder_rotate * (layers_per_rank_rotate + 1) +
-                              (i - remainder_rotate) * layers_per_rank_rotate;
+                          (i - remainder_rotate) * layers_per_rank_rotate;
           }
           eff_start_layer = layer_id + my_start_rotate;
           eff_num_layers = (i < remainder_rotate) ? (layers_per_rank_rotate + 1)
-                                                  : layers_per_rank_rotate;
+                                              : layers_per_rank_rotate;
         }
 
         // One region's arguments, this rank's slice. The three-arm switch on
@@ -356,8 +344,7 @@ void TPTransferThreadGroup::tp_group_transfer(
                        cudaGetErrorString(err));
         }
       } catch (const std::exception &e) {
-        record_error(std::string("rank ") + std::to_string(i) + ": " +
-                     e.what());
+        record_error(std::string("rank ") + std::to_string(i) + ": " + e.what());
       } catch (...) {
         // A non-std::exception throw previously escaped the packaged_task and
         // resurfaced at f.get() as an opaque failure with `failed` still
