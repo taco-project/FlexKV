@@ -47,6 +47,9 @@ from flexkv.server.request import (
 )
 import contextlib
 
+_INHERITED_ENV_PREFIXES = ("CUDA_", "NCCL_", "UCX_", "NIXL_", "MC_")
+
+
 class DPClient:
     def __init__(
         self,
@@ -266,6 +269,13 @@ class KVServer:
                 for key in ("PYTHONPATH", "LD_LIBRARY_PATH", "PATH"):
                     if key in os.environ and key not in env:
                         env[key] = os.environ[key]
+                # The device and transport setup the workers run under: without
+                # it they can number GPUs differently (CUDA_DEVICE_ORDER), join
+                # an MPS server the caller kept out of (CUDA_MPS_*), or lose the
+                # UCX/NIXL/Mooncake settings of the peer transfers.
+                for key, val in os.environ.items():
+                    if key.startswith(_INHERITED_ENV_PREFIXES) and key not in env:
+                        env[key] = val
 
             cvd = os.environ.get('CUDA_VISIBLE_DEVICES')
             if cvd is not None and 'CUDA_VISIBLE_DEVICES' not in env:
