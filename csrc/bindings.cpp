@@ -50,8 +50,8 @@ namespace py = pybind11;
 
 namespace flexkv {
 #ifdef FLEXKV_ENABLE_NVCOMP
-void register_common_compression_bindings(pybind11::module_ &m);
-void register_ans_bindings(pybind11::module_ &m);
+void register_common_compression_bindings(pybind11::module_& m);
+void register_ans_bindings(pybind11::module_& m);
 #endif
 } // namespace flexkv
 
@@ -159,8 +159,8 @@ void transfer_kv_blocks_ssd_binding(
     int64_t cpu_kv_stride_in_bytes, int64_t ssd_layer_stride_in_bytes,
     int64_t ssd_kv_stride_in_bytes, int64_t chunk_size_in_bytes,
     int64_t block_stride_in_bytes, bool is_read, int num_blocks_per_file,
-    int round_robin = 1, int num_threads_per_device = 8, int kv_dim = 2,
-    bool ssd_io_opt = true) {
+    int round_robin = 1, int num_threads_per_device = 8,
+    int kv_dim = 2, bool ssd_io_opt = true) {
   TORCH_CHECK(ssd_block_ids.dtype() == torch::kInt64,
               "ssd_block_ids must be int64");
   TORCH_CHECK(cpu_block_ids.dtype() == torch::kInt64,
@@ -209,7 +209,8 @@ void shared_transfer_kv_blocks_remote_read_binding(
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
     int64_t cfs_layer_stride_in_bytes, int64_t cfs_block_stride_in_bytes,
     int64_t cfs_kv_stride_in_bytes, int64_t block_size_in_bytes,
-    int64_t total_layers, int kv_dim = 2, int num_threads_per_file = 8) {
+    int64_t total_layers, int kv_dim = 2,
+    int num_threads_per_file = 8) {
 
   // convert file_nodeids
   std::vector<std::uint64_t> file_nodeids;
@@ -242,7 +243,7 @@ void shared_transfer_kv_blocks_remote_read_binding(
       file_nodeids, cfs_blocks_partition, cpu_blocks_partition,
       cpu_layer_id_list, cpu_tensor_ptr, cpu_layer_stride_in_bytes,
       cpu_kv_stride_in_bytes, cfs_layer_stride_in_bytes,
-      cfs_block_stride_in_bytes, cfs_kv_stride_in_bytes, block_size_in_bytes,
+      cfs_block_stride_in_bytes,       cfs_kv_stride_in_bytes, block_size_in_bytes,
       total_layers, kv_dim, num_threads_per_file);
 }
 #endif
@@ -257,7 +258,8 @@ void transfer_kv_blocks_gds_binding(
     int64_t ssd_block_stride_in_bytes, int64_t ssd_kv_stride_in_bytes,
     int64_t block_size_in_bytes, int64_t ssd_copy_off_inside_chunks,
     int num_blocks_per_file, int64_t total_layers, bool is_read,
-    bool verbose = false, int kv_dim = 2, int gpu_block_type = 0,
+    bool verbose = false, int kv_dim = 2,
+    int gpu_block_type = 0,
     int gpu_device_id = 0) {
   TORCH_CHECK(gpu_layer_ptrs_tensor.dtype() == torch::kInt64,
               "gpu_layer_ptrs must be int64");
@@ -462,7 +464,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("chunk_size_in_bytes"), py::arg("block_stride_in_bytes"),
         py::arg("is_read"), py::arg("num_blocks_per_file"),
         py::arg("round_robin") = 1, py::arg("num_threads_per_device") = 16,
-        py::arg("kv_dim") = 2, py::arg("ssd_io_opt") = true,
+        py::arg("kv_dim") = 2,
+        py::arg("ssd_io_opt") = true,
         // Blocking io_uring submit/reap across num_threads_per_device threads;
         // no Python API is touched inside. See transfer_kv_blocks above.
         py::call_guard<py::gil_scoped_release>());
@@ -480,22 +483,24 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("total_layers"), py::arg("is_read"),
         py::arg("partition_block_type"), py::arg("round_robin"),
         py::arg("num_remote_blocks_per_file"), py::arg("use_mmap") = false,
-        py::arg("num_threads_per_file") = 16, py::arg("kv_dim") = 2);
+        py::arg("num_threads_per_file") = 16,
+        py::arg("kv_dim") = 2);
 #endif
 #ifdef FLEXKV_ENABLE_GDS
-  m.def("transfer_kv_blocks_gds", &transfer_kv_blocks_gds_binding,
-        "Transfer KV blocks between GPU and GDS storage",
-        py::arg("gds_manager"), py::arg("gpu_layer_id_list"),
-        py::arg("gpu_layer_ptrs_tensor"), py::arg("ssd_block_ids"),
-        py::arg("gpu_block_ids"), py::arg("gpu_kv_stride_in_bytes"),
-        py::arg("gpu_block_stride_in_bytes"),
-        py::arg("gpu_layer_stride_in_bytes"),
-        py::arg("ssd_layer_stride_in_bytes"),
-        py::arg("ssd_block_stride_in_bytes"), py::arg("ssd_kv_stride_in_bytes"),
-        py::arg("block_size_in_bytes"), py::arg("ssd_copy_off_inside_chunks"),
-        py::arg("num_blocks_per_file"), py::arg("total_layers"),
-        py::arg("is_read"), py::arg("verbose") = false, py::arg("kv_dim") = 2,
-        py::arg("gpu_block_type") = 0, py::arg("gpu_device_id") = 0);
+  m.def(
+      "transfer_kv_blocks_gds", &transfer_kv_blocks_gds_binding,
+      "Transfer KV blocks between GPU and GDS storage", py::arg("gds_manager"),
+      py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
+      py::arg("ssd_block_ids"), py::arg("gpu_block_ids"),
+      py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
+      py::arg("gpu_layer_stride_in_bytes"),
+      py::arg("ssd_layer_stride_in_bytes"),
+      py::arg("ssd_block_stride_in_bytes"), py::arg("ssd_kv_stride_in_bytes"),
+      py::arg("block_size_in_bytes"), py::arg("ssd_copy_off_inside_chunks"),
+      py::arg("num_blocks_per_file"), py::arg("total_layers"),
+      py::arg("is_read"), py::arg("verbose") = false,
+      py::arg("kv_dim") = 2,
+      py::arg("gpu_block_type") = 0, py::arg("gpu_device_id") = 0);
 #endif
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
@@ -512,29 +517,27 @@ PYBIND11_MODULE(c_ext, m) {
         // raw buffer reinterpreted as int64 would otherwise be read past its
         // end (an int32 array is half as long as the loop assumes).
         if (tokens_per_block <= 0)
-          throw py::value_error(
-              "gen_hashes_numpy: tokens_per_block must be > 0");
+          throw py::value_error("gen_hashes_numpy: tokens_per_block must be > 0");
         if (!py::isinstance<py::array_t<std::int64_t>>(token_ids))
           throw py::type_error(
               "gen_hashes_numpy: token_ids must be an int64 array, got dtype " +
               py::str(token_ids.dtype()).cast<std::string>());
         if (!py::isinstance<py::array_t<std::uint64_t>>(block_hashes))
           throw py::type_error(
-              "gen_hashes_numpy: block_hashes must be a uint64 array, got "
-              "dtype " +
+              "gen_hashes_numpy: block_hashes must be a uint64 array, got dtype " +
               py::str(block_hashes.dtype()).cast<std::string>());
         if (!(token_ids.flags() & py::array::c_style) ||
             !(block_hashes.flags() & py::array::c_style))
-          throw py::value_error("gen_hashes_numpy: token_ids and block_hashes "
-                                "must be C-contiguous");
+          throw py::value_error(
+              "gen_hashes_numpy: token_ids and block_hashes must be C-contiguous");
         py::buffer_info tok = token_ids.request();
         py::buffer_info bh = block_hashes.request(true);
         if (bh.size * static_cast<py::ssize_t>(tokens_per_block) > tok.size)
-          throw py::value_error("gen_hashes_numpy: block_hashes has " +
-                                std::to_string(bh.size) + " blocks of " +
-                                std::to_string(tokens_per_block) +
-                                " tokens but token_ids holds only " +
-                                std::to_string(tok.size) + " tokens");
+          throw py::value_error(
+              "gen_hashes_numpy: block_hashes has " + std::to_string(bh.size) +
+              " blocks of " + std::to_string(tokens_per_block) +
+              " tokens but token_ids holds only " + std::to_string(tok.size) +
+              " tokens");
         const int64_t *tok_ptr = static_cast<const int64_t *>(tok.ptr);
         flexkv::HashType *bh_ptr = static_cast<flexkv::HashType *>(bh.ptr);
         for (py::ssize_t i = 0; i < bh.size; i++) {
@@ -554,48 +557,58 @@ PYBIND11_MODULE(c_ext, m) {
   py::class_<flexkv::TPTransferThreadGroup> tp_thread_group(
       m, "TPTransferThreadGroup");
   tp_thread_group
-      .def(
-          py::init(
-              [](int num_gpus, const std::vector<int64_t> &gpu_block_ptrs_flat,
-                 int num_tensors_per_gpu, int64_t cpu_blocks_ptr,
-                 int num_layers,
-                 const std::vector<int64_t> &gpu_kv_strides_in_bytes,
-                 const std::vector<int64_t> &gpu_block_strides_in_bytes,
-                 const std::vector<int64_t> &gpu_layer_strides_in_bytes,
-                 const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
-                 const std::vector<int64_t> &gpu_device_ids, bool enable_nvcomp,
-                 int nvcomp_batch_size, int nvcomp_data_type,
-                 int64_t ce_segment_threshold, bool ce_path_opt,
-                 int ce_force_path, bool ce_enable_memcpy2d, bool is_blockfirst,
-                 int num_kv_heads, int ce_gather_threads, bool ce_gather_nt) {
-                flexkv::CETransferConfig cfg;
-                cfg.segment_threshold = ce_segment_threshold;
-                cfg.path_opt_enabled = ce_path_opt;
-                cfg.force_path = ce_force_path;
-                cfg.enable_memcpy2d = ce_enable_memcpy2d;
-                cfg.is_blockfirst = is_blockfirst;
-                cfg.num_kv_heads = num_kv_heads;
-                cfg.gather_threads = ce_gather_threads;
-                cfg.gather_nt = ce_gather_nt;
-                return new flexkv::TPTransferThreadGroup(
-                    num_gpus, gpu_block_ptrs_flat, num_tensors_per_gpu,
-                    cpu_blocks_ptr, num_layers, gpu_kv_strides_in_bytes,
-                    gpu_block_strides_in_bytes, gpu_layer_strides_in_bytes,
-                    gpu_chunk_sizes_in_bytes, gpu_device_ids, enable_nvcomp,
-                    nvcomp_batch_size, nvcomp_data_type, cfg);
-              }),
-          py::arg("num_gpus"), py::arg("gpu_block_ptrs_flat"),
-          py::arg("num_tensors_per_gpu"), py::arg("cpu_blocks_ptr"),
-          py::arg("num_layers"), py::arg("gpu_kv_strides_in_bytes"),
-          py::arg("gpu_block_strides_in_bytes"),
-          py::arg("gpu_layer_strides_in_bytes"),
-          py::arg("gpu_chunk_sizes_in_bytes"), py::arg("gpu_device_ids"),
-          py::arg("enable_nvcomp") = false, py::arg("nvcomp_batch_size") = 0,
-          py::arg("nvcomp_data_type") = 0, py::arg("ce_segment_threshold") = 8,
-          py::arg("ce_path_opt") = true, py::arg("ce_force_path") = -1,
-          py::arg("ce_enable_memcpy2d") = false,
-          py::arg("is_blockfirst") = false, py::arg("num_kv_heads") = 1,
-          py::arg("ce_gather_threads") = 4, py::arg("ce_gather_nt") = true)
+      .def(py::init([](int num_gpus, const std::vector<int64_t> &gpu_block_ptrs_flat,
+                       int num_tensors_per_gpu, int64_t cpu_blocks_ptr,
+                       int num_layers,
+                       const std::vector<int64_t> &gpu_kv_strides_in_bytes,
+                       const std::vector<int64_t> &gpu_block_strides_in_bytes,
+                       const std::vector<int64_t> &gpu_layer_strides_in_bytes,
+                       const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
+                       const std::vector<int64_t> &gpu_device_ids,
+                       bool enable_nvcomp, int nvcomp_batch_size,
+                       int nvcomp_data_type,
+                       int64_t ce_segment_threshold,
+                       bool ce_path_opt,
+                       int ce_force_path,
+                       bool ce_enable_memcpy2d,
+                       bool is_blockfirst,
+                       int num_kv_heads,
+                       int ce_gather_threads,
+                       bool ce_gather_nt) {
+            flexkv::CETransferConfig cfg;
+            cfg.segment_threshold = ce_segment_threshold;
+            cfg.path_opt_enabled = ce_path_opt;
+            cfg.force_path = ce_force_path;
+            cfg.enable_memcpy2d = ce_enable_memcpy2d;
+            cfg.is_blockfirst = is_blockfirst;
+            cfg.num_kv_heads = num_kv_heads;
+            cfg.gather_threads = ce_gather_threads;
+            cfg.gather_nt = ce_gather_nt;
+             return new flexkv::TPTransferThreadGroup(
+                 num_gpus, gpu_block_ptrs_flat, num_tensors_per_gpu,
+                 cpu_blocks_ptr, num_layers, gpu_kv_strides_in_bytes,
+                 gpu_block_strides_in_bytes, gpu_layer_strides_in_bytes,
+                 gpu_chunk_sizes_in_bytes, gpu_device_ids, enable_nvcomp,
+                 nvcomp_batch_size, nvcomp_data_type, cfg);
+           }),
+           py::arg("num_gpus"), py::arg("gpu_block_ptrs_flat"),
+           py::arg("num_tensors_per_gpu"), py::arg("cpu_blocks_ptr"),
+           py::arg("num_layers"),
+           py::arg("gpu_kv_strides_in_bytes"),
+           py::arg("gpu_block_strides_in_bytes"),
+           py::arg("gpu_layer_strides_in_bytes"),
+           py::arg("gpu_chunk_sizes_in_bytes"), py::arg("gpu_device_ids"),
+           py::arg("enable_nvcomp") = false,
+           py::arg("nvcomp_batch_size") = 0,
+           py::arg("nvcomp_data_type") = 0,
+           py::arg("ce_segment_threshold") = 8,
+           py::arg("ce_path_opt") = true,
+           py::arg("ce_force_path") = -1,
+           py::arg("ce_enable_memcpy2d") = false,
+           py::arg("is_blockfirst") = false,
+           py::arg("num_kv_heads") = 1,
+           py::arg("ce_gather_threads") = 4,
+           py::arg("ce_gather_nt") = true)
       .def("update_gpu_block_ptrs",
            &flexkv::TPTransferThreadGroup::update_gpu_block_ptrs,
            py::arg("gpu_block_ptrs_flat"))
@@ -607,14 +620,16 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_block_stride_in_bytes"),
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
-           py::arg("layer_id"), py::arg("layer_granularity"), py::arg("kv_dim"),
-           py::arg("num_kv_heads"),
+           py::arg("layer_id"), py::arg("layer_granularity"),
+           py::arg("kv_dim"), py::arg("num_kv_heads"),
            py::arg("kv_shared_across_ranks_mode") = "sharded",
-           py::arg("designated_rank") = 0, py::arg("sync") = true,
+           py::arg("designated_rank") = 0,
+           py::arg("sync") = true,
            // Fans out to per-rank threads and joins on all of them, each of
            // which ends in cudaStreamSynchronize. See transfer_kv_blocks.
            py::call_guard<py::gil_scoped_release>())
-      .def("wait_all_streams", &flexkv::TPTransferThreadGroup::wait_all_streams,
+      .def("wait_all_streams",
+           &flexkv::TPTransferThreadGroup::wait_all_streams,
            // Pure cudaStreamSynchronize fan-out; see tp_group_transfer.
            py::call_guard<py::gil_scoped_release>());
 #ifdef FLEXKV_ENABLE_NVCOMP
@@ -632,7 +647,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"), py::arg("kv_dim"),
-           py::arg("num_kv_heads"), py::arg("cpu_size_table_tp_ptr"),
+           py::arg("num_kv_heads"),
+           py::arg("cpu_size_table_tp_ptr"),
            py::arg("cpu_size_table_tp_rank_stride"),
            py::arg("cpu_size_table_block_stride"),
            py::arg("cpu_size_table_layer_stride"));
@@ -703,9 +719,12 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readwrite("transfer_num_cta",
                      &flexkv::RegionRequest::transfer_num_cta)
       .def_readwrite("backend", &flexkv::RegionRequest::backend)
-      .def_readwrite("use_ce_transfer", &flexkv::RegionRequest::use_ce_transfer)
-      .def_readwrite("rank_share_mode", &flexkv::RegionRequest::rank_share_mode)
-      .def_readwrite("designated_rank", &flexkv::RegionRequest::designated_rank)
+      .def_readwrite("use_ce_transfer",
+                     &flexkv::RegionRequest::use_ce_transfer)
+      .def_readwrite("rank_share_mode",
+                     &flexkv::RegionRequest::rank_share_mode)
+      .def_readwrite("designated_rank",
+                     &flexkv::RegionRequest::designated_rank)
       .def_readwrite("milestone_layer",
                      &flexkv::RegionRequest::milestone_layer);
 
@@ -729,7 +748,8 @@ PYBIND11_MODULE(c_ext, m) {
            }),
            py::arg("gpu_device_ids"), py::arg("regions"),
            py::arg("ce_segment_threshold") = 8, py::arg("ce_path_opt") = true,
-           py::arg("ce_force_path") = -1, py::arg("ce_enable_memcpy2d") = false,
+           py::arg("ce_force_path") = -1,
+           py::arg("ce_enable_memcpy2d") = false,
            py::arg("is_blockfirst") = false, py::arg("num_kv_heads") = 1,
            py::arg("ce_gather_threads") = 4, py::arg("ce_gather_nt") = true)
       .def_property_readonly("num_regions",
@@ -743,8 +763,9 @@ PYBIND11_MODULE(c_ext, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("wait_all_streams", &flexkv::RegionBatchGroup::wait_all_streams,
            py::call_guard<py::gil_scoped_release>())
-      .def("set_layer_eventfds", &flexkv::RegionBatchGroup::set_layer_eventfds,
-           py::arg("fds_tensor"), py::arg("tp_size"), py::arg("num_layers"),
+      .def("set_layer_eventfds",
+           &flexkv::RegionBatchGroup::set_layer_eventfds, py::arg("fds_tensor"),
+           py::arg("tp_size"), py::arg("num_layers"),
            py::arg("notify_mode") = "hostfunc")
       .def_property_readonly(
           "layer_notification_enabled",
@@ -783,7 +804,8 @@ PYBIND11_MODULE(c_ext, m) {
                     const std::vector<int64_t> &>(),
            py::arg("num_gpus"), py::arg("gpu_block_ptrs_flat"),
            py::arg("num_tensors_per_gpu"), py::arg("ssd_files"),
-           py::arg("num_layers"), py::arg("gpu_kv_strides_in_bytes"),
+           py::arg("num_layers"),
+           py::arg("gpu_kv_strides_in_bytes"),
            py::arg("gpu_block_strides_in_bytes"),
            py::arg("gpu_layer_strides_in_bytes"),
            py::arg("gpu_chunk_sizes_in_bytes"), py::arg("gpu_device_ids"))
@@ -858,8 +880,9 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("cpu_tensor_ptr"), py::arg("cpu_layer_stride_in_bytes"),
         py::arg("cpu_kv_stride_in_bytes"), py::arg("cfs_layer_stride_in_bytes"),
         py::arg("cfs_block_stride_in_bytes"), py::arg("cfs_kv_stride_in_bytes"),
-        py::arg("block_size_in_bytes"), py::arg("total_layers"),
-        py::arg("kv_dim") = 2, py::arg("num_threads_per_file") = 8);
+        py::arg("block_size_in_bytes"),         py::arg("total_layers"),
+        py::arg("kv_dim") = 2,
+        py::arg("num_threads_per_file") = 8);
 #endif
 
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
@@ -926,10 +949,10 @@ PYBIND11_MODULE(c_ext, m) {
       .def("size", &flexkv::CRadixNode::size)
       .def("has_block_node_ids", &flexkv::CRadixNode::has_block_node_ids)
       // Structural / lock accessors — needed to assert the node-mount SWA
-      // invariants (I1/I2/I3) from Python against the production
-      // CRadixTreeIndex path (see tests/test_swa_node_mount.py). Previously
-      // only bound for the P2P LocalRadixTree, so the non-P2P DSv4 build had no
-      // way to read them and the C++ node-mount SWA path went untested.
+      // invariants (I1/I2/I3) from Python against the production CRadixTreeIndex
+      // path (see tests/test_swa_node_mount.py). Previously only bound for
+      // the P2P LocalRadixTree, so the non-P2P DSv4 build had no way to read
+      // them and the C++ node-mount SWA path went untested.
       .def("is_leaf", &flexkv::CRadixNode::is_leaf)
       .def("num_children", &flexkv::CRadixNode::get_num_children)
       .def("get_lock_cnt", &flexkv::CRadixNode::get_lock_cnt)
@@ -1153,39 +1176,35 @@ PYBIND11_MODULE(c_ext, m) {
           py::arg("node_id"), py::arg("hashes"), py::arg("batch_size") = 200)
       .def("delete_node_blocks", &flexkv::RedisMetaChannel::delete_node_blocks,
            py::arg("node_id"), py::arg("batch_size") = 200)
-      .def("has_any_block_keys",
-           [](flexkv::RedisMetaChannel &ch) {
-             bool has_keys = false;
-             if (!ch.has_any_block_keys(has_keys)) {
-               throw std::runtime_error("Failed to scan Redis block metadata");
-             }
-             return has_keys;
-           })
-      .def(
-          "begin_reset_barrier",
-          [](flexkv::RedisMetaChannel &ch, uint64_t ttl_ms) {
-            uint64_t epoch = 0;
-            if (!ch.begin_reset_barrier(ttl_ms, epoch)) {
-              throw std::runtime_error("Failed to begin Redis reset barrier");
-            }
-            return epoch;
-          },
-          py::arg("ttl_ms"))
+      .def("has_any_block_keys", [](flexkv::RedisMetaChannel &ch) {
+        bool has_keys = false;
+        if (!ch.has_any_block_keys(has_keys)) {
+          throw std::runtime_error("Failed to scan Redis block metadata");
+        }
+        return has_keys;
+      })
+      .def("begin_reset_barrier", [](flexkv::RedisMetaChannel &ch,
+                                      uint64_t ttl_ms) {
+        uint64_t epoch = 0;
+        if (!ch.begin_reset_barrier(ttl_ms, epoch)) {
+          throw std::runtime_error("Failed to begin Redis reset barrier");
+        }
+        return epoch;
+      }, py::arg("ttl_ms"))
       .def("mark_reset_barrier_arrival",
            &flexkv::RedisMetaChannel::mark_reset_barrier_arrival,
            py::arg("epoch"), py::arg("ttl_ms"))
-      .def(
-          "is_reset_barrier_ready",
-          [](flexkv::RedisMetaChannel &ch, uint64_t epoch) {
-            bool ready = false;
-            if (!ch.is_reset_barrier_ready(epoch, ready)) {
-              throw std::runtime_error("Failed to inspect Redis reset barrier");
-            }
-            return ready;
-          },
-          py::arg("epoch"))
+      .def("is_reset_barrier_ready", [](flexkv::RedisMetaChannel &ch,
+                                         uint64_t epoch) {
+        bool ready = false;
+        if (!ch.is_reset_barrier_ready(epoch, ready)) {
+          throw std::runtime_error("Failed to inspect Redis reset barrier");
+        }
+        return ready;
+      }, py::arg("epoch"))
       .def("finish_reset_barrier",
-           &flexkv::RedisMetaChannel::finish_reset_barrier, py::arg("epoch"));
+           &flexkv::RedisMetaChannel::finish_reset_barrier,
+           py::arg("epoch"));
 
   py::class_<flexkv::LocalRadixTree, flexkv::CRadixTreeIndex>(m,
                                                               "LocalRadixTree")
@@ -1241,8 +1260,7 @@ PYBIND11_MODULE(c_ext, m) {
       .def("inc_node_count", &flexkv::LocalRadixTree::inc_node_count)
       .def("dec_node_count", &flexkv::LocalRadixTree::dec_node_count)
       .def("lease_pool_capacity", &flexkv::LocalRadixTree::lease_pool_capacity)
-      .def("lease_pool_free_size",
-           &flexkv::LocalRadixTree::lease_pool_free_size)
+      .def("lease_pool_free_size", &flexkv::LocalRadixTree::lease_pool_free_size)
       .def("pending_queue_size", &flexkv::LocalRadixTree::pending_queue_size);
   m.attr("LocalRadixTree")
       .cast<py::class_<flexkv::LocalRadixTree, flexkv::CRadixTreeIndex>>()
