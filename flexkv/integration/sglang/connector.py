@@ -87,6 +87,20 @@ _INFO_STATUSES = {"hit", "miss", "skipped", "success"}
 _WARNING_STATUSES = {"cancelled", "failed", "missing", "not_found", "timeout"}
 # Minimum gap between idle engine nudges in non-chunked mode (seconds).
 _IDLE_DRIVE_INTERVAL_S = 0.1
+# Leader-side pacing of non-blocking store-completion polls (one RPC each).
+# The first poll after a launch is not delayed; each poll that finds nothing
+# doubles the gap from MIN up to MAX (2, 4, 8, 16, 32 ms by default), and any
+# completion restarts at MIN. A scheduler tick longer than the gap (a forward)
+# still polls every tick. Store completion only releases lock refs (off the
+# TTFT path), so idle polls can back off; MIN matches TaskRuntime's 2 ms
+# state-advance period. Setting MIN to 0 disables pacing.
+_STORE_POLL_MIN_INTERVAL_S = max(
+    0.0, float(os.getenv("FLEXKV_STORE_POLL_MIN_INTERVAL_MS", "2")) / 1000.0
+)
+_STORE_POLL_MAX_INTERVAL_S = max(
+    _STORE_POLL_MIN_INTERVAL_S,
+    float(os.getenv("FLEXKV_STORE_POLL_MAX_INTERVAL_MS", "32")) / 1000.0,
+)
 # Arrival lookups (L2-only): the leader issues the admission GET when the
 # request is queued, so admission does not pay one synchronous get_match RPC
 # per request on the serial scheduler path. Unconsumed positive GETs pin CPU
@@ -521,6 +535,8 @@ class FlexKVConnector:
         self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
         self._inflight_store_contexts: Dict[str, _CacheOpContext] = {}
         self._pending_store_batch: Optional[_StoreAdmission] = None
+        self._store_poll_next_ts = 0.0  # leader-only, see _advance_store_poll
+        self._store_poll_interval_s = _STORE_POLL_MIN_INTERVAL_S
         # Prefetches
         self._ongoing_prefetches: Dict[str, int] = {}  # rid -> fkv_task_id
         self._prefetch_contexts: Dict[str, _CacheOpContext] = {}
@@ -1858,6 +1874,7 @@ class FlexKVConnector:
             context.task_id = task_id
             self._inflight_stores[rid] = task_id
             self._inflight_store_contexts[rid] = context
+            self._note_store_launched()
             self._log_cache_op(
                 context, "launch", "running", direction="D2H",
                 transfer_mode="no-layerwise", tokens=start["unmatched_count"],
@@ -1865,13 +1882,49 @@ class FlexKVConnector:
             result.append(task_id)
         return result
 
+    def _reset_store_poll(self) -> None:
+        self._store_poll_next_ts = 0.0
+        self._store_poll_interval_s = _STORE_POLL_MIN_INTERVAL_S
+
+    def _note_store_launched(self) -> None:
+        """A new store should be observed soon even if older ones backed off."""
+        self._store_poll_interval_s = _STORE_POLL_MIN_INTERVAL_S
+        self._store_poll_next_ts = min(
+            getattr(self, "_store_poll_next_ts", 0.0),
+            time.monotonic() + _STORE_POLL_MIN_INTERVAL_S,
+        )
+
+    def _store_poll_due(self) -> bool:
+        return time.monotonic() >= getattr(self, "_store_poll_next_ts", 0.0)
+
+    def _advance_store_poll(self, progressed: bool) -> None:
+        """Schedule the next leader poll: restart at MIN on progress, otherwise
+        use the current gap and double it (capped at MAX) for the one after."""
+        if progressed:
+            gap = _STORE_POLL_MIN_INTERVAL_S
+        else:
+            gap = getattr(self, "_store_poll_interval_s", _STORE_POLL_MIN_INTERVAL_S)
+        self._store_poll_next_ts = time.monotonic() + gap
+        self._store_poll_interval_s = min(
+            _STORE_POLL_MAX_INTERVAL_S, max(gap * 2, _STORE_POLL_MIN_INTERVAL_S)
+        )
+
     def check_completed_stores(self) -> List[str]:
         """Return rids whose stores have completed since the last call."""
         completed_rids: List[str] = []
         completed_by_rid: Dict[str, Any] = {}
 
+        # Every rank changes _inflight_stores only from collective payloads
+        # (STORE_START / STORE_COMPLETION / STORE_RESET), so all ranks agree
+        # that it is empty and skip the STORE_COMPLETION scatter together.
+        if not self._inflight_stores:
+            self._reset_store_poll()
+            return completed_rids
+
+        # Pacing is leader-local: when it skips the RPC, followers still get
+        # the (empty) scatter, so the per-tick collective stays in lockstep.
         if (self._sync_ctx.is_sync_leader and self.kv_manager is not None
-                and self._inflight_stores):
+                and self._store_poll_due()):
             fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
             try:
                 completed_dict = (
@@ -1902,6 +1955,7 @@ class FlexKVConnector:
                 rid = fk_to_rid[fk_tid]
                 completed_rids.append(rid)
                 completed_by_rid[rid] = response
+            self._advance_store_poll(bool(completed_rids))
 
         if self._sync_ctx.needs_sync:
             completed_rids = self._sync_ctx.scatter(
@@ -1926,6 +1980,8 @@ class FlexKVConnector:
                 )
             else:
                 getattr(self, "_inflight_store_contexts", {}).pop(rid, None)
+        if not self._inflight_stores:
+            self._reset_store_poll()
         return completed_rids
 
     def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
@@ -2699,6 +2755,7 @@ class FlexKVConnector:
             raise RuntimeError(f"[FlexKV] {store_reset_status['error']}")
         self._inflight_stores.clear()
         getattr(self, "_inflight_store_contexts", {}).clear()
+        self._reset_store_poll()
         if self.layer_done_counter is not None:
             self.layer_done_counter.reset()
 

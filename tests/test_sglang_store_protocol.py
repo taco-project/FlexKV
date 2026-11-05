@@ -9,8 +9,16 @@ import pytest
 import torch
 
 from flexkv.common.request import KVResponse, KVResponseStatus
+from flexkv.integration.sglang import connector as connector_module
 from flexkv.integration.sglang.comm import FlexKVScatterChannel
 from flexkv.integration.sglang.connector import FlexKVConnector
+
+
+@pytest.fixture(autouse=True)
+def _unpaced_store_polls(monkeypatch):
+    """Protocol tests poll back-to-back; pacing tests override these."""
+    monkeypatch.setattr(connector_module, "_STORE_POLL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(connector_module, "_STORE_POLL_MAX_INTERVAL_S", 0.0)
 
 
 def _follower_connector(payload):
@@ -249,6 +257,72 @@ def test_store_completion_clears_nonleader_tracking():
     assert connector._inflight_stores == {}
     assert connector._inflight_store_contexts == {}
     connector._sync_ctx.scatter.assert_called_once_with([], channel=FlexKVScatterChannel.STORE_COMPLETION)
+
+
+def test_store_completion_skips_scatter_without_inflight_stores():
+    for is_leader in (True, False):
+        connector = _follower_connector(["unexpected"])
+        connector._sync_ctx.is_sync_leader = is_leader
+        connector.kv_manager = MagicMock() if is_leader else None
+
+        assert connector.check_completed_stores() == []
+        connector._sync_ctx.scatter.assert_not_called()
+        if is_leader:
+            connector.kv_manager.wait.assert_not_called()
+
+
+def test_store_completion_paces_leader_polls_but_keeps_scatter(monkeypatch):
+    tick = 1.0 / 1024  # binary-exact ~1 ms scheduler tick
+    monkeypatch.setattr(connector_module, "_STORE_POLL_MIN_INTERVAL_S", 2 * tick)
+    monkeypatch.setattr(connector_module, "_STORE_POLL_MAX_INTERVAL_S", 32 * tick)
+    now = [100.0]
+    monkeypatch.setattr(connector_module.time, "monotonic", lambda: now[0])
+    connector = _follower_connector(None)
+    connector._sync_ctx.is_sync_leader = True
+    connector._sync_ctx.scatter = MagicMock(side_effect=lambda data, channel: data)
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.wait.return_value = {
+        17: KVResponse(KVResponseStatus.TIMEOUT, 17, None),
+    }
+    connector._inflight_stores = {"request": 17}
+    connector._inflight_store_contexts = {"request": SimpleNamespace(task_id=17)}
+    connector._pop_context = MagicMock(return_value=SimpleNamespace(task_id=17))
+
+    poll_ticks = []
+    for i in range(80):
+        now[0] = 100.0 + i * tick
+        calls = connector.kv_manager.wait.call_count
+        assert connector.check_completed_stores() == []
+        if connector.kv_manager.wait.call_count > calls:
+            poll_ticks.append(i)
+    # Immediate first poll, then gaps of 2, 4, 8, 16, 32, 32 ... ticks.
+    assert poll_ticks == [0, 2, 6, 14, 30, 62]
+    # Followers must see one STORE_COMPLETION scatter per tick regardless.
+    assert connector._sync_ctx.scatter.call_count == 80
+
+    # A long tick (a forward) polls right away, and progress resets pacing.
+    now[0] += 0.5
+    connector.kv_manager.wait.return_value = {
+        17: KVResponse(KVResponseStatus.SUCCESS, 17, None),
+    }
+    assert connector.check_completed_stores() == ["request"]
+    assert connector._inflight_stores == {}
+    assert connector.check_completed_stores() == []
+    assert connector._store_poll_next_ts == 0.0
+
+
+def test_store_launch_pulls_backed_off_poll_forward(monkeypatch):
+    monkeypatch.setattr(connector_module, "_STORE_POLL_MIN_INTERVAL_S", 0.002)
+    monkeypatch.setattr(connector_module, "_STORE_POLL_MAX_INTERVAL_S", 0.032)
+    monkeypatch.setattr(connector_module.time, "monotonic", lambda: 100.0)
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._store_poll_next_ts = 100.032
+    connector._store_poll_interval_s = 0.032
+
+    connector._note_store_launched()
+
+    assert connector._store_poll_next_ts == pytest.approx(100.002)
+    assert connector._store_poll_interval_s == 0.002
 
 
 def test_store_ready_uses_leader_payload_and_dedicated_channel():

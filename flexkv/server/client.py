@@ -341,9 +341,15 @@ class KVDPClient:
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
         if response.status is not None:
+            # A zero-timeout wait is a non-blocking poll: TIMEOUT only means
+            # "still running", so it is not worth an error line per poll.
+            nonblocking = wait_timeout <= 0
             for k, v in response.status.items():
-                if v.status != KVResponseStatus.SUCCESS:
-                    flexkv_logger.error(f"wait task {k} failed: {v.status}")
+                if v.status == KVResponseStatus.SUCCESS:
+                    continue
+                if nonblocking and v.status == KVResponseStatus.TIMEOUT:
+                    continue
+                flexkv_logger.error(f"wait task {k} failed: {v.status}")
             return response.status
         else:
             flexkv_logger.error(f"wait tasks: {wait_task_ids} in dp_client_id={self.dp_client_id} failed.")
