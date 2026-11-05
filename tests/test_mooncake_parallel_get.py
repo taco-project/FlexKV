@@ -1,7 +1,7 @@
 """Bounded SDK concurrency and destination ownership; no live Store is needed."""
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 
 import pytest
@@ -58,6 +58,95 @@ def test_parallel_padding_bound_does_not_reinterpret_raw_sdk_batch_limit(client)
     client._store = SimpleNamespace(batch_get_into=get)
     assert client.batch_get(list("abcd"), [1, 2, 3, 4], [4] * 4) == [True] * 4
     assert sorted(calls) == [["a", "b"], ["c", "d"]]
+
+
+@pytest.mark.parametrize("raw_limit", [0, 4 * 1024 * 1024])
+def test_small_reads_use_available_workers_even_with_large_budget(client, raw_limit):
+    client._get_executor.shutdown()
+    client._get_concurrency = 4
+    client._get_executor = ThreadPoolExecutor(max_workers=4)
+    client._get_max_inflight_bytes = 512 * 1024 * 1024
+    client._config.max_get_batch_bytes = raw_limit
+    barrier = Barrier(4)
+
+    def get(keys, pointers, sizes):
+        if raw_limit:
+            assert sum(sizes) <= raw_limit
+        barrier.wait(timeout=5)
+        return sizes
+
+    client._store = SimpleNamespace(batch_get_into=get)
+    assert client.batch_get(list("abcdefgh"), list(range(1, 9)), [4 * 1024 * 1024] * 8) == [True] * 8
+
+
+def test_fast_completion_admits_next_read_before_slow_peer_finishes(client):
+    slow_entered, release_slow, third_entered = Event(), Event(), Event()
+
+    def get(keys, pointers, sizes):
+        if keys == ["a"]:
+            slow_entered.set()
+            assert release_slow.wait(5)
+        elif keys == ["b"]:
+            assert slow_entered.wait(5)
+        elif keys == ["c"]:
+            third_entered.set()
+        return [0] if keys == ["b"] else sizes
+
+    client._store = SimpleNamespace(batch_get_into=get)
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        result = caller.submit(client.batch_get, list("abc"), [1, 2, 3], [1] * 3)
+        try:
+            assert third_entered.wait(5), "free worker waited for the slow peer"
+            assert not result.done(), "caller returned before the slow read drained"
+        finally:
+            release_slow.set()
+        assert result.result(timeout=5) == [True, False, True]
+
+
+def test_large_blocks_reduce_concurrency_and_preserve_aggregate_budget(client):
+    client._get_executor.shutdown()
+    client._get_concurrency = 8
+    client._get_executor = ThreadPoolExecutor(max_workers=8)
+    client._get_max_inflight_bytes = 512 * 1024 * 1024
+    client._config.max_get_batch_bytes = 0
+    block_bytes = 64 * 1024 * 1024
+    cost = block_bytes + 8192
+    barrier, lock = Barrier(7), Lock()
+    active = peak = 0
+
+    def get(keys, pointers, sizes):
+        nonlocal active, peak
+        assert len(keys) == 1
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            assert active * cost <= client._get_max_inflight_bytes
+        try:
+            if keys[0] != "h":
+                barrier.wait(timeout=5)
+            return sizes
+        finally:
+            with lock:
+                active -= 1
+
+    client._store = SimpleNamespace(batch_get_into=get)
+    assert client.batch_get(list("abcdefgh"), list(range(1, 9)), [block_bytes] * 8) == [True] * 8
+    assert peak == 7 and active == 0
+
+
+def test_object_fitting_only_one_worker_is_read(client):
+    client._config.max_get_batch_bytes = 0
+    client._store = SimpleNamespace(batch_get_into=lambda keys, pointers, sizes: sizes)
+    # Padded cost is 20 KiB: fits the 24 KiB total but not a 12 KiB share.
+    assert client.batch_get(["large"], [1], [12288]) == [True]
+
+
+@pytest.mark.parametrize("raw_limit,size", [(0, 20000), (8, 9)])
+def test_oversized_object_is_rejected_before_any_submission(client, raw_limit, size):
+    client._config.max_get_batch_bytes = raw_limit
+    client._store = SimpleNamespace(batch_get_into=lambda *args: pytest.fail("unexpected SDK call"))
+    with pytest.raises(ValueError):
+        client.batch_get(["small", "large"], [1, 2], [1, size])
 
 
 @pytest.mark.parametrize("failure", ["sdk", "result_count", "submit"])

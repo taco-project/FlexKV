@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Optional, Set, Union, Any, List, Tuple, TYPE_CHECKING
 
@@ -654,45 +655,67 @@ class MooncakeStoreClient:
     def _parallel_get(
         self, keys: list[str], pointers: list[int], sizes: list[int]
     ) -> List[bool]:
-        # Padding is an additional bound, not a reinterpretation of the existing
-        # raw-byte SDK batch limit. zero_copy_get_impl still enforces that limit.
-        share = self._get_max_inflight_bytes // self._get_concurrency
+        if not keys:
+            return []
+        # Reduce concurrency for large objects instead of rejecting objects
+        # which fit the aggregate budget. Each task stays within its share, so
+        # any combination of outstanding tasks respects the aggregate bound.
         costs = [((size + 4095) // 4096) * 4096 + 8192 for size in sizes]
-        if share <= 0 or any(cost > share for cost in costs):
-            raise ValueError("A Mooncake Get object exceeds the parallel padded-byte share")
+        largest = max(costs)
+        if largest > self._get_max_inflight_bytes:
+            raise ValueError("A Mooncake Get object exceeds the aggregate padded-byte budget")
+        concurrency = min(
+            self._get_concurrency, len(keys), self._get_max_inflight_bytes // largest
+        )
+        share = self._get_max_inflight_bytes // concurrency
+        # Spread small batches across the available workers while retaining
+        # SDK batching. A final partial batch may contain fewer objects.
+        max_objects = (len(keys) + concurrency - 1) // concurrency
+        raw_limit = self._config.max_get_batch_bytes
         batches = []
         start = 0
         while start < len(keys):
-            end, cost = start, 0
-            while end < len(keys) and cost + costs[end] <= share:
+            end, cost, raw_bytes = start, 0, 0
+            while (
+                end < len(keys)
+                and end - start < max_objects
+                and cost + costs[end] <= share
+                and (not raw_limit or raw_bytes + sizes[end] <= raw_limit)
+            ):
                 cost += costs[end]
+                raw_bytes += sizes[end]
                 end += 1
             batches.append((start, end))
             start = end
-        results = []
-        for offset in range(0, len(batches), self._get_concurrency):
-            window = batches[offset:offset + self._get_concurrency]
-            futures, raw_window, error = [], [], None
-            try:
-                for a, b in window:
-                    futures.append(self._get_executor.submit(
+        results = [False] * len(keys)
+        pending = {}
+        offset = 0
+        try:
+            while offset < len(batches) or pending:
+                while offset < len(batches) and len(pending) < concurrency:
+                    a, b = batches[offset]
+                    future = self._get_executor.submit(
                         self.zero_copy_get_impl, keys[a:b], pointers[a:b], sizes[a:b]
-                    ))
-            except BaseException as exc:
-                error = exc
-            # Every accepted call must drain, even when a peer/submit fails.
-            # Destination buffers cannot be recycled or published before this.
-            for future in futures:
-                try:
-                    raw_window.append(future.result())
-                except BaseException as exc:
-                    if error is None:
-                        error = exc
-            if error is not None:
-                raise error
-            for (a, b), raw in zip(window, raw_window, strict=True):
-                self._check_result_count(raw, b - a, "batch_get_into")
-                results.extend(actual == expected for actual, expected in zip(raw, sizes[a:b], strict=True))
+                    )
+                    pending[future] = (a, b)
+                    offset += 1
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                # Check all observed completions before admitting more work.
+                # Completion order never changes the caller's result order.
+                for future in done:
+                    a, b = pending.pop(future)
+                    raw = future.result()
+                    self._check_result_count(raw, b - a, "batch_get_into")
+                    results[a:b] = [
+                        actual == expected for actual, expected in zip(raw, sizes[a:b], strict=True)
+                    ]
+        except BaseException:
+            # Stop submitting and drain every accepted call before propagating
+            # an error; destination buffers may still be written by a peer.
+            for future in pending:
+                with suppress(BaseException):
+                    future.result()
+            raise
         return results
 
     def batch_exists(self, keys_strs: list[str]) -> int:
