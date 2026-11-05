@@ -1,15 +1,8 @@
 # External backend adapters for FlexKV.
 # Currently provides the mooncake-store distributed KV cache backend.
-from flexkv.external.mooncake_store_utils import (
-    MooncakeStoreConfig,
-    MooncakeStoreClient,
-    MooncakeStoreCacheEngine,
-)
-from flexkv.external.mooncake_fault_inject import (
-    inject_mooncake_fault,
-    is_mooncake_fault_inject_enabled,
-    reset_mooncake_fault_rng,
-)
+#
+# Keep these imports lazy. Eagerly loading mooncake_store_utils pulls
+# `requests`, which recsys AOTI KVServer does not need.
 
 __all__ = [
     "MooncakeStoreConfig",
