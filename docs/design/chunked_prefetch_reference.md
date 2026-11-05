@@ -232,15 +232,29 @@ Enable INFO for the standard Python logger `flexkv.prefetch.coordinator` in the
 application logging configuration. `FLEXKV_LOG_LEVEL` alone configures a different
 logger. Per-session snapshots expose inflight counts/bytes and lease validity.
 
-This PR does not add dedicated prefetch Prometheus series. Chunk completions are
-routed to the coordinator before legacy transfer accounting, so existing transfer
-or joint-prefetch counters must not be interpreted as complete chunked-prefetch
-coverage. Metadata hits, CPU publication, H2D completion and model consumption are
-distinct. Follow-up instrumentation should add terminal outcome/token counters,
-elapsed/drain histograms, reserved/pinned/limit and inflight/state gauges, capacity
-source counts and runtime health. Use bounded labels only; keep session/request
-IDs and exception text in logs. See the [review document](chunked_prefetch_design_review.md#s9)
-for monitoring boundaries and acceptance requirements.
+With metrics enabled, the Python exporter also exposes:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `flexkv_prefetch_sessions_total` | policy, reason, outcome | Sessions counted once, after all claimed chunks drain |
+| `flexkv_prefetch_loaded_tokens_total` | policy | Published L3 tokens in the reusable prefix at terminal, only while its lease is valid |
+| `flexkv_prefetch_elapsed_seconds` | policy, reason | Histogram from admission to terminal |
+| `flexkv_prefetch_drain_seconds` | policy, reason | Histogram from seal to terminal |
+
+For example, the following PromQL shows the per-policy p95 drain time in seconds:
+
+```promql
+histogram_quantile(0.95, sum by (le, policy) (rate(flexkv_prefetch_drain_seconds_bucket[5m])))
+```
+
+An early release, reset or shutdown invalidates the result lease; such a session
+adds no loaded tokens. Unknown custom policies and stop reasons are labelled
+`other`; request IDs and exception text are never labels. These counters do not
+measure H2D completion or model consumption. Chunk completions are routed to the
+coordinator before legacy transfer accounting, so existing transfer or joint-prefetch
+counters are not complete chunked-prefetch coverage. Reserved/pinned/limit and
+inflight/state gauges, capacity source counts and runtime health remain future work.
+See the [review document](chunked_prefetch_design_review.md#s9) for boundaries.
 
 ## Failure and lifecycle contract
 
@@ -257,8 +271,8 @@ for monitoring boundaries and acceptance requirements.
   a worker. Existing lower-level shutdown behavior is unchanged after successful drain.
 - `[FlexKV-Prefetch]` terminal logs include epoch/session/policy/reason, submitted
   chunks, loaded tokens, elapsed time, and seal-to-terminal drain time. Snapshot
-  fields provide per-session in-flight observability; a Prometheus exporter is
-  not added in this first version.
+  fields provide per-session in-flight observability; terminal counters and
+  histograms are available in the Python Prometheus exporter.
 
 ## Validation
 

@@ -338,7 +338,7 @@ SGLang 预取改动已通过[分支间 PR #6](https://github.com/XingLiu1/sglang
 
 ### 9.1 当前可采集什么
 
-当前已有通用 FlexKV Prometheus 服务和预取终态日志；**本 PR 尚未实现预取专用 Prometheus 指标**。不能用旧整图 prefetch 或 HiCache 的计数，代替新 chunked session 的成功率、排空时间和 pin 占用。
+当前已有通用 FlexKV Prometheus 服务、分段预取终态指标和日志。不能用旧整图 prefetch 或 HiCache 的计数，代替新 chunked session 的成功率、排空时间和 pin 占用。
 
 ```bash
 export FLEXKV_ENABLE_METRICS=1
@@ -351,6 +351,9 @@ Python 与 C++ 都在所在进程网络命名空间的 `127.0.0.1:<port>/metrics
 
 | 当前信号 | 用途 | 不能据此推出的结论 |
 |---|---|---|
+| `flexkv_prefetch_sessions_total` | 按 policy/reason/outcome 统计终态会话 | 不包含仍在排空的会话 |
+| `flexkv_prefetch_loaded_tokens_total` | 统计终态时 lease 有效的连续可用 L3 前缀 | 不表示 H2D 已完成或模型实际使用 |
+| `flexkv_prefetch_elapsed_seconds` / `flexkv_prefetch_drain_seconds` | 观察 start→terminal 和 seal→terminal 的耗时分布 | timeout 预算不保证 terminal 时刻 |
 | `flexkv_py_mempool_total_blocks` / `flexkv_py_mempool_free_blocks` | CPU 池总量与可分配空间，结合 allocation/eviction 计数检查压力 | 不是新预取 session 的 reserved/pinned 精确占用 |
 | `flexkv_py_allocation_failures_total` / `flexkv_py_evicted_blocks_total` | 分配失败与淘汰压力趋势 | 不能覆盖 planner 中每一个容量回退分支 |
 | `flexkv_py_transfer_bytes_total` / `flexkv_py_transfer_ops_total` | 原有前台 GET/PUT 完成计数，例如 H2D | 新 chunk 完成由 coordinator 提前分流，当前不完整计入这组通用指标 |
@@ -378,13 +381,10 @@ Python 与 C++ 都在所在进程网络命名空间的 `127.0.0.1:<port>/metrics
 
 ### 9.3 下一步补齐的专用指标与验收要求
 
-以下是后续实现清单，当前 `/metrics` 中不存在。复用 Python exporter，由控制线程写入；采集线程只读指标值，不遍历或修改 session，也不增加传输面 IPC。
+终态计数和耗时由控制线程写入 Python exporter，采集线程不遍历 session，也不增加传输面 IPC。lease 已失效的 session 不计入 loaded tokens。以下指标仍待实现：
 
 | 拟新增指标 | 类型 / 低基数标签 | 记录边界 |
 |---|---|---|
-| `flexkv_prefetch_sessions_total` | Counter，policy/reason/outcome | 每个 session 终态只计一次，区分 complete、partial、empty、aborted、failed |
-| `flexkv_prefetch_loaded_tokens_total` | Counter，policy | 终态只计可交付 checkpoint 内实际发布的 L3 区间；metadata 命中不计 |
-| `flexkv_prefetch_elapsed_seconds` / `flexkv_prefetch_drain_seconds` | Histogram，policy/reason | 分别记录 start→terminal 与 seal→terminal；用 seconds，避免 ms 混用 |
 | `flexkv_prefetch_reserved_bytes` / `flexkv_prefetch_pinned_bytes` | Gauge，无请求标签 | 来自 coordinator/planner 账本；包含乱序完成和结果 lease；同时暴露对应 limit |
 | `flexkv_prefetch_inflight_chunks` / `flexkv_prefetch_sessions` | Gauge，后者仅 state 标签 | 活动、draining、保留终态结果与在途工作分开看 |
 | `flexkv_prefetch_capacity_stops_total` / `flexkv_prefetch_runtime_healthy` | Counter，resource；Gauge | 容量来源限定为 reserved/pinned/allocator，控制或发送异常立即置 unhealthy |
@@ -393,4 +393,4 @@ Python 与 C++ 都在所在进程网络命名空间的 `127.0.0.1:<port>/metrics
 
 告警优先看：runtime unhealthy；队列有请求但长期无 running 且预取不推进；reserved/pinned 接近上限同时出现容量回退；drain 高分位恶化；释放与 TTL 后 pinned 长期不下降。阈值应以正常负载分位数和延迟目标确定，不把 30 ms 策略预算当成 drain 的统一告警阈值。
 
-新增指标必须验证：禁用时无采集成本；重复 poll/release 不重复计数；停止后占用不提前清零；Full+SWA 部分失败只统计可交付范围；多实例重启无重复注册；HTTP 实际 scrape 和告警规则可用。上述专用指标、看板和持续资源趋势验收完成前，不将本 PR 描述为生产监控已闭环。
+新增指标必须验证：禁用时不采集；重复 poll/release 不重复计数；停止后占用不提前清零；Full+SWA 部分失败只统计可交付范围；多实例重启无重复注册；HTTP 实际 scrape 和告警规则可用。剩余指标、看板和持续资源趋势验收完成前，不将监控描述为已闭环。

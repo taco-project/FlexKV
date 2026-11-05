@@ -334,8 +334,8 @@ acceptance of the September 8 rebase or its changed chunk sizes.
 The feature remains disabled by default. The September 10 run covers the
 node-local TP8 eager configuration described above; other model and execution
 configurations still need GPU/model validation and block/window tuning. Cython release builds,
-DP/layerwise configurations, sustained failure injection, dedicated prefetch
-Prometheus instrumentation and long-term resource trends remain outstanding.
+DP/layerwise configurations, sustained failure injection, prefetch resource/health
+metrics and long-term resource trends remain outstanding.
 Broader same-cache-state performance A/B and prolonged load tests are required
 before extending the controlled results to production readiness. SSD, P2P,
 multi-node and TRT-remote prefetch are explicitly outside this version's scope.

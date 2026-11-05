@@ -228,6 +228,8 @@ SGLang Hybrid Radix 继续管理 GPU 树。H2D 恢复到请求持有的槽位，
 
 `wait_prefetch(timeout_s=...)` 是调用方的等待上限，和策略预算不同。等待超时不会自动取消 session；终态之前不能依据一次 wait 返回就释放 inflight 资源。
 
+启用 `FLEXKV_ENABLE_METRICS=1` 后，Python exporter 会记录分段预取的终态数、仍受 lease 保护的可用 L3 token 数，以及总耗时和排空耗时；指标含义和未覆盖的资源监控见[接口参考](chunked_prefetch_reference.md#monitoring-status)。
+
 ## 10. 如何检查是否正确
 
 | 检查点 | 证据 |

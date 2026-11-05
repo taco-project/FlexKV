@@ -57,6 +57,7 @@ class PrefetchCoordinator:
         result_ttl_s=60.0,
         max_batch_graphs=32,
         epoch=None,
+        metrics=None,
     ):
         if (
             max_sessions <= 0
@@ -72,6 +73,7 @@ class PrefetchCoordinator:
         self.result_ttl_s = result_ttl_s
         self.max_batch_graphs = max_batch_graphs
         self.epoch = epoch or uuid.uuid4().hex
+        self.metrics = metrics
         self.sessions: Dict[PrefetchHandle, Session] = OrderedDict()
         # Released/expired terminal snapshots only: never retain a context or
         # charge an admission slot after the caller has relinquished its lease.
@@ -283,7 +285,13 @@ class PrefetchCoordinator:
             return
         session.terminal_at = self.clock()
         session.version += 1
-        logging.getLogger(__name__).info(
+        snapshot = self.snapshot(session.handle)
+        elapsed_s = session.terminal_at - session.created
+        drain_s = session.terminal_at - (
+            session.sealed_at if session.sealed_at is not None else session.terminal_at
+        )
+        logger = logging.getLogger(__name__)
+        logger.info(
             "[FlexKV-Prefetch] epoch=%s session_id=%d policy=%s reason=%s "
             "submitted_chunks=%d sealed_submit_seq=%d loaded_tokens=%d "
             "elapsed_ms=%.3f drain_ms=%.3f error=%r",
@@ -293,19 +301,19 @@ class PrefetchCoordinator:
             session.reason,
             session.submitted,
             session.sealed_seq,
-            self.snapshot(session.handle).loaded_tokens,
-            (session.terminal_at - session.created) * 1000,
-            (
-                session.terminal_at
-                - (
-                    session.sealed_at
-                    if session.sealed_at is not None
-                    else session.terminal_at
-                )
-            )
-            * 1000,
+            snapshot.loaded_tokens,
+            elapsed_s * 1000,
+            drain_s * 1000,
             session.error,
         )
+        if self.metrics is not None:
+            try:
+                self.metrics.record_prefetch_terminal(
+                    session.options.policy, session.reason, snapshot.outcome,
+                    snapshot.loaded_tokens if snapshot.lease_valid else 0, elapsed_s, drain_s,
+                )
+            except Exception:
+                logger.exception("Failed to record chunked prefetch metrics")
         if session.released or session.discard_result:
             self._retire(session)
 
