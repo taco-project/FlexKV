@@ -7,6 +7,8 @@
   as an error, a peer that stopped serving times out -- for a 4 KiB-aligned
   block (served with O_DIRECT) and a 512 B-aligned one (served buffered, like
   FlexKV's own engine writes it).
+* A peer never writes after the reader gave up (the slots may be reused), and
+  a reader that dropped a peer fails fast, then reconnects.
 * A reader whose own endpoint is still starting fails at once.
 Skipped without NIXL (UCX + POSIX plugins) or `flexkv.c_ext`.
 """
@@ -150,6 +152,34 @@ def test_a_silent_peer_times_out(pair):
     server.close()  # stops serving; the agent stays reachable
     with pytest.raises(TimeoutError):
         client.read(server.name, [0], [0], 1)
+
+
+def test_an_expired_request_is_not_served(pair):
+    server, client, dst, n, bs = pair
+    with pytest.raises(RuntimeError, match="expired"):
+        client.read(server.name, [0, 1], [0, 1], 30, write_window_s=-1)
+    assert not dst[:2 * bs].any()
+
+
+def test_a_stalled_peer_does_not_write_late_and_the_reader_reconnects(pair, monkeypatch):
+    server, client, dst, n, bs = pair
+    serve = server._serve
+
+    def _stalled(sender, req, staging):  # first request: the peer stalls past the timeout
+        monkeypatch.setattr(server, "_serve", serve)
+        time.sleep(2.0)
+        serve(sender, req, staging)
+    monkeypatch.setattr(server, "_serve", _stalled)
+    client.retry_s = 1.0
+    with pytest.raises(TimeoutError):
+        client.read(server.name, [3], [3], 1)
+    with pytest.raises(RuntimeError, match="dropped"):  # fails fast while backing off
+        client.connect(server.name, "127.0.0.1", server.port, 5)
+    time.sleep(2.5)                      # the stalled peer has woken up and answered
+    assert not dst[3 * bs:4 * bs].any()  # ... without writing into the given-up slot
+    client.connect(server.name, "127.0.0.1", server.port, 30)
+    client.read(server.name, [4], [5], 30)
+    assert np.array_equal(dst[5 * bs:6 * bs], _pattern(4, bs))
 
 
 def test_reads_fail_at_once_while_the_endpoint_starts():

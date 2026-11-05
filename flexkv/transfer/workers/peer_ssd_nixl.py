@@ -155,6 +155,9 @@ class NixlSSDEndpoint:
         self._waiters: Dict[str, List[Any]] = {}  # request id -> [Event, error or None]
         self._lock = threading.Lock()
         self._connected: set = set()
+        self._contacts: Dict[str, Tuple[str, int]] = {}
+        self._down_until: Dict[str, float] = {}   # peer -> monotonic time of the next reconnect
+        self.retry_s = float(os.getenv("FLEXKV_NIXL_SSD_RETRY_S", "") or 10)
         self._requests: "queue.Queue[Tuple[str, Dict[str, Any]]]" = queue.Queue()
         self._stop = threading.Event()
         self._threads = [threading.Thread(target=self._dispatch, name=f"{name}-notif", daemon=True)]
@@ -189,36 +192,79 @@ class NixlSSDEndpoint:
 
     # -- reader side ------------------------------------------------------
     def connect(self, peer: str, ip: str, port: int, timeout_s: float) -> None:
-        if peer in self._connected:
-            return
+        with self._lock:
+            if peer in self._connected:
+                return
+            self._contacts[peer] = (ip, int(port))
+            wait = self._down_until.get(peer, 0.0) - time.monotonic()
+        if wait > 0:
+            # Recently dropped: fail at once instead of making every prefetch
+            # wait out the metadata timeout of a peer that may still be down.
+            raise RuntimeError(f"[peer-ssd-nixl] {peer} was dropped; reconnecting in {wait:.0f}s")
         self.agent.send_local_metadata(ip, port)
         self.agent.fetch_remote_metadata(peer, ip, port)
         deadline = time.monotonic() + timeout_s
         while not self.agent.check_remote_metadata(peer):
             if time.monotonic() > deadline:
+                self.drop(peer, "no metadata")
                 raise TimeoutError(f"[peer-ssd-nixl] no metadata from {peer} at {ip}:{port}")
             time.sleep(0.01)
-        self._connected.add(peer)
+        with self._lock:
+            self._connected.add(peer)
+            self._down_until.pop(peer, None)
         flexkv_logger.info(f"[peer-ssd-nixl] {self.name} connected to {peer} ({ip}:{port})")
 
+    def drop(self, peer: str, why: str) -> None:
+        """Forget ``peer`` after a timeout or a transport error: NIXL keeps a
+        failed UCX endpoint and fails every later send on it, so both sides
+        drop each other's metadata and the next `connect` (after `retry_s`)
+        builds a fresh connection."""
+        with self._lock:
+            self._connected.discard(peer)
+            self._down_until[peer] = time.monotonic() + self.retry_s
+            contact = self._contacts.get(peer)
+        for step in (lambda: self.agent.remove_remote_agent(peer),
+                     lambda: contact and self.agent.invalidate_local_metadata(*contact)):
+            try:
+                step()
+            except Exception as e:  # noqa: BLE001 - best effort, the peer may be gone
+                flexkv_logger.debug(f"[peer-ssd-nixl] dropping {peer}: {e!r}")
+        flexkv_logger.warning(f"[peer-ssd-nixl] {self.name} dropped {peer} ({why}); "
+                              f"reconnecting after {self.retry_s:.0f}s")
+
     def read(self, peer: str, src_blocks: Sequence[int], dst_blocks: Sequence[int],
-             timeout_s: float) -> None:
+             timeout_s: float, write_window_s: Optional[float] = None) -> None:
         """Have ``peer`` write its SSD blocks ``src_blocks`` into this node's
         CPU blocks ``dst_blocks``. Raises on error or timeout; the destination
-        slots then hold undefined bytes."""
+        slots then hold undefined bytes.
+
+        The caller recycles the slots once this raises, so the peer must not
+        write into them later (a stalled peer would otherwise serve the queued
+        request after the timeout and overwrite whatever reused the slots): the
+        request carries a wall-clock deadline (``write_window_s``, by default
+        the timeout minus a margin) after which the peer posts no more writes.
+        The nodes' clocks must agree to well within that margin."""
         if len(src_blocks) != len(dst_blocks):
             raise ValueError("src and dst block lists differ in length")
         if len(src_blocks) == 0:
             return
+        if write_window_s is None:
+            write_window_s = timeout_s - min(5.0, timeout_s / 3)
         rid = uuid.uuid4().hex[:16]
         waiter = [threading.Event(), None]
         with self._lock:
             self._waiters[rid] = waiter
         body = {"id": rid, "base": self._cpu_ptr, "block": self.block_bytes,
+                "expires": time.time() + write_window_s,
                 "src": [int(b) for b in src_blocks], "dst": [int(b) for b in dst_blocks]}
         try:
-            self.agent.send_notif(peer, _REQ + json.dumps(body).encode())
+            try:
+                self.agent.send_notif(peer, _REQ + json.dumps(body).encode())
+            except Exception as e:  # noqa: BLE001
+                self.drop(peer, repr(e))
+                raise
             if not waiter[0].wait(timeout_s):
+                self.drop(peer, f"no answer in {timeout_s:.0f}s")
                 raise TimeoutError(
                     f"[peer-ssd-nixl] {peer} did not answer a {len(src_blocks)}-block read "
                     f"in {timeout_s:.0f}s")
@@ -304,6 +350,9 @@ class NixlSSDEndpoint:
         if int(req["block"]) != self.block_bytes:
             raise ValueError(f"block size {req['block']} != this node's {self.block_bytes}")
         src, dst, base = req["src"], req["dst"], int(req["base"])
+        expires = float(req.get("expires", float("inf")))
+        if time.time() > expires:
+            raise TimeoutError("request expired before it was served")
         chunks = [(i, min(i + self.chunk_blocks, len(src))) for i in range(0, len(src), self.chunk_blocks)]
         free = deque(range(staging.count))
         reads: deque = deque()   # (chunk, buffer, handle)
@@ -320,6 +369,12 @@ class NixlSSDEndpoint:
                 nxt += 1
             progressed = False
             if reads and self._done(reads[0][2]):
+                if time.time() > expires:
+                    # The reader has given up and may have reused the slots.
+                    for _, _, h in list(reads)[1:] + list(writes):  # reads[0] is released
+                        while not self._done(h):
+                            time.sleep(_IDLE_SLEEP_S)
+                    raise TimeoutError("request expired before it was served")
                 c, buf, _ = reads.popleft()
                 lo, hi = chunks[c]
                 local = [(staging.ptr(buf) + j * bb, bb, 0) for j in range(hi - lo)]
