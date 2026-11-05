@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <queue>
+#include <stdexcept>
 #include <sys/time.h>
 
 namespace flexkv {
@@ -43,6 +44,11 @@ bool OrderedHashList::contains(int64_t hash) {
   return map.find(hash) != map.end();
 }
 
+void OrderedHashList::clear() {
+  list.clear();
+  map.clear();
+}
+
 LocalRadixTree::LocalRadixTree(int tokens_per_block, unsigned int max_num_blocks,
   uint32_t ttl_ms, uint32_t renew_ms,
   uint32_t batch_sz, uint32_t idle_sleep_ms,
@@ -75,32 +81,12 @@ LocalRadixTree::LocalRadixTree(int tokens_per_block, unsigned int max_num_blocks
 LocalRadixTree::~LocalRadixTree() {
   // Ensure background worker is stopped before nodes/lease pool destruction
   stop();
-  // Drain and delete any pending block lists in the eviction queues
-  {
-    std::unique_ptr<std::deque<int64_t>> ptr;
-    while (evicted_blocks_queue.pop(ptr)) {
-      // unique_ptr auto-frees
-      ptr.reset();
-    }
-  }
-  {
-    std::unique_ptr<std::deque<int64_t>> ptr;
-    while (about_to_evict_blocks_queue.pop(ptr)) {
-      // unique_ptr auto-frees
-      ptr.reset();
-    }
-  }
-  {
-    NewBlockMeta* ptr = nullptr;
-    while (new_block_queue.pop(ptr)) {
-      if (ptr) delete ptr;
-    }
-  }
+  discard_pending_queues();
 }
 
 CRadixNode *LocalRadixTree::insert(torch::Tensor &physical_block_ids,
   torch::Tensor &block_hashes, int num_blocks, int num_insert_blocks,
-  bool ready, CRadixNode *last_node, int num_matched_blocks, int last_node_matched_length) {
+  CRadixNode *last_node, int num_matched_blocks, int last_node_matched_length) {
   // Mirror CRadixTreeIndex::insert but attach LeaseMeta for every newly created node
   if (num_insert_blocks == -1) {
     num_insert_blocks = num_blocks;
@@ -117,12 +103,18 @@ CRadixNode *LocalRadixTree::insert(torch::Tensor &physical_block_ids,
   }
 
   assert(last_node != nullptr);
-  assert(last_node_matched_length != 0 || is_root(last_node));
   assert(physical_block_ids.size() == num_insert_blocks - num_matched_blocks);
 
   if (num_matched_blocks >= num_insert_blocks) {
     return nullptr;
   }
+
+  // Keep stale-match handling identical to the base radix tree. This check is
+  // deliberately before split/LeaseMeta allocation/current_block_count changes;
+  // a rejected insert leaves both the tree and caller-owned physical blocks
+  // untouched.
+  validate_insert_target(last_node, block_hashes, num_blocks,
+                         num_matched_blocks, last_node_matched_length);
 
   // Handle split if the last node only partially matched
   if (last_node_matched_length < last_node->size()) {
@@ -150,7 +142,7 @@ CRadixNode *LocalRadixTree::insert(torch::Tensor &physical_block_ids,
   }
 
   // Create the new leaf node and attach LeaseMeta immediately
-  CRadixNode *new_node = new CRadixNode(this, ready, 0);
+  CRadixNode *new_node = new CRadixNode(this, 0);
 
   auto &new_block_hashes = new_node->get_block_hashes();
   auto &new_physical_blocks = new_node->get_physical_blocks();
@@ -362,7 +354,7 @@ void LocalRadixTree::refresh_worker() {
   struct timeval tv0; gettimeofday(&tv0, nullptr);
   uint64_t now_ms0 = (uint64_t)tv0.tv_sec * 1000 + (uint64_t)(tv0.tv_usec / 1000);
   uint64_t next_renew_ms = now_ms0 + renew_lease_ms;
-  while (!refresh_should_stop) {
+  while (!refresh_should_stop.load(std::memory_order_acquire)) {
     size_t n = local_block_report(batch);
     struct timeval tv; gettimeofday(&tv, nullptr);
     uint64_t now_ms = (uint64_t)tv.tv_sec * 1000 + (uint64_t)(tv.tv_usec / 1000);
@@ -381,7 +373,7 @@ bool LocalRadixTree::start(RedisMetaChannel *ch) {
   // Initialize channel and node_id from ch
   set_meta_channel(ch);
   if (channel == nullptr) return false;
-  refresh_should_stop = false;
+  refresh_should_stop.store(false, std::memory_order_release);
   refresh_started = true;
   int result = pthread_create(&refresh_tid, nullptr, &LocalRadixTree::refresh_worker_trampoline, this);
   if (result != 0) {
@@ -415,7 +407,7 @@ void LocalRadixTree::renew_relese_time() {
 
 void LocalRadixTree::stop() {
   if (!refresh_started) return;
-  refresh_should_stop = true;
+  refresh_should_stop.store(true, std::memory_order_release);
   pthread_join(refresh_tid, nullptr);
   refresh_started = false;
 }
@@ -482,7 +474,6 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
   int evictable_count = 0;
   int not_evictable_count = 0;
   int locked_count = 0;
-  int not_ready_count = 0;
   int expired_count = 0;
   int fresh_count = 0;
   int about_to_evict_count = 0;
@@ -493,7 +484,6 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
       not_evictable_count++;
       // Check why not evictable
       if (node->get_lock_cnt() > 0) locked_count++;
-      if (!node->is_ready()) not_ready_count++;
       continue;
     }
     evictable_count++;
@@ -520,9 +510,9 @@ int LocalRadixTree::evict(torch::Tensor &evicted_blocks, int num_evicted) {
       fresh_q(CRadixNode::Compare(), std::move(fresh_candidates));
   
   // Log eviction状态 when eviction is attempted
-  /*printf("[EVICT] need=%d, leaf_list=%zu, evictable=%d (expired=%d, fresh_normal=%d, about_to_evict=%d), not_evictable=%d (locked=%d, not_ready=%d)\n",
+  /*printf("[EVICT] need=%d, leaf_list=%zu, evictable=%d (expired=%d, fresh_normal=%d, about_to_evict=%d), not_evictable=%d (locked=%d)\n",
          num_evicted, leaf_list.size(), evictable_count, expired_count, fresh_count, 
-         about_to_evict_count, not_evictable_count, locked_count, not_ready_count);*/
+         about_to_evict_count, not_evictable_count, locked_count);*/
 
   auto push_parent_if_candidate = [&](CRadixNode *parent){
     if (parent == nullptr) {
@@ -677,11 +667,25 @@ std::shared_ptr<CMatchResult> LocalRadixTree::match_prefix(torch::Tensor &block_
   return result;
 }
 
-int LocalRadixTree::total_unready_blocks() { return CRadixTreeIndex::total_unready_blocks(); }
-int LocalRadixTree::total_ready_blocks() { return CRadixTreeIndex::total_ready_blocks(); }
 int LocalRadixTree::total_cached_blocks() { return CRadixTreeIndex::total_cached_blocks(); }
 int LocalRadixTree::total_node_num() { return CRadixTreeIndex::total_node_num(); }
-void LocalRadixTree::reset() { CRadixTreeIndex::reset(); }
+void LocalRadixTree::reset() {
+  if (refresh_started) {
+    throw std::runtime_error("LocalRadixTree::reset requires the refresh worker to be stopped");
+  }
+
+  discard_pending_queues();
+
+  if (channel != nullptr && !channel->delete_node_blocks(node_id, refresh_batch_size)) {
+    throw std::runtime_error(
+        "LocalRadixTree::reset failed to delete this node's Redis block metadata");
+  }
+
+  normal_block_hashes.clear();
+  CRadixTreeIndex::reset();
+  lease_pool.reset();
+  current_block_count = 0;
+}
 bool LocalRadixTree::is_root(CRadixNode *node) { return CRadixTreeIndex::is_root(node); }
 void LocalRadixTree::remove_node(CRadixNode *node) {
   auto lm = node->get_lease_meta();
@@ -698,8 +702,39 @@ void LocalRadixTree::unlock(CRadixNode *node) { CRadixTreeIndex::unlock(node); }
 bool LocalRadixTree::is_empty() { return CRadixTreeIndex::is_empty(); }
 void LocalRadixTree::inc_node_count() { CRadixTreeIndex::inc_node_count(); }
 void LocalRadixTree::dec_node_count() { CRadixTreeIndex::dec_node_count(); }
-void LocalRadixTree::set_ready(CRadixNode *node, bool ready, int ready_length) {
-  CRadixTreeIndex::set_ready(node, ready, ready_length);
+size_t LocalRadixTree::lease_pool_capacity() const { return lease_pool.capacity(); }
+size_t LocalRadixTree::lease_pool_free_size() const { return lease_pool.free_size(); }
+size_t LocalRadixTree::pending_queue_size() const {
+  return new_block_queue.size() + evicted_blocks_queue.size() +
+         about_to_evict_blocks_queue.size();
+}
+
+size_t LocalRadixTree::discard_pending_queues() {
+  size_t discarded = 0;
+  {
+    std::unique_ptr<std::deque<int64_t>> ptr;
+    while (evicted_blocks_queue.pop(ptr)) {
+      if (ptr) discarded += ptr->size();
+      ptr.reset();
+    }
+  }
+  {
+    std::unique_ptr<std::deque<int64_t>> ptr;
+    while (about_to_evict_blocks_queue.pop(ptr)) {
+      if (ptr) discarded += ptr->size();
+      ptr.reset();
+    }
+  }
+  {
+    NewBlockMeta *ptr = nullptr;
+    while (new_block_queue.pop(ptr)) {
+      if (ptr) {
+        discarded += ptr->block_hashes.size();
+        delete ptr;
+      }
+    }
+  }
+  return discarded;
 }
 
 size_t LocalRadixTree::drain_pending_queues() {

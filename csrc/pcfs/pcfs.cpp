@@ -1,7 +1,7 @@
 // Pcfs.cpp
 #include "pcfs.h"
+#include "logging.h"
 #include <fcntl.h>
-#define INIT_IO_SIZE (1024 * 1024)
 #define MAX_PCFS_LINK_NUM 64 // read + write <= 128, pcfs limits
 
 flexkv::Pcfs::Pcfs(const std::string &fsid, uint32_t port,
@@ -15,8 +15,10 @@ flexkv::Pcfs::~Pcfs() { destroy(); }
 bool flexkv::Pcfs::init() {
   fsctx = hifs_init(fsid.c_str(), port, ip.c_str(), false, nullptr);
   if (!fsctx) {
-    fprintf(stderr, "HIFS初始化失败 (fsid=%s, ip=%s)\n", fsid.c_str(),
-            ip.c_str());
+    FLEXKV_LOG_ERROR(
+        "operation=pcfs_init act=complete status=failed fsid=\"%s\" "
+        "ip=\"%s\" port=%u",
+        fsid.c_str(), ip.c_str(), port);
     return false;
   }
   return true;
@@ -57,8 +59,10 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
     crreq.unique = 1000;
     snprintf(crreq.name, sizeof(crreq.name), "%s", filename.c_str());
     if (hifs_create(fsctx, &crreq, &crreply) != 0 || crreply.error != 0) {
-      fprintf(stderr, "embedded create file data pnodeid:%lu file %s fail\n",
-              parent_nodeid, crreq.name);
+      FLEXKV_LOG_ERROR(
+          "operation=pcfs_file_create act=complete status=failed "
+          "parent_node_id=%lu path=\"%s\" error_code=%d",
+          parent_nodeid, crreq.name, crreply.error);
       return 0;
     }
     file_nodeid = crreply.nodeid;
@@ -72,8 +76,10 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
 
     if (hifs_open(fsctx, &open_req, &open_reply) != 0 ||
         open_reply.error != 0) {
-      fprintf(stderr, "embedded open file data pnodeid:%lu file %s fail\n",
-              parent_nodeid, filename.c_str());
+      FLEXKV_LOG_ERROR(
+          "operation=pcfs_file_open act=complete status=failed "
+          "parent_node_id=%lu path=\"%s\" error_code=%d",
+          parent_nodeid, filename.c_str(), open_reply.error);
       return 0;
     }
     hifs_truncate_req_t truncate_req = {0};
@@ -85,45 +91,21 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
     truncate_req.size = file_size;
     if (hifs_truncate(fsctx, &truncate_req, &truncate_reply) != 0 ||
         truncate_reply.error != 0) {
-      fprintf(
-          stderr,
-          "embedded truncate file data pnodeid:%lu file %s to size %lu fail\n",
-          parent_nodeid, filename.c_str(), file_size);
+      FLEXKV_LOG_ERROR(
+          "operation=pcfs_file_truncate act=complete status=failed "
+          "parent_node_id=%lu path=\"%s\" size=%lu error_code=%d",
+          parent_nodeid, filename.c_str(), file_size, truncate_reply.error);
       return 0;
     }
 
-    // init with 0x00
-    // char *buffer = static_cast<char*>(malloc(INIT_IO_SIZE));
-    // if (!buffer) {
-    //     return false;
-    // }
-    // memset(buffer, 0, INIT_IO_SIZE);
-
-    // size_t remaining = file_size;
-    // size_t offset = 0;
-    // for (offset = 0; remaining > 0; offset += INIT_IO_SIZE) {
-    //     size_t write_size = (remaining > INIT_IO_SIZE) ? INIT_IO_SIZE :
-    //     remaining; hifs_write_req_t wrreq = {0}; hifs_write_reply_t wrreply =
-    //     {0}; wrreq.fh = open_reply.fh; wrreq.offset = offset; wrreq.size =
-    //     write_size; wrreq.buf = buffer; wrreq.uid = 0; wrreq.gid = 0;
-    //     wrreq.unique= 1000;
-    //     if (hifs_write(fsctx, &wrreq, &wrreply) != 0 || wrreply.error != 0) {
-    //         fprintf(stderr, "embedded write file data pnodeid:%lu file %s
-    //         fail\n", open_reply.fh, filename.c_str()); free(buffer); return
-    //         0;
-    //     }
-
-    //     remaining -= write_size;
-    // }
-    // free(buffer);
   } else {
     // return 0 if the size is smaller than file_size
     uint64_t exist_file_size = lkreply.attr.size;
     if (exist_file_size < file_size) {
-      fprintf(
-          stderr,
-          "file exists and its size smaller than allocate: %lu file %s fail\n",
-          parent_nodeid, filename.c_str());
+      FLEXKV_LOG_ERROR(
+          "operation=pcfs_file_validate act=complete status=failed "
+          "parent_node_id=%lu path=\"%s\" existing_size=%lu required_size=%lu",
+          parent_nodeid, filename.c_str(), exist_file_size, file_size);
       return 0;
     }
     hifs_open_req_t open_req = {0};
@@ -136,8 +118,10 @@ uint64_t flexkv::Pcfs::lookup_or_create_file(const std::string &filename,
 
     if (hifs_open(fsctx, &open_req, &open_reply) != 0 ||
         open_reply.error != 0) {
-      fprintf(stderr, "embedded open file data pnodeid:%lu file %s fail\n",
-              parent_nodeid, filename.c_str());
+      FLEXKV_LOG_ERROR(
+          "operation=pcfs_file_open act=complete status=failed "
+          "parent_node_id=%lu path=\"%s\" error_code=%d",
+          parent_nodeid, filename.c_str(), open_reply.error);
       return 0;
     }
   }
@@ -310,7 +294,8 @@ static void _transfer_single_thread_impl(
     int start_block, int end_block, int64_t cpu_tensor_ptr,
     int64_t cpu_layer_stride_in_bytes, int64_t cfs_layer_stride_in_bytes,
     int64_t cpu_kv_stride_in_bytes, int64_t cfs_kv_stride_in_bytes,
-    int64_t block_size_in_bytes, bool is_read, int thread_id, bool is_mla) {
+    int64_t block_size_in_bytes, bool is_read, int thread_id,
+    int kv_dim) {
   int num_blocks = end_block - start_block;
   if (num_blocks == 0) {
     return;
@@ -348,7 +333,7 @@ static void _transfer_single_thread_impl(
       if (!transfer_ret) {
         throw std::runtime_error("Failed to transfer K block");
       }
-      if (is_mla) {
+      if (kv_dim == 1) {
         continue;
       }
       // read V block
@@ -377,8 +362,8 @@ static void _shared_transfer_single_thread_impl(
     const std::vector<int64_t> &cpu_block_ids, int start_layer, int end_layer,
     int64_t cpu_tensor_ptr, int64_t cpu_layer_stride_in_bytes,
     int64_t cfs_layer_stride_in_bytes, int64_t cpu_kv_stride_in_bytes,
-    int64_t cfs_kv_stride_in_bytes, int64_t block_size_in_bytes,
-    int thread_id, bool is_mla) {
+    int64_t cfs_kv_stride_in_bytes,     int64_t block_size_in_bytes,
+    int thread_id, int kv_dim) {
   
   int num_blocks = cfs_block_ids.size();
   if (num_blocks == 0) {
@@ -412,7 +397,7 @@ static void _shared_transfer_single_thread_impl(
         throw std::runtime_error("Failed to transfer K block");
       }
       
-      if (is_mla) {
+      if (kv_dim == 1) {
         continue;
       }
       
@@ -443,7 +428,7 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
     int64_t cfs_kv_stride_in_bytes, int64_t block_size_in_bytes,
     int64_t total_layers, bool is_read, int partition_block_type,
     int round_robin, int64_t num_remote_blocks_per_file, bool use_mmap,
-    int num_threads_per_file, bool is_mla) {
+    int num_threads_per_file, int kv_dim) {
 
   int num_files = file_nodeids.size();
   // int file_size = cfs_layer_stride_in_bytes * total_layers;
@@ -501,7 +486,8 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
              start_layer, end_layer, start_block, end_block, cpu_tensor_ptr,
              cpu_layer_stride_in_bytes, cfs_layer_stride_in_bytes,
              cpu_kv_stride_in_bytes, cfs_kv_stride_in_bytes,
-             block_size_in_bytes, is_read, is_mla, prom = std::move(prom),
+             block_size_in_bytes, is_read, kv_dim,
+             prom = std::move(prom),
              thread_id]() mutable {
               try {
                 _transfer_single_thread_impl(
@@ -510,7 +496,8 @@ void transfer_kv_blocks_cfs_mmap_multi_thread(
                     start_block, end_block, cpu_tensor_ptr,
                     cpu_layer_stride_in_bytes, cfs_layer_stride_in_bytes,
                     cpu_kv_stride_in_bytes, cfs_kv_stride_in_bytes,
-                    block_size_in_bytes, is_read, thread_id, is_mla);
+                    block_size_in_bytes, is_read, thread_id,
+                    kv_dim);
                 prom.set_value(nullptr);
               } catch (...) {
                 prom.set_value(std::current_exception());
@@ -545,7 +532,7 @@ void shared_transfer_kv_blocks_remote_read(
   int64_t cfs_kv_stride_in_bytes,
   int64_t block_size_in_bytes,
   int64_t total_layers,
-  bool is_mla,
+  int kv_dim,
   int num_threads_per_file) {
   
   int num_files = file_nodeids.size();
@@ -602,7 +589,8 @@ void shared_transfer_kv_blocks_remote_read(
                    start_layer, end_layer, cpu_tensor_ptr,
                    cpu_layer_stride_in_bytes, cfs_layer_stride_in_bytes,
                    cpu_kv_stride_in_bytes, cfs_kv_stride_in_bytes,
-                   block_size_in_bytes, thread_id, is_mla, prom = std::move(prom)]() mutable {
+                   block_size_in_bytes, thread_id, kv_dim,
+                   prom = std::move(prom)]() mutable {
                       try {
                           _shared_transfer_single_thread_impl(
                               file_nodeids[f],
@@ -616,7 +604,7 @@ void shared_transfer_kv_blocks_remote_read(
                               cfs_kv_stride_in_bytes,
                               block_size_in_bytes,
                               thread_id,
-                              is_mla);
+                              kv_dim);
                           prom.set_value(nullptr);
                       } catch (...) {
                           prom.set_value(std::current_exception());

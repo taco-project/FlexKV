@@ -100,6 +100,14 @@ public:
                               std::deque<int64_t> *hashes,
                               size_t batch_size = 200);
 
+  bool delete_node_blocks(uint32_t node_id, size_t batch_size = 200);
+
+  bool has_any_block_keys(bool &has_keys);
+  bool begin_reset_barrier(uint64_t ttl_ms, uint64_t &epoch);
+  bool mark_reset_barrier_arrival(uint64_t epoch, uint64_t ttl_ms);
+  bool is_reset_barrier_ready(uint64_t epoch, bool &ready);
+  bool finish_reset_barrier(uint64_t epoch);
+
   // Generic helpers for metadata queries
   bool list_keys(const std::string &pattern, std::vector<std::string> &keys);
 
@@ -125,5 +133,3 @@ public:
 };
 
 } // namespace flexkv
-
-

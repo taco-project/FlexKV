@@ -1,0 +1,43 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
+@@ -55,0 +56,5 @@
++    @classmethod
++    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
++        """Layer-wise eventfd waits must execute between CUDA graph pieces."""
++        return bool(extra_config.get("use_layerwise", False))
++
+@@ -78,0 +84,8 @@
++    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
++        super().bind_connector_metadata(connector_metadata)
++        self._flexkv_connector.bind_connector_metadata(connector_metadata)
++
++    def clear_connector_metadata(self) -> None:
++        self._flexkv_connector.clear_connector_metadata()
++        super().clear_connector_metadata()
++
+--- a/tests/v1/kv_connector/unit/test_flexkv_connector.py
++++ b/tests/v1/kv_connector/unit/test_flexkv_connector.py
+@@ -232,0 +233,23 @@
++
++class TestFlexKVLayerwiseContract:
++    def test_piecewise_cudagraph_required_only_for_layerwise(self):
++        from vllm.distributed.kv_transfer.kv_connector.v1.flexkv_connector import (
++            FlexKVConnectorV1,
++        )
++
++        assert FlexKVConnectorV1.requires_piecewise_for_cudagraph(
++            {"use_layerwise": True})
++        assert not FlexKVConnectorV1.requires_piecewise_for_cudagraph({})
++
++    def test_metadata_bind_and_clear_are_delegated(self):
++        impl = MagicMock()
++        connector = _build_connector(_make_vllm_config(), impl)
++        metadata = MagicMock()
++
++        connector.bind_connector_metadata(metadata)
++        assert connector._get_connector_metadata() is metadata
++        impl.bind_connector_metadata.assert_called_once_with(metadata)
++
++        connector.clear_connector_metadata()
++        impl.clear_connector_metadata.assert_called_once()
++        assert not connector.has_connector_metadata()

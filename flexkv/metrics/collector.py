@@ -16,17 +16,25 @@ from typing import Dict, Optional
 
 # Optional import for prometheus_client
 try:
-    from prometheus_client import Counter, Gauge
+    from prometheus_client import Counter, Gauge, Histogram
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
     Counter = None
     Gauge = None
+    Histogram = None
 
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 
 logger = flexkv_logger
+
+# Transfer duration buckets, in seconds: 0.5ms (small H2D/D2H hit) up to 30s
+# (a cold SSD read of a long prefix). Wide because the same op type spans both.
+TRANSFER_DURATION_BUCKETS = (
+    0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
+    0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0,
+)
 
 # Flag to track if metrics server auto-start has been attempted
 _metrics_server_auto_started = False
@@ -186,6 +194,32 @@ class FlexKVMetricsCollector:
             documentation="Total number of bytes transferred by transfer type and operation",
             labelnames=["transfer_type", "operation"],
         )
+
+        # Transfer durations. Measured on the worker and carried back on the
+        # CompletedOp, so they cost nothing to record at the task layer.
+        duration_kwargs = {
+            "labelnames": ["transfer_type"],
+            "buckets": TRANSFER_DURATION_BUCKETS,
+        }
+        self.transfer_wait_duration_seconds = Histogram(
+            name="flexkv_py_transfer_wait_duration_seconds",
+            documentation="Time a transfer op waited on the worker before launch, by transfer type",
+            **duration_kwargs,
+        )
+        self.transfer_xfer_duration_seconds = Histogram(
+            name="flexkv_py_transfer_xfer_duration_seconds",
+            documentation="Time spent in the transfer itself (launch start to launch return), by transfer type",
+            **duration_kwargs,
+        )
+        self.transfer_e2e_duration_seconds = Histogram(
+            name="flexkv_py_transfer_e2e_duration_seconds",
+            documentation="Time from op submit to completion being observed, by transfer type",
+            **duration_kwargs,
+        )
+        # transfer_type -> (wait, xfer, e2e) children. Resolving a label set
+        # costs more than the observation itself, and transfer types are a
+        # small fixed set, so resolve once and reuse.
+        self._duration_children: Dict[str, tuple] = {}
         
         # Memory pool gauges by device
         mempool_gauge_kwargs = {
@@ -212,13 +246,44 @@ class FlexKVMetricsCollector:
             documentation="Total number of evicted blocks by device",
             labelnames=["device"],
         )
-        
         self.allocated_blocks_total = Counter(
             name="flexkv_py_allocated_blocks_total",
             documentation="Total number of allocated blocks by device",
             labelnames=["device"],
         )
-        
+
+        # Joint Full+SWA prefetch outcome (mooncake). One increment per prefetch
+        # task at graph_completed. Outcome buckets (see _finalize_prefetch_return_mask):
+        #   full_and_swa       — Full covers J AND SWA op OK (SWA mounted on tree)
+        #   full_only_swa_lost — Full covers J but SWA op failed (Full[:J] on tree,
+        #                        no SWA; subsequent swa_aware GET misses SWA)
+        #   partial_full       — Full L<J (regardless of SWA)
+        #   all_failed         — Full L==0
+        #   full_only          — non-swa prefetch (no SWA op in graph)
+        # return_mask / storage_hit_length: Full REMOTE2H success tokens when
+        # non-joint; for joint Full+SWA only when both succeed (else 0).
+        # Independent of outcome buckets except that gate.
+        self.joint_prefetch_outcomes_total = Counter(
+            name="flexkv_py_joint_prefetch_outcomes_total",
+            documentation=(
+                "Joint Full+SWA prefetch outcomes by bucket "
+                "(full_and_swa / full_only_swa_lost / partial_full / all_failed / full_only)"
+            ),
+            labelnames=["outcome"],
+        )
+
+        # Joint prefetch CPU SWA slot allocation failures (mooncake). Incremented
+        # when _alloc_swa_slot returned -1 during plan-time joint prefetch build:
+        # the task then falls back to Full-only prefetch, which will not restore
+        # SWA on a subsequent swa_aware GET. Persistent non-zero => tune num_slots
+        # or SWA eviction pressure.
+        self.joint_prefetch_swa_slot_alloc_failed_total = Counter(
+            name="flexkv_py_joint_prefetch_swa_slot_alloc_failed_total",
+            documentation=(
+                "Joint prefetch CPU SWA slot allocation failures at plan time"
+            ),
+        )
+
         logger.info("[FlexKV PyMetrics] Prometheus metrics collector initialized")
     
     def _init_dummy_metrics(self):
@@ -230,9 +295,11 @@ class FlexKVMetricsCollector:
                 pass
             def set(self, *args, **kwargs):
                 pass
-        
+            def observe(self, *args, **kwargs):
+                pass
+
         dummy = DummyMetric()
-        
+
         # Cache engine dummy metrics
         self.cache_hit_blocks_total = dummy
         self.cache_miss_blocks_total = dummy
@@ -240,10 +307,15 @@ class FlexKVMetricsCollector:
         self.transfer_blocks_total = dummy
         self.transfer_ops_total = dummy
         self.transfer_bytes_total = dummy
+        self.transfer_wait_duration_seconds = dummy
+        self.transfer_xfer_duration_seconds = dummy
+        self.transfer_e2e_duration_seconds = dummy
         self.mempool_total_blocks = dummy
         self.mempool_free_blocks = dummy
         self.evicted_blocks_total = dummy
         self.allocated_blocks_total = dummy
+        self.joint_prefetch_outcomes_total = dummy
+        self.joint_prefetch_swa_slot_alloc_failed_total = dummy
     
 
     
@@ -304,6 +376,28 @@ class FlexKVMetricsCollector:
             self.transfer_blocks_total.labels(transfer_type=transfer_type, operation=operation).inc(num_blocks)
         if num_bytes > 0:
             self.transfer_bytes_total.labels(transfer_type=transfer_type, operation=operation).inc(num_bytes)
+
+    def record_transfer_duration(self, transfer_type: str, wait_ms: float, xfer_ms: float, e2e_ms: float):
+        """
+        Record the lifecycle durations of one completed transfer op, in seconds.
+
+        Durations are measured on the worker and carried back on the op, so
+        this only converts and observes. ``e2e_ms <= 0`` means the op was never
+        timed (it never reached a worker, or metrics were off when the transfer
+        worker started) and is skipped rather than recorded as a real zero.
+        """
+        if not self.enabled or e2e_ms <= 0:
+            return
+        children = self._duration_children.get(transfer_type)
+        if children is None:
+            children = self._duration_children[transfer_type] = (
+                self.transfer_wait_duration_seconds.labels(transfer_type=transfer_type),
+                self.transfer_xfer_duration_seconds.labels(transfer_type=transfer_type),
+                self.transfer_e2e_duration_seconds.labels(transfer_type=transfer_type),
+            )
+        children[0].observe(wait_ms / 1000.0)
+        children[1].observe(xfer_ms / 1000.0)
+        children[2].observe(e2e_ms / 1000.0)
     
     def update_mempool_stats(self, device: str, total_blocks: int, free_blocks: int):
         """
@@ -342,7 +436,29 @@ class FlexKVMetricsCollector:
         if not self.enabled or num_blocks <= 0:
             return
         self.allocated_blocks_total.labels(device=device).inc(num_blocks)
-    
+
+    def record_joint_prefetch_outcome(self, outcome: str) -> None:
+        """Record one joint Full+SWA prefetch outcome bucket.
+
+        Args:
+            outcome: one of ``full_and_swa`` / ``full_only_swa_lost`` /
+                ``partial_full`` / ``all_failed`` / ``full_only``.
+                See ``KVTaskManager._finalize_prefetch_return_mask`` for the
+                exact classification. Called once per prefetch task at
+                graph_completed.
+        """
+        if not self.enabled:
+            return
+        self.joint_prefetch_outcomes_total.labels(outcome=outcome).inc(1)
+
+    def record_joint_prefetch_swa_slot_alloc_failure(self) -> None:
+        """Record one CPU SWA slot allocation failure at plan-time joint prefetch
+        build. Persistent non-zero indicates SWA host pool pressure and forces the
+        request to fall back to Full-only prefetch."""
+        if not self.enabled:
+            return
+        self.joint_prefetch_swa_slot_alloc_failed_total.inc(1)
+
 # Global collector instance
 _global_collector: Optional[FlexKVMetricsCollector] = None
 

@@ -57,6 +57,8 @@ public:
   // Returns a LeaseMeta to the pool. The object is reset for reuse.
   void free(LeaseMeta *ptr);
 
+  void reset();
+
 
   // Iterate over currently allocated items and invoke callback for each.
   // The iteration is done on a snapshot to avoid holding the mutex while executing user code.
@@ -80,5 +82,3 @@ public:
 };
 
 } // namespace flexkv
-
-

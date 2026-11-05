@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <vector>
 #include <map>
 #include <list>
@@ -35,6 +36,7 @@ public:
   void insert(int64_t hash);
   void remove(int64_t hash);
   bool contains(int64_t hash);
+  void clear();
   std::list<int64_t>& get_list() { return list; }
 };
 
@@ -59,7 +61,7 @@ private:
   // It's not thread safe, so we need to ensure only refresh thread can access it
   OrderedHashList normal_block_hashes;
   bool refresh_started = false;
-  volatile bool refresh_should_stop = false;
+  std::atomic<bool> refresh_should_stop{false};
   pthread_t refresh_tid{};
   // Lease meta memory pool for nodes created by this LocalRadixTree
   LeaseMetaMemPool lease_pool;
@@ -74,6 +76,7 @@ private:
   bool publish_single_node(CRadixNode *src);
   // Renew in-memory LeaseMeta times and refresh Redis lt for this node
   void renew_relese_time();
+  size_t discard_pending_queues();
 
 public:
   LocalRadixTree(int tokens_per_block,
@@ -103,7 +106,7 @@ public:
   // Override insert to attach a LeaseMeta from the pool to new nodes
   CRadixNode *insert(torch::Tensor &physical_block_ids,
     torch::Tensor &block_hashes, int num_blocks, int num_insert_blocks,
-    bool ready = true, CRadixNode *node = nullptr, int num_matched_blocks = -1,
+    CRadixNode *node = nullptr, int num_matched_blocks = -1,
     int last_node_matched_length = -1) override;
 
   // Override evict: prefer evicting expired leases; otherwise mark as ABOUT_TO_EVICT
@@ -113,8 +116,6 @@ public:
   // Wrappers that mirror CRadixTreeIndex APIs
   std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,
     int num_blocks, bool update_cache_info = true) override;
-  int total_unready_blocks();
-  int total_ready_blocks();
   int total_cached_blocks();
   int total_node_num();
   void reset();
@@ -128,7 +129,10 @@ public:
   bool is_empty();
   void inc_node_count();
   void dec_node_count();
-  void set_ready(CRadixNode *node, bool ready = true, int ready_length = -1);
+
+  size_t lease_pool_capacity() const;
+  size_t lease_pool_free_size() const;
+  size_t pending_queue_size() const;
 
   // Drain and free all pending items from eviction queues; returns total hashes dropped
   size_t drain_pending_queues();

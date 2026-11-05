@@ -53,7 +53,7 @@ import numpy as np
 from flexkv.server.client import KVTPClient
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.config import (
-    ModelConfig, CacheConfig, UserConfig,
+    ModelConfig, CacheConfig, UserConfig, RankInfo,
     update_default_config_from_user_config, parse_path_list,
     GLOBAL_CONFIG_FROM_ENV,
 )
@@ -89,7 +89,7 @@ def load_dist_config(config_path: str):
     model_config.num_kv_heads = config["num_kv_heads"]
     model_config.head_size = config["head_size"]
     model_config.dtype = eval(f"torch.{config['dtype']}")
-    model_config.use_mla = config["use_mla"]
+    model_config.kv_dim = config.get("kv_dim", 2)
     model_config.tp_size = config["tp_size"]
     model_config.dp_size = config["dp_size"]
     cache_config.tokens_per_block = config["tokens_per_block"]
@@ -152,7 +152,7 @@ def load_dist_config(config_path: str):
         # Store mooncake_config_path in cache_config so it survives spawn subprocesses via pickle
         cache_config.mooncake_config_path = mooncake_config_path
 
-    update_default_config_from_user_config(model_config, cache_config, user_config)
+    update_default_config_from_user_config(RankInfo(model_config=model_config), cache_config, user_config)
 
     # Handle server_client_mode from config
     if config.get("server_client_mode", False):
@@ -185,7 +185,8 @@ class BenchmarkConfig:
 def run_tp_client(dp_client_id, tp_rank, gpu_register_port, model_config, cache_config, num_gpu_blocks):
     """Run tp_client process to register GPU blocks"""
     device_id = tp_rank + dp_client_id * model_config.tp_size
-    tp_client = KVTPClient(gpu_register_port, dp_client_id, device_id)
+    tp_client = KVTPClient(gpu_register_port, dp_client_id, device_id,
+                           intra_client_id=tp_rank)
 
     gpu_kv_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
@@ -194,7 +195,7 @@ def run_tp_client(dp_client_id, tp_rank, gpu_register_port, model_config, cache_
         tokens_per_block=cache_config.tokens_per_block,
         num_head=model_config.num_kv_heads,
         head_size=model_config.head_size,
-        is_mla=model_config.use_mla,
+        kv_dim=model_config.kv_dim,
     )
 
     # Create GPU blocks for this tp_rank in the tp_client process
@@ -307,14 +308,20 @@ def benchmark_single_batch(kvmanager, model_config, cache_config, bench_config):
             batch_get_ids.append(task_id)
         get_match_time = time.time() - start_time
 
-        kvmanager.launch(batch_get_ids, batch_slot_mapping, as_batch=True, layerwise_transfer=False)
-        get_result = kvmanager.wait(batch_get_ids)
+        # When as_batch=True, launch returns the batch id(s); the sub-tasks are popped
+        # by the engine, so we must wait on the returned id(s), not on batch_get_ids.
+        launched_get_ids = kvmanager.launch(batch_get_ids, batch_slot_mapping, as_batch=True)
+        get_result = kvmanager.wait(launched_get_ids)
         elapsed_time_get = time.time() - start_time
 
         cached_tokens = 0
         for _, response in get_result.items():
             if response.status == KVResponseStatus.SUCCESS:
-                cached_tokens += response.return_mask.sum().item()
+                # For a batched task return_mask is a list of per-sub-task masks.
+                masks = response.return_mask if isinstance(response.return_mask, list) \
+                    else [response.return_mask]
+                for mask in masks:
+                    cached_tokens += mask.sum().item()
         transfer_data_size_GB = cached_tokens * model_config.token_size_in_bytes / (1024 ** 3)
         transfer_bandwidth_get = transfer_data_size_GB / elapsed_time_get if elapsed_time_get > 0 else 0
         print(f"  GET: {cached_tokens}/{all_tokens} tokens, data_size: {transfer_data_size_GB:.3f} GB, "

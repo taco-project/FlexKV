@@ -1,0 +1,29 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"PingFang SC, Microsoft YaHei, sans-serif","fontSize":"17px","actorBkg":"#edf6f8","actorBorder":"#568896","actorTextColor":"#173344","noteBkgColor":"#f4f6f8","noteBorderColor":"#b0bcc6","signalColor":"#506978"},"sequence":{"mirrorActors":false,"messageMargin":25,"noteMargin":15,"diagramMarginX":15}}}%%
+sequenceDiagram
+    participant S as SGLang / 调用方
+    participant C as 控制线程
+    participant I as 发送线程
+    participant W as 原传输 worker
+    S->>C: 入队 start_prefetch(完整 token 链)
+    C-->>S: handle，尚不表示可用
+    Note over C: 查询线程返回候选范围<br/>重查并 pin CPU 已有前缀
+    C->>C: 分配 chunk 0，claim 记账
+    C->>I: chunk 0 入队
+    I->>W: 原 IPC 下发
+    par chunk 0 搬运中
+        W->>W: REMOTE2H chunk 0
+    and 填满 window = 2
+        C->>C: 准备 chunk 1，claim 记账
+        C->>I: chunk 1 入队
+        I->>W: 原 IPC 下发
+    end
+    W-->>C: chunk 0 完成
+    C->>C: 连续发布到 CPU，归还额度
+    C->>I: claim 后补入 chunk 2
+    Note over C,W: 按此循环补窗口；全部计划已下发时 seal<br/>继续收齐已登记图的完成并发布 / 回收
+    W-->>C: 最后一个在途图完成
+    C->>C: inflight = 0，发布 terminal snapshot
+    S->>C: 观察终态
+    C-->>S: 可复用前缀 + 有效结果 lease
+    S->>C: held GET 取得 CPU 引用，再 release_prefetch
+    Note over S,W: 准入通过后按原 H2D 恢复，计算未命中尾部

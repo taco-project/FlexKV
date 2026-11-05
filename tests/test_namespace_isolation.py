@@ -1,10 +1,18 @@
 import pytest
 import numpy as np
 
-from flexkv.common.block import SequenceMeta
+from flexkv.common.block import (
+    SequenceMeta,
+    format_block_hash,
+)
 
 
 class TestNamespace:
+    def test_block_hash_format_is_fixed_width_unsigned_hex(self):
+        assert format_block_hash(None) == "-"
+        assert format_block_hash(1) == "0x0000000000000001"
+        assert format_block_hash(-1) == "0xffffffffffffffff"
+
     def test_different_namespace_different_hash(self):
         tokens_per_block = 4
         token_ids = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.int64)

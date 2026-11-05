@@ -20,8 +20,7 @@ CRadixNode* dfs_build_subtree_from_meta(const BlockMeta* current_meta,
                                 CRadixNode* parent_node,
                                 const std::unordered_map<int64_t, std::vector<BlockMeta*>>& parent_to_children,
                                 std::unordered_set<int64_t>& processed_hashes,
-                                LeaseMetaMemPool& lt_pool,
-                                bool is_ready);
+                                LeaseMetaMemPool& lt_pool);
 
 void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_child,
    CRadixNode* current_root, LeaseMetaMemPool& lt_pool);
@@ -55,7 +54,6 @@ public:
   void lock(CRadixNode *node) override;
   void unlock(CRadixNode *node) override;
   bool is_empty() override;
-  void set_ready(CRadixNode *node, bool ready = true, int ready_length = -1) override;
   std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,
     int num_blocks, bool update_cache_info = true) override;
   // Remove node from node_list without deleting it (for manual memory management)
@@ -67,7 +65,7 @@ private:
   // Override base methods with custom behavior
   CRadixNode *insert(torch::Tensor &physical_block_ids,
     torch::Tensor &block_hashes, int num_blocks, int num_insert_blocks,
-    bool ready = true, CRadixNode *node = nullptr, int num_matched_blocks = -1,
+    CRadixNode *node = nullptr, int num_matched_blocks = -1,
     int last_node_matched_length = -1) override;
 
   int evict(torch::Tensor &evicted_blocks, int num_evicted) override;
@@ -109,7 +107,7 @@ private:
   uint32_t hit_reward_seconds_ = 0;
   LockFreeQueue<QueuedNode> renew_lease_queue;
   bool refresh_started = false;
-  volatile bool refresh_should_stop = false;
+  std::atomic<bool> refresh_should_stop{false};
   pthread_t refresh_tid{};
   std::atomic<RefRadixTree *> c_index;
   std::atomic<RefRadixTree *> old_index;
@@ -140,6 +138,7 @@ public:
 
   bool start(RedisMetaChannel *channel);
   void stop();
+  void reset();
   RefRadixTree* remote_tree_refresh();
   std::shared_ptr<CMatchResult> match_prefix(torch::Tensor &block_hashes,
     int num_blocks, bool update_cache_info = true);
@@ -147,9 +146,7 @@ public:
   void lock(CRadixNode *node);
   void unlock(CRadixNode *node);
   bool is_empty();
-  void set_ready(CRadixNode *node, bool ready = true, int ready_length = -1);
 };
 
 } // namespace flexkv
-
 
