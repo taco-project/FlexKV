@@ -317,7 +317,14 @@ class NixlSSDEndpoint:
 
 class NixlRemoteSSDReader:
     """`RemoteSSDReader` of a PEERSSD2H worker over :class:`NixlSSDEndpoint`.
-    Whole blocks only (PEERSSD2H ops are never layer-sliced)."""
+    Whole blocks only (PEERSSD2H ops are never layer-sliced).
+
+    The endpoint is built in a background thread: registering the CPU pool
+    with UCX pins it for CUDA too, which takes minutes while the TE's GPU
+    workers pin the same pool and the model loads, and FlexKV must not wait
+    for that. Until it is up this node neither serves nor reads (a read waits
+    up to the timeout, then fails and the prefetch misses); its contact file
+    appears only once it serves."""
 
     def __init__(self, worker: Any, pool_id: PoolId):
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
@@ -331,24 +338,39 @@ class NixlRemoteSSDReader:
             raise RuntimeError("the NIXL SSD reader needs FLEXKV_PEER_SSD_MANIFEST_DIR to find peers")
         self._client = radixshmem.RadixClient(worker.ssd_server_name)
         self.node = self._client.info.node_name or f"rank{self._client.info.rank}"
-        cpu = worker.cpu_blocks
-        port = _env_int("FLEXKV_NIXL_SSD_PORT", 5600) + (1 if self._pool == "swa" else 0)
-        self.endpoint = NixlSSDEndpoint(
-            f"flexkv-ssd-{self.node}-{self._pool}",
-            port=port,
-            cpu_ptr=int(cpu.data_ptr()),
-            cpu_bytes=int(cpu.numel() * cpu.element_size()),
-            block_bytes=int(worker.block_stride_in_bytes),
-            ssd_files=worker.ssd_files,
-            ucx_devices=os.getenv("FLEXKV_NIXL_UCX_DEVICES", ""),
-            posix_params={"use_uring": os.getenv("FLEXKV_NIXL_POSIX_URING", "true")},
-        )
-        os.makedirs(self._dir, exist_ok=True)
-        path = os.path.join(self._dir, f"{self.node}.nixl-{self._pool}.json")
-        with open(f"{path}.tmp", "w") as f:
-            json.dump({"agent": self.endpoint.name, "ip": _default_ip(), "port": port}, f)
-        os.replace(f"{path}.tmp", path)
         self._node_names: Dict[int, str] = {}
+        self.endpoint: Optional[NixlSSDEndpoint] = None
+        self._ready = threading.Event()
+        self._error: Optional[BaseException] = None
+        threading.Thread(target=self._start, name=f"nixl-ssd-{self._pool}-init", daemon=True).start()
+
+    def _start(self) -> None:
+        cpu = self._worker.cpu_blocks
+        port = _env_int("FLEXKV_NIXL_SSD_PORT", 5600) + (1 if self._pool == "swa" else 0)
+        t0 = time.monotonic()
+        try:
+            self.endpoint = NixlSSDEndpoint(
+                f"flexkv-ssd-{self.node}-{self._pool}",
+                port=port,
+                cpu_ptr=int(cpu.data_ptr()),
+                cpu_bytes=int(cpu.numel() * cpu.element_size()),
+                block_bytes=int(self._worker.block_stride_in_bytes),
+                ssd_files=self._worker.ssd_files,
+                ucx_devices=os.getenv("FLEXKV_NIXL_UCX_DEVICES", ""),
+                posix_params={"use_uring": os.getenv("FLEXKV_NIXL_POSIX_URING", "true")},
+            )
+            os.makedirs(self._dir, exist_ok=True)
+            path = os.path.join(self._dir, f"{self.node}.nixl-{self._pool}.json")
+            with open(f"{path}.tmp", "w") as f:
+                json.dump({"agent": self.endpoint.name, "ip": _default_ip(), "port": port}, f)
+            os.replace(f"{path}.tmp", path)
+            flexkv_logger.info(f"[peer-ssd-nixl] {self.endpoint.name} serving after "
+                               f"{time.monotonic() - t0:.1f}s; contact {path}")
+        except BaseException as e:  # noqa: BLE001 - reported by every read
+            self._error = e
+            flexkv_logger.error(f"[peer-ssd-nixl] endpoint start failed: {e!r}")
+        finally:
+            self._ready.set()
 
     def _peer(self, rank: int) -> Tuple[str, str, int]:
         if rank not in self._node_names:
@@ -358,14 +380,22 @@ class NixlRemoteSSDReader:
         node = self._node_names.get(rank)
         if not node:
             raise RuntimeError(f"[peer-ssd-nixl] no SSD index node has rank {rank}")
-        with open(os.path.join(self._dir, f"{node}.nixl-{self._pool}.json")) as f:
-            c = json.load(f)
+        path = os.path.join(self._dir, f"{node}.nixl-{self._pool}.json")
+        try:
+            with open(path) as f:
+                c = json.load(f)
+        except FileNotFoundError:
+            raise RuntimeError(f"[peer-ssd-nixl] {node} does not serve its SSD yet ({path})") from None
         return c["agent"], c["ip"], int(c["port"])
 
     def read(self, peer_rank: int, pool_id: PoolId, src_ssd_blocks: torch.Tensor,
              dst_cpu_blocks: torch.Tensor, layer_id: int, layer_end: int) -> None:
         if layer_id != 0 or layer_end < self._worker.num_layers:
             raise ValueError("the NIXL SSD reader moves whole blocks only")
+        if not self._ready.wait(self._timeout):
+            raise TimeoutError("[peer-ssd-nixl] this node's NIXL endpoint is still starting")
+        if self._error is not None:
+            raise RuntimeError(f"[peer-ssd-nixl] endpoint unavailable: {self._error!r}")
         agent, ip, port = self._peer(int(peer_rank))
         self.endpoint.connect(agent, ip, port, self._timeout)
         self.endpoint.read(agent, src_ssd_blocks.tolist(), dst_cpu_blocks.tolist(), self._timeout)
