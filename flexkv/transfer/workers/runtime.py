@@ -717,7 +717,7 @@ class TransferWorkerBase(ABC):
                             "layerwise" if is_layerwise else "no-layerwise",
                             (time.perf_counter_ns() - transfer_start_ns) / 1e9,
                             str(e),
-                            exc_info=True,
+                            exc_info=not getattr(e, "quiet", False),
                         )
                     finally:
                         if nvtx_pushed:

@@ -46,6 +46,12 @@ _DIRECT_IO_ALIGN = 4096
 _NOT_READY_LOG_EVERY_S = 30.0
 
 
+class PeerUnavailable(RuntimeError):
+    """An expected miss (this endpoint still starting, the peer not serving yet
+    or backing off after a drop): the prefetch misses, no stack trace needed."""
+    quiet = True
+
+
 def _env_int(name: str, default: int) -> int:
     return int(os.getenv(name, "") or default)
 
@@ -200,7 +206,7 @@ class NixlSSDEndpoint:
         if wait > 0:
             # Recently dropped: fail at once instead of making every prefetch
             # wait out the metadata timeout of a peer that may still be down.
-            raise RuntimeError(f"[peer-ssd-nixl] {peer} was dropped; reconnecting in {wait:.0f}s")
+            raise PeerUnavailable(f"[peer-ssd-nixl] {peer} was dropped; reconnecting in {wait:.0f}s")
         self.agent.send_local_metadata(ip, port)
         self.agent.fetch_remote_metadata(peer, ip, port)
         deadline = time.monotonic() + timeout_s
@@ -461,7 +467,7 @@ class NixlRemoteSSDReader:
             with open(path) as f:
                 c = json.load(f)
         except FileNotFoundError:
-            raise RuntimeError(f"[peer-ssd-nixl] {node} does not serve its SSD yet ({path})") from None
+            raise PeerUnavailable(f"[peer-ssd-nixl] {node} does not serve its SSD yet ({path})") from None
         return c["agent"], c["ip"], int(c["port"])
 
     def read(self, peer_rank: int, pool_id: PoolId, src_ssd_blocks: torch.Tensor,
@@ -476,7 +482,7 @@ class NixlRemoteSSDReader:
                 flexkv_logger.warning(
                     "[peer-ssd-nixl] this node's NIXL endpoint is still starting; "
                     "peer SSD reads fail (prefetch misses) until it serves")
-            raise RuntimeError("[peer-ssd-nixl] this node's NIXL endpoint is still starting")
+            raise PeerUnavailable("[peer-ssd-nixl] this node's NIXL endpoint is still starting")
         if self._error is not None:
             raise RuntimeError(f"[peer-ssd-nixl] endpoint unavailable: {self._error!r}")
         agent, ip, port = self._peer(int(peer_rank))
