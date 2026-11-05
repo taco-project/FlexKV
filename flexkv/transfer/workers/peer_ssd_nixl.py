@@ -42,6 +42,8 @@ from flexkv.transfer.nixlutil import file_path_for_ssd_block, require_nixl
 
 _REQ, _OK, _ERR = b"RQ", b"OK", b"ER"
 _IDLE_SLEEP_S = 50e-6
+_DIRECT_IO_ALIGN = 4096
+_NOT_READY_LOG_EVERY_S = 30.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -56,6 +58,15 @@ def _default_ip() -> str:
         return socket.gethostbyname(socket.gethostname())
     except OSError:
         return "127.0.0.1"
+
+
+def use_direct_io(block_bytes: int) -> bool:
+    """Whether served reads bypass the page cache. Same rule as FlexKV's own
+    io_uring engine (csrc/transfer_ssd.cpp): O_DIRECT only for 4 KiB-aligned
+    blocks. Otherwise that engine writes the blocks through the page cache
+    too (DeepSeek-V4's 1671680 B blocks), and serving them buffered reads the
+    same, current pages."""
+    return int(block_bytes) % _DIRECT_IO_ALIGN == 0
 
 
 def ssd_block_location(files: Dict[int, List[str]], block: int, block_bytes: int) -> Tuple[str, int]:
@@ -119,12 +130,18 @@ class NixlSSDEndpoint:
         # This node's CPU pool: where peers write the blocks it reads.
         agent.register_memory([(self._cpu_ptr, self._cpu_bytes, 0, "cpu")], "DRAM",
                               backends=["UCX"])
-        # This node's SSD files: what it serves.
+        # This node's SSD files: what it serves, bypassing the page cache
+        # whenever FlexKV's own writer does (use_direct_io).
+        self.direct_io = use_direct_io(self.block_bytes)
+        flags = os.O_RDWR | (os.O_DIRECT if self.direct_io else 0)
         self._fds: Dict[str, int] = {}
         for paths in self._files.values():
             for path in paths:
                 if path not in self._fds:
-                    self._fds[path] = os.open(path, os.O_RDWR)
+                    self._fds[path] = os.open(path, flags)
+        # Blocks each file holds: a block past them must fail, not read short.
+        self._file_blocks = {path: os.fstat(fd).st_size // self.block_bytes
+                             for path, fd in self._fds.items()}
         if self._fds:
             agent.register_memory([(0, 0, fd, path) for path, fd in self._fds.items()],
                                   "FILE", backends=["POSIX"])
@@ -149,7 +166,8 @@ class NixlSSDEndpoint:
         flexkv_logger.info(
             f"[peer-ssd-nixl] endpoint {name} on port {self.port}: CPU pool {self._cpu_bytes >> 20} MB, "
             f"{len(self._fds)} SSD files, block {self.block_bytes} B, chunk {self.chunk_blocks} blocks "
-            f"x {num_chunks} per server x {num_servers} servers, ucx_devices={ucx_devices or 'auto'}")
+            f"x {num_chunks} per server x {num_servers} servers, ucx_devices={ucx_devices or 'auto'}, "
+            f"ssd_io={'direct' if self.direct_io else 'buffered (block not 4 KiB-aligned, like the local writer)'}")
 
     def close(self) -> None:
         self._stop.set()
@@ -165,6 +183,8 @@ class NixlSSDEndpoint:
     def ssd_location(self, block: int) -> Tuple[int, int]:
         """(fd, byte offset) of one of this node's SSD blocks."""
         path, offset = ssd_block_location(self._files, block, self.block_bytes)
+        if block < 0 or offset // self.block_bytes >= self._file_blocks[path]:
+            raise ValueError(f"SSD block {block} is out of range")
         return self._fds[path], offset
 
     # -- reader side ------------------------------------------------------
@@ -341,6 +361,7 @@ class NixlRemoteSSDReader:
         self._node_names: Dict[int, str] = {}
         self.endpoint: Optional[NixlSSDEndpoint] = None
         self._ready = threading.Event()
+        self._not_ready_logged = -_NOT_READY_LOG_EVERY_S
         self._error: Optional[BaseException] = None
         threading.Thread(target=self._start, name=f"nixl-ssd-{self._pool}-init", daemon=True).start()
 
@@ -392,8 +413,15 @@ class NixlRemoteSSDReader:
              dst_cpu_blocks: torch.Tensor, layer_id: int, layer_end: int) -> None:
         if layer_id != 0 or layer_end < self._worker.num_layers:
             raise ValueError("the NIXL SSD reader moves whole blocks only")
-        if not self._ready.wait(self._timeout):
-            raise TimeoutError("[peer-ssd-nixl] this node's NIXL endpoint is still starting")
+        if not self._ready.is_set():
+            # Fail at once: a prefetch waiting here would only delay its miss.
+            now = time.monotonic()
+            if now - self._not_ready_logged >= _NOT_READY_LOG_EVERY_S:
+                self._not_ready_logged = now
+                flexkv_logger.warning(
+                    "[peer-ssd-nixl] this node's NIXL endpoint is still starting; "
+                    "peer SSD reads fail (prefetch misses) until it serves")
+            raise RuntimeError("[peer-ssd-nixl] this node's NIXL endpoint is still starting")
         if self._error is not None:
             raise RuntimeError(f"[peer-ssd-nixl] endpoint unavailable: {self._error!r}")
         agent, ip, port = self._peer(int(peer_rank))
