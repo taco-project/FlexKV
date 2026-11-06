@@ -56,6 +56,7 @@ class PrefetchCoordinator:
         max_reserved_bytes=512 * 1024 * 1024,
         result_ttl_s=60.0,
         max_batch_graphs=32,
+        max_data_sessions=0,
         epoch=None,
     ):
         if (
@@ -65,6 +66,14 @@ class PrefetchCoordinator:
             or result_ttl_s <= 0
         ):
             raise ValueError("prefetch runtime limits must be positive")
+        if (
+            isinstance(max_data_sessions, bool)
+            or not isinstance(max_data_sessions, int)
+            or max_data_sessions < 0
+        ):
+            raise ValueError("max_data_sessions must be a nonnegative integer")
+        self.max_data_sessions = max_data_sessions
+        self._data_sessions = set()
         self.backend = backend
         self.clock = clock
         self.max_sessions = max_sessions
@@ -187,6 +196,15 @@ class PrefetchCoordinator:
             self.seal(session, "complete")
             self._finalize(session)
             return None
+        # Finish a bounded wave of real reads before opening more sessions.
+        # Every request keeps its metadata future, deadline and result lease;
+        # waiting for this slot is not a capacity miss.
+        if (
+            self.max_data_sessions
+            and session.handle not in self._data_sessions
+            and len(self._data_sessions) >= self.max_data_sessions
+        ):
+            return None
         if len(session.chunks) >= session.options.max_inflight_chunks:
             return None
         chunk = self.backend.reserve(
@@ -197,8 +215,11 @@ class PrefetchCoordinator:
             self.max_reserved_bytes - self.reserved_bytes,
         )
         if chunk is None:
-            # Do not wait for capacity held by our own pinned prefix.
-            if not session.chunks:
+            # Outstanding graphs hold temporary byte credits. A late session
+            # without its first chunk must wait for those graphs to drain,
+            # rather than turn transient contention into an empty cache miss.
+            # With no reserved I/O, retain the permanent-capacity fallback.
+            if not session.chunks and not self.reserved_bytes:
                 self.seal(session, "capacity")
                 self._finalize(session)
             return None
@@ -221,6 +242,7 @@ class PrefetchCoordinator:
         if chunk.nbytes > self.max_reserved_bytes - self.reserved_bytes:
             self.backend.discard(session.context, chunk)
             raise RuntimeError("prefetch backend exceeded reservation budget")
+        self._data_sessions.add(session.handle)
         session.chunks[chunk.graph.graph_id] = chunk
         self.graphs[chunk.graph.graph_id] = session
         self.reserved_bytes += chunk.nbytes
@@ -282,6 +304,9 @@ class PrefetchCoordinator:
         if session.reason is None or session.chunks or session.terminal_at is not None:
             return
         session.terminal_at = self.clock()
+        # No submitted graph remains here; releasing a data slot does not
+        # release the separately retained CPU result/pin lease.
+        self._data_sessions.discard(session.handle)
         session.version += 1
         logging.getLogger(__name__).info(
             "[FlexKV-Prefetch] epoch=%s session_id=%d policy=%s reason=%s "
