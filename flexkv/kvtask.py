@@ -1229,10 +1229,10 @@ class KVTaskEngine(KVTaskManager):
             metrics = get_global_collector()
             self._prefetch = PrefetchCoordinator(
                 self._prefetch_backend,
+                metrics=metrics if metrics is not None and metrics.enabled else None,
                 max_sessions=cache_config.prefetch_max_sessions,
                 max_reserved_bytes=cache_config.prefetch_max_reserved_bytes,
-                result_ttl_s=cache_config.prefetch_result_ttl_s,
-                metrics=metrics if metrics is not None and metrics.enabled else None)
+                result_ttl_s=cache_config.prefetch_result_ttl_s)
 
     def start(self) -> None:
         super().start()
