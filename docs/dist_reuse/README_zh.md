@@ -75,13 +75,22 @@ sudo make install
 
 下载 vLLM，切换到 v0.10.1.1 版本，应用 FlexKV 的 patch，然后从源码安装 vLLM 和 FlexKV。
 
-详细步骤请参考：[FlexKV vLLM 适配文档](https://github.com/taco-project/FlexKV/blob/main/docs/vllm_adapter/README_zh.md#%E8%BF%90%E8%A1%8C)
+详细步骤请参考：[FlexKV vLLM 适配文档](../vllm_adapter/README_zh.md)
 
 **注意**：想要启动分布式重用的功能，编译/安装 FlexKV 之前需设置环境变量：
 
 ```bash
 export FLEXKV_ENABLE_P2P=1
 ```
+
+### Mooncake Store I/O 限制
+
+Mooncake Store 配置 JSON 中的 `max_get_batch_bytes` 和 `max_put_batch_bytes`
+限制单次 SDK 调用的原始数据字节数，默认均为 `0`（不限制）；正值必须容纳最大的单个
+block。并行 Get 的 `FLEXKV_MOONCAKE_GET_CONCURRENCY` 默认 `1`，
+`FLEXKV_MOONCAKE_GET_MAX_INFLIGHT_BYTES` 默认 `536870912` 字节，后者还计入
+对齐开销。这些限制彼此独立。失败和排空语义、验证范围详见
+[批量 I/O 说明](../mooncake_batched_io_zh.md)和[性能控制说明](../cache_tier_performance_controls_zh.md)。
 
 ## 运行
 

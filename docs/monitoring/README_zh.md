@@ -55,6 +55,14 @@ Python 指标由 `GlobalCacheEngine` 在 `cache_engine.py` 中记录，通过 `F
 
 ---
 
+采集器还提供 Mooncake Full+SWA 预取的
+`flexkv_py_joint_prefetch_outcomes_total`（标签 `outcome`）和
+`flexkv_py_joint_prefetch_swa_slot_alloc_failed_total`。这两项描述联合预取，
+不代表所有请求或所有预取失败。
+
+
+---
+
 ### 2.2 C++ 运行时指标 (`flexkv_cpp_*`)
 
 C++ 指标由 `MetricsManager` 单例管理，主要在 RadixTree 缓存操作和数据传输中埋点。

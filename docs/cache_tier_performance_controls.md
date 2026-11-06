@@ -1,5 +1,7 @@
 # Cache tier performance controls
 
+[中文文档](cache_tier_performance_controls_zh.md)
+
 These opt-in controls bound remote read pressure and reduce SGLang control-message
 overhead. Defaults retain serial Store reads, unrestricted data sessions within
 the existing session/byte limits, and the legacy control framing.

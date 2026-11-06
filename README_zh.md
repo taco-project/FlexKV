@@ -8,7 +8,7 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 ## Updates
 
-- **2026 年 10 月 9 日**：FlexKV 完成 DeepSeek-V4.1 适配（[#303](https://github.com/taco-project/FlexKV/pull/303)），已合入 `main`。配套 SGLang 适配尚未合入官方主干；在 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 合入前，请拉取该 PR 并固定到最新 commit。部署使用当前 FlexKV `main`。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)。
+- **2026 年 10 月 9 日**：FlexKV 完成 DeepSeek-V4.1 适配（[#303](https://github.com/taco-project/FlexKV/pull/303)），已合入 `main`。配套 SGLang 适配尚未合入官方主干；在 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 合入前，请拉取该 PR 并使用集成说明中固定的 commit。部署使用当前 FlexKV `main`。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)。
 
 - **2026 年 7–8 月**：传输性能与可运维性全面增强，包括 [GPU↔CPU 自适应多路径传输](https://github.com/taco-project/FlexKV/pull/203)、[可靠性与运行日志增强](https://github.com/taco-project/FlexKV/pull/233)、[优雅退出](https://github.com/taco-project/FlexKV/pull/238)、[分块注册 Host Memory](https://github.com/taco-project/FlexKV/pull/240)、[SSD 向量化 I/O](https://github.com/taco-project/FlexKV/pull/242) 和 [Op 级传输 Trace](https://github.com/taco-project/FlexKV/pull/247)。
 
@@ -34,38 +34,7 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 - **2025 年 11 月**：FlexKV 从 client-server 模式升级为**可直接调用的库函数**（commit [0290841](https://github.com/taco-project/FlexKV/commit/0290841dce65ae9b036a23d733cf94e47e814934)），消除进程间通信开销，即 v1.0.0 API。
 
-## 最新版本主要变更
-### 功能
-通用功能:
-- 添加本地 get/put 的操作级回调 [#13](https://github.com/taco-project/FlexKV/pull/13)
-- 添加分布式 KV Cache 共享支持，支持 CPU 和 SSD 之间的 KV Cache 共享，以及 PCFS 的分布式共享 ([#17](https://github.com/taco-project/FlexKV/pull/17))
-- 添加 GDS (GPU Direct Storage) 支持 ([#25](https://github.com/taco-project/FlexKV/pull/25))
-- TP16 支持 ([#26](https://github.com/taco-project/FlexKV/pull/26))
-- 支持更多 kv cache 布局。现在包括：vLLM、SGLang、TensorRT-LM ([#27](https://github.com/taco-project/FlexKV/pull/27))
-- GDS 重构和 gtensor 支持 ([#42](https://github.com/taco-project/FlexKV/pull/42))
-- 支持直接从 CUDA IPC Handle 构造 TensorSharedHandle ([#44](https://github.com/taco-project/FlexKV/pull/44))
-
-
-针对 vLLM:
-- 在 vLLM 集成中支持 dp > 1 ([#18](https://github.com/taco-project/FlexKV/pull/18))
-- 添加 vLLM 适配的启动脚本 ([#47](https://github.com/taco-project/FlexKV/pull/47))
-- 支持 vLLM+FlexKV 的 TP16 ([#59](https://github.com/taco-project/FlexKV/pull/59))
-
-针对 SGLang:
-- SGLang `v0.5.16` 及以上版本已原生内置 FlexKV backend，无需再应用 patch（[sglang#29701](https://github.com/sgl-project/sglang/pull/29701)）
-- 支持 DeepSeek-V4 异构 C4/C128/indexer KV group、FullKV + SWA 双缓存、compress-state sidecar 和逐层恢复（[#225](https://github.com/taco-project/FlexKV/pull/225)）。在配套的 SGLang 适配合入前，请使用 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 并固定到 [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac)。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)
-- 支持 DeepSeek-V4.1（[#303](https://github.com/taco-project/FlexKV/pull/303)），FlexKV 使用当前 `main`。配套 SGLang 适配尚未合入官方主干；在 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 合入前，请拉取该 PR 并固定到最新 commit。该 commit 与 V4 使用的 `ee0465a` 不同。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)
-
-针对 TensorRT-LLM
-- 在 TensorRT-LLM 上支持使用 FlexKV ([#48](https://github.com/taco-project/FlexKV/pull/48))
-- 支持 TensorRT-LLM+FlexKV 的 TP16 ([#53](https://github.com/taco-project/FlexKV/pull/53))
-### 优化
-- MLA d2h 传输优化 ([#19](https://github.com/taco-project/FlexKV/pull/19))
-- 优化 SSD I/O ([#33](https://github.com/taco-project/FlexKV/pull/33))
-- 增强缓存淘汰机制，引入频率感知的宽限时间 ([#38](https://github.com/taco-project/FlexKV/pull/38))
-- 在 RadixTree 中使用 std::unordered_map 替代 std::map ([#41](https://github.com/taco-project/FlexKV/pull/41))
-
-更多详细信息，请参阅 [CHANGELOG](CHANGELOG.md)
+版本变更请参阅[更新日志](CHANGELOG_zh.md)。
 
 ## 如何使用
 
@@ -84,6 +53,10 @@ apt install libhiredis-dev
 #./build.sh --release for cython package
 ```
 
+### 在 SGLang 中使用 FlexKV
+
+参阅 [SGLang 集成指南](flexkv/integration/sglang/README_zh.md)。
+
 ### 在 vLLM 中使用 FlexKV
 
 见[docs/vllm_adapter/README_zh.md](docs/vllm_adapter/README_zh.md)
@@ -95,6 +68,12 @@ apt install libhiredis-dev
 ### FlexKV和Dynamo框架的集成
 
 见[docs/dynamo_integration/README_zh.md](docs/dynamo_integration/README_zh.md)
+
+### 文档导航
+
+- [配置参考](docs/flexkv_config_reference/README_zh.md) · [命令行工具](docs/cli/README_zh.md) · [监控](docs/monitoring/README_zh.md)
+- [多实例模式](docs/multi_instance/README_zh.md) · [分布式复用](docs/dist_reuse/README_zh.md) · [命名空间隔离](docs/namespace/README_zh.md)
+- [驱逐策略](docs/eviction_policy/README_zh.md) · [GDS](docs/gds/README_zh.md) · [HugePage](docs/hugepage/README_zh.md) · [持续集成](docs/ci/README_zh.md) · [参与贡献](CONTRIBUTING_zh.md)
 
 ## 设计框架
 

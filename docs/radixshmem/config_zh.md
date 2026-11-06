@@ -1,5 +1,7 @@
 # radixshmem 模式配置
 
+[English](config_en.md)
+
 FlexKV 以 radixshmem 作为 CPU 层（索引 + SlotStore + 跨节点拉取）。配置分两处：
 
 | 谁 | 载体 | 内容 |

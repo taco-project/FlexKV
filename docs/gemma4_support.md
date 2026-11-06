@@ -1,5 +1,9 @@
 # FlexKV 支持 Gemma4 31B：多组异构 KV Cache 传输
 
+[English](gemma4_support_en.md)
+
+> 本文包含历史设计和验证过程；部分代码片段、路径和日志描述对应当时版本。当前实现请以源码为准，具体模型、拓扑及存储组合需重新验证。
+
 ## 1. 背景
 
 ### 1.1 Gemma4 31B 的 KV Cache 异构结构
@@ -156,14 +160,14 @@ for gi, gp in enumerate(self.group_transfer_params):
     )
 ```
 
-TP 模式（`tpGPUCPUTransferWorker`）有对应的 `_init_tp_multi_group()`，逻辑类似但需处理多 device。
+当前实现使用统一的 `GPUCPUTransferWorker` 处理单卡和 TP；多 device 的处理见 `flexkv/transfer/workers/gpu_cpu.py`。
 
 ### 2.9 CPU<->SSD / GDS Worker
 
-**`flexkv/transfer/worker.py`** 中的 `CPUSSDDiskTransferWorker` 和 `GDSTransferWorker` 也有对应的多组支持：
+`flexkv/transfer/workers/cpu_ssd.py` 和 `gds.py` 中的 worker 包含多组路径：
 
 - `_init_multi_group_ssd()`：计算每组的 CPU/SSD stride 和 offset
-- `_init_multi_group_gds()` / `_init_tp_multi_group_gds()`：GDS 变体
+- `_init_multi_group_gds()`：GDS 多组路径
 
 ### 2.10 任务引擎修复
 
@@ -283,8 +287,8 @@ python3 -m vllm.entrypoints.openai.api_server \
 - **Round 3**：再次相同 prompt，同样触发 H2D reload
 
 **正确性判定**：
-- Round 2 == Round 3（**必须通过**，两轮都走 cache reload 路径）
-- Round 1 != Round 2 是可接受的（vLLM prefill chunking 在有/无 cache 时可能有微小非确定性）
+- 比较冷算基线和缓存恢复路径，并结合实际模型和运行配置检查输出与 KV 数据；确认实际发生 CPU 命中和 H2D 恢复。
+- 两次恢复结果一致是必要的检查之一，但不足以证明两次结果均正确。冷算与恢复输出不同时，应进一步排查数值差异和缓存数据，不能直接视为通过。
 
 发送测试请求：
 
@@ -328,22 +332,10 @@ D2H transfer request: N finished transfer data size: X GB
 H2D transfer request: N finished transfer data size: X GB
 ```
 
-### 4.6 完整的 dp2 自动化测试脚本
+### 4.6 自动化验证
 
-项目中包含 `test_dp2_kv_reuse.sh`，自动化执行上述流程：
-
-```bash
-cd /workspace/FlexKV
-bash test_dp2_kv_reuse.sh
-```
-
-脚本会：
-1. 启动 dp2 vLLM server
-2. 等待 server ready
-3. 发送 3 组 × 3 轮请求
-4. 验证 Round2 == Round3
-5. 输出 PASS/FAIL 结果
-6. 打印 D2H/H2D 传输日志摘要
+历史验证使用过 `test_dp2_kv_reuse.sh`；该脚本不在当前仓库中，不能按原路径运行。
+在当前代码上复现时，请根据部署的 vLLM、模型、GPU 和缓存配置重新验证输出及缓存命中。
 
 ---
 
@@ -359,7 +351,7 @@ bash test_dp2_kv_reuse.sh
 | `flexkv/transfer_manager.py` | 延迟 StorageEngine 创建；layer_groups 传播；block 数重算 |
 | `flexkv/storage/storage_engine.py` | 传递 `layer_groups` 到 CPU/SSD/Remote layout |
 | `flexkv/transfer/transfer_engine.py` | 存储并分发 per-group GPU 数据到 worker |
-| `flexkv/transfer/worker.py` | GPU stride 自动探测；多组 init/transfer（GPU↔CPU, CPU↔SSD, GDS） |
+| `flexkv/transfer/workers/` | GPU↔CPU、CPU↔SSD 和 GDS 的传输 worker |
 | `flexkv/kvtask.py` | `get_match()`/`put_match()` 中 flush D2H 完成事件 |
 | `flexkv/server/server.py` | 主循环 flush D2H 完成事件（server_client_mode） |
 
@@ -367,7 +359,7 @@ bash test_dp2_kv_reuse.sh
 
 ## 6. 已知限制与后续工作
 
-- **CPU↔SSD 多组传输**：框架已搭建（`_init_multi_group_ssd`），但 C++ 层的 `transfer_kv_blocks_ssd` 尚未添加 `ssd_copy_offset` 参数，多组 SSD 传输暂不可用
-- **GDS 多组传输**：框架已搭建，实际验证待进行
-- **Remote/PEER 多组传输**：优先级较低，待后续实现
-- **非 BLOCKFIRST 布局**：多组支持仅针对 BLOCKFIRST 实现，LAYERFIRST 的 CPU 端多组传输在 worker 中有基本支持但未充分测试
+本文的 dp1/dp2 模型结果是历史验证记录，不代表当前分支的所有版本和拓扑均已验证。
+当前代码包含 CPU↔SSD 和 GDS 的多组路径，但这不等于本文中的 Gemma4、模型布局、
+TP/DP 拓扑和存储组合都通过端到端验证。使用前应针对实际版本复测字节正确性与输出。
+非 BLOCKFIRST 布局也需要单独验证。

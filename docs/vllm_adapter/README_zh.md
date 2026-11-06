@@ -55,7 +55,7 @@ export FLEXKV_CONFIG_PATH="./flexkv_config.yml"
 
 1. 安装 vLLM（>= 0.17.2 正式版，或从官方 main 分支源码安装）
 ```bash
-pip install vllm>=0.17.2
+pip install 'vllm>=0.17.2'
 # 或从源码安装最新 main 分支：
 # git clone https://github.com/vllm-project/vllm.git && cd vllm && pip install -e .
 ```
@@ -67,8 +67,8 @@ pip install flexkv  # 或从源码编译：./build.sh
 
 3. offline test
 ```bash
-# 参考 VLLM_DIR/examples/offline_inference/prefix_caching_flexkv.py
-python examples/offline_inference/prefix_caching_flexkv.py
+# 将 VLLM_DIR 设置为包含此示例的兼容 vLLM 源码目录。
+python "$VLLM_DIR/examples/disaggregated/flexkv_connector/prefix_caching_flexkv.py" --model /path/to/model
 ```
 
 4. online serving
@@ -96,7 +96,7 @@ Layer-wise 加载可让 FlexKV 搬运第 `N+1` 层 KV 的同时，vLLM 计算第
 ```bash
 VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
   --kv-transfer-config \
-  '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both",\
+  '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both",
 "kv_connector_extra_config":{"use_layerwise":true}}'
 ```
 
@@ -126,7 +126,9 @@ vLLM wrapper 改动合入上游前，请给 vLLM 应用
 
 ```bash
 cd vllm
-git apply FLEXKV_DIR/examples/vllm_adaption/<对应patch文件>
+# 设置 FLEXKV_DIR，并选择与 vLLM 版本匹配的 patch。
+PATCH_FILE=vllm_0_16_0-flexkv-connector.patch
+git apply "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 pip install -e .
 ```
 
@@ -156,16 +158,7 @@ export FLEXKV_CONFIG_PATH="./flexkv_config.json"
 ```
 
 ### 运行
-在 vLLM 0.8.4 版本中应用patch `examples/vllm_adaption_legacy/flexkv_vllm_0_8_4.patch`，分别启动 FlexKV、vLLM 和测试脚本：
 
-```bash
-# 启动 FlexKV 作为服务端
-bash benchmarks/flexkv_benchmark/run_flexkv_server.sh
-
-# 启动 vLLM 作为客户端
-bash benchmarks/flexkv_benchmark/serving_vllm.sh
-
-# 启动性能测试
-bash benchmarks/flexkv_benchmark/multiturn_benchmark.sh
-```
-在 vLLM 0.10.0 版本中应用patch `examples/vllm_adaption_legacy/flexkv_vllm_0_10_0.patch`，测试方法同上。
+`examples/vllm_adaption_legacy/` 中的历史 patch 分别针对 vLLM 0.8.4 和 0.10.0。
+历史 `benchmarks/flexkv_benchmark/` 启动脚本不在当前仓库中。若需复现旧版部署，
+请使用包含对应脚本的兼容历史 FlexKV 版本；当前分支及其配置示例针对当前 API。

@@ -2,7 +2,7 @@
 
 FlexKV CLI 是一个本地观察工具，用于查看配置、环境、进程、trace、SSD 目录和 Prometheus 指标。当前 CLI 不负责拉起或停止 FlexKV 运行时，也不修改推理进程状态。
 
-当前实现没有 `flexkv version` 命令，因为 FlexKV 尚未提供独立的版本号元数据。`flexkv collect-env` 会显示当前代码仓的短 Git commit，可作为开发分支的辅助标识。
+当前实现没有 `flexkv version` 命令，因为 FlexKV 尚未提供独立的版本号元数据。`flexkv collect-env` 在当前工作目录执行 `git rev-parse`；显示的短 commit 属于该目录的仓库，不一定是已安装的 FlexKV 版本。
 
 ---
 
@@ -123,7 +123,7 @@ flexkv config show
 - 启用 SSD 时，`ssd_cache_gb` 必须大于 `cpu_cache_gb`
 - 启用 SSD 时，每个 `ssd_cache_dir` 都必须是已存在目录
 
-注意：当前实现会在终端输出违规项，但没有为校验失败设置独立的非零退出码。`config show` 展示的是 CLI 侧解析结果，不代表某个正在运行推理进程内部最终合并后的配置。
+配置加载或校验失败时，错误输出到 stderr，退出码为 1。`config show` 展示的是 CLI 侧解析结果，不代表某个正在运行推理进程内部最终合并后的配置。
 
 ### 4.3 `flexkv collect-env`
 
@@ -134,7 +134,7 @@ flexkv collect-env
 flexkv collect-env --format json
 ```
 
-包含 OS、Python 版本、当前代码仓短 commit、PyTorch / CUDA / GPU 摘要、NVIDIA 驱动、关键 Python 包版本，以及 `FLEXKV_*` 变量数量。为了控制输出大小，它不导出完整环境变量内容；需要逐项查看时使用 `flexkv env`。
+包含 OS、Python 版本、当前工作目录仓库的短 commit、PyTorch / CUDA / GPU 摘要、NVIDIA 驱动、关键 Python 包版本，以及 `FLEXKV_*` 变量数量。为了控制输出大小，它不导出完整环境变量内容；需要逐项查看时使用 `flexkv env`。
 
 ---
 

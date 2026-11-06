@@ -33,7 +33,7 @@ sudo chmod 666 /dev/nvidia-fs*
 
 ### 1.2 Configure File System
 
-GDS requires file systems to be mounted with `data=ordered mode` (ext4).
+The following ext4 example uses `data=ordered`. Check the GDS requirements for your actual filesystem, driver and CUDA version before changing mount options.
 
 #### Check Current Mount Status
 
@@ -109,14 +109,13 @@ docker run -itd \
 ### 2.2 Configure FlexKV to Use GDS
 
 `export FLEXKV_ENABLE_GDS=1` to compile
-Configuration example after compilation `config.yaml`:
+Configuration example after compilation `config.yaml` (a positive `ssd_cache_gb` enables the SSD tier):
 
 ```yaml
 cpu_cache_gb: 32
 ssd_cache_gb: 1024
 ssd_cache_dir: /data/flexkv_ssd/
 enable_gds: true
-enable_ssd: true
 ```
 
 ---
@@ -127,7 +126,7 @@ enable_ssd: true
 
 Edit `/etc/cufile.json`:
 
-```json
+```text
 {
     ...
     "logging": {

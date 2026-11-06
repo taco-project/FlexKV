@@ -56,6 +56,14 @@ Python metrics are recorded by `GlobalCacheEngine` in `cache_engine.py` and coll
 
 ---
 
+The collector also exposes `flexkv_py_joint_prefetch_outcomes_total` (label
+`outcome`) and `flexkv_py_joint_prefetch_swa_slot_alloc_failed_total` for
+Mooncake Full+SWA prefetch. These describe joint-prefetch outcomes, not all
+requests or every prefetch failure.
+
+
+---
+
 ### 2.2 C++ Runtime Metrics (`flexkv_cpp_*`)
 
 C++ metrics are managed by the `MetricsManager` singleton, primarily instrumented in RadixTree cache operations and data transfers.

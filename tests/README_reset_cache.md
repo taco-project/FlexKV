@@ -1,5 +1,7 @@
 # KV-cache reset feature — test guide
 
+[中文文档](README_reset_cache_zh.md)
+
 This covers the `reset_cache` path that lets vLLM's
 `reset_prefix_cache(reset_connector=True)` (what verl calls after every weight
 update) propagate into FlexKV so stale-weight KV is dropped.
@@ -75,7 +77,7 @@ from flexkv.kvmanager import KVManager
 from flexkv.common.config import ModelConfig, CacheConfig
 import torch
 m = ModelConfig(num_layers=4, num_kv_heads=8, head_size=128,
-                dtype=torch.float16, use_mla=False, tp_size=1, dp_size=1)
+                dtype=torch.float16, kv_dim=2, tp_size=1, dp_size=1)
 c = CacheConfig(tokens_per_block=16, enable_cpu=True, enable_ssd=False, num_cpu_blocks=1024)
 kv = KVManager(model_config=m, cache_config=c, dp_client_id=0); kv.start()
 kv.reset()          # must not raise, must be near-instant on empty cache
