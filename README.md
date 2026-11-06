@@ -77,6 +77,28 @@ Admission batching additionally requires the [SGLang companion #17](https://gith
 which targets the adaptation branch used by [sglang#31781](https://github.com/sgl-project/sglang/pull/31781).
 Use matching source revisions while these PRs are under review.
 
+With the relevant controls enabled:
+
+```mermaid
+flowchart TB
+    subgraph Control[Request control]
+        direction LR
+        A[Allocate and vote] --> P[Prepare without DMA] --> B[One batch launch]
+    end
+    subgraph Data[Cache data]
+        direction LR
+        S[Remote Store] -->|Bounded Get| H[CPU host cache]
+        H -->|Eligible direct 2D CE| G[GPU KV]
+    end
+    Control -.->|Submit H2D| Data
+```
+
+`Request control` shows preparation and launch order; `Cache data` shows
+movement through the tiers. The dashed edge submits H2D. These are mechanism
+diagrams, not measured timing; Store prefetch can start before this submission. The
+[illustrated guide](docs/cache_tier_performance_controls.md) shows the old and
+new launch, copy and communication paths, with their limits.
+
 | Area | Previous behavior | Changed behavior and implementation |
 | --- | --- | --- |
 | Admitted layerwise restores | Each request starts its own restore during admission. | Prepare mappings without DMA, then merge the final admitted members into one launch. Each layer has one completion signal. See [`connector.py`](flexkv/integration/sglang/connector.py). |
