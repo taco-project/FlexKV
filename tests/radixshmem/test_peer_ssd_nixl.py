@@ -5,8 +5,9 @@
 * Two endpoints in one process: arbitrary, scattered block lists read
   byte-exact, concurrent requests from two threads, a bad block id comes back
   as an error, a peer that stopped serving times out -- for a 4 KiB-aligned
-  block (served with O_DIRECT) and a 512 B-aligned one (served buffered, like
-  FlexKV's own engine writes it).
+  block (served with O_DIRECT) and a 512 B-aligned one (written buffered, like
+  FlexKV's own engine writes it; read through the aligned O_DIRECT span
+  around it, or buffered).
 * A peer never writes after the reader gave up (the slots may be reused), and
   a reader that dropped a peer fails fast, then reconnects.
 * A reader whose own endpoint is still starting fails at once.
@@ -73,9 +74,11 @@ def test_block_location_matches_the_io_uring_layout(tmp_path):
             assert np.array_equal(np.frombuffer(fh.read(BLOCK), np.uint8), _pattern(i)), i
 
 
-@pytest.fixture(params=[BLOCK, BLOCK_512], ids=["direct", "buffered"])
-def pair(tmp_path, request):
-    block = request.param
+@pytest.fixture(params=[(BLOCK, "1"), (BLOCK_512, "1"), (BLOCK_512, "0")],
+                ids=["direct", "buffered-aligned-reads", "buffered"])
+def pair(tmp_path, request, monkeypatch):
+    block, direct_read = request.param
+    monkeypatch.setenv("FLEXKV_NIXL_SSD_DIRECT_READ", direct_read)
     files, n = _write_with_io_uring(tmp_path, devices=1, files_per_device=2, blocks_per_file=16,
                                     block=block)
     port = _port[0]
@@ -89,6 +92,7 @@ def pair(tmp_path, request):
                              cpu_ptr=dst_buf.ctypes.data, cpu_bytes=dst_buf.nbytes,
                              block_bytes=block, ssd_files={})
     assert server.direct_io == (block % 4096 == 0)
+    assert server.direct_read == (block % 4096 != 0 and direct_read == "1")
     client.connect(server.name, "127.0.0.1", port, 30)
     yield server, client, dst_buf, n, block
     client.close()

@@ -69,6 +69,10 @@ def _default_ip() -> str:
         return "127.0.0.1"
 
 
+def _round_up(n: int, align: int) -> int:
+    return (int(n) + align - 1) // align * align
+
+
 def use_direct_io(block_bytes: int) -> bool:
     """Whether served reads bypass the page cache. Same rule as FlexKV's own
     io_uring engine (csrc/transfer_ssd.cpp): O_DIRECT only for 4 KiB-aligned
@@ -149,13 +153,26 @@ class NixlSSDEndpoint:
                 if path not in self._fds:
                     self._fds[path] = os.open(path, flags)
         # Blocks each file holds: a block past them must fail, not read short.
-        self._file_blocks = {path: os.fstat(fd).st_size // self.block_bytes
-                             for path, fd in self._fds.items()}
-        if self._fds:
-            agent.register_memory([(0, 0, fd, path) for path, fd in self._fds.items()],
-                                  "FILE", backends=["POSIX"])
+        self._file_size = {path: os.fstat(fd).st_size for path, fd in self._fds.items()}
+        self._file_blocks = {path: size // self.block_bytes for path, size in self._file_size.items()}
+        # Blocks that are not 4 KiB-aligned are written through the page cache,
+        # and buffered reads of them crawl (~2 GB/s however many run at once).
+        # Served reads instead read the 4 KiB-aligned span around each block
+        # with O_DIRECT, which writes the span's dirty pages back first, so
+        # they see what the buffered writer wrote. Writes stay buffered.
+        self.direct_read = (not self.direct_io and bool(self._fds)
+                            and os.getenv("FLEXKV_NIXL_SSD_DIRECT_READ", "1") != "0")
+        self._dfds: Dict[str, int] = {}
+        if self.direct_read:
+            self._dfds = {path: os.open(path, os.O_RDONLY | os.O_DIRECT) for path in self._fds}
+        self.slot_bytes = (_round_up(self.block_bytes, _DIRECT_IO_ALIGN) + _DIRECT_IO_ALIGN
+                           if self.direct_read else self.block_bytes)
+        files = [(0, 0, fd, path) for path, fd in self._fds.items()]
+        files += [(0, 0, fd, f"{path}#direct") for path, fd in self._dfds.items()]
+        if files:
+            agent.register_memory(files, "FILE", backends=["POSIX"])
         # Staging: storage reads land here, UCX writes leave from here.
-        self._staging = [_Staging(num_chunks, self.chunk_blocks * self.block_bytes)
+        self._staging = [_Staging(num_chunks, self.chunk_blocks * self.slot_bytes)
                          for _ in range(num_servers)]
         for st in self._staging:
             agent.register_memory([(st.base, st.count * st.chunk_bytes, 0, "staging")], "DRAM",
@@ -179,13 +196,14 @@ class NixlSSDEndpoint:
             f"[peer-ssd-nixl] endpoint {name} on port {self.port}: CPU pool {self._cpu_bytes >> 20} MB, "
             f"{len(self._fds)} SSD files, block {self.block_bytes} B, chunk {self.chunk_blocks} blocks "
             f"x {num_chunks} per server x {num_servers} servers, ucx_devices={ucx_devices or 'auto'}, "
-            f"ssd_io={'direct' if self.direct_io else 'buffered (block not 4 KiB-aligned, like the local writer)'}")
+            f"ssd_io={'direct' if self.direct_io else 'buffered (block not 4 KiB-aligned, like the local writer)'}"
+            f"{', aligned direct reads' if self.direct_read else ''}")
 
     def close(self) -> None:
         self._stop.set()
         for t in self._threads:
             t.join(timeout=2)
-        for fd in self._fds.values():
+        for fd in list(self._fds.values()) + list(self._dfds.values()):
             try:
                 os.close(fd)
             except OSError:
@@ -198,6 +216,20 @@ class NixlSSDEndpoint:
         if block < 0 or offset // self.block_bytes >= self._file_blocks[path]:
             raise ValueError(f"SSD block {block} is out of range")
         return self._fds[path], offset
+
+    def read_span(self, block: int) -> Tuple[int, int, int, int]:
+        """(fd, file offset, length, offset of the block in it) a served read
+        of one block reads into a staging slot: the block itself, or with
+        `direct_read` the 4 KiB-aligned span around it."""
+        fd, offset = self.ssd_location(block)
+        if not self.direct_read:
+            return fd, offset, self.block_bytes, 0
+        path, _ = ssd_block_location(self._files, block, self.block_bytes)
+        lo = offset - offset % _DIRECT_IO_ALIGN
+        hi = _round_up(offset + self.block_bytes, _DIRECT_IO_ALIGN)
+        if hi > self._file_size[path]:  # the file's tail: no full aligned page
+            return fd, offset, self.block_bytes, 0
+        return self._dfds[path], lo, hi - lo, offset - lo
 
     # -- reader side ------------------------------------------------------
     def connect(self, peer: str, ip: str, port: int, timeout_s: float) -> None:
@@ -386,13 +418,14 @@ class NixlSSDEndpoint:
         reads: deque = deque()   # (chunk, buffer, handle)
         writes: deque = deque()
         nxt = done = 0
-        bb = self.block_bytes
+        bb, sb = self.block_bytes, self.slot_bytes
+        spans = [self.read_span(b) for b in src]  # range check before any I/O
         while done < len(chunks):
             while free and nxt < len(chunks):
                 buf = free.popleft()
                 lo, hi = chunks[nxt]
-                local = [(staging.ptr(buf) + j * bb, bb, 0) for j in range(hi - lo)]
-                files = [(off, bb, fd) for fd, off in (self.ssd_location(b) for b in src[lo:hi])]
+                local = [(staging.ptr(buf) + j * sb, spans[lo + j][2], 0) for j in range(hi - lo)]
+                files = [(off, n, fd) for fd, off, n, _ in spans[lo:hi]]
                 reads.append((nxt, buf, self._post("READ", local, files, "FILE", self.name)))
                 nxt += 1
             progressed = False
@@ -405,7 +438,7 @@ class NixlSSDEndpoint:
                     raise TimeoutError("request expired before it was served")
                 c, buf, _ = reads.popleft()
                 lo, hi = chunks[c]
-                local = [(staging.ptr(buf) + j * bb, bb, 0) for j in range(hi - lo)]
+                local = [(staging.ptr(buf) + j * sb + spans[lo + j][3], bb, 0) for j in range(hi - lo)]
                 remote = [(base + int(d) * bb, bb, 0) for d in dst[lo:hi]]
                 writes.append((c, buf, self._post("WRITE", local, remote, "DRAM", sender)))
                 progressed = True
@@ -433,7 +466,7 @@ class NixlSSDEndpoint:
         nets: deque = deque()    # (chunk, buffer, handle)
         disks: deque = deque()
         nxt = done = 0
-        bb = self.block_bytes
+        bb, sb = self.block_bytes, self.slot_bytes
 
         def _expire() -> None:
             for _, _, h in list(nets) + list(disks):
@@ -447,7 +480,7 @@ class NixlSSDEndpoint:
                     _expire()
                 buf = free.popleft()
                 lo, hi = chunks[nxt]
-                local = [(staging.ptr(buf) + j * bb, bb, 0) for j in range(hi - lo)]
+                local = [(staging.ptr(buf) + j * sb, bb, 0) for j in range(hi - lo)]
                 remote = [(base + int(b) * bb, bb, 0) for b in src[lo:hi]]
                 nets.append((nxt, buf, self._post("READ", local, remote, "DRAM", sender)))
                 nxt += 1
@@ -457,7 +490,7 @@ class NixlSSDEndpoint:
                 if time.time() > expires:
                     _expire()
                 lo, hi = chunks[c]
-                local = [(staging.ptr(buf) + j * bb, bb, 0) for j in range(hi - lo)]
+                local = [(staging.ptr(buf) + j * sb, bb, 0) for j in range(hi - lo)]
                 files = [(off, bb, fd) for fd, off in files_of[lo:hi]]
                 disks.append((c, buf, self._post("WRITE", local, files, "FILE", self.name)))
                 progressed = True
