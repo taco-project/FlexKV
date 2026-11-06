@@ -6,7 +6,17 @@ This document describes all cache eviction policies supported by FlexKV, includi
 
 ## Overview
 
-When GPU KV cache memory is full, FlexKV evicts (removes) cached blocks from the Radix Tree to free space for new requests. The **eviction policy** determines which cached blocks are removed first.
+FlexKV is a multi-tier cache layer (CPU memory / SSD / remote storage) that sits below the GPU; the GPU KV cache itself is managed by the inference engine and is not subject to FlexKV's eviction. When a cache tier (CPU/SSD/remote) runs low on space or its utilization exceeds the configured threshold, FlexKV evicts (removes) cached blocks from **that tier's Radix Tree** to free space for new requests. The **eviction policy** determines which cached blocks are removed first.
+
+---
+
+## Multi-Level Cache Inclusion
+
+FlexKV uses an approximately **inclusive / write-through** multi-level cache model. During `put`, data is written to the CPU cache first; if SSD or remote storage is enabled and available, FlexKV also tries to fill the blocks that are missing in those lower tiers. As a result, the same KV block usually has copies in multiple cache tiers.
+
+With this model, eviction in one tier only removes blocks from the **current tier's** index and recycles physical block space in that tier. Eviction itself does not trigger write-back, migration, or extra transfer to the next lower tier. For example, CPU eviction does not actively issue CPU→SSD transfers, and SSD eviction does not actively issue SSD→remote transfers.
+
+Note that this inclusion property is **best-effort**. If a lower tier is disabled, skipped by a temporary cache strategy, lacks free space, or fails during transfer, that tier may not contain a copy. After an upper-tier eviction in such cases, later requests can only hit other existing tiers or fall back to a cache miss.
 
 ---
 

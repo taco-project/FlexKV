@@ -40,9 +40,9 @@ class MoonCakeTransferEngineWrapper:
             self.config = MooncakeTransferEngineConfig.from_file(mooncake_config_path)
         else:
             self.config = config
-        self.engine_ip = config.engine_ip
-        self.engien_port = config.engine_port
-        self.mooncake_addr = f"{self.engine_ip}:{self.engien_port}"
+        self.engine_ip = self.config.engine_ip
+        self.engine_port = self.config.engine_port
+        self.mooncake_addr = f"{self.engine_ip}:{self.engine_port}"
         flexkv_logger.info(f"Mooncake listen on: {self.mooncake_addr}")
 
         supported_backend = ["redis", "http"]
@@ -75,7 +75,7 @@ class MoonCakeTransferEngineWrapper:
         ret = self.engine.register_memory(buffer_ptr, buffer_size)
         return ret if ret == 0 else -1
 
-    def unregist_buffer(self, buffer_ptr: int) -> None:
+    def unregist_buffer(self, buffer_ptr: int) -> int:
         """Unregister the buffer to the mooncake engine."""
         ret = self.engine.unregister_memory(buffer_ptr)
         return ret if ret == 0 else -1
@@ -102,7 +102,7 @@ class MoonCakeTransferEngineWrapper:
         ret = self.engine.batch_transfer_sync_write(peer_engine_addr, src_ptr_list, dst_ptr_list, data_size_list)
         return ret if ret == 0 else -1
     
-    def transfer_sync_write_with_notify(self, peer_engine_addr: str, src_ptr: int, dst_ptr: int, data_size: int, notify_name: str, msg : NotifyMsg):
+    def transfer_sync_write_with_notify(self, peer_engine_addr: str, src_ptr: int, dst_ptr: int, data_size: int, notify_name: str, msg : NotifyMsg) -> int:
         if not MOONCAKE_AVAILABLE:
             raise RuntimeError("Mooncake engine is not available")
         notify = engine.TransferNotify(notify_name, msg.to_string())

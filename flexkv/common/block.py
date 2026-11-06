@@ -33,6 +33,14 @@ def hash_token(token_ids: np.ndarray, namespace: Optional[List[str]]) -> HashTyp
 
     return HashType(hasher.digest())
 
+
+def format_block_hash(value: Optional[int]) -> str:
+    """Format signed or unsigned 64-bit hashes as fixed-width hex."""
+    if value is None:
+        return "-"
+    return f"0x{int(value) & ((1 << 64) - 1):016x}"
+
+
 @dataclass
 class SequenceMeta:
 

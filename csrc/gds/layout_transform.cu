@@ -33,10 +33,9 @@ __global__ void layout_transform_kernel(
     int64_t* gpu_block_ids,
     int num_blocks,
     int num_layers,
-    bool is_mla,
+    int kv_dim,
     bool buffer_to_target
 ) {
-    int kv_dim = is_mla ? 1 : 2;
     int num_chunks = num_layers * kv_dim * num_blocks;
     int64_t chunk_size_in_float4 = chunk_size * sizeof(int64_t) / sizeof(float4);
     
@@ -77,14 +76,13 @@ void launch_layout_transform_kernel(
     int64_t* gpu_block_ids,
     int num_blocks,
     int num_layers,
-    bool is_mla,
+    int kv_dim,
     bool buffer_to_target,
     cudaStream_t stream
 ) {
     if (num_blocks == 0 || num_layers == 0) return;
     
     int block_size = 128; // TODO: warp level ?
-    int kv_dim = is_mla ? 1 : 2;
     int num_chunks = num_layers * kv_dim * num_blocks;
     
     int device_id;
@@ -108,7 +106,7 @@ void launch_layout_transform_kernel(
         gpu_block_ids,
         num_blocks,
         num_layers,
-        is_mla,
+        kv_dim,
         buffer_to_target
     );
 
@@ -117,15 +115,14 @@ void launch_layout_transform_kernel(
 // Explicit template instantiations
 template void launch_layout_transform_kernel<BackendType::VLLM>(
     int64_t*, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
-    int, int, bool, bool, cudaStream_t);
+    int, int, int, bool, cudaStream_t);
 
 template void launch_layout_transform_kernel<BackendType::TRTLLM>(
     int64_t*, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
-    int, int, bool, bool, cudaStream_t);
+    int, int, int, bool, cudaStream_t);
 
 template void launch_layout_transform_kernel<BackendType::SGLANG>(
     int64_t*, int64_t, int64_t, int64_t, int64_t, GTensorHandler, int64_t*,
-    int, int, bool, bool, cudaStream_t);
+    int, int, int, bool, cudaStream_t);
 
 } // namespace flexkv
-

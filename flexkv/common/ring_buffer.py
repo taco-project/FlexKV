@@ -61,10 +61,10 @@ class SharedOpPool:
 
                 slot_id = self.free_slots.popleft()
                 self.slot_map[slot_hash] = slot_id
-
-        # update status managers
-        self.slot_ref_count[slot_id] += 1
-        self.slot_hashes[slot_id] = slot_hash
+            # update status managers
+            self.slot_ref_count[slot_id] += 1
+            self.slot_hashes[slot_id] = slot_hash
+        
 
         # do copy
         if not reuse:

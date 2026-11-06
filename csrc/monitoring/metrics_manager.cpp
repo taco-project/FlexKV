@@ -4,8 +4,8 @@
  */
 
 #include "metrics_manager.h"
+#include "logging.h"
 
-#include <iostream>
 #include <thread>
 
 namespace flexkv {
@@ -29,7 +29,9 @@ MetricsManager::~MetricsManager() {
 void MetricsManager::Configure(bool enabled, int port) {
     // Protect against duplicate configuration
     if (configured_) {
-        std::cout << "[FlexKV CppMetrics] Already configured, ignoring duplicate Configure() call" << std::endl;
+        FLEXKV_LOG_DEBUG(
+            "operation=metrics_config act=configure status=skipped "
+            "reason=already_configured");
         return;
     }
     configured_ = true;
@@ -37,9 +39,14 @@ void MetricsManager::Configure(bool enabled, int port) {
     port_ = port;
     
     if (enabled_) {
-        std::cout << "[FlexKV CppMetrics] Configured from Python: enabled=true, port=" << port_ << std::endl;
+        FLEXKV_LOG_INFO(
+            "operation=metrics_config act=configure status=success "
+            "enabled=true port=%d",
+            port_);
     } else {
-        std::cout << "[FlexKV CppMetrics] Configured from Python: disabled" << std::endl;
+        FLEXKV_LOG_DEBUG(
+            "operation=metrics_config act=configure status=success "
+            "enabled=false");
     }
 }
 
@@ -78,7 +85,9 @@ bool MetricsManager::Initialize(const std::string& bind_address) {
     }
 
     if (!enabled_) {
-        std::cout << "[FlexKV CppMetrics] Metrics disabled, skipping initialization" << std::endl;
+        FLEXKV_LOG_DEBUG(
+            "operation=metrics_init act=complete status=skipped "
+            "reason=disabled");
         return false;
     }
 
@@ -103,12 +112,16 @@ bool MetricsManager::Initialize(const std::string& bind_address) {
             .Register(*registry_);
 
         running_.store(true);
-        std::cout << "[FlexKV CppMetrics] Initialized successfully, exposing metrics at http://" 
-                  << bind_address << "/metrics" << std::endl;
+        FLEXKV_LOG_INFO(
+            "operation=metrics_init act=complete status=success "
+            "endpoint=\"http://%s/metrics\"",
+            bind_address.c_str());
         return true;
 
     } catch (const std::exception& e) {
-        std::cerr << "[FlexKV CppMetrics] Initialization failed: " << e.what() << std::endl;
+        FLEXKV_LOG_ERROR(
+            "operation=metrics_init act=complete status=failed error=\"%s\"",
+            e.what());
         registry_.reset();
         exposer_.reset();
         return false;
@@ -133,7 +146,8 @@ void MetricsManager::Shutdown() {
     exposer_.reset();
     registry_.reset();
 
-    std::cout << "[FlexKV CppMetrics] Shutdown completed" << std::endl;
+    FLEXKV_LOG_DEBUG(
+        "operation=metrics_shutdown act=complete status=success");
 #endif
 }
 

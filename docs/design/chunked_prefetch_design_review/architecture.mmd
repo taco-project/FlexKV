@@ -1,0 +1,23 @@
+%%{init: {"theme":"base","htmlLabels":false,"themeVariables":{"fontFamily":"Arial, PingFang SC, sans-serif","fontSize":"17px","primaryColor":"#edf6f8","primaryTextColor":"#173344","primaryBorderColor":"#568896","lineColor":"#637786"},"flowchart":{"htmlLabels":false,"curve":"basis","nodeSpacing":30,"rankSpacing":38}}}%%
+flowchart TB
+    S["SGLang adapter<br/>入队 / demand / abort<br/>TP 同步"]
+    A["FlexKV API / RPC<br/>handle · snapshot · held GET"]
+    S --> A
+    subgraph CT["新增控制与调度部分"]
+        C["控制线程<br/>策略 / 规划 / 完成处理<br/>session 与资源账本"]
+        Q["查询线程<br/>hash chain<br/>分批 metadata"]
+        I["发送线程 + 有界队列<br/>原 submit_batch / IPC"]
+        C <-->|异步查询 / 结果| Q
+        C -->|先计入 inflight，再排队| I
+    end
+    A --> C
+    W["原传输 worker<br/>Mooncake → CPU staging"]
+    I -->|原图格式| W
+    W -->|原完成消息| C
+    R["CPU radix cache<br/>连续发布<br/>Full / SWA 保护"]
+    C -->|成功提交| R
+    G["前台 held GET<br/>原 H2D<br/>请求 / GPU cache 接手"]
+    R --> G
+    style CT fill:#f7fafb,stroke:#91abb5,stroke-dasharray:5 4
+    style W fill:#f2f3f5,stroke:#8b98a5
+    style G fill:#f2f3f5,stroke:#8b98a5

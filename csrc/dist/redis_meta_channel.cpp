@@ -595,4 +595,173 @@ bool RedisMetaChannel::delete_blockmeta_batch(uint32_t node_id,
   return true;
 }
 
+bool RedisMetaChannel::delete_node_blocks(uint32_t node_id, size_t batch_size) {
+  std::vector<std::string> keys;
+  if (!list_block_keys(node_id, keys)) return false;
+  if (keys.empty()) return true;
+  if (batch_size == 0) batch_size = 200;
+
+  size_t idx = 0;
+  while (idx < keys.size()) {
+    const size_t end = std::min(idx + batch_size, keys.size());
+    std::vector<std::vector<std::string>> batch;
+    batch.reserve(end - idx);
+    for (size_t i = idx; i < end; ++i) {
+      batch.push_back({"DEL", keys[i]});
+    }
+    std::vector<std::vector<std::string>> replies;
+    if (!client.pipeline(batch, replies)) return false;
+    idx = end;
+  }
+  return true;
+}
+
+bool RedisMetaChannel::has_any_block_keys(bool &has_keys) {
+  has_keys = false;
+  const std::string pattern = blocks_key + ":block:*";
+  std::string cursor = "0";
+  size_t iter_safety = 0;
+  const size_t max_scan_iterations = 100000;
+
+  do {
+    redisContext *context = client.get_context();
+    if (context == nullptr) return false;
+
+    const std::vector<std::string> scan_cmd = {
+        "SCAN", cursor, "MATCH", pattern, "COUNT", "100"};
+    std::vector<const char *> argv;
+    std::vector<size_t> arglen;
+    argv.reserve(scan_cmd.size());
+    arglen.reserve(scan_cmd.size());
+    for (const auto &arg : scan_cmd) {
+      argv.push_back(arg.c_str());
+      arglen.push_back(arg.length());
+    }
+
+    redisReply *reply = nullptr;
+    if (redisAppendCommandArgv(context, argv.size(), argv.data(),
+                              arglen.data()) != REDIS_OK) {
+      return false;
+    }
+    if (redisGetReply(context, reinterpret_cast<void **>(&reply)) != REDIS_OK ||
+        reply == nullptr) {
+      if (reply != nullptr) freeReplyObject(reply);
+      return false;
+    }
+
+    bool valid_reply = reply->type == REDIS_REPLY_ARRAY && reply->elements >= 2;
+    if (valid_reply) {
+      redisReply *cursor_reply = reply->element[0];
+      if (cursor_reply->type == REDIS_REPLY_STRING) {
+        cursor.assign(cursor_reply->str, cursor_reply->len);
+      } else if (cursor_reply->type == REDIS_REPLY_INTEGER) {
+        cursor = std::to_string(cursor_reply->integer);
+      } else {
+        valid_reply = false;
+      }
+    }
+
+    if (valid_reply) {
+      redisReply *keys_reply = reply->element[1];
+      if (keys_reply->type != REDIS_REPLY_ARRAY) {
+        valid_reply = false;
+      } else {
+        for (size_t i = 0; i < keys_reply->elements; ++i) {
+          if (keys_reply->element[i]->type == REDIS_REPLY_STRING) {
+            has_keys = true;
+            break;
+          }
+        }
+      }
+    }
+
+    freeReplyObject(reply);
+    if (!valid_reply) return false;
+    if (has_keys) return true;
+    if (++iter_safety > max_scan_iterations) return false;
+  } while (cursor != "0");
+
+  return true;
+}
+
+bool RedisMetaChannel::begin_reset_barrier(uint64_t ttl_ms, uint64_t &epoch) {
+  const std::string active_key = blocks_key + ":reset:active";
+  const std::string epoch_key = blocks_key + ":reset:epoch";
+  const std::string script =
+      "local current = redis.call('GET', KEYS[1]); "
+      "if current then "
+      "redis.call('PEXPIRE', KEYS[1], ARGV[1]); "
+      "return tonumber(current); "
+      "end; "
+      "local next_epoch = redis.call('INCR', KEYS[2]); "
+      "redis.call('PSETEX', KEYS[1], ARGV[1], tostring(next_epoch)); "
+      "return next_epoch;";
+  std::vector<std::string> reply;
+  if (!client.command({"EVAL", script, "2", active_key, epoch_key,
+                       std::to_string(ttl_ms)},
+                      reply) ||
+      reply.empty()) {
+    return false;
+  }
+  try {
+    epoch = std::stoull(reply[0]);
+  } catch (const std::exception &) {
+    return false;
+  }
+  return epoch != 0;
+}
+
+bool RedisMetaChannel::mark_reset_barrier_arrival(uint64_t epoch,
+                                                  uint64_t ttl_ms) {
+  const std::string arrivals_key = blocks_key + ":reset:arrivals";
+  std::vector<std::vector<std::string>> commands = {
+      {"HSET", arrivals_key, std::to_string(node_id), std::to_string(epoch)},
+      {"PEXPIRE", arrivals_key, std::to_string(ttl_ms)}};
+  std::vector<std::vector<std::string>> replies;
+  return client.pipeline(commands, replies);
+}
+
+bool RedisMetaChannel::is_reset_barrier_ready(uint64_t epoch, bool &ready) {
+  ready = false;
+  std::vector<std::string> node_keys;
+  if (!list_node_keys(node_keys) || node_keys.empty()) return false;
+
+  const std::string arrivals_key = blocks_key + ":reset:arrivals";
+  std::vector<std::vector<std::string>> commands;
+  commands.reserve(node_keys.size());
+  for (const auto &key : node_keys) {
+    if (key.size() <= 5 || key.rfind("node:", 0) != 0) continue;
+    commands.push_back({"HGET", arrivals_key, key.substr(5)});
+  }
+  if (commands.empty()) return false;
+
+  std::vector<std::vector<std::string>> replies;
+  if (!client.pipeline(commands, replies) || replies.size() != commands.size()) {
+    return false;
+  }
+  const std::string expected_epoch = std::to_string(epoch);
+  for (const auto &reply : replies) {
+    if (reply.empty() || reply[0] != expected_epoch) return true;
+  }
+  ready = true;
+  return true;
+}
+
+bool RedisMetaChannel::finish_reset_barrier(uint64_t epoch) {
+  const std::string active_key = blocks_key + ":reset:active";
+  const std::string script =
+      "local current = redis.call('GET', KEYS[1]); "
+      "if not current then return 1; end; "
+      "if current == ARGV[1] then redis.call('DEL', KEYS[1]); return 1; end; "
+      "return 0;";
+  std::vector<std::string> reply;
+  if (!client.command({"EVAL", script, "1", active_key,
+                       std::to_string(epoch)},
+                      reply) ||
+      reply.empty()) {
+    return false;
+  }
+  return reply[0] == "1";
+}
+
 } // namespace flexkv

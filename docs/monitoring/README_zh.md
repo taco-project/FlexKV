@@ -13,6 +13,7 @@ FlexKV 集成了基于 [Prometheus](https://prometheus.io/) 的运行时指标�
 | `FLEXKV_ENABLE_METRICS` | `0` | 启用指标收集（设为 `1` 启用，默认禁用） |
 | `FLEXKV_PY_METRICS_PORT` | `8080` | Python 指标 HTTP 服务端口 |
 | `FLEXKV_CPP_METRICS_PORT` | `8081` | C++ 指标 HTTP 服务端口 |
+| `FLEXKV_TRANSFER_TRACE` | `0` | 逐条打印传输耗时日志（`[XFER]`）。只影响日志，不影响指标 |
 
 ### 1.2 配置方式
 
@@ -45,6 +46,12 @@ Python 指标由 `GlobalCacheEngine` 在 `cache_engine.py` 中记录，通过 `F
 | `flexkv_py_evicted_blocks_total` | Counter | `device` | 驱逐的 blocks 总数 |
 | `flexkv_py_allocated_blocks_total` | Counter | `device` | 分配的 blocks 总数 |
 | `flexkv_py_allocation_failures_total` | Counter | `mode` | 资源分配失败次数 |
+| `flexkv_py_transfer_wait_duration_seconds` | Histogram | `transfer_type` | op 在 worker 上排队的时间（收到 → 开始传输） |
+| `flexkv_py_transfer_xfer_duration_seconds` | Histogram | `transfer_type` | 传输本身耗时（开始 → 返回） |
+| `flexkv_py_transfer_e2e_duration_seconds` | Histogram | `transfer_type` | 端到端耗时（提交 → 观察到完成），含排队与传输 |
+
+> 三个延迟指标按 `transfer_type` 分桶（0.5ms – 30s），计时跟随
+> `FLEXKV_ENABLE_METRICS`，只统计成功的传输。
 
 ---
 

@@ -1,6 +1,5 @@
-# This workflow will upload a Python Package to Release asset
-# For more information see: https://help.github.com/en/actions/language-and-framework-guides/using-python-with-github-actions
-# Copied from vLLM github actions https://github.com/vllm-project/vllm/blob/main/.github/workflows/publish.yml
+# Build a release wheel for pull requests and protected-branch pushes.
+# Wheels from protected-branch pushes are also uploaded to COS.
 name: flexkv ci
 
 on:
@@ -9,9 +8,8 @@ on:
   push:
     branches: [ "main", "dev"]
 
-# Needed to create wheel and upload assets
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -57,12 +55,45 @@ jobs:
         run: |
           ./build.sh --release
 
+      - name: Install wheel and test dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+
+      - name: Run CPU unit tests
+        shell: bash
+        run: |
+          mapfile -t unit_test_files < <(
+            python - <<'PY'
+          import os
+          from pathlib import Path
+
+          tests_dir = Path(os.environ["GITHUB_WORKSPACE"]) / "tests"
+          marker = "pytestmark = pytest.mark.unit"
+          for path in sorted(tests_dir.rglob("test_*.py")):
+              if marker in path.read_text():
+                  print(path)
+          PY
+          )
+
+          if [ "${#unit_test_files[@]}" -eq 0 ]; then
+            echo "No unit test files found."
+            exit 1
+          fi
+
+          echo "Running ${#unit_test_files[@]} CPU unit test files against the built wheel."
+          cd "$RUNNER_TEMP"
+          # Keep pytest's configured pythonpath from shadowing the installed wheel.
+          timeout 10m python -m pytest -q --maxfail=1 -o pythonpath= "${unit_test_files[@]}"
+
       - name: Get Date and Time
+        if: github.event_name == 'push'
         run: |
           echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
           echo "time=$(date +'%H-%M-%S')" >> $GITHUB_ENV
 
       - name: Upload to cos
+        if: github.event_name == 'push'
         uses: shallwefootball/s3-upload-action@master
         with:
           aws_key_id: ${{ secrets.COS_SECRET_ID }}

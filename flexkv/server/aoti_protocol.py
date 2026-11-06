@@ -97,7 +97,7 @@ class RecsysKVCacheLayout(KVCacheLayout):
             [
                 self.num_layer,
                 self.num_block,
-                self._kv_dim,
+                self.kv_dim,
                 self.tokens_per_block,
                 self.num_head,
                 self.head_size,
@@ -125,14 +125,22 @@ def _read_tensor_handle(reader: "BufferReader") -> _RawTensorHandle:
 
 
 def _read_layout(reader: "BufferReader") -> KVCacheLayout:
+    layout_type = CODE_TO_LAYOUT_TYPE[reader.read_i32()]
+    num_layer = reader.read_i32()
+    num_block = reader.read_i32()
+    tokens_per_block = reader.read_i32()
+    num_head = reader.read_i32()
+    head_size = reader.read_i32()
+    is_mla = reader.read_bool()
     return RecsysKVCacheLayout(
-        type=CODE_TO_LAYOUT_TYPE[reader.read_i32()],
-        num_layer=reader.read_i32(),
-        num_block=reader.read_i32(),
-        tokens_per_block=reader.read_i32(),
-        num_head=reader.read_i32(),
-        head_size=reader.read_i32(),
-        is_mla=reader.read_bool(),
+        type=layout_type,
+        num_layer=num_layer,
+        num_block=num_block,
+        tokens_per_block=tokens_per_block,
+        num_head=num_head,
+        head_size=head_size,
+        kv_dim=1 if is_mla else 2,
+        num_kv_heads=num_head,
     )
 
 
@@ -289,22 +297,30 @@ def decode_request(frame: bytes):
         ), True
 
     if opcode == OP_GET:
+        dp_client_id = reader.read_i32()
+        token_ids = reader.read_int64_array()
+        slot_mapping = reader.read_int64_array()
+        token_mask = reader.read_optional_bool_array()
+        task_id = reader.read_i64()
+        reader.read_i32()  # layer_granularity on the wire; GET no longer carries it
         return GetRequest(
-            dp_client_id=reader.read_i32(),
-            token_ids=reader.read_int64_array(),
-            slot_mapping=reader.read_int64_array(),
-            token_mask=reader.read_optional_bool_array(),
-            task_id=reader.read_i64(),
-            layer_granularity=reader.read_i32(),
+            dp_client_id=dp_client_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            token_mask=token_mask,
+            task_id=task_id,
             namespace=reader.read_string_list(),
         ), True
 
     if opcode == OP_GET_MATCH:
+        dp_client_id = reader.read_i32()
+        token_ids = reader.read_int64_array()
+        token_mask = reader.read_optional_bool_array()
+        reader.read_i32()  # layer_granularity on the wire; match no longer carries it
         return GetMatchRequest(
-            dp_client_id=reader.read_i32(),
-            token_ids=reader.read_int64_array(),
-            token_mask=reader.read_optional_bool_array(),
-            layer_granularity=reader.read_i32(),
+            dp_client_id=dp_client_id,
+            token_ids=token_ids,
+            token_mask=token_mask,
             task_id=reader.read_i64(),
             namespace=reader.read_string_list(),
         ), True
@@ -329,12 +345,14 @@ def decode_request(frame: bytes):
         wait_task_ids = [reader.read_i64() for _ in range(task_count)]
         wait_timeout = reader.read_f64()
         completely = reader.read_bool()
-        return WaitRequest(dp_client_id, None, wait_task_ids, wait_timeout, completely), True
+        return WaitRequest(dp_client_id, wait_task_ids, wait_timeout, completely), True
 
     if opcode == OP_TRY_WAIT:
         dp_client_id = reader.read_i32()
         task_count = reader.read_i32()
-        return TryWaitRequest(dp_client_id, None, [reader.read_i64() for _ in range(task_count)]), True
+        return TryWaitRequest(
+            dp_client_id, [reader.read_i64() for _ in range(task_count)]
+        ), True
 
     if opcode == OP_SHUTDOWN:
         return ShutdownRequest(dp_client_id=reader.read_i32()), True
@@ -346,7 +364,14 @@ def decode_request(frame: bytes):
         raw_handles = [_read_tensor_handle(reader) for _ in range(handle_count)]
         gpu_layout = _read_layout(reader)
         handles = [_build_tensor_shared_handle(raw_handle, device_id) for raw_handle in raw_handles]
-        return RegisterTPClientRequest(dp_client_id, device_id, handles, gpu_layout), True
+        return RegisterTPClientRequest(
+            dp_client_id=dp_client_id,
+            pp_rank=0,
+            intra_client_id=0,
+            device_id=device_id,
+            handles=handles,
+            gpu_layout=gpu_layout,
+        ), True
 
     raise ValueError(f"Unknown FlexKV AOTI opcode: {opcode}")
 

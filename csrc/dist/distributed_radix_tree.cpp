@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <iostream>
+#include <stdexcept>
 
 namespace flexkv {
 DistributedRadixTree::DistributedRadixTree(int tokens_per_block, unsigned int max_num_blocks,
@@ -33,10 +34,37 @@ DistributedRadixTree::DistributedRadixTree(int tokens_per_block, unsigned int ma
 
 DistributedRadixTree::~DistributedRadixTree() {
   stop();
-  // Drain renew_lease_queue; nodes are owned by RefRadixTree, do not delete here
+  reset();
+}
+
+void DistributedRadixTree::reset() {
+  if (refresh_started) {
+    throw std::runtime_error(
+        "DistributedRadixTree::reset requires the refresh worker to be stopped");
+  }
+
   QueuedNode queued_node;
   while (renew_lease_queue.pop(queued_node)) {
-    // discard
+  }
+
+  RefRadixTree *current = nullptr;
+  RefRadixTree *previous = nullptr;
+  {
+    std::unique_lock<std::shared_mutex> lock(index_mutex);
+    current = c_index.exchange(nullptr, std::memory_order_acq_rel);
+    previous = old_index.exchange(nullptr, std::memory_order_acq_rel);
+    c_index_generation.store(0, std::memory_order_release);
+    old_index_generation.store(0, std::memory_order_release);
+  }
+
+  while (renew_lease_queue.pop(queued_node)) {
+  }
+
+  if (current != nullptr) {
+    current->dec_ref_cnt();
+  }
+  if (previous != nullptr && previous != current) {
+    previous->dec_ref_cnt();
   }
 }
 
@@ -70,7 +98,7 @@ void* DistributedRadixTree::refresh_worker_trampoline(void* arg) {
 bool DistributedRadixTree::start(RedisMetaChannel *ch) {
   if (refresh_started) return true;
   channel = ch;
-  refresh_should_stop = false;
+  refresh_should_stop.store(false, std::memory_order_release);
   refresh_started = true;
   int result = pthread_create(&refresh_tid, nullptr, &DistributedRadixTree::refresh_worker_trampoline, this);
   if (result != 0) {
@@ -83,7 +111,7 @@ bool DistributedRadixTree::start(RedisMetaChannel *ch) {
 
 void DistributedRadixTree::stop() {
   if (!refresh_started) return;
-  refresh_should_stop = true;
+  refresh_should_stop.store(true, std::memory_order_release);
   pthread_join(refresh_tid, nullptr);
   refresh_started = false;
 }
@@ -95,7 +123,7 @@ void DistributedRadixTree::refresh_worker() {
   struct timeval tv_start; gettimeofday(&tv_start, nullptr);
   uint64_t last_rebuild_ms = (uint64_t)tv_start.tv_sec * 1000 + (uint64_t)(tv_start.tv_usec / 1000);
   
-  while (!refresh_should_stop) {
+  while (!refresh_should_stop.load(std::memory_order_acquire)) {
     std::vector<CRadixNode*> batch;
     batch.reserve(batch_size);
     QueuedNode queued_node;
@@ -319,7 +347,7 @@ RefRadixTree* DistributedRadixTree::remote_tree_refresh() {
         
         // Note: pass nullptr as parent for root children - they will be attached to tree root later
         CRadixNode* temp_root_child = dfs_build_subtree_from_meta(root_child_ptr, new_index, nullptr,
-                                   parent_to_children, processed_hashes, lt_pool, true);
+                                   parent_to_children, processed_hashes, lt_pool);
         
         if (temp_root_child != nullptr) {
           // Root children are not added to node_list in dfs_build because parent is nullptr
@@ -355,7 +383,7 @@ std::shared_ptr<CMatchResult> DistributedRadixTree::match_prefix(
       // Remote index not yet built - this is normal at startup
       auto empty_i64 = torch::empty({0}, torch::dtype(torch::kInt64));
       auto empty_u32 = torch::empty({0}, torch::dtype(torch::kInt32));
-      return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
+      return std::make_shared<CMatchResult>(0, 0, nullptr, empty_i64, empty_u32);
     }
     
     // Safely increment reference count while holding the lock
@@ -377,12 +405,11 @@ std::shared_ptr<CMatchResult> DistributedRadixTree::match_prefix(
   
   std::shared_ptr<CMatchResult> result = idx->match_prefix(block_hashes, num_blocks, update_cache_info);
   
-  // IMPORTANT: The CRadixNode pointers in result (last_node, last_ready_node) point to
-  // nodes inside the RefRadixTree. These nodes may be deleted when refresh_worker
-  // replaces the index. To prevent use-after-free, we must NOT expose these pointers
-  // to Python. Set them to nullptr - Python code should not use these for remote matches.
+  // IMPORTANT: The CRadixNode pointer in result (last_node) points to a node
+  // inside the RefRadixTree. These nodes may be deleted when refresh_worker
+  // replaces the index. To prevent use-after-free, we must NOT expose this pointer
+  // to Python. Set it to nullptr - Python code should not use it for remote matches.
   result->last_node = nullptr;
-  result->last_ready_node = nullptr;
   
   return result;
 }
@@ -395,7 +422,7 @@ void DistributedRadixTree::lock(CRadixNode *node) {
     return;
   }
   // Note: For remote nodes (owner == nullptr), we should not be called
-  // since match_prefix now returns nullptr for last_node/last_ready_node.
+  // since match_prefix now returns nullptr for last_node.
   // But keep this implementation for safety.
   RefRadixTree *idx = nullptr;
   {
@@ -420,7 +447,7 @@ void DistributedRadixTree::unlock(CRadixNode *node) {
     return;
   }
   // Note: For remote nodes (owner == nullptr), we should not be called
-  // since match_prefix now returns nullptr for last_node/last_ready_node.
+  // since match_prefix now returns nullptr for last_node.
   RefRadixTree *idx = nullptr;
   {
     std::shared_lock<std::shared_mutex> lock(index_mutex);
@@ -450,30 +477,6 @@ bool DistributedRadixTree::is_empty() {
   };
   RefCountReleaser releaser{idx};
   return idx->is_empty();
-}
-
-void DistributedRadixTree::set_ready(CRadixNode *node, bool ready, int ready_length) {
-  if (node == nullptr) return;
-  CRadixTreeIndex *owner = node->get_index();
-  if (owner != nullptr) {
-    owner->set_ready(node, ready, ready_length);
-    return;
-  }
-  // Note: For remote nodes (owner == nullptr), we should not be called
-  // since match_prefix now returns nullptr for last_node/last_ready_node.
-  RefRadixTree *idx = nullptr;
-  {
-    std::shared_lock<std::shared_mutex> lock(index_mutex);
-    idx = c_index.load(std::memory_order_acquire);
-    if (idx == nullptr) return;
-    idx->inc_ref_cnt();
-  }
-  struct RefCountReleaser {
-    RefRadixTree* tree;
-    ~RefCountReleaser() { if (tree) tree->dec_ref_cnt(); }
-  };
-  RefCountReleaser releaser{idx};
-  idx->set_ready(node, ready, ready_length);
 }
 
 RefRadixTree::RefRadixTree(int tokens_per_block, unsigned int max_num_blocks, uint32_t lease_renew_ms,
@@ -530,16 +533,12 @@ bool RefRadixTree::is_empty() {
   return CRadixTreeIndex::is_empty();
 }
 
-void RefRadixTree::set_ready(CRadixNode *node, bool ready, int ready_length) {
-  CRadixTreeIndex::set_ready(node, ready, ready_length);
-}
-
 CRadixNode *RefRadixTree::insert(torch::Tensor &physical_block_ids,
   torch::Tensor &block_hashes, int num_blocks, int num_insert_blocks,
-  bool ready, CRadixNode *node, int num_matched_blocks,
+  CRadixNode *node, int num_matched_blocks,
   int last_node_matched_length) {
   (void)physical_block_ids; (void)block_hashes; (void)num_blocks; (void)num_insert_blocks;
-  (void)ready; (void)node; (void)num_matched_blocks; (void)last_node_matched_length;
+  (void)node; (void)num_matched_blocks; (void)last_node_matched_length;
   // we do nothing here, since the RefRadixTree is only used for reference and rebuild from remote nodes
   return nullptr;
 }
@@ -564,13 +563,11 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   if (root == nullptr) {
     auto empty_i64 = torch::empty({0}, torch::dtype(torch::kInt64));
     auto empty_u32 = torch::empty({0}, torch::dtype(torch::kInt32));
-    return std::make_shared<CMatchResult>(0, 0, 0, nullptr, nullptr, empty_i64, empty_u32);
+    return std::make_shared<CMatchResult>(0, 0, nullptr, empty_i64, empty_u32);
   }
   
   auto current_node = root;
-  auto last_ready_node = root;
   auto prefix_blocks_num = 0;
-  auto ready_prefix_blocks_num = 0;
   auto last_node_matched_length = 0;
   auto physical_blocks_tensor = torch::empty({num_blocks}, torch::dtype(torch::kInt64));
   auto *pb_out = physical_blocks_tensor.data_ptr<int64_t>();
@@ -643,11 +640,6 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
           ni_out[ni_write++] = (*bnis)[i];
         }
         
-        if (current_node->is_ready()) {
-          last_ready_node = current_node;
-          ready_prefix_blocks_num += matched;
-        }
-        
         prefix_blocks_num += matched;
       }
       
@@ -674,8 +666,8 @@ std::shared_ptr<CMatchResult> RefRadixTree::match_prefix(
   auto physical_blocks = physical_blocks_tensor.narrow(0, 0, pb_write);
   auto node_ids = node_ids_tensor.narrow(0, 0, ni_write);
   
-  return std::make_shared<CMatchResult>(prefix_blocks_num, prefix_blocks_num, last_node_matched_length,
-    last_ready_node, current_node, physical_blocks, node_ids);
+  return std::make_shared<CMatchResult>(prefix_blocks_num, last_node_matched_length,
+    current_node, physical_blocks, node_ids);
 }
 
 // Helper function to clean up an orphan tree (not attached to main tree)
@@ -722,8 +714,7 @@ CRadixNode* dfs_build_subtree_from_meta(const BlockMeta* current_meta,
                                 CRadixNode* parent_node,
                                 const std::unordered_map<int64_t, std::vector<BlockMeta*>>& parent_to_children,
                                 std::unordered_set<int64_t>& processed_hashes,
-                                LeaseMetaMemPool& lt_pool,
-                                bool is_ready) {
+                                LeaseMetaMemPool& lt_pool) {
   if (current_meta == nullptr) return nullptr;
   if (current_meta->state != NODE_STATE_NORMAL && current_meta->state != NODE_STATE_ABOUT_TO_EVICT) {
     return nullptr;
@@ -734,7 +725,7 @@ CRadixNode* dfs_build_subtree_from_meta(const BlockMeta* current_meta,
   }
   
   // Create a child node and try to compress a linear chain into it
-  auto* child_node = new CRadixNode(index, is_ready, 0, true);
+  auto* child_node = new CRadixNode(index, 0, true);
   if (child_node == nullptr) return nullptr;
   
   LeaseMeta *lm = lt_pool.alloc();
@@ -812,7 +803,7 @@ CRadixNode* dfs_build_subtree_from_meta(const BlockMeta* current_meta,
   if (tail_children_it != parent_to_children.end()) {
     for (const auto& child_meta : tail_children_it->second) {
       if (processed_hashes.find(child_meta->hash) == processed_hashes.end()) {
-        dfs_build_subtree_from_meta(child_meta, index, child_node, parent_to_children, processed_hashes, lt_pool, is_ready);
+        dfs_build_subtree_from_meta(child_meta, index, child_node, parent_to_children, processed_hashes, lt_pool);
       }
     }
   }
@@ -1040,5 +1031,4 @@ void attach_and_merge_root_child(CRadixTreeIndex* temp_tree, CRadixNode* root_ch
 }
 
 } // namespace flexkv
-
 

@@ -88,6 +88,10 @@ jobs:
           # Config
           check_import("vllm.config", "VllmConfig")
 
+          # Process groups (used to derive tp_rank / local_rank on the worker)
+          check_import("vllm.distributed.parallel_state", "get_tp_group")
+          check_import("vllm.distributed.parallel_state", "get_world_group")
+
           # Logger
           check_import("vllm.logger", "init_logger")
 

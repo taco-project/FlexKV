@@ -105,6 +105,27 @@ void LeaseMetaMemPool::free(LeaseMeta *ptr) {
   free_count.fetch_add(1, std::memory_order_relaxed);
 }
 
+void LeaseMetaMemPool::reset() {
+  std::lock_guard<std::mutex> lk(allocated_mu);
+  free_queue.clear();
+  allocated_set.clear();
+
+  size_t rebuilt_free_count = 0;
+  for (const auto &block : allocated_blocks) {
+    const size_t count = block.bytes / sizeof(LeaseMeta);
+    char *raw = reinterpret_cast<char *>(block.raw);
+    for (size_t i = 0; i < count; ++i) {
+      LeaseMeta *ptr = reinterpret_cast<LeaseMeta *>(raw + i * sizeof(LeaseMeta));
+      ptr->state = NODE_STATE_EVICTED;
+      ptr->lease_time = 0;
+      ptr->published = false;
+      free_queue.push_back(ptr);
+      rebuilt_free_count++;
+    }
+  }
+  free_count.store(rebuilt_free_count, std::memory_order_relaxed);
+}
+
 
 size_t LeaseMetaMemPool::capacity() const {
   return total_capacity.load(std::memory_order_relaxed);
@@ -115,5 +136,4 @@ size_t LeaseMetaMemPool::free_size() const {
 }
 
 } // namespace flexkv
-
 
