@@ -8,7 +8,7 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 
 ## Updates
 
-- **Oct 9, 2026**: DeepSeek-V4.1 support is on FlexKV `main` ([#303](https://github.com/taco-project/FlexKV/pull/303)). The matching SGLang adaptation is not upstream yet; until [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) is merged, fetch that PR and pin its latest commit. Deploy with the current FlexKV `main` branch. See the [SGLang integration guide](flexkv/integration/sglang/README.md).
+- **Oct 9, 2026**: DeepSeek-V4.1 support is on FlexKV `main` ([#303](https://github.com/taco-project/FlexKV/pull/303)). The matching SGLang adaptation is not upstream yet; until [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) is merged, fetch that PR and use the pinned commit in the integration guide. Deploy with the current FlexKV `main` branch. See the [SGLang integration guide](flexkv/integration/sglang/README.md).
 
 - **Jul–Aug 2026**: Transfer performance and operability received a broad refresh: [adaptive multi-path GPU↔CPU transfers](https://github.com/taco-project/FlexKV/pull/203), [reliability and operational logging](https://github.com/taco-project/FlexKV/pull/233), [graceful shutdown](https://github.com/taco-project/FlexKV/pull/238), [chunked host-memory registration](https://github.com/taco-project/FlexKV/pull/240), [vectored SSD I/O](https://github.com/taco-project/FlexKV/pull/242), and [per-operation transfer tracing](https://github.com/taco-project/FlexKV/pull/247).
 
@@ -36,39 +36,7 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 
 - **Nov 2025**: FlexKV transitioned from client-server mode to a **directly-callable library** (commit [0290841](https://github.com/taco-project/FlexKV/commit/0290841dce65ae9b036a23d733cf94e47e814934)), eliminating inter-process communication overhead. This is the v1.0.0 API.
 
-## Main Change for latest version
-### Feature
-Universal:
-- Add op-level callback for local get/put [#13](https://github.com/taco-project/FlexKV/pull/13)
-- Add support for distributed sharing of the KV Cache, to suppot KV Cache sharing between CPU and SSD, as well as distributed sharing of PCFS  ([#17](https://github.com/taco-project/FlexKV/pull/17))
-- Add GDS (GPU Direct Storage) Support ([#25](https://github.com/taco-project/FlexKV/pull/25))
-- TP16 support ([#26](https://github.com/taco-project/FlexKV/pull/26))
-- Support more kv cache layout. Now include: vLLM, SGLang, TensorRT-LM ([#27](https://github.com/taco-project/FlexKV/pull/27))
-- GDS refactor & gtensor support ([#42](https://github.com/taco-project/FlexKV/pull/42))
-- Support construct TensorSharedHandle directly from CUDA IPC Handle ([#44](https://github.com/taco-project/FlexKV/pull/44))
-
-
-Targeting vLLM:
-- Support dp > 1 while integrated with vLLM ([#18](https://github.com/taco-project/FlexKV/pull/18))
-- Add launch scripts for vLLM adaption ([#47](https://github.com/taco-project/FlexKV/pull/47))
-- Support TP16 for vLLM+FlexKV ([#59](https://github.com/taco-project/FlexKV/pull/59))
-
-Targeting SGLang:
-- The native FlexKV backend is available in upstream SGLang `v0.5.16` and later; no patch is required ([sglang#29701](https://github.com/sgl-project/sglang/pull/29701))
-- Support DeepSeek-V4 heterogeneous C4/C128/indexer KV groups, FullKV + SWA dual caches, compress-state sidecars, and layerwise restore ([#225](https://github.com/taco-project/FlexKV/pull/225)). Until the matching SGLang adaptation is merged, use [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) pinned to [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac). See the [SGLang integration guide](flexkv/integration/sglang/README.md)
-- Support DeepSeek-V4.1 ([#303](https://github.com/taco-project/FlexKV/pull/303)) on the current FlexKV `main` branch. The matching SGLang adaptation is not upstream yet; until [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) is merged, fetch that PR and pin its latest commit. That commit is not the V4 pin `ee0465a`. See the [SGLang integration guide](flexkv/integration/sglang/README.md)
-
-Targeting TensorRT-LLM
-- Support using FlexKV on TensorRT-LLM ([#48](https://github.com/taco-project/FlexKV/pull/48))
-- Support TP16 for TensorRT-LLM+FlexKV ([#53](https://github.com/taco-project/FlexKV/pull/53))
-
-### Optimization
-- Mla d2h transfer optimization ([#19](https://github.com/taco-project/FlexKV/pull/19))
-- optimize SSD I/O ([#33](https://github.com/taco-project/FlexKV/pull/33))
-- Enhance cache eviction with frequency-aware grace time mechanism ([#38](https://github.com/taco-project/FlexKV/pull/38))
-- Replace std::map with std::unordered_map in RadixTree ([#41](https://github.com/taco-project/FlexKV/pull/41))
-
-For more details, see [CHANGELOG](CHANGELOG.md)
+For release history, see [CHANGELOG.md](CHANGELOG.md).
 
 ## How to Use
 
@@ -87,6 +55,10 @@ apt install libhiredis-dev
 #./build.sh --release for cython package
 ```
 
+### Use FlexKV with SGLang
+
+See the [SGLang integration guide](flexkv/integration/sglang/README.md).
+
 ### Use FlexKV with vLLM
 
 See [docs/vllm_adapter/README_en.md](docs/vllm_adapter/README_en.md)
@@ -98,6 +70,12 @@ See [docs/trtllm_adaption/README_en.md](docs/trtllm_adaption/README_en.md)
 ### FlexKV Integration with Dynamo
 
 See [docs/dynamo_integration/README_en.md](docs/dynamo_integration/README_en.md)
+
+### Documentation
+
+- [Configuration](docs/flexkv_config_reference/README_en.md) · [CLI](docs/cli/README_en.md) · [Monitoring](docs/monitoring/README_en.md)
+- [Multi-instance mode](docs/multi_instance/README_en.md) · [Distributed reuse](docs/dist_reuse/README_en.md) · [Namespace isolation](docs/namespace/README_en.md)
+- [Eviction policies](docs/eviction_policy/README_en.md) · [GDS](docs/gds/README_en.md) · [HugePages](docs/hugepage/README_en.md) · [CI](docs/ci/README_en.md) · [Contributing](CONTRIBUTING.md)
 
 ## Design Architecture
 

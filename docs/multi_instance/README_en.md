@@ -26,9 +26,9 @@ FlexKV multi-instance mode allows running multiple inference engine instances (e
 
 ## How It Works
 
-1. The process with instance ID 0 automatically creates the FlexKV Server
-2. Other instances connect to the Server as clients
-3. All instances share the same CPU/SSD cache, with the Server handling unified management and scheduling
+1. In the default `embedded` launch mode, local client 0 starts the FlexKV Server; the other clients connect to it.
+2. In `external` mode, all clients connect to a separately started server. Set `FLEXKV_SERVER_LAUNCH_MODE=external` and enable server-client mode; the clients do not own server shutdown.
+3. Clients share the configured cache managed by that server.
 
 ## Usage Example
 

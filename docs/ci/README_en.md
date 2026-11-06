@@ -65,7 +65,7 @@ If no matching files are found, the workflow fails. The selected files run
 with:
 
 ```bash
-timeout 10m python -m pytest -q --maxfail=1 <selected-test-files>
+timeout 10m python -m pytest -q --maxfail=1 -o pythonpath= "${unit_test_files[@]}"
 ```
 
 To add a test to this CI tier:
@@ -103,7 +103,7 @@ PY
 
 ci_test_dir=$(mktemp -d)
 cd "$ci_test_dir"
-timeout 10m python -m pytest -q --maxfail=1 "${unit_test_files[@]}"
+timeout 10m python -m pytest -q --maxfail=1 -o pythonpath= "${unit_test_files[@]}"
 ```
 
 `timeout` and `mapfile` are GNU/Linux commands. Use an Ubuntu environment when

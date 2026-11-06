@@ -1,5 +1,7 @@
 # Contributing to FlexKV
 
+[中文文档](CONTRIBUTING_zh.md)
+
 Thank you for your interest in contributing to FlexKV!
 
 ## PR Title and Classification

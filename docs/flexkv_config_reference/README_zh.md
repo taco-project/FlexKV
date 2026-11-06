@@ -33,7 +33,6 @@ enable_gds: false
 - `ssd_cache_dir`：SSD 缓存数据的存放目录。若有多块 SSD，可通过分号 `;` 分隔多个挂载路径。例如 `ssd_cache_dir: /data0/flexkv_ssd/;/data1/flexkv_ssd/`，以提升带宽。
 - `enable_gds`：是否启用 GPU Direct Storage（GDS）。如硬件和驱动支持，开启后可提升 SSD 到 GPU 的数据吞吐能力。默认关闭。
 - `swa_multi_group`：DeepSeek-V4 SWA sidecar 开关。未配置或设为 `true` 时，SWA KV 会与 attention/indexer compress state 一起存取；显式设为 `false` 时保留 SWA KV 存取，但不注册或存取 state。
-- `swa_multi_layer`：控制 layerwise restore 是否把 SWA/state H2D 融合进主 layerwise worker。默认为 `true`；设为 `false` 时使用独立的 SWA/state H2D 前置 worker。
 
 如需切换到 SWA-only，可在配置文件中显式添加：
 
@@ -45,9 +44,9 @@ swa_multi_group: false
 
 ### 二、通过环境变量配置
 
-如果未设置 `FLEXKV_CONFIG_PATH`环境变量，则可通过以下环境变量进行配置。
+未设置 `FLEXKV_CONFIG_PATH` 时，集成代码从环境变量加载下列 UserConfig 字段。
 
-> 注：如果设置了`FLEXKV_CONFIG_PATH`，将优先使用`FLEXKV_CONFIG_PATH`指定的配置文件，以下环境变量将被忽略。
+> 使用配置文件时，UserConfig 字段从文件加载，不与其对应环境变量合并。部分运行时设置（例如 `FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES` 和 `FLEXKV_CUDAHOST_CHUNK_SIZE_GB`）直接读取环境变量，仍然生效；请参阅各配置项说明。
 
 | 环境变量             | 类型  | 默认值        | 说明                                                                                                            |
 |----------------------|-------|-------------|----------------------------------------------------------------------------------------------------------------|
@@ -63,13 +62,12 @@ swa_multi_group: false
 | `FLEXKV_MOONCAKE_MR_SPLIT_POLICY` | str | `strict` | Mooncake external MR 切分策略：`strict` 同时保持 KV block、指针和大小对齐；`block_boundary` 保证每个 KV block 完整位于单个 MR，同时允许派生 MR 的指针/大小不对齐。2 GiB 等小 MR 上限可在 YAML/JSON 中设置 `mooncake_mr_split_policy: block_boundary` |
 | `FLEXKV_CUDAHOST_CHUNK_SIZE_GB` | float | 0 | HugePage host buffer 执行 `cudaHostRegister` 时的分段大小，单位为 GB。默认 `0` 表示整块一次性注册；设为大于 0 时按该大小分段注册（并对应分段反注册），可避免超大 buffer 一次注册失败。分段大小会自动向下对齐到 4 KiB 页边界，并预留少量对齐余量 |
 | `FLEXKV_SWA_MULTI_GROUP` | bool | 未设置（自动开启） | DeepSeek-V4 下未设置或设为 `1` 时，SWA KV 与 attention/indexer compress state 一起存取；设为 `0` 时只保留 SWA KV 存取 |
-| `FLEXKV_SWA_MULTI_LAYER` | bool | 1 | `1` 表示把 SWA/state H2D 融合进 layerwise restore；`0` 表示使用独立的 SWA/state H2D 前置 worker |
 
 ---
 
 ## 高级配置选项
 高级配置主要针对需要精细化性能优化或自定义特殊需求的用户，建议对 FlexKV 具备一定理解的用户使用。
-所有高级配置均支持通过环境变量或 yml/json 配置文件进行设置，如有多级配置冲突，最终生效顺序为：**配置文件 > 环境变量 > 默认内置参数**。
+支持覆盖的全局配置字段可通过 YAML/JSON 文件设置；同一字段同时设置时，文件覆盖环境变量生成的值。部分配置直接从环境变量读取，不支持文件覆盖；未设置时使用内置默认值。
 如果在配置文件中设置，请去除`FLEXKV_`前缀并全部转换为小写，例如在yml文件中设置`server_client_mode: 1`将会覆盖`FLEXKV_SERVER_CLIENT_MODE`环境变量的值。
 部分配置只能通过环境变量设置。
 
@@ -116,7 +114,7 @@ swa_multi_group: false
 | `FLEXKV_TRANSFER_NUM_CTA_D2H` | int | 4 | D2H 传输使用的 CUDA thread block (CTA) 数量，仅在`FLEXKV_USE_CE_TRANSFER_D2H`为0时生效 |
 | `FLEXKV_CE_PATH_OPT` | bool | 1 | 是否启用 CE 优化路径（五路自适应策略）。`0` = baseline（`PER_BLOCK` 逐块 memcpy，无优化）；`1` = 优化路径（`CONTIG_DIRECT` / `SEGMENT_DIRECT` / `SEGMENT_SCATTER` / `GATHER_SCATTER` / `GATHER_DIRECT` 自动选择，**默认**）。仅在 `FLEXKV_USE_CE_TRANSFER_H2D` 或 `FLEXKV_USE_CE_TRANSFER_D2H` 为 1 时生效 |
 | `FLEXKV_CE_SEGMENT_THRESHOLD` | int | 8 | `SEGMENT_DIRECT` 与 `GATHER_SCATTER` 的段数切换阈值（仅 `FLEXKV_CE_PATH_OPT=1` 时生效）。**对 LAYERFIRST 场景生效**（非连续段数 ≤ 阈值时走 `SEGMENT_DIRECT`，否则走 `GATHER_SCATTER`）。BLOCKFIRST 场景走 `GATHER_DIRECT`，其内部分别在「整块直传」与「逐块拷贝」两种实现间切换（取决于是否一次性传输整层），其中逐块实现可启用 `cudaMemcpy2DAsync` 快路径（受 `FLEXKV_ENABLE_CE_MEMCPY2D` 控制）；`segment_threshold` 还用于 `SEGMENT_SCATTER` / `GATHER_SCATTER` 的 `cudaMemcpy2DAsync` 分支选择 |
-| `FLEXKV_MLA_D2H_MODE` | str | "sharded" | **仅适用于 MLA 场景**（kv_heads=1，所有 TP rank 的 KV 相同）。控制 D2H 时 CPU KV Cache 的写入模式。可选值：<br/>• `rank_rotate` - 跨请求轮换 designated rank 写完整 KV，避免单 rank 持续满载导致热节流，配合 CE 效果最佳<br/>• `sharded` - **默认**。每个 GPU 写 1/N 分片拼成一个完整 KV（需要 `chunk_size % num_gpus == 0`）<br/>• `all_write` - 每个 GPU 写完整 KV 到各自位置（CPU 内存占用 N×）<br/>• `rank0_only` - 仅 rank 0 写完整 KV<br/>• `layer_parallel` - 按 layer 并行写入 |
+| `FLEXKV_KV_SHARED_ACROSS_RANKS_MODE` | str | "sharded" | **仅适用于 MLA 场景**（kv_heads=1，所有 TP rank 的 KV 相同）。控制 D2H 时 CPU KV Cache 的写入模式。可选值：<br/>• `rank_rotate` - 跨请求轮换 designated rank 写完整 KV，避免单 rank 持续满载导致热节流，配合 CE 效果最佳<br/>• `sharded` - **默认**。每个 GPU 写 1/N 分片拼成一个完整 KV（需要 `chunk_size % num_gpus == 0`）<br/>• `all_write` - 每个 GPU 写完整 KV 到各自位置（CPU 内存占用 N×）<br/>• `rank0_only` - 仅 rank 0 写完整 KV<br/>• `layer_parallel` - 按 layer 并行写入 |
 | `FLEXKV_ENABLE_CE_MEMCPY2D` | bool | 1 | 控制 `SEGMENT_SCATTER` / `GATHER_SCATTER` / `GATHER_DIRECT` 中的 `cudaMemcpy2DAsync` strided 快路径（D2H 与 H2D 双向生效）。`1` = **默认**：使用 `cudaMemcpy2DAsync` 做 strided GPU↔CPU 直传，在 NVIDIA 上快，但在其他平台上慢或不受支持；`0` = 可移植的 staging buffer + CPU scatter/gather 路径，用于这些平台。仅在 CE 传输开启且选择上述三条路径之一时生效；`CONTIG_DIRECT` / `SEGMENT_DIRECT` 不受影响 |
 | `FLEXKV_CE_GATHER_THREADS` | int | 4 | CPU 并行 gather/scatter 线程池的线程数，用于 `SEGMENT_SCATTER` / `GATHER_SCATTER` 路径（BLOCKFIRST 散列布局）。未设置 = `4`（开启并行，默认 4 线程）；`0` = 关闭并行（单线程 memcpy 基线）；`N>0` = 开启并行，使用 N 个线程（含调用线程）。线程池为 `thread_local`——每个 GPU 调度线程拥有独立的线程池，无跨 GPU 竞争。LAYERFIRST 布局会将连续 block 合并为一次大拷贝，不使用线程池 |
 | `FLEXKV_CE_GATHER_NT` | bool | 1 | 控制 CPU scatter/gather 路径中对 staging buffer / KV pool 目标地址的非时间（NT）存储（AVX-512 / AVX2 streaming store）。`1` = **默认**：使用 NT 存储以避免 RFO 流量和缓存污染；`0` = 回退到 `std::memcpy`。非 x86 平台不支持 NT 存储，无论此设置如何均使用 `memcpy` |
@@ -214,10 +212,18 @@ FlexKV 的 KVServer 由 `dp_client_id == 0` 的调用方拉起（例如 SGLang �
 | 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `FLEXKV_INDEX_ACCEL` | bool | 1 | 0-启用Python版本RadixTree实现，1-启用C++版本RadixTree实现 |
-| `FLEXKV_EVICTION_POLICY` | str | "lru" | 缓存淘汰策略，可选 "lru"、"lfu"、"fifo"、"mru" 和 "filo"。 "lru" 表示最近最少使用，"lfu" 表示最不经常使用，"fifo" 表示先进先出，"mru" 表示最近最多使用，"filo" 表示先进后出 |
-| `FLEXKV_EVICT_RATIO` | float | 0.05 | cpu，ssd一次evict主动淘汰比例（0.0 = 只淘汰最小的必要的block数）。建议保持 `0.05`，即每一次淘汰5%的最久未使用的block |
-| `FLEXKV_EVICT_START_THRESHOLD` | float | 0.7 | 触发主动淘汰的内存利用率阈值。当缓存利用率达到该比例时，FlexKV 开始主动淘汰节点。例如 `0.7` 表示缓存占用达到 70% 时即开始淘汰。设为 `1.0` 则仅在缓存满时才淘汰 |
+| `FLEXKV_EVICTION_POLICY` | str | "lru" | 缓存淘汰策略，可选 "lru"、"lfu"、"slru"、"fifo"、"mru" 和 "filo"。 "lru" 表示最近最少使用，"lfu" 表示最不经常使用，"fifo" 表示先进先出，"mru" 表示最近最多使用，"filo" 表示先进后出 |
+| `FLEXKV_EVICT_RATIO` | float | 0 | cpu，ssd一次evict主动淘汰比例（0.0 = 不设置最小批量比例；仍需满足请求和利用率阈值）。例如设置 `0.05` 时，每轮请求的最小批量为总块数的 5%，实际结果取决于策略和可驱逐块 |
+| `FLEXKV_EVICT_START_THRESHOLD` | float | 1.0 | 触发主动淘汰的内存利用率阈值。当缓存利用率达到该比例时，FlexKV 开始主动淘汰节点。例如 `0.7` 表示缓存占用达到 70% 时即开始淘汰。设为 `1.0` 时，空闲块不足仍可能在缓存未满时触发淘汰 |
 | `FLEXKV_HIT_REWARD_SECONDS` | int | 0 | 每次缓存命中时向节点的有效访问时间叠加的额外秒数，为 LRU 增加频率感知能力。设为 `0`（默认值）时为标准 LRU 行为。设为正数时，频繁命中的节点会累积额外的保护时间，使其更难被驱逐。详见[驱逐策略指南](../eviction_policy/README_zh.md) |
+
+---
+
+### 分段预取
+
+分段预取默认关闭。策略、限额、配置示例和兼容性要求见
+[SGLang 集成指南](../../flexkv/integration/sglang/README_zh.md#分段远端预取)。
+Mooncake Store 和控制消息的性能选项见[缓存层性能控制](../cache_tier_performance_controls_zh.md)。
 
 ---
 
@@ -228,3 +234,10 @@ FlexKV 的 KVServer 由 `dp_client_id == 0` 的调用方拉起（例如 SGLang �
 | 环境变量 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `FLEXKV_ENABLE_COLLECTIVE_SYNC` | bool | 1 | 是否启用跨 rank 集合同步（scatter/barrier/all_reduce）。该同步主要用于 Pipeline Parallelism (PP) 场景下各 stage 间的协调。在不使用 PP 的部署中可设为 0 关闭以减少同步开销、提升性能 |
+
+## Worker 启动超时
+
+- `FLEXKV_WORKER_SPAWN_TIMEOUT_S`（默认 `60` 秒）：限制 TransferManager 子进程启动握手的等待时间。
+- `FLEXKV_READY_TIMEOUT_S`（默认 `360` 秒）：限制 SGLang connector 注册后等待 FlexKV 就绪的时间。
+
+两者必须为有限的正数，不影响传输排空和关闭超时。初始化失败时，父进程错误包含子进程 traceback；就绪后仍会检查 worker 健康状态。

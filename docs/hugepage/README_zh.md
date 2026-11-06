@@ -86,9 +86,7 @@ print(torch.cuda.is_available())
 PY
 ```
 
-说明：`use_hugepage_cpu_buffer` 不依赖 `cudaHostRegister`。
-
-补充说明：`use_hugepage_cpu_buffer` 不依赖 CUDA runtime，主 CPU KV cache 通过 `/proc/<pid>/fd/<fd>` 让 `spawn` worker 重新打开同一个 hugetlb memfd。
+主 CPU HugePage 池的分配本身使用 hugetlb memfd，`spawn` worker 通过 `/proc/<pid>/fd/<fd>` 重新打开它。GPU/CPU 传输 worker 随后会对 CPU 池调用 `cudaHostRegister`，因此将该池用于 GPU 传输仍需要可用的 CUDA runtime 和合适的注册限制。
 
 ---
 

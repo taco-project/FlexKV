@@ -24,6 +24,7 @@ This file provides:
 from __future__ import annotations
 
 import ctypes
+from contextlib import suppress
 import errno
 import logging
 import os
@@ -205,6 +206,14 @@ class FlexKVComm:
         self._pp_stage_member_ranks = list(
             range(pp_stage_offset, pp_stage_offset + stride)
         )
+
+        # Enable only on a homogeneous node-local fan-out. Every rank must
+        # use the same framing; leave cross-node PP on the established wire.
+        self._control_inline_bytes = int(os.getenv("FLEXKV_CONTROL_INLINE_BYTES", "0"))
+        if self._control_inline_bytes not in (0, 256, 512, 1024, 4096):
+            raise ValueError("FLEXKV_CONTROL_INLINE_BYTES must be 0/256/512/1024/4096")
+        if self._control_inline_bytes and self.pp_size > 1:
+            raise ValueError("inline control framing requires node-local PP=1")
 
         self.needs_sync = (
             self.pp_size > 1 or self.attn_tp_size > 1 or self.attn_cp_size > 1
@@ -402,8 +411,11 @@ class FlexKVComm:
         if is_leader:
             dsts = [r for r in group_ranks if r != self.world_rank]
             works = []
+            # Serialize once for the whole fan-out. The tensors remain immutable
+            # and each Gloo Work retains its send buffers through completion.
+            buffers = self._pack_control_payload(data) if dsts else []
             for dst in dsts:
-                works.extend(self._isend(dst, data, tag, self._world_cpu_group))
+                works.extend(self._isend_buffers(dst, buffers, tag, self._world_cpu_group))
             if blocking:
                 for w in works:
                     w.wait()
@@ -469,19 +481,39 @@ class FlexKVComm:
     # Low-level send / recv on the world cpu group
     # ------------------------------------------------------------------
 
-    def _isend(self, dst: int, data: Any, tag: int = 0, group=None) -> list:
+    def _pack_control_payload(self, data: Any) -> list:
         serialized = bytearray(pickle.dumps(data))
-        t_size = torch.tensor([len(serialized)], dtype=torch.long)
-        t_data = torch.frombuffer(serialized, dtype=torch.uint8)
-        return [
-            dist.isend(t_size, dst=dst, tag=tag, group=group),
-            dist.isend(t_data, dst=dst, tag=tag, group=group),
-        ]
+        inline_bytes = getattr(self, "_control_inline_bytes", 0)
+        if inline_bytes:
+            frame = bytearray(inline_bytes)
+            struct.pack_into("!Q", frame, 0, len(serialized))
+            header = torch.frombuffer(frame, dtype=torch.uint8)
+            if len(serialized) <= inline_bytes - 8:
+                frame[8:8 + len(serialized)] = serialized
+                return [header]
+            return [header, torch.frombuffer(serialized, dtype=torch.uint8)]
+        return [torch.tensor([len(serialized)], dtype=torch.long),
+                torch.frombuffer(serialized, dtype=torch.uint8)]
+
+    def _isend_buffers(self, dst: int, buffers: list, tag: int = 0, group=None) -> list:
+        return [dist.isend(buffer, dst=dst, tag=tag, group=group) for buffer in buffers]
+
+    def _isend(self, dst: int, data: Any, tag: int = 0, group=None) -> list:
+        return self._isend_buffers(dst, self._pack_control_payload(data), tag, group)
 
     def _recv(self, src: int, tag: int = 0, group=None) -> Any:
-        t_size = torch.tensor([0], dtype=torch.long)
-        dist.irecv(t_size, src=src, tag=tag, group=group).wait()
-        size = int(t_size.item())
+        inline_bytes = getattr(self, "_control_inline_bytes", 0)
+        if inline_bytes:
+            header = torch.empty(inline_bytes, dtype=torch.uint8)
+            dist.irecv(header, src=src, tag=tag, group=group).wait()
+            raw = header.numpy().tobytes()
+            size = struct.unpack_from("!Q", raw)[0]
+            if 0 < size <= inline_bytes - 8:
+                return pickle.loads(raw[8:8 + size])
+        else:
+            t_size = torch.tensor([0], dtype=torch.long)
+            dist.irecv(t_size, src=src, tag=tag, group=group).wait()
+            size = int(t_size.item())
         if size <= 0:
             raise RuntimeError(
                 "[FlexKV] received invalid serialized payload size: "
@@ -748,17 +780,13 @@ class FlexKVLayerLoadingEvent:
 
     def close(self) -> None:
         for fd in self.load_event_fds:
-            try:
+            with suppress(Exception):
                 os.close(fd)
-            except Exception:
-                pass
         self.load_event_fds.clear()
 
     def __del__(self) -> None:
-        try:
+        with suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 class FlexKVLayerDoneCounter:
