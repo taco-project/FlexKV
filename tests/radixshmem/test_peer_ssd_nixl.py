@@ -194,3 +194,27 @@ def test_reads_fail_at_once_while_the_endpoint_starts():
         with pytest.raises(RuntimeError, match="still starting"):
             reader.read(1, PoolId.FULL_KV, torch.tensor([0]), torch.tensor([0]), 0, 4)
     assert time.monotonic() - t0 < 1.0
+
+
+@pytest.mark.parametrize("same_name", [False, True], ids=["new-name", "same-name"])
+def test_a_restarted_reader_is_served_at_once(pair, same_name):
+    """A reader process restarts (same node): the peer still holds the old process's
+    metadata, so the new process must come back under a new agent name."""
+    server, client, dst, n, bs = pair
+    client.read(server.name, [1], [1], 30)
+    name, port = client.name, client.port + 100
+    client.close()
+    client.agent = None
+    buf = np.zeros(bs * n, dtype=np.uint8)
+    again = NixlSSDEndpoint(name if same_name else f"{name}@{time.time_ns()}", port=port,
+                            cpu_ptr=buf.ctypes.data, cpu_bytes=buf.nbytes, block_bytes=bs, ssd_files={})
+    try:
+        again.connect(server.name, "127.0.0.1", server.port, 10)
+        if same_name:
+            with pytest.raises((TimeoutError, RuntimeError)):
+                again.read(server.name, [2], [2], 5)
+        else:
+            again.read(server.name, [2], [2], 5)
+            assert np.array_equal(buf[2 * bs:3 * bs], _pattern(2, bs))
+    finally:
+        again.close()

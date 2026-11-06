@@ -431,8 +431,10 @@ class NixlRemoteSSDReader:
         port = _env_int("FLEXKV_NIXL_SSD_PORT", 5600) + (1 if self._pool == "swa" else 0)
         t0 = time.monotonic()
         try:
+            # One agent name per process: a peer still holding a restarted node's
+            # old metadata would otherwise serve it over the dead connection.
             self.endpoint = NixlSSDEndpoint(
-                f"flexkv-ssd-{self.node}-{self._pool}",
+                f"flexkv-ssd-{self.node}-{self._pool}@{os.getpid()}.{time.time_ns()}",
                 port=port,
                 cpu_ptr=int(cpu.data_ptr()),
                 cpu_bytes=int(cpu.numel() * cpu.element_size()),
