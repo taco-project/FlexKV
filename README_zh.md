@@ -43,6 +43,27 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 其目标是上游 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 使用的适配分支。
 在 PR 审核期间，请使用相互匹配的源码版本。
 
+启用相关开关后的路径示意：
+
+```mermaid
+flowchart TB
+    subgraph Control[请求控制]
+        direction LR
+        A[分配槽位并投票] --> P[准备映射<br/>尚未提交 DMA] --> B[合并为一次启动]
+    end
+    subgraph Data[缓存数据]
+        direction LR
+        S[远端 Store] -->|有界 Get| H[CPU Host Cache]
+        H -->|符合条件时直接二维 CE| G[GPU KV]
+    end
+    Control -.->|提交 H2D| Data
+```
+
+“请求控制”表示准备与启动的顺序，“缓存数据”表示层级间的数据流，虚线表示 H2D 提交。
+Store 预取可提前运行，图示不代表测得的耗时。
+[中文图解](docs/cache_restore_optimizations_zh.md)逐项对照优化前后的启动、拷贝和通信路径，
+并区分性能改进与正确性保护。
+
 | 范围 | 原有行为 | 修改后的行为与实现位置 |
 | --- | --- | --- |
 | 准入后的逐层恢复 | 每个请求在准入过程中分别发起恢复。 | 先准备映射而不提交 DMA，再将最终准入的请求合并为一次启动，每层只发送一次完成信号。见 [`connector.py`](flexkv/integration/sglang/connector.py)。 |
