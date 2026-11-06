@@ -55,7 +55,7 @@ export FLEXKV_CONFIG_PATH="./flexkv_config.yml"
 
 1. Install vLLM (>= 0.17.2 stable, or build from official `main` branch)
 ```bash
-pip install vllm>=0.17.2
+pip install 'vllm>=0.17.2'
 # Or install from source (latest main):
 # git clone https://github.com/vllm-project/vllm.git && cd vllm && pip install -e .
 ```
@@ -67,8 +67,8 @@ pip install flexkv  # or build from source: ./build.sh
 
 3. offline test
 ```bash
-# VLLM_DIR/examples/offline_inference/prefix_caching_flexkv.py
-python examples/offline_inference/prefix_caching_flexkv.py
+# Set VLLM_DIR to a compatible vLLM checkout containing this example.
+python "$VLLM_DIR/examples/disaggregated/flexkv_connector/prefix_caching_flexkv.py" --model /path/to/model
 ```
 
 4. online serving
@@ -97,7 +97,7 @@ critical path.
 ```bash
 VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
   --kv-transfer-config \
-  '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both",\
+  '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both",
 "kv_connector_extra_config":{"use_layerwise":true}}'
 ```
 
@@ -128,7 +128,9 @@ If you need to use FlexKV with vLLM < 0.17.2, apply the corresponding patch manu
 
 ```bash
 cd vllm
-git apply FLEXKV_DIR/examples/vllm_adaption/<patch-file>
+# Set FLEXKV_DIR and choose the patch matching your vLLM version.
+PATCH_FILE=vllm_0_16_0-flexkv-connector.patch
+git apply "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 pip install -e .
 ```
 
@@ -158,16 +160,9 @@ export FLEXKV_CONFIG_PATH="./flexkv_config.json"
 ```
 
 ### Running
-Apply the patch `examples/vllm_adaption_legacy/flexkv_vllm_0_8_4.patch` to vLLM 0.8.4, then start FlexKV, vLLM, and the benchmark script:
 
-```bash
-# Start FlexKV as server
-bash benchmarks/flexkv_benchmark/run_flexkv_server.sh
-
-# Start vLLM as client
-bash benchmarks/flexkv_benchmark/serving_vllm.sh
-
-# Start benchmark
-bash benchmarks/flexkv_benchmark/multiturn_benchmark.sh
-```
-Apply the patch `examples/vllm_adaption_legacy/flexkv_vllm_0_10_0.patch` to vLLM 0.10.0, and use the same testing method as above.
+The legacy patches in `examples/vllm_adaption_legacy/` target vLLM 0.8.4 and
+0.10.0 respectively. The historical `benchmarks/flexkv_benchmark/` launch
+scripts are not present in this checkout. To reproduce a legacy deployment,
+use a compatible historical FlexKV revision containing its scripts; the current
+branch and its configuration examples target the current API.

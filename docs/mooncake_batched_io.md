@@ -1,5 +1,7 @@
 # Mooncake I/O batch limits
 
+[中文文档](mooncake_batched_io_zh.md)
+
 The Mooncake store JSON config accepts optional `max_get_batch_bytes` and
 `max_put_batch_bytes`, measured in payload bytes per SDK call. Both default
 to `0` (unbounded), preserving existing batching. For example:

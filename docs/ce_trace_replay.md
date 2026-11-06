@@ -1,5 +1,7 @@
 # Transfer trace and synthetic replay
 
+[中文文档](ce_trace_replay_zh.md)
+
 Set `FLEXKV_CE_TRACE=1` **before starting workers** to record native CPU/GPU
 transfer launches. This is off by default and does not change transfer selection
 or completion. It covers direct calls, TP thread groups and region batches after

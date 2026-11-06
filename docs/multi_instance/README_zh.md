@@ -26,9 +26,9 @@ FlexKV 多实例模式允许在单台机器上运行多个推理引擎实例（�
 
 ## 工作原理
 
-1. 实例 ID 为 0 的进程会自动创建 FlexKV Server
-2. 其他实例作为客户端连接到该 Server
-3. 所有实例共享同一套 CPU/SSD 缓存，Server 负责统一管理和调度
+1. 默认的 `embedded` 模式由本地 client 0 启动 FlexKV Server，其他客户端连接该服务。
+2. `external` 模式下，所有客户端连接单独启动的 server。设置 `FLEXKV_SERVER_LAUNCH_MODE=external` 并启用 server-client 模式；客户端不负责关闭服务。
+3. 客户端共享该 server 管理的缓存。
 
 ## 使用示例
 

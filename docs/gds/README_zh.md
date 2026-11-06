@@ -33,7 +33,7 @@ sudo chmod 666 /dev/nvidia-fs*
 
 ### 1.2 配置文件系统
 
-GDS 要求文件系统以 `data=ordered mode` 挂载（ext4）。
+以下 ext4 示例使用 `data=ordered`。修改挂载选项前，请先检查实际文件系统、驱动和 CUDA 版本对应的 GDS 要求。
 
 #### 检查当前挂载状态
 
@@ -109,14 +109,13 @@ docker run -itd \
 
 `export FLEXKV_ENABLE_GDS=1` 进行编译
 
-编译后config例子 `config.yaml`：
+编译后配置示例 `config.yaml`（正数 `ssd_cache_gb` 会启用 SSD 层）：
 
 ```yaml
 cpu_cache_gb: 32
 ssd_cache_gb: 1024
 ssd_cache_dir: /data/flexkv_ssd/
 enable_gds: true
-enable_sdd: true
 ```
 
 ---
@@ -127,7 +126,7 @@ enable_sdd: true
 
 编辑 `/etc/cufile.json`：
 
-```json
+```text
 {
     ...
     "logging": {

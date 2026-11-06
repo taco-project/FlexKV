@@ -70,8 +70,8 @@ export FLEXKV_EVICTION_POLICY=lru
 | 配置项 | 环境变量 | 类型 | 默认值 | 说明 |
 |--------|---------|------|--------|------|
 | `eviction_policy` | `FLEXKV_EVICTION_POLICY` | str | `lru` | 驱逐策略，可选值见上方[支持的驱逐策略](#支持的驱逐策略) |
-| `evict_start_threshold` | `FLEXKV_EVICT_START_THRESHOLD` | float | `0.7` | 触发主动驱逐的缓存利用率阈值。当缓存占用比例达到该值时，FlexKV 开始主动驱逐节点。例如 `0.7` 表示缓存占用达到 70% 时即开始驱逐；设为 `1.0` 则仅在缓存满时才驱逐 |
-| `evict_ratio` | `FLEXKV_EVICT_RATIO` | float | `0.05` | 每次驱逐的最小淘汰比例。例如 `0.05` 表示每次至少淘汰总 block 数的 5%，以减少频繁小量驱逐带来的开销。设为 `0.0` 则仅淘汰满足当前需求所需的最少 block 数 |
+| `evict_start_threshold` | `FLEXKV_EVICT_START_THRESHOLD` | float | `1.0` | 触发主动驱逐的缓存利用率阈值。当缓存占用比例达到该值时，FlexKV 开始主动驱逐节点。例如 `0.7` 表示缓存占用达到 70% 时即开始驱逐；设为 `1.0` 时，空闲块不足仍可能在缓存未满时触发驱逐 |
+| `evict_ratio` | `FLEXKV_EVICT_RATIO` | float | `0` | 每次驱逐的最小淘汰比例。例如 `0.05` 表示每次至少淘汰总 block 数的 5%，以减少频繁小量驱逐带来的开销。设为 `0.0` 则不设最小批量比例；请求和阈值仍可能要求淘汰 |
 | `hit_reward_seconds` | `FLEXKV_HIT_REWARD_SECONDS` | int | `0` | 命中奖励秒数，仅对 LRU 策略生效。每次缓存命中时向节点的有效访问时间叠加指定秒数（可累积），使命中越多的节点越难被驱逐。设为 `0` 时为标准 LRU 行为。注意：该参数对其他策略（LFU/SLRU/FIFO/MRU/FILO）不生效 |
 | `slru_protected_threshold` | `FLEXKV_SLRU_PROTECTED_THRESHOLD` | int | `2` | SLRU 策略的保护阈值。节点命中次数达到该值后进入保护段，不易被驱逐。仅对 SLRU 策略生效 |
 

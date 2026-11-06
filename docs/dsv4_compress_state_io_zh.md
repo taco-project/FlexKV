@@ -1,5 +1,7 @@
 # DeepSeek-V4 compress state 在 FlexKV 中的存取设计
 
+[English](dsv4_compress_state_io_en.md)
+
 ## 1. 背景与目标
 
 DeepSeek-V4 的 DSA attention 除了读取 C4 KV 和 C4 indexer KV，还会读取两组运行时 score：
@@ -183,7 +185,7 @@ bytes_per_block = tp_size × Σ(
 
 ### 5.2 GPU 与 CPU 之间
 
-GPU 上每个 group 保留原生 tensor、dtype 和 layout。`GPUCPUTransferWorker` 或 `tpGPUCPUTransferWorker` 根据 group metadata 计算：
+GPU 上每个 group 保留原生 tensor、dtype 和 layout。`GPUCPUTransferWorker` 根据 group metadata 计算：
 
 - GPU block/layer stride；
 - 每个 group 在 Host block 中的 byte offset；
@@ -266,7 +268,7 @@ LayerwiseTransferOp
 
 `swa.multi_group=True` 时，SWA 池使用与 main-KV 同构的 `GroupParams + layer_members`；C4 层会等该层 state 写完再发 eventfd，无 state 的层只等 SWA KV + main。
 
-`swa_multi_layer` 控制上述融合路径，默认开启。显式设为 `false`（或通过环境变量设置 `FLEXKV_SWA_MULTI_LAYER=0`）时，main-KV 仍使用 layerwise restore，但 SWA/state 改由独立 H2D worker 搬运；主 layerwise op 会依赖该 worker 完成，因此不会提前暴露未恢复的 state。该开关不改变 `swa_multi_group` 是否注册 compress-state sidecar 的语义。
+当前实现启用 layerwise 传输时，将 SWA/state H2D 融合到 layerwise worker，不再提供 `swa_multi_layer` 切换。`swa_multi_group` 仍控制是否注册 compress-state sidecar。
 
 非 layerwise GET 会等待整个 FlexKV task 完成后再把请求交还给 SGLang。
 
@@ -329,7 +331,7 @@ FlexKV 单测 `tests/test_swa_state_sidecars.py` 覆盖：
 | FlexKV | `flexkv/storage/storage_engine.py` | 分配 CPU/SSD/Remote byte-flat SWA pool |
 | FlexKV | `flexkv/common/storage.py` | 计算 heterogeneous block layout 和 group stride |
 | FlexKV | `flexkv/transfer/transfer_engine.py` | 创建 SWA/state 专用 multi-group worker |
-| FlexKV | `flexkv/transfer/worker.py` | GPU/CPU、SSD、Remote 实际搬运 |
+| FlexKV | `flexkv/transfer/workers/` | GPU/CPU、SSD、Remote 实际搬运 |
 | FlexKV | `flexkv/common/transfer.py` | layerwise transfer graph 依赖 |
 | FlexKV | `flexkv/kvtask.py` | 根据 `swa.multi_group` 选择 layerwise 路径 |
 | FlexKV | `tests/test_swa_state_sidecars.py` | block layout 和 restore 时序单测 |

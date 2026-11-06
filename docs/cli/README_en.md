@@ -2,7 +2,7 @@
 
 The FlexKV CLI is a local inspection tool for configuration, environment, processes, traces, SSD directories, and Prometheus metrics. It does not launch or stop the FlexKV runtime, and it does not mutate inference-process state.
 
-There is currently no `flexkv version` command because FlexKV does not yet expose independent version metadata. `flexkv collect-env` reports the current repository's short Git commit, which is useful as a development-branch identifier.
+There is currently no `flexkv version` command because FlexKV does not yet expose independent version metadata. `flexkv collect-env` runs `git rev-parse` in the current working directory. Its short commit identifies that directory's repository, which may differ from the installed FlexKV package.
 
 ---
 
@@ -123,7 +123,7 @@ flexkv config show
 - When SSD is enabled, `ssd_cache_gb` must be greater than `cpu_cache_gb`
 - When SSD is enabled, every `ssd_cache_dir` must be an existing directory
 
-Note: violations are printed, but the current implementation does not assign a distinct non-zero exit code for validation failure. `config show` represents the CLI-side parsed configuration; it is not the final merged configuration inside an already-running inference process.
+Configuration loading or validation failures are reported on stderr and exit with status 1. `config show` represents the CLI-side parsed configuration; it is not the final merged configuration inside an already-running inference process.
 
 ### 4.3 `flexkv collect-env`
 
@@ -134,7 +134,7 @@ flexkv collect-env
 flexkv collect-env --format json
 ```
 
-It includes the OS, Python version, current repository short commit, PyTorch/CUDA/GPU summary, NVIDIA driver, key Python package versions, and the number of `FLEXKV_*` variables. To keep output small, it does not export full environment-variable values; use `flexkv env` for individual variables.
+It includes the OS, Python version, current working directory repository short commit, PyTorch/CUDA/GPU summary, NVIDIA driver, key Python package versions, and the number of `FLEXKV_*` variables. To keep output small, it does not export full environment-variable values; use `flexkv env` for individual variables.
 
 ---
 

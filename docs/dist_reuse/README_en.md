@@ -75,13 +75,24 @@ sudo make install
 
 Clone vLLM, checkout version v0.10.1.1, apply the FlexKV patch, then build vLLM and FlexKV from source.
 
-For detailed instructions, please refer to: [FlexKV vLLM Adapter Documentation](https://github.com/taco-project/FlexKV/blob/main/docs/vllm_adapter/README_en.md)
+For detailed instructions, please refer to: [FlexKV vLLM Adapter Documentation](../vllm_adapter/README_en.md)
 
 **Note**: Set the following environment variable before building/installing FlexKV:
 
 ```bash
 export FLEXKV_ENABLE_P2P=1
 ```
+
+### Mooncake Store I/O limits
+
+For the Mooncake Store backend, `max_get_batch_bytes` and `max_put_batch_bytes`
+in the Store JSON config limit raw payload bytes per SDK call; both default to
+`0` (unbounded). A positive limit must fit the largest individual block. For
+parallel Get, `FLEXKV_MOONCAKE_GET_CONCURRENCY` defaults to `1`, and
+`FLEXKV_MOONCAKE_GET_MAX_INFLIGHT_BYTES` defaults to `536870912` bytes; the
+latter also accounts for padding. These are different limits. See [batch
+semantics](../mooncake_batched_io.md) and [performance controls](../cache_tier_performance_controls.md)
+for failure, drain and validation details.
 
 ## Running
 

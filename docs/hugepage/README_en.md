@@ -86,9 +86,7 @@ print(torch.cuda.is_available())
 PY
 ```
 
-Note: `use_hugepage_cpu_buffer` does not depend on `cudaHostRegister`.
-
-Additional note: `use_hugepage_cpu_buffer` does not require CUDA runtime; spawned workers reopen the same hugetlb memfd through `/proc/<pid>/fd/<fd>`.
+Allocating the main HugePage pool itself uses a hugetlb memfd, and spawned workers reopen it through `/proc/<pid>/fd/<fd>`. GPU/CPU transfer workers subsequently call `cudaHostRegister` on the CPU pool, so using that pool for GPU transfers still requires a working CUDA runtime and suitable registration limits.
 
 ---
 
