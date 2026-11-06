@@ -548,7 +548,14 @@ def test_global_dedup_writes_the_rest_to_the_peer_holding_the_prefix(ok):
             assert calls["insert"] == []
             assert [(r, s) for r, s, _ in calls["recycle"]] == [(3, [500, 501, 502, 503])]
         assert _hit(engine.ssd_cache_engine, tok) == 0     # nothing written locally
-        assert len(engine.cpu_cache_engine.take(CPU_BLOCKS)) == CPU_BLOCKS  # no pin left
+        taken = engine.cpu_cache_engine.take(CPU_BLOCKS)
+        assert len(taken) == CPU_BLOCKS                    # no pin left
+        engine.cpu_cache_engine.recycle(taken)
+        if not ok:   # the peer is written around for a while: the next PUT writes locally
+            tok2, mask2, sm2 = _request(12, base=1000)
+            graph2, _, _, _ = _put(engine, tok2, mask2, sm2, rid=2)
+            assert (TransferType.H2PEERSSD, PoolId.FULL_KV) not in _ops(graph2)
+            assert engine._ssd_dedup_stats.get("fallback_backoff") == 1
 
 
 def test_global_dedup_abort_returns_the_peer_slots():

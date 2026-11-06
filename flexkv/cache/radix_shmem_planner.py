@@ -303,6 +303,7 @@ class _PeerSsdWrite:
         self._settled = True
         if self._failed:
             self._owner._ssd_dedup_count("remote_write_failed")
+            self._owner._ssd_dedup_peer_down(self._rank)
             flexkv_logger.warning(
                 f"radixshmem {self._label}: SSD write to rank {self._rank} failed; "
                 f"its {len(self._full)} blocks stay in CPU only")
@@ -315,6 +316,7 @@ class _PeerSsdWrite:
             flexkv_logger.error(f"radixshmem {self._label}: publish on SSD rank "
                                 f"{self._rank} failed: {e!r}")
             self._owner._ssd_dedup_count("remote_publish_failed")
+            self._owner._ssd_dedup_peer_down(self._rank)
             self._recycle()
             return
         self._owner._ssd_dedup_count("remote_landed_blocks", landed)
@@ -497,6 +499,11 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             flexkv_logger.info("[FlexKV-IO] operation=ssd_dedup act=stats " + " ".join(
                 f"{k}={v}" for k, v in sorted(stats.items())))
 
+    def _ssd_dedup_peer_down(self, rank: int) -> None:
+        """Write around a peer a while: its writes fail (its FlexKV down while
+        its SSD index still answers, say), and each failure costs a timeout."""
+        self._ssd_dedup_down[rank] = time.monotonic() + self._ssd_dedup_backoff_s
+
     def _ssd_dedup_lookup(self, ssd_engine: CacheEngineRadixShmem) -> bool:
         """Whether this PUT looks its SSD part up cluster-wide."""
         if not self._ssd_global_dedup or not ssd_engine.peer_enabled:
@@ -541,7 +548,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         if full is None:
             self._ssd_dedup_count("fallback_alloc")
             if "status" in why or "raised" in why:  # unreachable: write around it a while
-                self._ssd_dedup_down[peer] = now + self._ssd_dedup_backoff_s
+                self._ssd_dedup_peer_down(peer)
             flexkv_logger.warning(
                 f"radixshmem PUT {request_id}: SSD rank {peer} cannot take "
                 f"[{hit}, {end}) ({why}); writing [{local}, {end}) locally")
