@@ -23,7 +23,7 @@ joint hit plus the W-block window ending there; SWA slots are addressed by
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -104,8 +104,10 @@ class StagedRadixInsert:
                  path_end: int,
                  label: str,
                  holds: Sequence[Callable[[], None]] = (),
-                 component: radixshmem.ComponentType = COMPONENT_FULL) -> None:
+                 component: radixshmem.ComponentType = COMPONENT_FULL,
+                 unused_out: Optional[list] = None) -> None:
         self._engine = engine
+        self._unused_out = unused_out
         self._sequence_meta = sequence_meta
         self._slots = slots
         self._path_end = path_end
@@ -124,9 +126,10 @@ class StagedRadixInsert:
             return
         self._settled = True
         try:
+            extra = {} if self._unused_out is None else {"unused_out": self._unused_out}
             self.landed = self._engine.insert(self._sequence_meta, self._slots,
                                               num_insert_blocks=self._path_end,
-                                              component=self._component)
+                                              component=self._component, **extra)
         except Exception as e:
             flexkv_logger.error(
                 f"radixshmem {self._label}: insert of {len(self._slots)} "
@@ -345,10 +348,14 @@ class CacheEngineRadixShmem:
                sequence_meta: SequenceMeta,
                physical_block_ids: np.ndarray,
                num_insert_blocks: int,
-               component: radixshmem.ComponentType = COMPONENT_FULL) -> int:
+               component: radixshmem.ComponentType = COMPONENT_FULL,
+               unused_out: Optional[list] = None) -> int:
         """Attach transferred slots: `physical_block_ids[i]` is block
         `num_insert_blocks - len(physical_block_ids) + i`. Ownership passes to
         radixshmem (`auto_recycle=True`); do not recycle these slots again.
+        With `unused_out` the slots the tree did not take (it held those
+        blocks already) are appended there instead, still allocated, for the
+        caller to recycle once nothing reads them any more.
         Returns how many of them landed on the tree."""
         sequence_meta.gen_hashes()
         hashes = sequence_meta.block_hashes.view(np.uint64)
@@ -367,19 +374,20 @@ class CacheEngineRadixShmem:
 
         tree_start = start if component == COMPONENT_FULL else 0
         result = self._tree.insert(hashes[:path_end], slots, start=tree_start,
-                                   auto_recycle=True, component=component)
+                                   auto_recycle=unused_out is None, component=component)
 
         landed = num_slots - len(result.unused_slots)
+        if unused_out is not None and len(result.unused_slots) > 0:
+            unused_out.append(np.asarray(result.unused_slots, dtype=np.int64))
         if result.error == radixshmem.InsertError.FULL_PATH_MISSING:
             flexkv_logger.warning(
                 f"radixshmem {component} insert on {self.shm_name}: full path "
-                f"[0, {path_end}) was evicted before the window published "
-                f"(slots were auto-recycled)")
+                f"[0, {path_end}) was evicted before the window published")
         elif result.error != radixshmem.InsertError.OK:
             flexkv_logger.warning(
                 f"radixshmem {component} insert on {self.shm_name} returned "
                 f"{result.error}: {landed}/{num_slots} blocks landed at "
-                f"start={start} (unused slots were auto-recycled)")
+                f"start={start}")
         if landed <= 0:
             return 0
 
@@ -399,6 +407,75 @@ class CacheEngineRadixShmem:
                 block_size=self.tokens_per_block,
                 medium="CPU")
         return landed
+
+    # -- a peer's pools (SSD global dedup) ----------------------------------
+    def remote_take(self, rank: int, num_full: int,
+                    num_swa: int = 0) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
+        """Allocate `num_full` FULL (and `num_swa` SWA) slots in peer `rank`'s
+        pools, all or none, evicting there as `take` does here. Returns
+        (full, swa, "") or (None, None, reason)."""
+        comps = [(COMPONENT_FULL, int(num_full))]
+        if num_swa > 0:
+            comps.append((COMPONENT_SWA, int(num_swa)))
+        try:
+            rep = self._client.remote_allocate_components(int(rank), comps)
+        except Exception as e:  # noqa: BLE001 - the caller writes locally instead
+            return None, None, f"allocate raised {e!r}"
+        if rep.status != radixshmem.RemoteStatus.OK:
+            return None, None, f"allocate status {rep.status}"
+        slots = list(rep.slots)
+        if (rep.error != radixshmem.InsertError.OK or len(slots) != len(comps)
+                or any(len(s) != n for s, (_, n) in zip(slots, comps))):
+            for s, (comp, _) in zip(slots, comps):  # all-or-none: nothing to hold
+                if len(s) > 0:
+                    self.remote_recycle(rank, s, comp)
+            return None, None, f"allocate error {rep.error}"
+        full = np.asarray(slots[0], dtype=np.int64)
+        swa = np.asarray(slots[1], dtype=np.int64) if num_swa > 0 else None
+        return full, swa, ""
+
+    def remote_insert(self, rank: int, sequence_meta: SequenceMeta, path_end: int,
+                      full_slots: np.ndarray,
+                      swa_slots: Optional[np.ndarray] = None) -> int:
+        """Publish blocks `[path_end - len(full_slots), path_end)` (and the
+        SWA window ending at `path_end`) in peer `rank`'s tree, which must
+        hold `[0, path_end - len(full_slots))`. The peer keeps what it holds
+        already and recycles the surplus. Returns the FULL blocks landed;
+        raises when the request did not reach the peer (slots stay allocated)."""
+        hashes = self._hashes(sequence_meta, int(path_end))
+        start = int(path_end) - len(full_slots)
+        runs = []
+        if swa_slots is not None and len(swa_slots) > 0:
+            runs.append((COMPONENT_SWA, int(path_end),
+                         np.ascontiguousarray(swa_slots, dtype=np.int32)))
+        res = self._client.remote_insert_path(
+            int(rank), np.ascontiguousarray(hashes), start,
+            np.ascontiguousarray(full_slots, dtype=np.int32), runs, True)
+        if res.remote_status != radixshmem.RemoteStatus.OK:
+            raise RuntimeError(f"remote insert on rank {rank}: {res.remote_status}")
+        landed = len(full_slots) - len(res.full.unused_slots)
+        if res.full.error != radixshmem.InsertError.OK:
+            flexkv_logger.warning(
+                f"radixshmem {self.medium} insert on rank {rank} returned "
+                f"{res.full.error}: {landed}/{len(full_slots)} blocks landed at start={start}")
+        return landed
+
+    def remote_recycle(self, rank: int, slots: np.ndarray,
+                       component: radixshmem.ComponentType = COMPONENT_FULL) -> bool:
+        if slots is None or len(slots) == 0:
+            return True
+        try:
+            st = self._client.remote_recycle(
+                int(rank), np.ascontiguousarray(slots, dtype=np.int32), component)
+        except Exception as e:  # noqa: BLE001
+            flexkv_logger.error(f"radixshmem {self.medium}: recycle of {len(slots)} "
+                                f"{component} slots on rank {rank} raised {e!r}")
+            return False
+        if st != radixshmem.RemoteStatus.OK:
+            flexkv_logger.error(f"radixshmem {self.medium}: recycle of {len(slots)} "
+                                f"{component} slots on rank {rank} returned {st}")
+            return False
+        return True
 
     def take(self,
              num_required_blocks: int,

@@ -1,9 +1,11 @@
-"""A peer's SSD -> local CPU (PEERSSD2H), radixshmem mode.
+"""A peer's SSD <-> local CPU (PEERSSD2H / H2PEERSSD), radixshmem mode.
 
 The SSD tier is indexed by an index-only radix-server per node; a cluster-wide
 match ends in a peer's run whose slot ids are that peer's SSD block ids. This
 worker moves such a run into the local CPU pool with a destination-initiated,
-synchronous ``read()`` of a pluggable :class:`RemoteSSDReader`:
+synchronous ``read()`` of a pluggable :class:`RemoteSSDReader`, and -- for the
+SSD global dedup of PUTs -- local CPU blocks into slots allocated in a peer's
+SSD with its ``write()``:
 
   * ``FLEXKV_REMOTE_SSD_READER=module:factory`` -- ``factory(worker, pool_id)``
     returns the reader (the real cross-node transport plugs in here);
@@ -31,7 +33,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.common.pool import PoolId
 from flexkv.common.storage import StorageHandle
 from flexkv.common.transfer import TransferType
-from flexkv.transfer.worker_op import WorkerTransferOp
+from flexkv.transfer.worker_op import WorkerTransferOp, WorkerTransferResult
 from flexkv.transfer.workers.cpu_ssd import CPUSSDDiskTransferWorker
 
 _MANIFEST_VERSION = 1
@@ -48,6 +50,12 @@ class RemoteSSDReader(Protocol):
 
     def read(self, peer_rank: int, pool_id: PoolId, src_ssd_blocks: torch.Tensor,
              dst_cpu_blocks: torch.Tensor, layer_id: int, layer_end: int) -> None: ...
+
+    # Optional (H2PEERSSD): local CPU blocks -> the peer's SSD blocks, which
+    # the caller allocated in the peer's SSD index. Raises on failure; the
+    # source CPU blocks must stay unchanged until it returns.
+    def write(self, peer_rank: int, pool_id: PoolId, src_cpu_blocks: torch.Tensor,
+              dst_ssd_blocks: torch.Tensor) -> None: ...
 
 
 def _manifest_dir() -> str:
@@ -168,6 +176,16 @@ class SharedFileRemoteSSDReader:
         finally:
             w.ioctx = own
 
+    def write(self, peer_rank: int, pool_id: PoolId, src_cpu_blocks: torch.Tensor,
+              dst_ssd_blocks: torch.Tensor) -> None:
+        w = self._worker
+        own = w.ioctx
+        w.ioctx = self._peer_ctx(peer_rank)
+        try:
+            w.write_local_layout(src_cpu_blocks, dst_ssd_blocks)
+        finally:
+            w.ioctx = own
+
 
 def _load_reader(worker: "PeerSSDReadWorker", pool_id: PoolId) -> RemoteSSDReader:
     spec = GLOBAL_CONFIG_FROM_ENV.remote_ssd_reader
@@ -180,8 +198,9 @@ def _load_reader(worker: "PeerSSDReadWorker", pool_id: PoolId) -> RemoteSSDReade
 
 
 class PeerSSDReadWorker(CPUSSDDiskTransferWorker):
-    """PEERSSD2H: this node's CPU pool and SSD layout (the peer's is the same
-    by the cluster's geometry), a :class:`RemoteSSDReader` for the bytes."""
+    """PEERSSD2H / H2PEERSSD: this node's CPU pool and SSD layout (the peer's
+    is the same by the cluster's geometry), a :class:`RemoteSSDReader` for
+    the bytes."""
 
     def __init__(self, *args: Any, pool_id: PoolId = PoolId.FULL_KV,
                  ssd_server_name: str = "", **kwargs: Any):
@@ -197,7 +216,43 @@ class PeerSSDReadWorker(CPUSSDDiskTransferWorker):
         self._transfer_impl(src_ssd_blocks, dst_cpu_blocks, TransferType.DISK2H,
                             layer_id=layer_id, layer_granularity=gran)
 
-    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+    def write_local_layout(self, src_cpu_blocks: torch.Tensor,
+                           dst_ssd_blocks: torch.Tensor) -> None:
+        """An H2DISK of whole blocks with this worker's addressing against ``self.ioctx``."""
+        self._transfer_impl(src_cpu_blocks, dst_ssd_blocks, TransferType.H2DISK,
+                            layer_id=0, layer_granularity=-1)
+
+    def _launch_write(self, transfer_op: WorkerTransferOp) -> WorkerTransferResult:
+        """H2PEERSSD: ``src_block_node_ids`` names the peer. A failure is
+        reported per block, not raised: the PUT has its CPU copy, and the plan
+        gives the peer's slots back."""
+        src, dst = self.get_transfer_block_ids(transfer_op)
+        ranks = transfer_op.src_block_node_ids
+        n = len(src)
+        start = time.time()
+        try:
+            if ranks is None or len(ranks) != n:
+                raise RuntimeError("H2PEERSSD op carries no per-block target rank")
+            peers = torch.unique(torch.as_tensor(ranks, dtype=torch.int64)).tolist()
+            if len(peers) != 1:
+                raise RuntimeError(f"H2PEERSSD op spans ranks {peers}")
+            write = getattr(self._reader, "write", None)
+            if write is None:
+                raise RuntimeError(f"{type(self._reader).__name__} cannot write a peer's SSD")
+            write(int(peers[0]), self.pool_id, src, dst)
+        except Exception as e:  # noqa: BLE001
+            flexkv_logger.warning(
+                f"[peer-ssd] H2PEERSSD of {n} blocks failed: {e!r}",
+                exc_info=not getattr(e, "quiet", False))
+            return WorkerTransferResult(transfer_op.transfer_op_id, (False,) * n)
+        self._log_transfer_performance(
+            transfer_op, int(self.block_stride_in_bytes) * transfer_op.valid_block_num,
+            start, time.time())
+        return WorkerTransferResult(transfer_op.transfer_op_id, (True,) * n)
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp):
+        if transfer_op.transfer_type == TransferType.H2PEERSSD:
+            return self._launch_write(transfer_op)
         src, dst = self.get_transfer_block_ids(transfer_op)
         ranks = transfer_op.src_block_node_ids
         if ranks is None or len(ranks) != len(src):

@@ -880,6 +880,14 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     remote_ssd_reader=os.getenv('FLEXKV_REMOTE_SSD_READER', ''),
     # Where every node's TE publishes its SSD file manifest for that reader.
     peer_ssd_manifest_dir=os.getenv('FLEXKV_PEER_SSD_MANIFEST_DIR', ''),
+    # SSD write-through placement: "local" writes every new block to this
+    # node's SSD; "global_dedup" first looks the prefix up cluster-wide, skips
+    # what a peer's SSD holds and writes the rest to that peer (H2PEERSSD).
+    ssd_write_mode=os.getenv('FLEXKV_SSD_WRITE_MODE', 'local').lower(),
+    # global_dedup: share of SSD writes that skip the cluster lookup and stay local.
+    ssd_dedup_local_fraction=float(os.getenv('FLEXKV_SSD_DEDUP_LOCAL_FRACTION', 0) or 0),
+    # global_dedup: how long a peer whose allocate failed is written around.
+    ssd_dedup_peer_backoff_s=float(os.getenv('FLEXKV_SSD_DEDUP_PEER_BACKOFF_S', 10) or 0),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),

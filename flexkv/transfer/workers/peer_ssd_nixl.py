@@ -1,4 +1,5 @@
-"""NIXL transport for PEERSSD2H: a peer's SSD blocks -> this node's CPU pool.
+"""NIXL transport for PEERSSD2H / H2PEERSSD: a peer's SSD blocks <-> this
+node's CPU pool.
 
 NIXL has no one-sided read of a remote file, so the node holding the blocks
 does the I/O (the ``remote_storage_example`` pattern of nixl.git): the reader
@@ -6,6 +7,8 @@ sends a request notification naming the peer's SSD blocks and where they go in
 its own CPU pool; the peer reads them from its SSD files into a staging buffer
 with the POSIX file plugin and writes them over UCX straight into the reader's
 CPU slots, one chunk while the next is read, then answers OK (or ER + reason).
+A write (SSD global dedup) is the mirror image: the peer reads the writer's
+CPU blocks over UCX into staging and writes them to its SSD files.
 
 One :class:`NixlSSDEndpoint` per (node, pool) lives in the PEERSSD2H worker of
 that pool. It is both sides: it serves this node's SSD to every peer (a
@@ -250,6 +253,19 @@ class NixlSSDEndpoint:
         request carries a wall-clock deadline (``write_window_s``, by default
         the timeout minus a margin) after which the peer posts no more writes.
         The nodes' clocks must agree to well within that margin."""
+        self._request(peer, "R", src_blocks, dst_blocks, timeout_s, write_window_s)
+
+    def write(self, peer: str, src_blocks: Sequence[int], dst_blocks: Sequence[int],
+              timeout_s: float, write_window_s: Optional[float] = None) -> None:
+        """Have ``peer`` store this node's CPU blocks ``src_blocks`` in its SSD
+        blocks ``dst_blocks`` (allocated there by the caller). Raises on error
+        or timeout; the destination blocks then hold undefined bytes and the
+        caller gives them back. Past the request's deadline the peer neither
+        reads the source blocks nor writes its SSD any more, as for `read`."""
+        self._request(peer, "W", src_blocks, dst_blocks, timeout_s, write_window_s)
+
+    def _request(self, peer: str, op: str, src_blocks: Sequence[int], dst_blocks: Sequence[int],
+                 timeout_s: float, write_window_s: Optional[float]) -> None:
         if len(src_blocks) != len(dst_blocks):
             raise ValueError("src and dst block lists differ in length")
         if len(src_blocks) == 0:
@@ -260,7 +276,7 @@ class NixlSSDEndpoint:
         waiter = [threading.Event(), None]
         with self._lock:
             self._waiters[rid] = waiter
-        body = {"id": rid, "base": self._cpu_ptr, "block": self.block_bytes,
+        body = {"id": rid, "op": op, "base": self._cpu_ptr, "block": self.block_bytes,
                 "expires": time.time() + write_window_s,
                 "src": [int(b) for b in src_blocks], "dst": [int(b) for b in dst_blocks]}
         try:
@@ -272,13 +288,14 @@ class NixlSSDEndpoint:
             if not waiter[0].wait(timeout_s):
                 self.drop(peer, f"no answer in {timeout_s:.0f}s")
                 raise TimeoutError(
-                    f"[peer-ssd-nixl] {peer} did not answer a {len(src_blocks)}-block read "
-                    f"in {timeout_s:.0f}s")
+                    f"[peer-ssd-nixl] {peer} did not answer a {len(src_blocks)}-block "
+                    f"{'read' if op == 'R' else 'write'} in {timeout_s:.0f}s")
         finally:
             with self._lock:
                 self._waiters.pop(rid, None)
         if waiter[1] is not None:
-            raise RuntimeError(f"[peer-ssd-nixl] {peer} failed the read: {waiter[1]}")
+            raise RuntimeError(f"[peer-ssd-nixl] {peer} failed the "
+                               f"{'read' if op == 'R' else 'write'}: {waiter[1]}")
 
     # -- notification routing ----------------------------------------------
     def _dispatch(self) -> None:
@@ -314,12 +331,17 @@ class NixlSSDEndpoint:
             except queue.Empty:
                 continue
             t0 = time.perf_counter()
+            writing = req.get("op", "R") == "W"
             try:
-                self._serve(sender, req, staging)
+                if writing:
+                    self._serve_write(sender, req, staging)
+                else:
+                    self._serve(sender, req, staging)
                 reply = _OK + req["id"].encode()
                 flexkv_logger.info(
-                    "[FlexKV-IO] operation=peer_ssd_serve act=complete status=ok to=%s blocks=%d "
-                    "bytes=%d time_ms=%.1f", sender, len(req["src"]),
+                    "[FlexKV-IO] operation=%s act=complete status=ok to=%s blocks=%d "
+                    "bytes=%d time_ms=%.1f",
+                    "peer_ssd_store" if writing else "peer_ssd_serve", sender, len(req["src"]),
                     len(req["src"]) * self.block_bytes, (time.perf_counter() - t0) * 1e3)
             except Exception as e:  # noqa: BLE001 - the reader learns why
                 flexkv_logger.error(f"[peer-ssd-nixl] serving {sender} failed: {e!r}")
@@ -389,6 +411,58 @@ class NixlSSDEndpoint:
                 progressed = True
             if writes and self._done(writes[0][2]):
                 _, buf, _ = writes.popleft()
+                free.append(buf)
+                done += 1
+                progressed = True
+            if not progressed:
+                time.sleep(_IDLE_SLEEP_S)
+
+
+    def _serve_write(self, sender: str, req: Dict[str, Any], staging: _Staging) -> None:
+        """The mirror of `_serve`: a UCX read of chunk k+1 from the writer's
+        CPU pool overlaps the SSD write of chunk k. Past the deadline nothing
+        new is posted: the writer may have reused its source blocks and given
+        the destination blocks back."""
+        if int(req["block"]) != self.block_bytes:
+            raise ValueError(f"block size {req['block']} != this node's {self.block_bytes}")
+        src, dst, base = req["src"], req["dst"], int(req["base"])
+        expires = float(req.get("expires", float("inf")))
+        files_of = [self.ssd_location(b) for b in dst]  # range check before any I/O
+        chunks = [(i, min(i + self.chunk_blocks, len(src))) for i in range(0, len(src), self.chunk_blocks)]
+        free = deque(range(staging.count))
+        nets: deque = deque()    # (chunk, buffer, handle)
+        disks: deque = deque()
+        nxt = done = 0
+        bb = self.block_bytes
+
+        def _expire() -> None:
+            for _, _, h in list(nets) + list(disks):
+                while not self._done(h):
+                    time.sleep(_IDLE_SLEEP_S)
+            raise TimeoutError("write request expired before it was served")
+
+        while done < len(chunks):
+            while free and nxt < len(chunks):
+                if time.time() > expires:
+                    _expire()
+                buf = free.popleft()
+                lo, hi = chunks[nxt]
+                local = [(staging.ptr(buf) + j * bb, bb, 0) for j in range(hi - lo)]
+                remote = [(base + int(b) * bb, bb, 0) for b in src[lo:hi]]
+                nets.append((nxt, buf, self._post("READ", local, remote, "DRAM", sender)))
+                nxt += 1
+            progressed = False
+            if nets and self._done(nets[0][2]):
+                c, buf, _ = nets.popleft()
+                if time.time() > expires:
+                    _expire()
+                lo, hi = chunks[c]
+                local = [(staging.ptr(buf) + j * bb, bb, 0) for j in range(hi - lo)]
+                files = [(off, bb, fd) for fd, off in files_of[lo:hi]]
+                disks.append((c, buf, self._post("WRITE", local, files, "FILE", self.name)))
+                progressed = True
+            if disks and self._done(disks[0][2]):
+                _, buf, _ = disks.popleft()
                 free.append(buf)
                 done += 1
                 progressed = True
@@ -476,20 +550,29 @@ class NixlRemoteSSDReader:
              dst_cpu_blocks: torch.Tensor, layer_id: int, layer_end: int) -> None:
         if layer_id != 0 or layer_end < self._worker.num_layers:
             raise ValueError("the NIXL SSD reader moves whole blocks only")
+        agent, ip, port = self._ready_peer(int(peer_rank))
+        self.endpoint.read(agent, src_ssd_blocks.tolist(), dst_cpu_blocks.tolist(), self._timeout)
+
+    def write(self, peer_rank: int, pool_id: PoolId, src_cpu_blocks: torch.Tensor,
+              dst_ssd_blocks: torch.Tensor) -> None:
+        agent, ip, port = self._ready_peer(int(peer_rank))
+        self.endpoint.write(agent, src_cpu_blocks.tolist(), dst_ssd_blocks.tolist(), self._timeout)
+
+    def _ready_peer(self, peer_rank: int) -> Tuple[str, str, int]:
         if not self._ready.is_set():
-            # Fail at once: a prefetch waiting here would only delay its miss.
+            # Fail at once: a request waiting here would only delay its miss.
             now = time.monotonic()
             if now - self._not_ready_logged >= _NOT_READY_LOG_EVERY_S:
                 self._not_ready_logged = now
                 flexkv_logger.warning(
                     "[peer-ssd-nixl] this node's NIXL endpoint is still starting; "
-                    "peer SSD reads fail (prefetch misses) until it serves")
+                    "peer SSD reads and writes fail until it serves")
             raise PeerUnavailable("[peer-ssd-nixl] this node's NIXL endpoint is still starting")
         if self._error is not None:
             raise RuntimeError(f"[peer-ssd-nixl] endpoint unavailable: {self._error!r}")
-        agent, ip, port = self._peer(int(peer_rank))
+        agent, ip, port = self._peer(peer_rank)
         self.endpoint.connect(agent, ip, port, self._timeout)
-        self.endpoint.read(agent, src_ssd_blocks.tolist(), dst_cpu_blocks.tolist(), self._timeout)
+        return agent, ip, port
 
 
 def make_reader(worker: Any, pool_id: PoolId) -> NixlRemoteSSDReader:

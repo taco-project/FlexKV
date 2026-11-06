@@ -218,3 +218,43 @@ def test_a_restarted_reader_is_served_at_once(pair, same_name):
             assert np.array_equal(buf[2 * bs:3 * bs], _pattern(2, bs))
     finally:
         again.close()
+
+
+def _file_block(server, block: int, bs: int) -> np.ndarray:
+    path, off = ssd_block_location(server._files, block, bs)
+    with open(path, "rb") as fh:
+        fh.seek(off)
+        return np.frombuffer(fh.read(bs), np.uint8)
+
+
+def test_scattered_writes_land_byte_exact_and_read_back(pair):
+    """H2PEERSSD: the peer stores the writer's CPU blocks in its SSD blocks,
+    at the io_uring engine's addresses, and serves them back."""
+    server, client, cpu, n, bs = pair
+    src = [4, 0, 9, 2, 7]
+    dst = [30, 1, 11, 6, 17]
+    for i, s in enumerate(src):
+        cpu[s * bs:(s + 1) * bs] = _pattern(500 + i, bs)
+    client.write(server.name, src, dst, 30)
+    for i, d in enumerate(dst):
+        assert np.array_equal(_file_block(server, d, bs), _pattern(500 + i, bs)), d
+    cpu[:] = 0
+    client.read(server.name, dst, list(range(len(dst))), 30)
+    for i in range(len(dst)):
+        assert np.array_equal(cpu[i * bs:(i + 1) * bs], _pattern(500 + i, bs)), i
+
+
+def test_a_write_to_a_bad_block_touches_nothing(pair):
+    server, client, cpu, n, bs = pair
+    cpu[:bs] = _pattern(900, bs)
+    with pytest.raises(RuntimeError, match="failed the write"):
+        client.write(server.name, [0, 0], [3, n + 100], 30)
+    assert np.array_equal(_file_block(server, 3, bs), _pattern(3, bs))
+
+
+def test_an_expired_write_is_not_stored(pair):
+    server, client, cpu, n, bs = pair
+    cpu[:bs] = _pattern(901, bs)
+    with pytest.raises(RuntimeError, match="expired"):
+        client.write(server.name, [0], [2], 30, write_window_s=-1)
+    assert np.array_equal(_file_block(server, 2, bs), _pattern(2, bs))

@@ -459,3 +459,173 @@ def test_full_only_put_skips_the_swa_window():
         assert len(ops[(TransferType.D2H, PoolId.FULL_KV)][0].dst_block_ids) == 1
         assert (TransferType.D2H, PoolId.SWA) in ops
         assert _hit(cpu, tok2, JOINT_MASK) == 10 and _hit(ssd, tok2, JOINT_MASK) == 10
+
+
+@contextlib.contextmanager
+def _dedup_peer(engine, local_blocks: int, peer_blocks: int, peer: int = 3,
+                take_ok: bool = True):
+    """Global dedup against a synthetic peer whose SSD holds [0, peer_blocks)
+    while this node's SSD holds [0, local_blocks). Yields the recorded calls."""
+    ssd = engine.ssd_cache_engine
+    engine._ssd_global_dedup = True
+    ssd.peer_enabled = True
+    calls = {"take": [], "insert": [], "recycle": [], "local_only": []}
+    real_match = ssd.match
+
+    def _match(seq, **kw):
+        calls["local_only"].append(kw.get("local_only", True))
+        if kw.get("local_only", True):
+            return real_match(seq, **kw)
+        local = real_match(seq, local_only=True)
+        nl = min(local.num_local_blocks, local_blocks)
+        return ShmRadixMatch(num_matched_blocks=max(nl, peer_blocks),
+                             local_slots=local.local_slots[:nl].copy(),
+                             remote_rank=peer if peer_blocks > nl else -1,
+                             remote_slots=np.arange(900, 900 + max(0, peer_blocks - nl),
+                                                    dtype=np.int64),
+                             finalize=local.release)
+
+    def _take(rank, n_full, n_swa=0):
+        calls["take"].append((rank, n_full, n_swa))
+        if not take_ok:
+            return None, None, "allocate error MEMPOOL_FULL"
+        return (np.arange(500, 500 + n_full, dtype=np.int64),
+                np.arange(700, 700 + n_swa, dtype=np.int64) if n_swa else None, "")
+
+    def _insert(rank, seq, path_end, full, swa=None):
+        calls["insert"].append((rank, path_end, full.tolist(), None if swa is None else swa.tolist()))
+        return len(full)
+
+    def _recycle(rank, slots, component=None):
+        calls["recycle"].append((rank, list(slots), component))
+        return True
+    ssd.match, ssd.remote_take = _match, _take        # type: ignore[method-assign]
+    ssd.remote_insert, ssd.remote_recycle = _insert, _recycle  # type: ignore[method-assign]
+    yield calls
+
+
+def test_global_dedup_skips_what_a_peer_ssd_holds():
+    with _engine() as (engine, _):
+        tok, mask, sm = _request(10)
+        with _dedup_peer(engine, local_blocks=0, peer_blocks=10) as calls:
+            graph, ret, _, _ = _put(engine, tok, mask, sm)
+        ops = _ops(graph)
+        assert calls["local_only"] == [False]
+        assert (TransferType.H2DISK, PoolId.FULL_KV) not in ops
+        assert (TransferType.H2PEERSSD, PoolId.FULL_KV) not in ops
+        assert calls["take"] == [] and _hit(engine.ssd_cache_engine, tok) == 0
+        assert _hit(engine.cpu_cache_engine, tok) == 10
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_global_dedup_writes_the_rest_to_the_peer_holding_the_prefix(ok):
+    """[0, 6) on peer 3 -> [6, 10) goes to peer 3's SSD (H2PEERSSD into slots
+    allocated there) and is published there once written; a failed write
+    gives the slots back to the peer instead and fails nothing."""
+    from flexkv.common.transfer import CompletedOp
+    with _engine() as (engine, _):
+        tok, mask, sm = _request(10)
+        with _dedup_peer(engine, local_blocks=2, peer_blocks=6) as calls:
+            graph, ret, cb, op_cbs = _put(engine, tok, mask, sm, complete=False)
+            ops = _ops(graph)
+            assert (TransferType.H2DISK, PoolId.FULL_KV) not in ops
+            (peer_op,) = ops[(TransferType.H2PEERSSD, PoolId.FULL_KV)]
+            (d2h,) = ops[(TransferType.D2H, PoolId.FULL_KV)]
+            assert calls["take"] == [(3, 4, 0)]
+            np.testing.assert_array_equal(peer_op.dst_block_ids, np.arange(500, 504))
+            np.testing.assert_array_equal(peer_op.src_block_node_ids, [3] * 4)
+            np.testing.assert_array_equal(peer_op.src_block_ids, d2h.dst_block_ids[6:])
+            assert d2h.op_id in peer_op.predecessors
+            op_cbs[d2h.op_id]()
+            done = CompletedOp(graph_id=graph.graph_id, op_id=peer_op.op_id,
+                               block_results=(ok,) * 4)
+            op_cbs[peer_op.op_id](done)
+            cb()
+        if ok:
+            assert calls["insert"] == [(3, 10, [500, 501, 502, 503], None)]
+            assert calls["recycle"] == []
+        else:
+            assert calls["insert"] == []
+            assert [(r, s) for r, s, _ in calls["recycle"]] == [(3, [500, 501, 502, 503])]
+        assert _hit(engine.ssd_cache_engine, tok) == 0     # nothing written locally
+        assert len(engine.cpu_cache_engine.take(CPU_BLOCKS)) == CPU_BLOCKS  # no pin left
+
+
+def test_global_dedup_abort_returns_the_peer_slots():
+    with _engine() as (engine, _):
+        tok, mask, sm = _request(10)
+        with _dedup_peer(engine, local_blocks=0, peer_blocks=4) as calls:
+            graph, ret, cb, op_cbs = _put(engine, tok, mask, sm, complete=False)
+            cb.abort()
+        assert calls["insert"] == []
+        assert [(r, len(s)) for r, s, _ in calls["recycle"]] == [(3, 6)]
+
+
+def test_global_dedup_writes_locally_when_the_peer_cannot_take_it():
+    with _engine() as (engine, _):
+        tok, mask, sm = _request(10)
+        with _dedup_peer(engine, local_blocks=2, peer_blocks=6, take_ok=False) as calls:
+            graph, ret, _, _ = _put(engine, tok, mask, sm)
+        ops = _ops(graph)
+        assert (TransferType.H2PEERSSD, PoolId.FULL_KV) not in ops
+        h2disk = ops[(TransferType.H2DISK, PoolId.FULL_KV)]
+        assert sum(len(o.dst_block_ids) for o in h2disk[:1]) == 10  # this node's own run: none
+        assert engine._ssd_dedup_stats.get("fallback_alloc") == 1
+
+
+def test_global_dedup_local_fraction_skips_the_cluster_lookup():
+    with _engine() as (engine, _):
+        tok, mask, sm = _request(10)
+        with _dedup_peer(engine, local_blocks=0, peer_blocks=10) as calls:
+            engine._ssd_dedup_local_fraction = 1.0
+            graph, ret, _, _ = _put(engine, tok, mask, sm)
+        assert calls["local_only"] == [True]
+        assert (TransferType.H2DISK, PoolId.FULL_KV) in _ops(graph)
+
+
+def test_global_dedup_carries_the_swa_window_to_the_peer():
+    from flexkv.common.transfer import CompletedOp
+    with _engine(swa=True) as (engine, _):
+        tok, mask, sm = _request(10)
+        with _dedup_peer(engine, local_blocks=0, peer_blocks=6) as calls:
+            graph, ret, cb, op_cbs = _put(engine, tok, mask, sm, complete=False)
+            ops = _ops(graph)
+            (swa_op,) = ops[(TransferType.H2PEERSSD, PoolId.SWA)]
+            (full_op,) = ops[(TransferType.H2PEERSSD, PoolId.FULL_KV)]
+            assert (TransferType.H2DISK, PoolId.SWA) not in ops
+            assert calls["take"] == [(3, 4, SWA_W)]
+            for op_id in sorted(op_cbs):
+                if op_id in (swa_op.op_id, full_op.op_id):
+                    continue
+                op_cbs[op_id]()
+            op_cbs[full_op.op_id](CompletedOp(graph_id=graph.graph_id, op_id=full_op.op_id,
+                                              block_results=(True,) * 4))
+            assert calls["insert"] == []                # waits for the window too
+            op_cbs[swa_op.op_id](CompletedOp(graph_id=graph.graph_id, op_id=swa_op.op_id,
+                                             block_results=(True,) * SWA_W))
+            cb()
+        assert calls["insert"] == [(3, 10, [500, 501, 502, 503], list(range(700, 700 + SWA_W)))]
+
+
+def test_ssd_write_keeps_cpu_slots_a_concurrent_put_published_first():
+    """Two PUTs of the same blocks planned together: the second one's CPU
+    insert finds them published and does not take its slots, which its SSD
+    write still reads -- they go back only once that write is done."""
+    with _engine() as (engine, _):
+        cpu, ssd = engine.cpu_cache_engine, engine.ssd_cache_engine
+        tok, mask, sm = _request(8)
+        g1, _, cb1, cbs1 = _put(engine, tok, mask, sm, rid=1, complete=False)
+        g2, _, cb2, cbs2 = _put(engine, tok, mask, sm, rid=2, complete=False)
+        for op_id in sorted(cbs1):
+            cbs1[op_id]()
+        cb1()
+        free = cpu.num_free_blocks
+        (d2h,) = _ops(g2)[(TransferType.D2H, PoolId.FULL_KV)]
+        cbs2[d2h.op_id]()                               # publish: all 8 already there
+        assert cpu.num_free_blocks == free              # not recycled under the SSD write
+        for op_id in sorted(cbs2):
+            if op_id != d2h.op_id:
+                cbs2[op_id]()
+        assert cpu.num_free_blocks == free + 8
+        cb2()
+        assert _hit(ssd, tok) == 8

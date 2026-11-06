@@ -68,6 +68,8 @@ from flexkv.server.shm_radix_bootstrap import (PREFETCH_MAX_INFLIGHT, PREFETCH_T
                                                attach_ssd_index_client, expected_geometry,
                                                radix_server_name, radix_ssd_server_name)
 from flexkv.common.transfer import (
+    CompletedOp,
+    CompletionAwareCallback,
     DeviceType,
     TransferOp,
     TransferOpGraph,
@@ -186,6 +188,149 @@ def _noop() -> None:
     return None
 
 
+class _CpuSourceHold:
+    """Keeps a PUT's new CPU blocks readable while the SSD writes read them.
+
+    The CPU tier publishes at the D2H, before the SSD writes run. Slots the
+    insert did not take (a concurrent PUT published those blocks first) are
+    kept allocated instead of auto-recycled, and the published path is pinned
+    with a local match; both go once every SSD writer reported, or at graph
+    end / abort."""
+
+    def __init__(self, engine: CacheEngineRadixShmem, sequence_meta: SequenceMeta,
+                 path_end: int, swa: bool):
+        self._engine = engine
+        self._sequence_meta = sequence_meta
+        self._path_end = path_end
+        self._mask = COMPONENT_MASK_FULL | (COMPONENT_MASK_SWA if swa else 0)
+        self.unused: Dict[Any, List[np.ndarray]] = {COMPONENT_FULL: [], COMPONENT_SWA: []}
+        self._pin: Optional[ShmRadixMatch] = None
+        self._pending: set = set()
+        self._released = False
+
+    def expect(self, writers: List[int]) -> None:
+        self._pending = set(writers)
+
+    def pin(self) -> None:
+        if self._released or self._pin is not None:
+            return
+        try:
+            self._pin = self._engine.match(self._sequence_meta, component_mask=self._mask,
+                                           query_end=self._path_end)
+        except Exception as e:  # noqa: BLE001 - the unused slots are still held
+            flexkv_logger.warning(f"radixshmem PUT: could not pin the CPU source: {e!r}")
+
+    def writer_done(self, op_id: int) -> None:
+        self._pending.discard(op_id)
+        if not self._pending:
+            self.release()
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        pin, self._pin = self._pin, None
+        if pin is not None:
+            pin.release()
+        for comp, parts in self.unused.items():
+            for slots in parts:
+                try:
+                    self._engine.recycle(slots, component=comp)
+                except Exception as e:  # noqa: BLE001
+                    flexkv_logger.error(f"radixshmem PUT: could not return {len(slots)} "
+                                        f"{comp} CPU slots: {e!r}")
+            parts.clear()
+
+
+def _chain_writer_done(prev: Optional[Callable], hold: _CpuSourceHold, op_id: int) -> Callable:
+    """An SSD writer's op callback: its own commit (`prev`), then the hold."""
+    if isinstance(prev, CompletionAwareCallback):
+        def _done_aware(completed_op: Optional[CompletedOp] = None) -> None:
+            try:
+                prev(completed_op)
+            finally:
+                hold.writer_done(op_id)
+        return CompletionAwareCallback(_done_aware)
+
+    def _done() -> None:
+        try:
+            if prev is not None:
+                prev()
+        finally:
+            hold.writer_done(op_id)
+    return _done
+
+
+class _PeerSsdWrite:
+    """The SSD part of a PUT placed on peer `rank`'s SSD (global dedup).
+
+    Its slots were allocated in the peer's pools at plan time; the H2PEERSSD
+    ops (FULL, and the SWA window) report per-block outcomes. Once all of
+    them landed, one remote insert publishes the path on the peer; a failed
+    write or an abort gives the slots back to the peer instead. Settles once."""
+
+    def __init__(self, owner: "RadixShmemCacheEngine", engine: CacheEngineRadixShmem,
+                 rank: int, sequence_meta: SequenceMeta, path_end: int,
+                 full_slots: np.ndarray, swa_slots: Optional[np.ndarray], label: str):
+        self._owner = owner
+        self._engine = engine
+        self._rank = rank
+        self._sequence_meta = sequence_meta
+        self._path_end = path_end
+        self._full = full_slots
+        self._swa = swa_slots
+        self._label = label
+        self._pending: set = set()
+        self._failed = False
+        self._settled = False
+
+    def expect(self, writers: List[int]) -> None:
+        self._pending = set(writers)
+
+    def on_write(self, op_id: int, completed_op: Optional[CompletedOp] = None) -> None:
+        results = getattr(completed_op, "block_results", None)
+        if results is not None and not all(results):
+            self._failed = True
+        self._pending.discard(op_id)
+        if not self._pending:
+            self.settle()
+
+    def settle(self) -> None:
+        if self._settled:
+            return
+        if self._pending:  # graph end before a writer reported: outcome unknown
+            self._failed = True
+        self._settled = True
+        if self._failed:
+            self._owner._ssd_dedup_count("remote_write_failed")
+            flexkv_logger.warning(
+                f"radixshmem {self._label}: SSD write to rank {self._rank} failed; "
+                f"its {len(self._full)} blocks stay in CPU only")
+            self._recycle()
+            return
+        try:
+            landed = self._engine.remote_insert(self._rank, self._sequence_meta,
+                                                self._path_end, self._full, self._swa)
+        except Exception as e:  # noqa: BLE001
+            flexkv_logger.error(f"radixshmem {self._label}: publish on SSD rank "
+                                f"{self._rank} failed: {e!r}")
+            self._owner._ssd_dedup_count("remote_publish_failed")
+            self._recycle()
+            return
+        self._owner._ssd_dedup_count("remote_landed_blocks", landed)
+
+    def abort(self) -> None:
+        if self._settled:
+            return
+        self._settled = True
+        self._recycle()
+
+    def _recycle(self) -> None:
+        self._engine.remote_recycle(self._rank, self._full, COMPONENT_FULL)
+        if self._swa is not None:
+            self._engine.remote_recycle(self._rank, self._swa, COMPONENT_SWA)
+
+
 def _check_cache_config(cache_config: CacheConfig) -> None:
     if not cache_config.enable_cpu:
         raise ValueError("radix_shmem needs enable_cpu=True: it backs the CPU tier")
@@ -275,6 +420,16 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                  event_collector: Optional[KVEventCollector] = None):
         _check_cache_config(cache_config)
         self._prefetch_jobs: List[Any] = []
+        mode = GLOBAL_CONFIG_FROM_ENV.ssd_write_mode
+        if mode not in ("local", "global_dedup"):
+            raise ValueError(f"FLEXKV_SSD_WRITE_MODE={mode!r}: expected local or global_dedup")
+        self._ssd_global_dedup = mode == "global_dedup"
+        self._ssd_dedup_local_fraction = min(1.0, max(0.0, GLOBAL_CONFIG_FROM_ENV.ssd_dedup_local_fraction))
+        self._ssd_dedup_backoff_s = GLOBAL_CONFIG_FROM_ENV.ssd_dedup_peer_backoff_s
+        self._ssd_dedup_down: Dict[int, float] = {}  # peer rank -> monotonic end of its backoff
+        self._ssd_dedup_stats: Dict[str, int] = {}
+        self._ssd_dedup_logged = time.monotonic()
+        self._ssd_dedup_rng = np.random.default_rng()
         super().__init__(cache_config, model_config, redis_meta, event_collector)
         self._segments = _AttachedSegments(
             [getattr(e, "client", None) for e in (self.cpu_cache_engine, getattr(self, "ssd_cache_engine", None))
@@ -331,6 +486,70 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             f"SWA={'on' if engine.swa_enabled else 'off'}, peers="
             f"{'on' if engine.peer_enabled else 'off'} (rank {engine.rank})")
         return engine
+
+    # -- SSD global dedup ----------------------------------------------------
+    def _ssd_dedup_count(self, key: str, n: int = 1) -> None:
+        stats = self._ssd_dedup_stats
+        stats[key] = stats.get(key, 0) + int(n)
+        now = time.monotonic()
+        if now - self._ssd_dedup_logged >= 60.0:
+            self._ssd_dedup_logged = now
+            flexkv_logger.info("[FlexKV-IO] operation=ssd_dedup act=stats " + " ".join(
+                f"{k}={v}" for k, v in sorted(stats.items())))
+
+    def _ssd_dedup_lookup(self, ssd_engine: CacheEngineRadixShmem) -> bool:
+        """Whether this PUT looks its SSD part up cluster-wide."""
+        if not self._ssd_global_dedup or not ssd_engine.peer_enabled:
+            return False
+        if (self._ssd_dedup_local_fraction > 0
+                and self._ssd_dedup_rng.random() < self._ssd_dedup_local_fraction):
+            self._ssd_dedup_count("puts_local_by_fraction")
+            return False
+        return True
+
+    def _ssd_dedup_target(self, request_id: int, ssd_engine: CacheEngineRadixShmem,
+                          match: ShmRadixMatch, end: int, num_swa: int
+                          ) -> Tuple[int, int, Optional[np.ndarray], Optional[np.ndarray]]:
+        """Place the SSD part of a PUT from a cluster-wide match.
+
+        A peer holding the whole ``[0, end)`` -> nothing to write. A peer
+        holding ``[0, R)`` past this node's own run -> the rest ``[R, end)``
+        goes to that peer (its slots are allocated here); the peer's tree is
+        the only one that can take it, the insert being positional. Otherwise,
+        or when the peer cannot take it, this node writes from its own run.
+        Returns (ssd_tot, peer rank or -1, peer FULL slots, peer SWA slots)."""
+        local = min(match.num_local_blocks, end)
+        hit = min(match.num_matched_blocks, end)
+        peer = match.remote_rank
+        self._ssd_dedup_count("puts")
+        if peer < 0 or hit <= local:
+            self._ssd_dedup_count("puts_local")
+            return local, -1, None, None
+        if hit >= end:
+            self._ssd_dedup_count("puts_skipped")
+            self._ssd_dedup_count("blocks_skipped", end - local)
+            flexkv_logger.info(
+                "[FlexKV-IO] operation=put act=ssd_dedup_skip flexkv_task_id=%d "
+                "local=%d peer=%d peer_end=%d", request_id, local, peer, hit)
+            return end, -1, None, None
+        now = time.monotonic()
+        if self._ssd_dedup_down.get(peer, 0.0) > now:
+            self._ssd_dedup_count("fallback_backoff")
+            return local, -1, None, None
+        num_swa = num_swa if ssd_engine.swa_enabled else 0
+        full, swa, why = ssd_engine.remote_take(peer, end - hit, num_swa)
+        if full is None:
+            self._ssd_dedup_count("fallback_alloc")
+            if "status" in why or "raised" in why:  # unreachable: write around it a while
+                self._ssd_dedup_down[peer] = now + self._ssd_dedup_backoff_s
+            flexkv_logger.warning(
+                f"radixshmem PUT {request_id}: SSD rank {peer} cannot take "
+                f"[{hit}, {end}) ({why}); writing [{local}, {end}) locally")
+            return local, -1, None, None
+        self._ssd_dedup_count("puts_remote")
+        self._ssd_dedup_count("blocks_skipped", hit - local)
+        self._ssd_dedup_count("blocks_remote", end - hit)
+        return hit, peer, full, swa
 
     def _update_mempool_metrics(self) -> None:
         if self._metrics_collector is None:
@@ -428,11 +647,19 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             complete=partial(self._run_actions, plan.on_complete, "completion"),
             abort=partial(self._run_actions, plan.on_abort, "abort"),
         )
-        op_callbacks = {op_id: partial(self._run_actions, [action], "tier commit")
+        op_callbacks = {op_id: self._op_commit(action)
                         for op_id, action in plan.op_callbacks.items()}
         if self._metrics_collector is not None:
             self._update_mempool_metrics()
         return transfer_graph, return_mask, handle, op_callbacks, task_end_op_id
+
+    def _op_commit(self, action: Callable) -> Callable:
+        """An op's commit callback; one that reads the op's outcome gets it."""
+        if isinstance(action, CompletionAwareCallback):
+            return CompletionAwareCallback(
+                lambda completed_op: self._run_actions([partial(action, completed_op)],
+                                                       "tier commit"))
+        return partial(self._run_actions, [action], "tier commit")
 
     @staticmethod
     def _empty_result(token_mask: np.ndarray) \
@@ -880,6 +1107,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         swa_new: Optional[np.ndarray] = None
         ssd_new: Optional[np.ndarray] = None
         ssd_swa_new: Optional[np.ndarray] = None
+        ssd_peer = -1
         try:
             if self.swa_op_constructor.enabled and use_swa:
                 k = min(block_mask_end, self.cache_config.swa.window_blocks)
@@ -895,12 +1123,19 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
 
             # The SSD part: [ssd_tot, end), sourced from the cached CPU slots
             # below cpu_tot (pinned by cpu_match) and the new ones above it.
+            # It goes to this node's SSD, or with global dedup to the peer
+            # whose SSD holds [0, ssd_tot) (ssd_peer >= 0).
             ssd_tot = 0
             if ssd_engine is not None:
-                ssd_match = ssd_engine.match(sequence_meta)
-                ssd_tot = min(ssd_match.num_matched_blocks, block_mask_end)
+                dedup = self._ssd_dedup_lookup(ssd_engine)
+                ssd_match = ssd_engine.match(sequence_meta, local_only=not dedup)
+                ssd_tot = min(ssd_match.num_local_blocks, block_mask_end)
+                if dedup:
+                    ssd_tot, ssd_peer, ssd_new, ssd_swa_new = self._ssd_dedup_target(
+                        request_id, ssd_engine, ssd_match, block_mask_end,
+                        len(swa_new) if swa_new is not None else 0)
                 num_ssd_new = block_mask_end - ssd_tot
-                if num_ssd_new > 0:
+                if num_ssd_new > 0 and ssd_peer < 0:
                     take = ssd_engine.take(num_required_blocks=num_ssd_new)
                     if len(take) == num_ssd_new:
                         ssd_new = take
@@ -909,7 +1144,8 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                         flexkv_logger.warning(
                             f"radixshmem PUT {request_id}: SSD {len(take)}/{num_ssd_new} "
                             f"blocks available; storing in CPU only")
-                if ssd_new is not None and swa_new is not None and ssd_engine.swa_enabled:
+                if (ssd_new is not None and swa_new is not None and ssd_engine.swa_enabled
+                        and ssd_peer < 0):
                     swa_take = ssd_engine.take(num_required_blocks=len(swa_new),
                                                component=COMPONENT_SWA)
                     if len(swa_take) == len(swa_new):
@@ -941,7 +1177,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                     transfer_graph,
                     gpu_slot_ids=np.zeros(len(swa_new), dtype=np.int64),
                     cpu_slot_ids=swa_new,
-                    ssd_slot_ids=ssd_swa_new,
+                    ssd_slot_ids=ssd_swa_new if ssd_peer < 0 else None,
                     dp_client_id=dp_client_id,
                     return_op_ids=True,
                 )
@@ -949,6 +1185,19 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                 swa_d2h_id = swa_ops.d2h_id
                 swa_h2disk_id = swa_ops.h2disk_id
                 finished_ops_ids.append(swa_d2h_id)
+                if ssd_peer >= 0 and ssd_swa_new is not None:
+                    op = TransferOp(
+                        graph_id=transfer_graph.graph_id,
+                        transfer_type=TransferType.H2PEERSSD,
+                        src_block_ids=swa_new,
+                        dst_block_ids=ssd_swa_new,
+                        dp_client_id=dp_client_id,
+                        pool_id=PoolId.SWA,
+                        src_block_node_ids=np.full(len(swa_new), ssd_peer, dtype=np.int64),
+                    )
+                    transfer_graph.add_transfer_op(op)
+                    transfer_graph.add_dependency(op.op_id, swa_d2h_id)
+                    swa_h2disk_id = op.op_id
 
             h2disk_ops: List[TransferOp] = []
             if ssd_new is not None:
@@ -956,34 +1205,61 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                 cached_src = cpu_match.local_range(ssd_tot, cpu_tot) if ssd_tot < cpu_tot \
                     else np.empty(0, dtype=np.int64)
                 new_src = cpu_new[max(0, ssd_tot - cpu_tot):]
-                h2disk_ops = self._make_sliced_host_ops(
-                    transfer_graph,
-                    transfer_type=TransferType.H2DISK,
-                    src_block_ids=np.concatenate([cached_src, new_src]),
-                    dst_block_ids=ssd_new,
-                    dp_client_id=dp_client_id,
-                )
+                src = np.concatenate([cached_src, new_src])
+                if ssd_peer >= 0:
+                    op = TransferOp(
+                        graph_id=transfer_graph.graph_id,
+                        transfer_type=TransferType.H2PEERSSD,
+                        src_block_ids=src,
+                        dst_block_ids=ssd_new,
+                        dp_client_id=dp_client_id,
+                        src_block_node_ids=np.full(len(src), ssd_peer, dtype=np.int64),
+                    )
+                    transfer_graph.add_transfer_op(op)
+                    h2disk_ops = [op]
+                else:
+                    h2disk_ops = self._make_sliced_host_ops(
+                        transfer_graph,
+                        transfer_type=TransferType.H2DISK,
+                        src_block_ids=src,
+                        dst_block_ids=ssd_new,
+                        dp_client_id=dp_client_id,
+                    )
                 for op in h2disk_ops:
                     transfer_graph.add_dependency(op.op_id, op_d2h.op_id)
 
             on_complete: List[Action] = []
             on_abort: List[Action] = []
             op_callbacks: Dict[int, Action] = {}
+            ssd_writers = [op.op_id for op in h2disk_ops] + [swa_h2disk_id]
+            # The SSD writes read the new CPU slots after the CPU tier has
+            # published them: keep them readable until the writes are done
+            # (a concurrent PUT may have published the same blocks first, and
+            # an unpinned slot could be evicted and reused).
+            cpu_hold = _CpuSourceHold(cpu_engine, sequence_meta, block_mask_end,
+                                      swa=swa_new is not None) \
+                if ssd_new is not None else None
 
             def _arm_tier(engine: CacheEngineRadixShmem,
                           parts: List[Tuple[Optional[np.ndarray], Any, str]],
-                          writers: List[Optional[int]]) -> None:
+                          writers: List[Optional[int]],
+                          hold: Optional[_CpuSourceHold] = None) -> None:
                 """Publish one tier's staged slots (FULL before SWA: the SWA
                 insert needs the FULL path) once every op writing that tier has
-                completed -- they complete in any order -- or at graph end."""
+                completed -- they complete in any order -- or at graph end.
+                `hold` keeps the published slots readable for the SSD writes."""
                 staged = [StagedRadixInsert(engine=engine, sequence_meta=sequence_meta,
                                             slots=slots, path_end=block_mask_end,
-                                            label=label, component=component)
+                                            label=label, component=component,
+                                            unused_out=(None if hold is None else
+                                                        hold.unused[component]))
                           for slots, component, label in parts if slots is not None]
 
                 def _publish() -> None:
                     for ins in staged:
                         ins.publish()
+                    if hold is not None:
+                        hold.pin()
                 pending = {w for w in writers if w is not None}
                 for op_id in list(pending):
                     def _on_write(op_id: int = op_id) -> None:
@@ -998,12 +1274,33 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             _arm_tier(cpu_engine,
                       [(cpu_new, COMPONENT_FULL, f"PUT {request_id} CPU"),
                        (swa_new, COMPONENT_SWA, f"PUT {request_id} CPU SWA")],
-                      [op_d2h.op_id, swa_d2h_id])
-            if ssd_new is not None:
+                      [op_d2h.op_id, swa_d2h_id], hold=cpu_hold)
+            if ssd_new is not None and ssd_peer < 0:
                 _arm_tier(ssd_engine,
                           [(ssd_new, COMPONENT_FULL, f"PUT {request_id} SSD"),
                            (ssd_swa_new, COMPONENT_SWA, f"PUT {request_id} SSD SWA")],
-                          [op.op_id for op in h2disk_ops] + [swa_h2disk_id])
+                          ssd_writers)
+            elif ssd_new is not None:
+                remote = _PeerSsdWrite(self, ssd_engine, ssd_peer, sequence_meta,
+                                       block_mask_end, ssd_new, ssd_swa_new,
+                                       label=f"PUT {request_id}")
+                for op_id in ssd_writers:
+                    if op_id is not None:
+                        op_callbacks[op_id] = CompletionAwareCallback(
+                            partial(remote.on_write, op_id))
+                remote.expect([w for w in ssd_writers if w is not None])
+                on_complete.append(remote.settle)
+                on_abort.append(remote.abort)
+            if cpu_hold is not None:
+                # Last writer done -> drop the hold; graph end/abort as backstop.
+                for op_id in ssd_writers:
+                    if op_id is None:
+                        continue
+                    prev = op_callbacks.get(op_id)
+                    op_callbacks[op_id] = _chain_writer_done(prev, cpu_hold, op_id)
+                cpu_hold.expect([w for w in ssd_writers if w is not None])
+                on_complete.append(cpu_hold.release)
+                on_abort.append(cpu_hold.release)
             # The H2DISK reads cached CPU slots: drop the pins at graph end.
             on_complete.append(cpu_match.release)
             on_abort.append(cpu_match.release)
@@ -1014,8 +1311,9 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             if ssd_new is not None:
                 flexkv_logger.info(
                     "[FlexKV-IO] operation=put act=ssd_write flexkv_task_id=%d "
-                    "cpu_new=%d ssd_start=%d ssd_new=%d swa=%s",
-                    request_id, len(cpu_new), ssd_tot, len(ssd_new), ssd_swa_new is not None)
+                    "cpu_new=%d ssd_start=%d ssd_new=%d swa=%s dest=%s",
+                    request_id, len(cpu_new), ssd_tot, len(ssd_new), ssd_swa_new is not None,
+                    f"peer{ssd_peer}" if ssd_peer >= 0 else "local")
 
             return RadixPutPlan(
                 transfer_graph=transfer_graph,
@@ -1034,6 +1332,9 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                 if eng is None or slots is None or len(slots) == 0:
                     continue
                 try:
+                    if eng is ssd_engine and ssd_peer >= 0:
+                        eng.remote_recycle(ssd_peer, slots, comp)
+                        continue
                     eng.recycle(slots, component=comp)
                 except Exception as e:  # noqa: BLE001 - report, keep unwinding
                     flexkv_logger.error(

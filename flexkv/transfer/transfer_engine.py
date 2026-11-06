@@ -537,6 +537,8 @@ class TransferEngine:
                 )
                 self._register_worker(PoolId.FULL_KV, TransferType.PEERSSD2H,
                                       self.peer_ssd_read_worker)
+                self._register_worker(PoolId.FULL_KV, TransferType.H2PEERSSD,
+                                      self.peer_ssd_read_worker)
         if self._remote_handle is not None and self._cpu_handle is not None:
             self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
@@ -731,6 +733,7 @@ class TransferEngine:
                         ssd_server_name=self._radix_ssd_server,
                     )
                     self._register_worker(PoolId.SWA, TransferType.PEERSSD2H, swa_peer_ssd_worker)
+                    self._register_worker(PoolId.SWA, TransferType.H2PEERSSD, swa_peer_ssd_worker)
                 flexkv_logger.info("TransferEngine: swa CPU<->SSD workers initialized")
 
 
