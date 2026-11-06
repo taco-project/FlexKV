@@ -1047,6 +1047,7 @@ class MooncakeStoreBackend(StorageBackend):
         client = self.mooncake_client
         if client is None:
             return
+        client.shutdown_get_workers()
         _unregister_mooncake_regions(client, self._registered_regions)
         self._registered_regions = []
 

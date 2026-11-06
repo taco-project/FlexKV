@@ -67,6 +67,68 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 更多详细信息，请参阅 [CHANGELOG](CHANGELOG.md)
 
+## 本分支的缓存恢复改进
+
+这些改动由 [FlexKV #323](https://github.com/taco-project/FlexKV/pull/323) 提供。
+准入后合并恢复还需要 [SGLang 配套 #17](https://github.com/XingLiu1/sglang/pull/17)，
+其目标是上游 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 使用的适配分支。
+在 PR 审核期间，请使用相互匹配的源码版本。
+
+启用相关开关后的路径示意：
+
+```mermaid
+flowchart TB
+    subgraph Control[请求控制]
+        direction LR
+        A[分配槽位并投票] --> P[准备映射<br/>尚未提交 DMA] --> B[合并为一次启动]
+    end
+    subgraph Data[缓存数据]
+        direction LR
+        S[远端 Store] -->|有界 Get| H[CPU Host Cache]
+        H -->|符合条件时直接二维 CE| G[GPU KV]
+    end
+    Control -.->|提交 H2D| Data
+```
+
+“请求控制”表示准备与启动的顺序，“缓存数据”表示层级间的数据流，虚线表示 H2D 提交。
+Store 预取可提前运行，图示不代表测得的耗时。
+[中文图解](docs/cache_restore_optimizations_zh.md)逐项对照优化前后的启动、拷贝和通信路径，
+并区分性能改进与正确性保护。
+
+| 范围 | 原有行为 | 修改后的行为与实现位置 |
+| --- | --- | --- |
+| 准入后的逐层恢复 | 每个请求在准入过程中分别发起恢复。 | 先准备映射而不提交 DMA，再将最终准入的请求合并为一次启动，每层只发送一次完成信号。见 [`connector.py`](flexkv/integration/sglang/connector.py)。 |
+| 跨 rank 分配与控制 | 某个 rank 分配失败时可能与其他 rank 走入不同流程；轮询完成状态可能长期保留异步 Gloo 发送。 | 恢复 collective 前先投票确认分配成功；达到发送保留上限时，用正常的 `Work.wait()` 回收最早的发送。见 [`comm.py`](flexkv/integration/sglang/comm.py)。 |
+| CE Host/Device 拷贝 | DMA 可能跨越独立注册的 Host 分块；部分 BlockFirst H2D 恢复需要中转和转置。 | 按实际注册边界拆分 DMA，符合条件时直接使用二维 H2D 拷贝。提交失败后先排空已接受的工作，再允许复用缓存块。见 [`host_dma.h`](csrc/host_dma.h) 和 [`ce_transfer.cu`](csrc/ce_transfer.cu)。 |
+| 远端预取 | Store 串行读取，数据会话受已有的会话数和字节预算限制。 | 可选的有界并行 Get 和数据会话限流；临时信用不足时保留等待，已提交工作排空前保留源数据租约。见[详细说明](docs/cache_tier_performance_controls.md)。 |
+
+性能相关开关默认不启用：
+
+| 设置 | 默认值 | 适用范围 |
+| --- | --- | --- |
+| `FLEXKV_ENABLE_LAYERWISE_TRANSFER` | `0` | 启用 SGLang 进程内逐层恢复路径。 |
+| `FLEXKV_BATCH_LAYERWISE_RESTORE` | `0` | 配套 SGLang 的普通缓存 IP adapter；需要 connector 的合并恢复 API。旧 connector 继续立即启动。 |
+| `FLEXKV_USE_CE_TRANSFER_H2D` / `FLEXKV_USE_CE_TRANSFER_D2H` | 分别为 `0` | 按方向独立选择 CE 拷贝。 |
+| `FLEXKV_CUDAHOST_CHUNK_SIZE_GB` | `0` | Host 注册分块大小，单位 GiB；零表示整块注册。它不设置缓存容量。 |
+
+安装匹配的两侧实现后，例如：
+
+```bash
+export FLEXKV_ENABLE_LAYERWISE_TRANSFER=1
+export FLEXKV_BATCH_LAYERWISE_RESTORE=1
+# 可选：CE 拷贝可以与准入后合并恢复分别评估。
+export FLEXKV_USE_CE_TRANSFER_H2D=1
+export FLEXKV_USE_CE_TRANSFER_D2H=1
+```
+
+合并恢复适用于普通 IP adapter；MP 和 hybrid adapter 保留现有启动路径。
+CE 和远端读取开关可分别评估。更新注册边界感知的 CE 实现后，需要重新编译并安装
+native extension。所有 rank 必须使用一致的通信设置；内联控制帧仅支持 PP=1。
+
+[详细说明](docs/cache_tier_performance_controls.md)包含远端预算、prepare/flush/cancel
+契约与复现命令。CPU/mock 生命周期测试与 CUDA 字节、完成通知测试的验证范围不同；
+模型输出一致性、跨机性能和持续容量需要单独验证。
+
 ## 如何使用
 
 ### 安装依赖

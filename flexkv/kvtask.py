@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional, List, Union, Tuple, Sequence
@@ -1230,7 +1231,9 @@ class KVTaskEngine(KVTaskManager):
                 self._prefetch_backend,
                 max_sessions=cache_config.prefetch_max_sessions,
                 max_reserved_bytes=cache_config.prefetch_max_reserved_bytes,
-                result_ttl_s=cache_config.prefetch_result_ttl_s)
+                result_ttl_s=cache_config.prefetch_result_ttl_s,
+                max_data_sessions=int(os.environ.get("FLEXKV_PREFETCH_DATA_CONCURRENCY", "0")),
+            )
 
     def start(self) -> None:
         super().start()
