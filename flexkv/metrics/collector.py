@@ -36,6 +36,13 @@ TRANSFER_DURATION_BUCKETS = (
     0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0,
 )
 
+PREFETCH_POLICIES = frozenset(("wait_complete", "timeout", "best_effort"))
+PREFETCH_REASONS = frozenset((
+    "complete", "deadline", "demand", "capacity", "partial_read",
+    "backend_error", "request_abort", "reset", "shutdown",
+))
+PREFETCH_OUTCOMES = frozenset(("complete", "partial", "empty", "aborted", "failed"))
+
 # Flag to track if metrics server auto-start has been attempted
 _metrics_server_auto_started = False
 
@@ -284,6 +291,30 @@ class FlexKVMetricsCollector:
             ),
         )
 
+        # Chunked prefetch is accounted separately from legacy whole-graph prefetch.
+        self.prefetch_sessions_total = Counter(
+            name="flexkv_prefetch_sessions_total",
+            documentation="Completed chunked prefetch sessions by policy, stop reason and outcome",
+            labelnames=["policy", "reason", "outcome"],
+        )
+        self.prefetch_loaded_tokens_total = Counter(
+            name="flexkv_prefetch_loaded_tokens_total",
+            documentation="Published L3 tokens in reusable chunked prefetch prefixes",
+            labelnames=["policy"],
+        )
+        self.prefetch_elapsed_seconds = Histogram(
+            name="flexkv_prefetch_elapsed_seconds",
+            documentation="Time from chunked prefetch admission to terminal state",
+            labelnames=["policy", "reason"],
+            buckets=TRANSFER_DURATION_BUCKETS,
+        )
+        self.prefetch_drain_seconds = Histogram(
+            name="flexkv_prefetch_drain_seconds",
+            documentation="Time from chunked prefetch seal to terminal state",
+            labelnames=["policy", "reason"],
+            buckets=TRANSFER_DURATION_BUCKETS,
+        )
+
         logger.info("[FlexKV PyMetrics] Prometheus metrics collector initialized")
     
     def _init_dummy_metrics(self):
@@ -316,6 +347,10 @@ class FlexKVMetricsCollector:
         self.allocated_blocks_total = dummy
         self.joint_prefetch_outcomes_total = dummy
         self.joint_prefetch_swa_slot_alloc_failed_total = dummy
+        self.prefetch_sessions_total = dummy
+        self.prefetch_loaded_tokens_total = dummy
+        self.prefetch_elapsed_seconds = dummy
+        self.prefetch_drain_seconds = dummy
     
 
     
@@ -355,7 +390,8 @@ class FlexKVMetricsCollector:
             return
         self.allocation_failures_total.labels(mode=mode).inc()
     
-    def record_transfer_completed(self, transfer_type: str, num_blocks: int, num_bytes: int, operation: str = "unknown"):
+    def record_transfer_completed(self, transfer_type: str, num_blocks: int,
+                                  num_bytes: int, operation: str = "unknown"):
         """
         Record metrics for a completed transfer operation (post-completion).
         
@@ -458,6 +494,19 @@ class FlexKVMetricsCollector:
         if not self.enabled:
             return
         self.joint_prefetch_swa_slot_alloc_failed_total.inc(1)
+
+    def record_prefetch_terminal(self, policy: str, reason: str, outcome: str,
+                                 loaded_tokens: int, elapsed_s: float, drain_s: float) -> None:
+        """Record one terminal chunked-prefetch session using bounded labels."""
+        if not self.enabled:
+            return
+        policy = policy if isinstance(policy, str) and policy in PREFETCH_POLICIES else "other"
+        reason = reason if isinstance(reason, str) and reason in PREFETCH_REASONS else "other"
+        outcome = outcome if isinstance(outcome, str) and outcome in PREFETCH_OUTCOMES else "other"
+        self.prefetch_sessions_total.labels(policy=policy, reason=reason, outcome=outcome).inc()
+        self.prefetch_loaded_tokens_total.labels(policy=policy).inc(loaded_tokens)
+        self.prefetch_elapsed_seconds.labels(policy=policy, reason=reason).observe(elapsed_s)
+        self.prefetch_drain_seconds.labels(policy=policy, reason=reason).observe(drain_s)
 
 # Global collector instance
 _global_collector: Optional[FlexKVMetricsCollector] = None
