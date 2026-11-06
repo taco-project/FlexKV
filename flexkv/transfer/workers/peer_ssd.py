@@ -241,9 +241,10 @@ class PeerSSDReadWorker(CPUSSDDiskTransferWorker):
                 raise RuntimeError(f"{type(self._reader).__name__} cannot write a peer's SSD")
             write(int(peers[0]), self.pool_id, src, dst)
         except Exception as e:  # noqa: BLE001
+            # A timeout or a peer backing off is the expected way a write fails.
             flexkv_logger.warning(
                 f"[peer-ssd] H2PEERSSD of {n} blocks failed: {e!r}",
-                exc_info=not getattr(e, "quiet", False))
+                exc_info=not (getattr(e, "quiet", False) or isinstance(e, TimeoutError)))
             return WorkerTransferResult(transfer_op.transfer_op_id, (False,) * n)
         self._log_transfer_performance(
             transfer_op, int(self.block_stride_in_bytes) * transfer_op.valid_block_num,
