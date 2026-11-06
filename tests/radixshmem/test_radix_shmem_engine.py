@@ -293,6 +293,109 @@ def test_standalone_region_has_no_peer(env):
     result.release()
 
 
+# ---------------------------------------------------------------------------
+# KV placement events: the real radix-server, its eviction ring, and the queue
+# a KV-aware router's feed is drained from.
+# ---------------------------------------------------------------------------
+
+_KVEventQueue = _load_module_direct(
+    "_kv_events_test", os.path.join(_FLEXKV_ROOT, "flexkv", "common", "kv_events.py"),
+).KVEventQueue
+
+
+@dataclass
+class _TokenSeq(FakeSeq):
+    """FakeSeq plus the tokens a store event carries."""
+    token_ids: np.ndarray = None
+
+
+def _token_seq(seed: int, num_blocks: int, tpb: int = 4) -> _TokenSeq:
+    return _TokenSeq(block_hashes=_hashes(seed, num_blocks), tokens_per_block=tpb,
+                     token_ids=np.arange(seed * 1000, seed * 1000 + num_blocks * tpb))
+
+
+def _events_engine(env, name: str, blocks: int, ring: int):
+    cfg, geo = _server_config(name, blocks, tokens_per_block=4)
+    env.server(dataclasses.replace(cfg, kvevent_ring_capacity=ring))
+    queue = _KVEventQueue()
+    engine = env.engine(name, geometry=geo, num_total_blocks=blocks, tokens_per_block=4,
+                        kv_event_queue=queue)
+    return engine, queue
+
+
+def _store(engine, seq) -> np.ndarray:
+    slots = engine.take(num_required_blocks=seq.num_blocks)
+    assert len(slots) == seq.num_blocks
+    engine.insert(seq, slots, num_insert_blocks=seq.num_blocks)
+    return slots
+
+
+def test_store_event_carries_hashes_tokens_and_parent(env):
+    """A stored path is announced with its tokens, block by block, so a router
+    that hashes content its own way can map FlexKV's hashes onto its keys."""
+    engine, queue = _events_engine(env, "/cers_ev_store", blocks=64, ring=64)
+    assert engine.start_kv_events() is True
+
+    seq = _token_seq(seed=21, num_blocks=3)
+    _store(engine, seq)
+    engine.drain_kv_events()
+    [ev] = queue.take()
+    assert type(ev).__name__ == "BlocksStored"
+    assert ev.block_hashes == [int(h) for h in seq.block_hashes]
+    assert ev.token_ids == [list(range(21000 + 4 * i, 21000 + 4 * i + 4)) for i in range(3)]
+    assert ev.parent_block_hash is None and ev.block_size == 4 and ev.medium == "CPU"
+
+    # Extending the path announces only the new tail, chained to its parent.
+    longer = _token_seq(seed=21, num_blocks=5)
+    longer.block_hashes[:3] = seq.block_hashes
+    slots = engine.take(num_required_blocks=2)
+    engine.insert(longer, slots, num_insert_blocks=5)
+    [ev] = queue.take()
+    assert ev.block_hashes == [int(h) for h in longer.block_hashes[3:]]
+    assert ev.parent_block_hash == int(seq.block_hashes[2])
+
+
+def test_eviction_reaches_the_queue_as_a_remove(env):
+    """Evictions happen inside the radix-server; the ring is the only way this
+    process learns of them. Every hash it evicts must come back out, once."""
+    engine, queue = _events_engine(env, "/cers_ev_evict", blocks=8, ring=64)
+    assert engine.start_kv_events() is True
+    first = _token_seq(seed=31, num_blocks=8)
+    _store(engine, first)
+    queue.take()
+
+    # A full pool: taking more slots evicts the unpinned LRU path.
+    _store(engine, _token_seq(seed=32, num_blocks=8))
+    assert engine.drain_kv_events() > 0
+    removed = [h for ev in queue.take() if type(ev).__name__ == "BlocksRemoved"
+               for h in ev.block_hashes]
+    assert sorted(removed) == sorted(int(h) for h in first.block_hashes)
+
+
+def test_without_a_ring_the_engine_declines(env):
+    """Stores with no removes would only ever grow a router's view; a region
+    started without the ring reports False so the consumer stays off."""
+    engine, queue = _events_engine(env, "/cers_ev_noring", blocks=16, ring=0)
+    assert engine.start_kv_events() is False
+    assert engine.drain_kv_events() == 0
+
+
+def test_reset_resyncs_the_consumer(env):
+    engine, queue = _events_engine(env, "/cers_ev_reset", blocks=16, ring=64)
+    assert engine.start_kv_events() is True
+    _store(engine, _token_seq(seed=41, num_blocks=4))
+    queue.take()
+    engine.reset()
+    assert [type(ev).__name__ for ev in queue.take()] == ["AllBlocksCleared"]
+
+
+def test_events_stay_off_until_a_consumer_arms_them(env):
+    """An unread queue is a leak: nothing is published before start_kv_events."""
+    engine, queue = _events_engine(env, "/cers_ev_off", blocks=16, ring=64)
+    _store(engine, _token_seq(seed=51, num_blocks=4))
+    assert queue.take() == []
+
+
 def test_local_range_intersects_the_window():
     """`local_range` bounds the range on BOTH sides, by slicing alone.
 

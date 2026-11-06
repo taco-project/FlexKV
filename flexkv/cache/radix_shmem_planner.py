@@ -51,6 +51,7 @@ from flexkv.cache.radix_shmem_engine import (
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.kv_events import KVEventQueue
 from flexkv.server.shm_radix_bootstrap import (PREFETCH_MAX_INFLIGHT, PREFETCH_TIMEOUT_MS,
                                                expected_geometry, radix_server_name)
 from flexkv.common.transfer import (
@@ -162,6 +163,9 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                  event_collector: Optional[KVEventCollector] = None):
         _check_cache_config(cache_config)
         self._prefetch_jobs: List[Any] = []
+        # Placement events for whoever forwards them to a KV-aware router
+        # (the sglang connector). Stays disabled until a consumer arms it.
+        self.kv_event_queue = KVEventQueue()
         super().__init__(cache_config, model_config, redis_meta, event_collector)
 
     def _build_cpu_cache_engine(self,
@@ -183,7 +187,23 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             swa_config=cache_config.swa,
             event_collector=event_collector,
             metrics_collector=self._metrics_collector,
+            kv_event_queue=self.kv_event_queue,
         )
+
+    # ----------------------------------------------------- placement events
+
+    def start_kv_events(self) -> bool:
+        """Arm CPU-tier event publication; True when evictions are reportable."""
+        if self.cpu_cache_engine is None:
+            return False
+        return bool(self.cpu_cache_engine.start_kv_events())
+
+    def drain_kv_events(self, max_hashes: int = 65536) -> List[Any]:
+        """Pull the eviction ring, then hand back everything queued since the
+        last call (stores included). Cheap enough for a scheduler tick."""
+        if self.cpu_cache_engine is not None:
+            self.cpu_cache_engine.drain_kv_events(max_hashes)
+        return self.kv_event_queue.take()
 
     def _update_mempool_metrics(self) -> None:
         if self._metrics_collector is None or self.cpu_cache_engine is None:
