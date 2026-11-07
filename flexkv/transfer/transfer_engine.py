@@ -89,14 +89,20 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
 
     src_device, dst_device = transfer_type_to_devices.get(op.transfer_type, (0, 0))
 
-    op.src_slot_id = pin_buffer.allocate_slot(op.src_block_ids, device_type_prefix=src_device)
-    op.dst_slot_id = pin_buffer.allocate_slot(op.dst_block_ids, device_type_prefix=dst_device)
+    try:
+        op.src_slot_id = pin_buffer.allocate_slot(op.src_block_ids, device_type_prefix=src_device)
+        op.dst_slot_id = pin_buffer.allocate_slot(op.dst_block_ids, device_type_prefix=dst_device)
+    except Exception:
+        free_op_from_buffer(op, pin_buffer)
+        raise
 
 def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
     if op.src_slot_id != -1:
         pin_buffer.free_slot(op.src_slot_id)
+        op.src_slot_id = -1
     if op.dst_slot_id != -1:
         pin_buffer.free_slot(op.dst_slot_id)
+        op.dst_slot_id = -1
 
 
 def _te_bounded_cuda_sync(device_ids: List[int], timeout_s: float) -> bool:
@@ -108,7 +114,10 @@ def _te_bounded_cuda_sync(device_ids: List[int], timeout_s: float) -> bool:
     """
     return synchronize_cuda_devices(device_ids, timeout_s, name="flexkv-te")
 
-class TransferEngine:
+from flexkv.transfer.resilience import WorkerResilience
+
+
+class TransferEngine(WorkerResilience):
     # Parent IDs are nonnegative and arrive from another process via pickle;
     # receiving them does not advance this process's TransferOp counter.
     # Replicas share the worker completion/trace namespace with those parents,
@@ -146,6 +155,7 @@ class TransferEngine:
             gpu_blocks_per_group: Per-group GPU handles, keyed by WorkerKey
             gpu_layouts_per_group: Per-group GPU layouts, keyed by WorkerKey
         """
+        self._init_resilience()
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
 
@@ -424,7 +434,7 @@ class TransferEngine:
         _enable_layerwise = GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
         # Use num_gpu_groups to support multi-instance mode
         # Use gpu_device_id from StorageHandle for correct CUDA device selection
-        
+
         # H2D / D2H workers. One worker class for every TP width: tp==1 is
         # num_gpus==1 inside TPTransferThreadGroup, which spawns one thread and
         # one stream per GPU either way.
@@ -955,8 +965,11 @@ class TransferEngine:
             raise
 
     def _scheduler_loop(self) -> None:
-        """Event-driven scheduler loop using selectors (ZERO LATENCY with shutdown pipe)"""
+        """Schedule queue events and process exits; serialize route lifecycle changes."""
         from flexkv.common.debug import flexkv_logger
+
+        if not hasattr(self, "_resilience_lock"):
+            self._init_resilience()
 
         # Setup selector to monitor both queues simultaneously
         sel = selectors.DefaultSelector()
@@ -968,135 +981,152 @@ class TransferEngine:
         # Register shutdown pipe for zero-latency shutdown
         sel.register(self.shutdown_read_fd, selectors.EVENT_READ, data="shutdown")
 
-        flexkv_logger.info("TransferEngine scheduler loop started with ZERO-LATENCY selector (timeout=None)")
+        flexkv_logger.info("TransferEngine scheduler loop started (worker health interval=0.1s)")
 
+        watched_workers = {}
         while self._running:
             try:
-                # Complete blocking with NO TIMEOUT for zero latency!
-                # Shutdown via pipe signal instead of timeout
-                events = sel.select(timeout=None)
+                # Process sentinels wake an idle scheduler immediately. Keep
+                # retired handles alive here until their FD is unregistered.
+                with self._resilience_lock:
+                    current = {h.process.sentinel: h for h in self._collect_worker_handles()
+                               if hasattr(h, "process") and id(h) not in self._dead_workers}
+                    for fd in watched_workers.keys() - current.keys():
+                        sel.unregister(fd)
+                    for fd in current.keys() - watched_workers.keys():
+                        sel.register(fd, selectors.EVENT_READ, data="worker_exit")
+                    watched_workers = current
+                # Queue FDs wake immediately; the bounded idle tick checks
+                # worker liveness even when no transfer is submitted.
+                events = sel.select(timeout=0.1)
 
-                new_graphs_num = 0
-                finished_ops: List[TransferOp] = []
-                should_shutdown = False
+                with self._resilience_lock:
+                    new_graphs_num = 0
+                    finished_ops: List[TransferOp] = []
+                    should_shutdown = False
 
-                # Process events from selector
-                for key, mask in events:
-                    if key.data == "shutdown":
-                        # Shutdown signal received via pipe
-                        flexkv_logger.info("Scheduler loop received shutdown signal via pipe")
-                        should_shutdown = True
+                    # Process events from selector
+                    for key, mask in events:
+                        if key.data == "shutdown":
+                            # Shutdown signal received via pipe
+                            flexkv_logger.info("Scheduler loop received shutdown signal via pipe")
+                            should_shutdown = True
+                            break
+
+                        elif key.data == "new_graph":
+                            # Process new transfer graphs (batch get all available)
+                            nvtx_r1 = nvtx.start_range(message="transfer scheduler. get new graphs", color="orange")
+                            # Get all available graphs in one go to reduce system calls
+                            while True:
+                                try:
+                                    transfer_graph = self.task_queue.get_nowait()
+                                    # Handle batch submission (list of graphs)
+                                    graphs = transfer_graph if isinstance(transfer_graph, list) else [transfer_graph]
+                                    for graph in graphs:
+                                        self.scheduler.add_transfer_graph(graph)
+                                    new_graphs_num += len(graphs)
+                                except queue.Empty:
+                                    break
+                            nvtx.end_range(nvtx_r1)
+
+                        elif key.data == "finished_op":
+                            # Collect finished ops from main KV worker (batch get all available)
+                            nvtx_r2 = nvtx.start_range(message="transfer scheduler. collect finished ops", color="orange")
+                            # Get all available ops in one go to reduce system calls
+                            while True:
+                                try:
+                                    payload = self.finished_ops_queue.get_nowait()
+                                    # Payload forms:
+                                    #   WorkerTransferResult (partial block outcomes)
+                                    #   int (legacy success)
+                                    #   (op_id|WorkerTransferResult, ok)
+                                    #   (op_id|WorkerTransferResult, ok, metrics)
+                                    op_succeeded = True
+                                    metrics = None
+                                    block_results = None
+                                    if isinstance(payload, WorkerTransferResult):
+                                        op_id = payload.transfer_op_id
+                                        block_results = payload.block_results
+                                    elif isinstance(payload, tuple):
+                                        if len(payload) >= 3:
+                                            first, op_succeeded, metrics = (
+                                                payload[0], payload[1], payload[2])
+                                        else:
+                                            first, op_succeeded = payload[0], payload[1]
+                                        if isinstance(first, WorkerTransferResult):
+                                            op_id = first.transfer_op_id
+                                            block_results = first.block_results
+                                        else:
+                                            op_id = first
+                                    else:
+                                        op_id = payload
+                                    if op_id not in self.op_id_to_op and op_id not in self._child_to_parent_op_id:
+                                        continue  # retired generation / duplicate completion
+                                    self._op_workers.pop(op_id, None)
+                                    if not op_succeeded:
+                                        # Keep trace state consistent even on failure.
+                                        trace.dec_inflight()
+                                        trace.consume_submit_ns(op_id)
+                                        self._handle_failed_op(op_id)
+                                        continue
+                                    if op_id in self._child_to_parent_op_id:
+                                        # Replica op (LAYERWISE PP fan-out): decrement parent's
+                                        # pending_count and finalize parent when all replicas done.
+                                        parent_op_id = self._child_to_parent_op_id.pop(op_id)
+                                        child_op = self._child_id_to_child.pop(op_id)
+                                        self._merge_block_results(child_op, block_results)
+                                        free_op_from_buffer(child_op, self.pin_buffer)
+                                        if op_id in self.op_id_to_nvtx_range:
+                                            nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
+                                        timing = self._emit_xfer_trace(op_id, metrics)
+                                        parent_op = self.op_id_to_op[parent_op_id]
+                                        self._merge_block_results(
+                                            parent_op, child_op.block_results)
+                                        # Slowest replica wins: the parent is not
+                                        # complete until every PP sibling lands, so
+                                        # its duration is the max, not whichever
+                                        # replica happened to be dequeued last.
+                                        self._accumulate_timing(parent_op, timing)
+                                        parent_op.pending_count -= 1
+                                        if parent_op.pending_count == 0:
+                                            self._finalize_or_discard(parent_op, finished_ops)
+                                        flexkv_logger.debug(
+                                            f"[TransferEngine] child op {op_id} completed, "
+                                            f"parent op {parent_op_id} pending_count={parent_op.pending_count}")
+                                    else:
+                                        op = self.op_id_to_op[op_id]
+                                        self._merge_block_results(op, block_results)
+                                        timing = self._emit_xfer_trace(op_id, metrics)
+                                        self._accumulate_timing(op, timing)
+                                        op.pending_count -= 1
+                                        if op.pending_count == 0:
+                                            self._finalize_or_discard(op, finished_ops)
+                                except queue.Empty:
+                                    break
+                            nvtx.end_range(nvtx_r2)
+
+                    # Exit loop if shutdown requested
+                    if should_shutdown:
                         break
 
-                    elif key.data == "new_graph":
-                        # Process new transfer graphs (batch get all available)
-                        nvtx_r1 = nvtx.start_range(message="transfer scheduler. get new graphs", color="orange")
-                        # Get all available graphs in one go to reduce system calls
-                        while True:
-                            try:
-                                transfer_graph = self.task_queue.get_nowait()
-                                # Handle batch submission (list of graphs)
-                                graphs = transfer_graph if isinstance(transfer_graph, list) else [transfer_graph]
-                                for graph in graphs:
-                                    self.scheduler.add_transfer_graph(graph)
-                                new_graphs_num += len(graphs)
-                            except queue.Empty:
-                                break
-                        nvtx.end_range(nvtx_r1)
+                    self._check_exited_workers()
 
-                    elif key.data == "finished_op":
-                        # Collect finished ops from main KV worker (batch get all available)
-                        nvtx_r2 = nvtx.start_range(message="transfer scheduler. collect finished ops", color="orange")
-                        # Get all available ops in one go to reduce system calls
-                        while True:
-                            try:
-                                payload = self.finished_ops_queue.get_nowait()
-                                # Payload forms:
-                                #   WorkerTransferResult (partial block outcomes)
-                                #   int (legacy success)
-                                #   (op_id|WorkerTransferResult, ok)
-                                #   (op_id|WorkerTransferResult, ok, metrics)
-                                op_succeeded = True
-                                metrics = None
-                                block_results = None
-                                if isinstance(payload, WorkerTransferResult):
-                                    op_id = payload.transfer_op_id
-                                    block_results = payload.block_results
-                                elif isinstance(payload, tuple):
-                                    if len(payload) >= 3:
-                                        first, op_succeeded, metrics = (
-                                            payload[0], payload[1], payload[2])
-                                    else:
-                                        first, op_succeeded = payload[0], payload[1]
-                                    if isinstance(first, WorkerTransferResult):
-                                        op_id = first.transfer_op_id
-                                        block_results = first.block_results
-                                    else:
-                                        op_id = first
-                                else:
-                                    op_id = payload
-                                if not op_succeeded:
-                                    # Keep trace state consistent even on failure.
-                                    trace.dec_inflight()
-                                    trace.consume_submit_ns(op_id)
-                                    self._handle_failed_op(op_id)
-                                    continue
-                                if op_id in self._child_to_parent_op_id:
-                                    # Replica op (LAYERWISE PP fan-out): decrement parent's
-                                    # pending_count and finalize parent when all replicas done.
-                                    parent_op_id = self._child_to_parent_op_id.pop(op_id)
-                                    child_op = self._child_id_to_child.pop(op_id)
-                                    self._merge_block_results(child_op, block_results)
-                                    free_op_from_buffer(child_op, self.pin_buffer)
-                                    if op_id in self.op_id_to_nvtx_range:
-                                        nvtx.end_range(self.op_id_to_nvtx_range.pop(op_id))
-                                    timing = self._emit_xfer_trace(op_id, metrics)
-                                    parent_op = self.op_id_to_op[parent_op_id]
-                                    self._merge_block_results(
-                                        parent_op, child_op.block_results)
-                                    # Slowest replica wins: the parent is not
-                                    # complete until every PP sibling lands, so
-                                    # its duration is the max, not whichever
-                                    # replica happened to be dequeued last.
-                                    self._accumulate_timing(parent_op, timing)
-                                    parent_op.pending_count -= 1
-                                    if parent_op.pending_count == 0:
-                                        self._finalize_or_discard(parent_op, finished_ops)
-                                    flexkv_logger.debug(
-                                        f"[TransferEngine] child op {op_id} completed, "
-                                        f"parent op {parent_op_id} pending_count={parent_op.pending_count}")
-                                else:
-                                    op = self.op_id_to_op[op_id]
-                                    self._merge_block_results(op, block_results)
-                                    timing = self._emit_xfer_trace(op_id, metrics)
-                                    self._accumulate_timing(op, timing)
-                                    op.pending_count -= 1
-                                    if op.pending_count == 0:
-                                        self._finalize_or_discard(op, finished_ops)
-                            except queue.Empty:
-                                break
-                        nvtx.end_range(nvtx_r2)
+                    # End NVTX ranges for finished ops
+                    for op in finished_ops:
+                        nvtx_range = self.op_id_to_nvtx_range.pop(op.op_id, None)
+                        if nvtx_range is not None:
+                            nvtx.end_range(nvtx_range)
 
-                # Exit loop if shutdown requested
-                if should_shutdown:
-                    break
+                    # Schedule next operations
+                    nvtx_r3 = nvtx.start_range(message="transfer scheduler. schedule next ops", color="orange")
+                    if finished_ops or new_graphs_num > 0:
+                        self._dispatch_scheduled_ops(finished_ops)
+                    nvtx.end_range(nvtx_r3)
 
-                # End NVTX ranges for finished ops
-                for op in finished_ops:
-                    nvtx_range = self.op_id_to_nvtx_range.pop(op.op_id, None)
-                    if nvtx_range is not None:
-                        nvtx.end_range(nvtx_range)
-
-                # Schedule next operations
-                nvtx_r3 = nvtx.start_range(message="transfer scheduler. schedule next ops", color="orange")
-                if finished_ops or new_graphs_num > 0:
-                    self._dispatch_scheduled_ops(finished_ops)
-                nvtx.end_range(nvtx_r3)
-
-                # Outside the dispatch block: a tick may consist solely of a
-                # failure report, with no finished op and no new graph.
-                if self._failed_graph_ids:
-                    self._emit_drained_graph_failures()
+                    # Outside the dispatch block: a tick may consist solely of a
+                    # failure report, with no finished op and no new graph.
+                    if self._failed_graph_ids:
+                        self._emit_drained_graph_failures()
 
             except Exception as e:
                 flexkv_logger.error(
@@ -1148,6 +1178,9 @@ class TransferEngine:
             self._park_skip_io(op)
             return None
         self.op_id_to_op[op.op_id] = op
+        if op.dp_client_id in getattr(self, "_disabled_routes", ()):
+            self._fail_dispatch(op)
+            return None
         if self._op_buffer_registered_here(op):
             register_op_to_buffer(op, self.pin_buffer)
         self._assign_op_to_worker(op)
@@ -1165,13 +1198,20 @@ class TransferEngine:
             completed_graph_ids, next_ops = self.scheduler.schedule(to_schedule)
             to_schedule = []
             for op in next_ops:
-                done = self._assign_or_complete_op(op)
-                if done is not None:
-                    to_schedule.append(done)
+                if op.graph_id in self._failed_graph_ids:
+                    continue
+                try:
+                    done = self._assign_or_complete_op(op)
+                    if done is not None:
+                        to_schedule.append(done)
+                except Exception:
+                    flexkv_logger.exception("Cannot dispatch op %s of graph %s", op.op_id, op.graph_id)
+                    self._fail_dispatch(op)
             self._note_ops_completed(to_schedule)
             to_schedule.extend(self._take_unparked_skip_io())
             for graph_id in completed_graph_ids:
-                self.completed_queue.put(CompletedOp.completed_graph(graph_id))
+                if graph_id not in self._failed_graph_ids:
+                    self.completed_queue.put(CompletedOp.completed_graph(graph_id))
 
     def _op_buffer_registered_here(self, op: TransferOp) -> bool:
         """The 'unified rule' shared by dispatch, _finalize_op and
@@ -1291,6 +1331,9 @@ class TransferEngine:
                 continue
             self.completed_queue.put(CompletedOp.failed_graph(graph_id))
             self._failed_graph_ids.discard(graph_id)
+            for op_id, op in list(getattr(self, "_parked_skip_io", {}).items()):
+                if op.graph_id == graph_id:
+                    self._parked_skip_io.pop(op_id, None)
 
     def _finalize_op(self, op: TransferOp, finished_ops: List[TransferOp]) -> None:
         """Finalize a completed op: release pin buffer, notify upper layer, and clean up.
@@ -1409,7 +1452,7 @@ class TransferEngine:
                 f"graph_id: {replica.graph_id}, worker_key={wk}",
                 color=get_nvtx_range_color(replica.graph_id))
             op.pending_count += 1
-            worker_map[wk].submit_transfer(replica)
+            self._submit_tracked(worker_map[wk], replica)
             flexkv_logger.debug(
                 f"[TransferEngine] LAYERWISE fan-out: "
                 f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
@@ -1493,7 +1536,7 @@ class TransferEngine:
                     f"graph_id: {replica.graph_id}, worker_key={wk}",
                     color=get_nvtx_range_color(replica.graph_id))
                 op.pending_count += 1
-                worker[wk].submit_transfer(replica)
+                self._submit_tracked(worker[wk], replica)
                 flexkv_logger.debug(
                     f"[TransferEngine] {label} fan-out: "
                     f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
@@ -1508,7 +1551,7 @@ class TransferEngine:
                 color=get_nvtx_range_color(op.graph_id),
             )
             op.pending_count += 1
-            worker.submit_transfer(op)
+            self._submit_tracked(worker, op)
 
     def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:
         """Submit a transfer graph for execution"""

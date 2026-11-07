@@ -217,6 +217,7 @@ class TransferWorkerBase(ABC):
                 worker_id, len(registered),
             )
             return
+        self._dma_quiesced = True
         # Unregister in reverse order of registration.
         while registered:
             tensor, label = registered.pop()
@@ -317,17 +318,18 @@ class TransferWorkerBase(ABC):
 
         parent_conn, child_conn = mp_ctx.Pipe()  # create pipe
         ready_event = mp_ctx.Event()
+        quiesced_event = mp_ctx.Event()
         worker_id = cls._get_worker_id()
 
         process = mp_ctx.Process(
             target=cls._worker_process,
             args=(worker_id, child_conn, finished_ops_queue, op_buffer_tensor, ready_event, *args),
-            kwargs=kwargs,
+            kwargs={**kwargs, "_quiesced_event": quiesced_event},
             daemon=True
         )
         process.start()
 
-        return WorkerHandle(worker_id, parent_conn, process, ready_event)
+        return WorkerHandle(worker_id, parent_conn, process, ready_event, quiesced_event)
 
     @classmethod
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
@@ -339,6 +341,7 @@ class TransferWorkerBase(ABC):
         # reference if ``__init__`` raises after partial cudaHostRegister; the
         # ``finally`` block can still unpin. ``run()`` only exits the loop —
         # this finally owns shutdown().
+        quiesced_event = kwargs.pop("_quiesced_event", None)
         worker: Optional["TransferWorkerBase"] = None
 
         def _on_sigterm(signum: int, frame: Any) -> None:
@@ -380,6 +383,8 @@ class TransferWorkerBase(ABC):
             if worker is not None:
                 try:
                     worker.shutdown()
+                    if getattr(worker, "_dma_quiesced", False) and quiesced_event is not None:
+                        quiesced_event.set()
                 except Exception as e:
                     flexkv_logger.error(f"[worker {worker_id}] final shutdown error: {e}")
             # Multiprocessing may exit without C++ static destructors. Flush
@@ -722,6 +727,12 @@ class TransferWorkerBase(ABC):
                     finally:
                         if nvtx_pushed:
                             nvtx.pop_range()
+                    if not transfer_status and not self._drain_cuda_bounded(self.worker_id, timeout_s=30.0):
+                        # No failure completion without quiescence: graph rollback
+                        # would otherwise recycle blocks still targeted by DMA.
+                        flexkv_logger.error("[worker %s] failed transfer did not drain; exiting",
+                                             self.worker_id)
+                        return
                     launched_ns = time.perf_counter_ns()
                     # Metrics are diagnostics: they must never decide whether
                     # a result is reported. Before this guard, a throw here
