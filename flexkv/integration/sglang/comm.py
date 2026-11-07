@@ -47,6 +47,9 @@ CMD_LAYERWISE = 3
 class FlexKVScatterChannel(str, Enum):
     """Logical channels multiplexed over the hierarchical P2P fan-out."""
 
+    LOAD_RESULT = "load_result"
+    RECOVERY = "recovery"
+    STORE_RESULT = "store_result"
     LOOKUP = "lookup"
     LAYERWISE_MANIFEST = "layerwise_manifest"
     STORE_COMPLETION = "store_completion"
@@ -59,6 +62,9 @@ class FlexKVScatterChannel(str, Enum):
 
 
 _SCATTER_CHANNEL_OFFSETS = {
+    FlexKVScatterChannel.LOAD_RESULT: 10,
+    FlexKVScatterChannel.RECOVERY: 11,
+    FlexKVScatterChannel.STORE_RESULT: 12,
     FlexKVScatterChannel.LOOKUP: 1,
     FlexKVScatterChannel.LAYERWISE_MANIFEST: 2,
     FlexKVScatterChannel.STORE_COMPLETION: 3,
@@ -70,6 +76,9 @@ _SCATTER_CHANNEL_OFFSETS = {
     FlexKVScatterChannel.STORE_READY: 9,
 }
 _SCATTER_CHANNEL_TYPES = {
+    FlexKVScatterChannel.LOAD_RESULT: dict,
+    FlexKVScatterChannel.RECOVERY: dict,
+    FlexKVScatterChannel.STORE_RESULT: dict,
     FlexKVScatterChannel.LOOKUP: dict,
     FlexKVScatterChannel.LAYERWISE_MANIFEST: dict,
     FlexKVScatterChannel.STORE_COMPLETION: list,

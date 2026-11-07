@@ -239,6 +239,12 @@ class FlexKVConnector:
         attn_cp_group: Any = None,
     ) -> None:
         self.page_size = int(page_size)
+        self._cache_bypassed = False
+        self._route_generation = 0
+        self._recovery_interval_s = float(os.getenv("FLEXKV_SGLANG_RECOVERY_INTERVAL_S", "0"))
+        if self._recovery_interval_s < 0:
+            raise ValueError("FLEXKV_SGLANG_RECOVERY_INTERVAL_S must be >= 0")
+        self._next_recovery_at = 0.0
 
         # 1. Resolve FlexKV config from env + sglang server args.
         self.flexkv_config = FlexKVConfig.from_env()
@@ -652,6 +658,12 @@ class FlexKVConnector:
           and may be smaller than the raw FlexKV match if the page
           floor truncated it.
         """
+        self._raise_if_cache_unsafe()
+        if (getattr(self, "_cache_bypassed", False)
+                and getattr(self, "_recovery_interval_s", 0) > 0):
+            self.recover_cache(force=False)
+        if getattr(self, "_cache_bypassed", False):
+            return -1, 0
         context = self._new_op_context("lookup", rid, sglang_req_id)
         fkv_task_id = -1
         hit_length = 0
@@ -778,6 +790,50 @@ class FlexKVConnector:
                 reason="lookup_released",
             )
 
+    def _fence_for_bypass(self) -> Dict[str, Any]:
+        """Leader only: stop GPU I/O before giving slots back to SGLang."""
+        result = {"bypass": True, "generation": getattr(self, "_route_generation", 0),
+                  "error": None}
+        try:
+            fence = self.tp_client.gpu_route_control("fence")
+            result["generation"] = int(fence["generation"])
+            if fence.get("safe") is not True:
+                raise RuntimeError("DMA drain was not acknowledged; restart inference instance")
+            for task_id in list(self._pending_lookups.values()):
+                self.kv_manager.cancel([task_id])
+            # Release seals chunked sessions, preventing new chunks while
+            # their existing resource ledger waits for in-flight I/O to drain.
+            for handle in list(getattr(self, "_prefetch_sessions", {}).values()):
+                self.kv_manager.release_prefetch(handle)
+            for task_id in list(getattr(self, "_ongoing_prefetches", {}).values()):
+                self.kv_manager.cancel([task_id])
+        except Exception as exc:
+            result["error"] = f"cannot safely bypass FlexKV: {exc}"
+        return result
+
+    def _apply_cache_result(self, result: Dict[str, Any]) -> None:
+        if int(result["generation"]) < getattr(self, "_route_generation", 0):
+            return  # completion/health message from a retired route generation
+        if result["bypass"] and not getattr(self, "_cache_bypassed", False):
+            logger.warning("FlexKV bypass entered generation=%d error=%s", result["generation"], result["error"])
+            self._next_recovery_at = time.monotonic() + getattr(self, "_recovery_interval_s", 0)
+        # A pre-failure store poll can arrive after a load failure on another
+        # logical channel. Only explicit collective recovery may clear bypass.
+        self._cache_bypassed = getattr(self, "_cache_bypassed", False) or bool(result["bypass"])
+        self._route_generation = max(getattr(self, "_route_generation", 0), int(result["generation"]))
+        self._cache_failure = getattr(self, "_cache_failure", None) or result["error"]
+        if self._cache_bypassed:
+            self._pending_lookups.clear()
+            getattr(self, "_pending_lookup_contexts", {}).clear()
+            getattr(self, "_prefetch_sessions", {}).clear()
+            getattr(self, "_ongoing_prefetches", {}).clear()
+        self._raise_if_cache_unsafe()
+
+    def _raise_if_cache_unsafe(self) -> None:
+        error = getattr(self, "_cache_failure", None)
+        if error is not None:
+            raise RuntimeError(error)
+
     def retrieve_kv(
         self,
         rid: str,
@@ -808,66 +864,86 @@ class FlexKVConnector:
             self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
 
         n = slot_mapping_cpu.numel()
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+        result = {"loaded": n, "bypass": False, "error": None,
+                  "generation": getattr(self, "_route_generation", 0)}
+        if self._sync_ctx.is_sync_leader:
+            status = "failed"
             try:
+                if self.kv_manager is None:
+                    raise RuntimeError("FlexKV manager is unavailable")
                 self.kv_manager.launch(
-                    task_ids=[fkv_task_id],
-                    slot_mappings=[slot_mapping_cpu],
-                    swa_slot_mappings=[swa_slot_mapping],
-                    as_batch=True,
+                    task_ids=[fkv_task_id], slot_mappings=[slot_mapping_cpu],
+                    swa_slot_mappings=[swa_slot_mapping], as_batch=True,
                     layerwise_transfer=False,
                 )
-            except Exception as exc:  # noqa: BLE001
-                self._log_cache_op(
-                    context,
-                    "complete",
-                    "failed",
-                    start_ns=load_start_ns,
-                    direction="H2D",
-                    transfer_mode="no-layerwise",
-                    stage="launch",
-                    error=str(exc),
-                )
-                raise
-            self._log_cache_op(
-                context,
-                "launch",
-                "running",
-                direction="H2D",
-                transfer_mode="no-layerwise",
-                slots=n,
-                swa_slots=swa_slots,
-            )
-            try:
-                resp = self.kv_manager.wait([fkv_task_id], timeout=30.0) or {}
-            except Exception as exc:  # noqa: BLE001
-                self._log_cache_op(
-                    context,
-                    "complete",
-                    "failed",
-                    start_ns=load_start_ns,
-                    direction="H2D",
-                    transfer_mode="no-layerwise",
-                    error=str(exc),
-                )
-                raise
-            status = _status_value(resp.get(fkv_task_id))
-            success = status == KVResponseStatus.SUCCESS.value
-            self._log_cache_op(
-                context,
-                "complete",
-                status,
-                start_ns=load_start_ns,
-                direction="H2D",
-                transfer_mode="no-layerwise",
-                slots=n,
-                swa_slots=swa_slots,
-            )
-            if not success:
-                n = 0
+                self._log_cache_op(context, "launch", "running", direction="H2D",
+                                   transfer_mode="no-layerwise", slots=n, swa_slots=swa_slots)
+                resp = self.kv_manager.wait([fkv_task_id], timeout=30.0, completely=True) or {}
+                status = _status_value(resp.get(fkv_task_id))
+                if status != KVResponseStatus.SUCCESS.value:
+                    raise RuntimeError(f"FlexKV load returned {status}")
+            except Exception as exc:  # all ranks must receive the same decision
+                result.update(self._fence_for_bypass(), loaded=0)
+                if result["error"] is None and status not in {"failed", "cancelled", "not_found"}:
+                    try:
+                        self.kv_manager.cancel([fkv_task_id])
+                        terminal = self.kv_manager.wait([fkv_task_id], timeout=30.0, completely=True) or {}
+                        if _status_value(terminal.get(fkv_task_id)) not in {
+                            "success", "failed", "cancelled", "not_found"
+                        }:
+                            raise RuntimeError("Fenced task has not drained")
+                    except Exception as fence_error:
+                        result["error"] = f"{exc}; cannot safely bypass FlexKV: {fence_error}"
+                self._log_cache_op(context, "complete", "failed", start_ns=load_start_ns,
+                                   direction="H2D", transfer_mode="no-layerwise",
+                                   error=str(exc))
+            else:
+                self._log_cache_op(context, "complete", status, start_ns=load_start_ns,
+                                   direction="H2D", transfer_mode="no-layerwise",
+                                   slots=n, swa_slots=swa_slots)
         if self._sync_ctx.needs_sync:
-            self._sync_ctx.barrier()
-        return n
+            result = self._sync_ctx.scatter(result, channel=FlexKVScatterChannel.LOAD_RESULT)
+        # All ranks make the same decision. An unsafe result raises before
+        # SGLang can free/reuse possibly live DMA targets.
+        self._apply_cache_result(result)
+        return int(result["loaded"])
+
+    def recover_cache(self, *, force: bool = True) -> bool:
+        """Collectively rebuild GPU workers for this live inference instance.
+
+        Invoke on all PP/CP/TP ranks at a scheduler boundary after polling
+        outstanding stores. CPU cache contents survive; exporter pointers
+        must still belong to the same inference processes.
+        """
+        result = {"ok": False, "generation": getattr(self, "_route_generation", 0),
+                  "error": None}
+        if self._sync_ctx.is_sync_leader:
+            try:
+                if not force and time.monotonic() < getattr(self, "_next_recovery_at", 0):
+                    pass
+                else:
+                    self._next_recovery_at = time.monotonic() + getattr(self, "_recovery_interval_s", 0)
+                    if not getattr(self, "_cache_bypassed", False):
+                        raise RuntimeError("FlexKV is not in bypass mode")
+                    self._raise_if_cache_unsafe()
+                    if self._inflight_stores:
+                        raise RuntimeError("Poll outstanding stores before recovery")
+                    response = self.tp_client.gpu_route_control("recover", result["generation"])
+                    result.update(ok=response.get("safe") is True,
+                                  generation=int(response["generation"]))
+            except Exception as exc:
+                result["error"] = str(exc)
+        if self._sync_ctx.needs_sync:
+            result = self._sync_ctx.scatter(result, channel=FlexKVScatterChannel.RECOVERY)
+        if result["error"] is not None:
+            logger.warning("FlexKV recovery deferred: %s", result["error"])
+            return False
+        self._route_generation = result["generation"]
+        self._cache_bypassed = not result["ok"]
+        self._cache_failure = None
+        if result["ok"]:
+            logger.info("FlexKV GPU route recovered generation=%d", self._route_generation)
+        return bool(result["ok"])
 
     def start_load_kv_layerwise(
         self,
@@ -1245,6 +1321,9 @@ class FlexKVConnector:
         Returns the FlexKV task id of the in-flight store, or -1 if
         nothing needed to be written.
         """
+        self._raise_if_cache_unsafe()
+        if getattr(self, "_cache_bypassed", False):
+            return -1
         context = self._new_op_context("store", rid, sglang_req_id)
         with self._store_profile_scope("flexkv.connector.store.tokens_to_numpy"):
             token_ids_np = np.asarray(token_ids, dtype=np.int64)
@@ -1441,6 +1520,10 @@ class FlexKVConnector:
         """Return rids whose stores have completed since the last call."""
         completed_rids: List[str] = []
         completed_by_rid: Dict[str, Any] = {}
+        result = {"rids": completed_rids, "bypass": getattr(self, "_cache_bypassed", False),
+                  "generation": getattr(self, "_route_generation", 0),
+                  "error": getattr(self, "_cache_failure", None)}
+        fence_needed = False
 
         if (self._sync_ctx.is_sync_leader and self.kv_manager is not None
                 and self._inflight_stores):
@@ -1467,19 +1550,29 @@ class FlexKVConnector:
                     error=str(exc),
                 )
                 completed_dict = {}
-            for fk_tid, response in completed_dict.items():
+                fence_needed = True
+            for fk_tid in fk_to_rid:
+                response = completed_dict.get(fk_tid)
                 status = _status_value(response)
                 if not _is_terminal_status(status):
+                    rid = fk_to_rid[fk_tid]
+                    context = getattr(self, "_inflight_store_contexts", {}).get(rid)
+                    started = getattr(context, "start_ns", time.perf_counter_ns())
+                    if (time.perf_counter_ns() - started) / 1e9 >= 30.0:
+                        fence_needed = True
                     continue
+                if status == "failed":
+                    fence_needed = True
                 rid = fk_to_rid[fk_tid]
                 completed_rids.append(rid)
                 completed_by_rid[rid] = response
 
+            if fence_needed:
+                result.update(self._fence_for_bypass())
         if self._sync_ctx.needs_sync:
-            completed_rids = self._sync_ctx.scatter(
-                completed_rids,
-                channel=FlexKVScatterChannel.STORE_COMPLETION,
-            )
+            result = self._sync_ctx.scatter(result, channel=FlexKVScatterChannel.STORE_RESULT)
+        self._apply_cache_result(result)
+        completed_rids = result["rids"]
         for rid in completed_rids:
             fk_tid = self._inflight_stores.pop(rid, None)
             if fk_tid is None:
@@ -1563,7 +1656,8 @@ class FlexKVConnector:
         namespace: Optional[List[str]] = None,
         *, candidate_start_token: int = 0,
     ) -> int:
-        if not self._prefetch_enabled or not rid:
+        self._raise_if_cache_unsafe()
+        if getattr(self, "_cache_bypassed", False) or not self._prefetch_enabled or not rid:
             return -1
         if getattr(self, "_chunked_prefetch", False):
             return self._start_chunked_prefetch(rid, token_ids, candidate_start_token, namespace)

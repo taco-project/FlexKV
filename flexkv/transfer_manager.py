@@ -189,6 +189,18 @@ class TransferManager:
             raise RuntimeError("Transfer engine is not initialized")
 
         request_type = request.get("type")
+        if request_type in ("fence_gpu_route", "recover_gpu_route"):
+            registration_key = request.get("registration_key")
+            if registration_key not in self.all_gpu_blocks:
+                raise KeyError(f"Unknown registration key {registration_key}")
+            dp_client_id = self.gpu_worker_key_mapping[registration_key].dp_client_id
+            if request_type == "fence_gpu_route":
+                result = self.transfer_engine.fence_gpu_route(dp_client_id)
+            else:
+                result = self.transfer_engine.recover_gpu_route(
+                    dp_client_id, request["generation"])
+            return {"ok": True, **result}
+
         if request_type == "suspend_gpu":
             registration_key = request.get("registration_key")
             if registration_key not in self.all_gpu_blocks:

@@ -112,3 +112,17 @@ def test_drained_sentinel_defers_shutdown_to_worker_process(monkeypatch):
     assert launched == [1, 2]
     assert [item[0] for item in worker.finished_ops_queue.items] == [1, 2]
     assert shutdowns == []
+
+
+@pytest.mark.parametrize("drained", [True, False])
+def test_failed_transfer_reports_only_after_cuda_drain(monkeypatch, drained):
+    from unittest.mock import Mock
+
+    instance, launched, _ = _worker(
+        _SentinelPipe([_FakeOp(1), _FakeOp(2), None]), monkeypatch)
+    instance.launch_transfer = lambda op: launched.append(op.transfer_op_id) or False
+    instance._drain_cuda_bounded = Mock(return_value=drained)
+    instance.run()
+    assert len(instance.finished_ops_queue.items) == (2 if drained else 0)
+    assert launched == ([1, 2] if drained else [1])
+    assert instance._drain_cuda_bounded.call_count == (2 if drained else 1)

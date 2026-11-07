@@ -23,17 +23,19 @@ from flexkv.transfer.worker_op import (
 
 class WorkerHandle:
     """handle for worker process"""
-    def __init__(self, worker_id: int, transfer_conn: Connection, process: mp.Process, ready_event: Any):
+    def __init__(self, worker_id: int, transfer_conn: Connection, process: mp.Process, ready_event: Any, quiesced_event: Any = None):
         self.worker_id = worker_id
         self.transfer_conn = transfer_conn
         self.process = process
         self.ready_event = ready_event
+        self.quiesced_event = quiesced_event
         # One handle is reachable from several TransferType keys (a mooncake
         # or GDS worker serves both directions), and TransferEngine shuts
         # handles down one thread each -- so shutdown() can be entered twice,
         # concurrently, on the same object. See the note on shutdown().
         self._shutdown_lock = threading.Lock()
         self._shutdown_done = False
+        flexkv_logger.info("Transfer worker created worker_id=%d pid=%d", worker_id, process.pid)
 
     def submit_transfer(self, op: Union[TransferOp, LayerwiseTransferOp]) -> None:
         if isinstance(op, LayerwiseTransferOp):
@@ -70,6 +72,27 @@ class WorkerHandle:
                 f"Worker {self.worker_id} {command} failed: {reply['error']}"
             )
         return reply.get("result")
+
+    def abort(self, timeout: float = 5.0) -> None:
+        """Bound fault containment without sending into a possibly full pipe.
+
+        SIGTERM enters the worker's existing CUDA-drain finally block. If it
+        cannot stop within the budget, SIGKILL leaves the quiesced event unset;
+        the engine must quarantine every transfer it had accepted.
+        """
+        with self._shutdown_lock:
+            if self._shutdown_done:
+                return
+            if self.process.is_alive():
+                self.process.terminate()
+            self.process.join(timeout=timeout)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join(timeout=timeout)
+            if self.process.is_alive():
+                raise TimeoutError(f"Worker {self.worker_id} did not exit after SIGKILL")
+            self._shutdown_done = True
+            self.transfer_conn.close()
 
     def shutdown(self) -> None:
         """Stop the worker process. Idempotent and safe to call concurrently.
