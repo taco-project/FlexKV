@@ -47,6 +47,7 @@ _REQ, _OK, _ERR = b"RQ", b"OK", b"ER"
 _IDLE_SLEEP_S = 50e-6
 _DIRECT_IO_ALIGN = 4096
 _NOT_READY_LOG_EVERY_S = 30.0
+_SENDER_METADATA_WAIT_S = 2.0   # a request may arrive just before its sender's metadata
 
 
 class PeerUnavailable(RuntimeError):
@@ -184,6 +185,8 @@ class NixlSSDEndpoint:
         self._contacts: Dict[str, Tuple[str, int]] = {}
         self._down_until: Dict[str, float] = {}   # peer -> monotonic time of the next reconnect
         self.retry_s = float(os.getenv("FLEXKV_NIXL_SSD_RETRY_S", "") or 10)
+        # Where peers fetch this agent's metadata (sent with every request).
+        self.contact = (_default_ip(), self.port)
         self._requests: "queue.Queue[Tuple[str, Dict[str, Any]]]" = queue.Queue()
         self._stop = threading.Event()
         self._threads = [threading.Thread(target=self._dispatch, name=f"{name}-notif", daemon=True)]
@@ -235,7 +238,11 @@ class NixlSSDEndpoint:
     def connect(self, peer: str, ip: str, port: int, timeout_s: float) -> None:
         with self._lock:
             if peer in self._connected:
-                return
+                if self.agent.check_remote_metadata(peer):
+                    return
+                # The peer dropped this side, which invalidated its metadata
+                # here too: connect afresh instead of failing every send.
+                self._connected.discard(peer)
             self._contacts[peer] = (ip, int(port))
             wait = self._down_until.get(peer, 0.0) - time.monotonic()
         if wait > 0:
@@ -309,6 +316,7 @@ class NixlSSDEndpoint:
         with self._lock:
             self._waiters[rid] = waiter
         body = {"id": rid, "op": op, "base": self._cpu_ptr, "block": self.block_bytes,
+                "ip": self.contact[0], "port": self.contact[1],
                 "expires": time.time() + write_window_s,
                 "src": [int(b) for b in src_blocks], "dst": [int(b) for b in dst_blocks]}
         try:
@@ -364,6 +372,9 @@ class NixlSSDEndpoint:
                 continue
             t0 = time.perf_counter()
             writing = req.get("op", "R") == "W"
+            if not self._sender_metadata(sender, req):
+                flexkv_logger.error(f"[peer-ssd-nixl] no metadata of {sender}: cannot serve or answer it")
+                continue
             try:
                 if writing:
                     self._serve_write(sender, req, staging)
@@ -378,10 +389,39 @@ class NixlSSDEndpoint:
             except Exception as e:  # noqa: BLE001 - the reader learns why
                 flexkv_logger.error(f"[peer-ssd-nixl] serving {sender} failed: {e!r}")
                 reply = _ERR + f"{req.get('id', '')}:{e!r}".encode()
+                if type(e).__module__.startswith("nixl") or "NIXL" in str(e):
+                    # A broken connection to the sender: rebuild it, or the
+                    # answer is lost too and the sender waits out its timeout.
+                    self._sender_metadata(sender, req, refresh=True)
             try:
                 self.agent.send_notif(sender, reply)
             except Exception as e:  # noqa: BLE001
                 flexkv_logger.error(f"[peer-ssd-nixl] cannot answer {sender}: {e!r}")
+
+    def _sender_metadata(self, sender: str, req: Dict[str, Any], refresh: bool = False) -> bool:
+        """Whether this agent holds ``sender``'s metadata, which it needs to
+        move the sender's blocks and to answer it. It can still be in flight
+        (sent right before the request) or have been dropped on this side;
+        then fetch it from the contact the request carries."""
+        if refresh:
+            try:
+                self.agent.remove_remote_agent(sender)
+            except Exception:  # noqa: BLE001 - may already be gone
+                pass
+        elif self.agent.check_remote_metadata(sender):
+            return True
+        ip, port = req.get("ip"), req.get("port")
+        if ip and port:
+            try:
+                self.agent.fetch_remote_metadata(sender, ip, int(port))
+            except Exception as e:  # noqa: BLE001
+                flexkv_logger.debug(f"[peer-ssd-nixl] fetching {sender}'s metadata: {e!r}")
+        deadline = time.monotonic() + _SENDER_METADATA_WAIT_S
+        while not self.agent.check_remote_metadata(sender):
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.005)
+        return True
 
     def _post(self, op: str, local: List[Tuple[int, int, int]], remote: List[Tuple[int, int, int]],
               remote_type: str, remote_agent: str) -> Any:

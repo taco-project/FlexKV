@@ -224,6 +224,33 @@ def test_a_restarted_reader_is_served_at_once(pair, same_name):
         again.close()
 
 
+def test_a_peer_without_the_readers_metadata_fetches_it(pair):
+    """The request can beat the reader's metadata to the peer, or the peer has
+    dropped it: the peer fetches it from the contact the request carries
+    instead of leaving the reader to wait out its timeout."""
+    server, client, dst, n, bs = pair
+    client.contact = ("127.0.0.1", client.port)
+    client.read(server.name, [1], [1], 30)
+    server.agent.remove_remote_agent(client.name)
+    t0 = time.monotonic()
+    client.read(server.name, [6], [2], 10)
+    assert time.monotonic() - t0 < 5
+    assert np.array_equal(dst[2 * bs:3 * bs], _pattern(6, bs))
+
+
+def test_a_reader_its_peer_dropped_reconnects(pair):
+    """A peer that drops this node invalidates its own metadata here: the next
+    request must connect afresh, not fail on the stale connection."""
+    server, client, dst, n, bs = pair
+    client.read(server.name, [1], [1], 30)
+    server.drop(client.name, "test")
+    deadline = time.monotonic() + 10
+    while client.agent.check_remote_metadata(server.name) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    client.read(server.name, [8], [3], 10)
+    assert np.array_equal(dst[3 * bs:4 * bs], _pattern(8, bs))
+
+
 def _file_block(server, block: int, bs: int) -> np.ndarray:
     path, off = ssd_block_location(server._files, block, bs)
     with open(path, "rb") as fh:
