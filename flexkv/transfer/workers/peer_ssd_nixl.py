@@ -184,10 +184,6 @@ class NixlSSDEndpoint:
         self._connected: set = set()
         self._contacts: Dict[str, Tuple[str, int]] = {}
         self._down_until: Dict[str, float] = {}   # peer -> monotonic time of the next reconnect
-        # Served requests in flight per peer, and peers whose metadata is to be
-        # removed once none is: NIXL must not drop an agent under its transfers.
-        self._serving: Dict[str, int] = {}
-        self._forget_later: set = set()
         self.retry_s = float(os.getenv("FLEXKV_NIXL_SSD_RETRY_S", "") or 10)
         # Where peers fetch this agent's metadata (sent with every request).
         self.contact = (_default_ip(), self.port)
@@ -244,8 +240,8 @@ class NixlSSDEndpoint:
             if peer in self._connected:
                 if self.agent.check_remote_metadata(peer):
                     return
-                # The peer dropped this side, which invalidated its metadata
-                # here too: connect afresh instead of failing every send.
+                # NIXL lost the peer's metadata: connect afresh instead of
+                # failing every send.
                 self._connected.discard(peer)
             self._contacts[peer] = (ip, int(port))
             wait = self._down_until.get(peer, 0.0) - time.monotonic()
@@ -254,7 +250,8 @@ class NixlSSDEndpoint:
             # wait out the metadata timeout of a peer that may still be down.
             raise PeerUnavailable(f"[peer-ssd-nixl] {peer} was dropped; reconnecting in {wait:.0f}s")
         self.agent.send_local_metadata(ip, port)
-        self.agent.fetch_remote_metadata(peer, ip, port)
+        if not self.agent.check_remote_metadata(peer):
+            self.agent.fetch_remote_metadata(peer, ip, port)
         deadline = time.monotonic() + timeout_s
         while not self.agent.check_remote_metadata(peer):
             if time.monotonic() > deadline:
@@ -267,31 +264,17 @@ class NixlSSDEndpoint:
         flexkv_logger.info(f"[peer-ssd-nixl] {self.name} connected to {peer} ({ip}:{port})")
 
     def drop(self, peer: str, why: str) -> None:
-        """Back off from ``peer`` after a timeout or a transport error and
-        forget its metadata, so the next `connect` (after `retry_s`) builds a
-        fresh connection: NIXL keeps a failed UCX endpoint and fails every
-        later send on it. The peer's view of this node is left alone (it may
-        be moving blocks to or from this node right now); it rebuilds that view
-        itself when one of its own transfers to this node fails."""
+        """Back off from ``peer`` after a timeout or a transport error; the
+        next `connect` after `retry_s` tries it again. Its metadata, and the
+        UCX endpoint behind it, stay: removing an agent while UCX may still
+        complete a send or a transfer to it crashes UCX (libucp segfaults
+        under load), and a restarted peer comes back under a new agent name,
+        with new metadata, anyway."""
         with self._lock:
             self._connected.discard(peer)
             self._down_until[peer] = time.monotonic() + self.retry_s
-        self._forget(peer)
         flexkv_logger.warning(f"[peer-ssd-nixl] {self.name} dropped {peer} ({why}); "
-                              f"reconnecting after {self.retry_s:.0f}s")
-
-    def _forget(self, peer: str) -> None:
-        """Remove ``peer``'s metadata now, or once the requests of it this node
-        is serving are done."""
-        with self._lock:
-            if self._serving.get(peer, 0) > 0:
-                self._forget_later.add(peer)
-                return
-            self._forget_later.discard(peer)
-        try:
-            self.agent.remove_remote_agent(peer)
-        except Exception as e:  # noqa: BLE001 - best effort, may already be gone
-            flexkv_logger.debug(f"[peer-ssd-nixl] forgetting {peer}: {e!r}")
+                              f"retrying after {self.retry_s:.0f}s")
 
     def read(self, peer: str, src_blocks: Sequence[int], dst_blocks: Sequence[int],
              timeout_s: float, write_window_s: Optional[float] = None) -> None:
@@ -385,16 +368,7 @@ class NixlSSDEndpoint:
                 continue
             t0 = time.perf_counter()
             writing = req.get("op", "R") == "W"
-            with self._lock:
-                self._serving[sender] = self._serving.get(sender, 0) + 1
-            try:
-                self._serve_one(sender, req, staging, t0, writing)
-            finally:
-                with self._lock:
-                    self._serving[sender] -= 1
-                    forget = self._serving[sender] == 0 and sender in self._forget_later
-                if forget:
-                    self._forget(sender)
+            self._serve_one(sender, req, staging, t0, writing)
 
     def _serve_one(self, sender: str, req: Dict[str, Any], staging: _Staging, t0: float,
                    writing: bool) -> None:
@@ -415,11 +389,6 @@ class NixlSSDEndpoint:
         except Exception as e:  # noqa: BLE001 - the reader learns why
             flexkv_logger.error(f"[peer-ssd-nixl] serving {sender} failed: {e!r}")
             reply = _ERR + f"{req.get('id', '')}:{e!r}".encode()
-            if type(e).__module__.startswith("nixl") or "NIXL" in str(e):
-                # A broken connection to the sender: rebuild it before the
-                # next request of it (not now, other threads may use it).
-                with self._lock:
-                    self._forget_later.add(sender)
         try:
             self.agent.send_notif(sender, reply)
         except Exception as e:  # noqa: BLE001

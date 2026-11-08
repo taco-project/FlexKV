@@ -249,19 +249,15 @@ def test_a_reader_that_lost_the_peers_metadata_reconnects(pair):
     assert np.array_equal(dst[3 * bs:4 * bs], _pattern(8, bs))
 
 
-def test_a_drop_waits_for_the_peers_requests_in_service(pair):
-    """Dropping a peer this node is serving removes its metadata only after
-    those transfers: NIXL must not lose an agent under its transfers."""
+def test_a_drop_backs_off_but_keeps_the_peer(pair):
+    """A drop only backs off: removing a peer's metadata under UCX sends or
+    transfers to it crashes UCX, so the peer stays known and is served on."""
     server, client, dst, n, bs = pair
     client.read(server.name, [1], [1], 30)
-    with server._lock:
-        server._serving[client.name] = 1          # a request of the client in service
     server.drop(client.name, "test")
     assert server.agent.check_remote_metadata(client.name)
-    with server._lock:
-        server._serving[client.name] = 0
-    server._forget(client.name)
-    assert not server.agent.check_remote_metadata(client.name)
+    client.read(server.name, [9], [4], 10)
+    assert np.array_equal(dst[4 * bs:5 * bs], _pattern(9, bs))
 
 
 def _file_block(server, block: int, bs: int) -> np.ndarray:
