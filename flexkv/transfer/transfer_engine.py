@@ -1592,8 +1592,11 @@ class TransferEngine:
             return
         self._dead_workers.add(id(worker))
         process = getattr(worker, "process", None)
+        if process is not None:
+            process.join(timeout=1.0)  # let a dying process report how it ended
         flexkv_logger.error(
-            f"[TransferEngine] transfer worker {getattr(worker, 'worker_id', '?')} is gone "
+            f"[TransferEngine] transfer worker {getattr(worker, 'kind', '')} "
+            f"{getattr(worker, 'worker_id', '?')} (pid {getattr(process, 'pid', None)}) is gone "
             f"(exitcode={getattr(process, 'exitcode', None)}, {why}); its in-flight and "
             f"future ops fail")
 

@@ -324,10 +324,12 @@ class TransferWorkerBase(ABC):
         )
         process.start()
 
-        return WorkerHandle(
+        handle = WorkerHandle(
             worker_id, parent_conn, process, ready_event, finished_ops_queue,
             isolate_remote=bool(getattr(cls, "_is_remote_worker", False)),
         )
+        handle.kind = cls.__name__
+        return handle
 
     @classmethod
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,

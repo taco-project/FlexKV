@@ -236,7 +236,8 @@ def test_failed_op_fails_graph_and_emits_after_drain():
 class _Worker:
     def __init__(self, alive=True, broken=False):
         self.worker_id = 9
-        self.process = type("P", (), {"is_alive": lambda _: alive, "exitcode": None if alive else -11})()
+        self.process = type("P", (), {"is_alive": lambda _: alive, "join": lambda _, timeout=None: None,
+                                      "pid": 1, "exitcode": None if alive else -11})()
         self.broken = broken
         self.sent = []
 
