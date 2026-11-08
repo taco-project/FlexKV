@@ -238,17 +238,30 @@ def test_a_peer_without_the_readers_metadata_fetches_it(pair):
     assert np.array_equal(dst[2 * bs:3 * bs], _pattern(6, bs))
 
 
-def test_a_reader_its_peer_dropped_reconnects(pair):
-    """A peer that drops this node invalidates its own metadata here: the next
-    request must connect afresh, not fail on the stale connection."""
+def test_a_reader_that_lost_the_peers_metadata_reconnects(pair):
+    """The peer's metadata can vanish here (NIXL dropped it, or a forget of
+    this side): the next request must connect afresh, not fail on it."""
     server, client, dst, n, bs = pair
     client.read(server.name, [1], [1], 30)
-    server.drop(client.name, "test")
-    deadline = time.monotonic() + 10
-    while client.agent.check_remote_metadata(server.name) and time.monotonic() < deadline:
-        time.sleep(0.01)
+    client.agent.remove_remote_agent(server.name)
+    client.connect(server.name, "127.0.0.1", server.port, 10)   # as before every request
     client.read(server.name, [8], [3], 10)
     assert np.array_equal(dst[3 * bs:4 * bs], _pattern(8, bs))
+
+
+def test_a_drop_waits_for_the_peers_requests_in_service(pair):
+    """Dropping a peer this node is serving removes its metadata only after
+    those transfers: NIXL must not lose an agent under its transfers."""
+    server, client, dst, n, bs = pair
+    client.read(server.name, [1], [1], 30)
+    with server._lock:
+        server._serving[client.name] = 1          # a request of the client in service
+    server.drop(client.name, "test")
+    assert server.agent.check_remote_metadata(client.name)
+    with server._lock:
+        server._serving[client.name] = 0
+    server._forget(client.name)
+    assert not server.agent.check_remote_metadata(client.name)
 
 
 def _file_block(server, block: int, bs: int) -> np.ndarray:
