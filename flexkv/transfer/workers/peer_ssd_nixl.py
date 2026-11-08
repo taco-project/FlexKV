@@ -24,6 +24,7 @@ FULL pool; SWA uses port + 1) / ``FLEXKV_NIXL_UCX_DEVICES`` /
 
 from __future__ import annotations
 
+import contextlib
 import json
 import mmap
 import os
@@ -54,6 +55,20 @@ class PeerUnavailable(RuntimeError):
     """An expected miss (this endpoint still starting, the peer not serving yet
     or backing off after a drop): the prefetch misses, no stack trace needed."""
     quiet = True
+
+
+@contextlib.contextmanager
+def _peer_errors_expected(peer: str):
+    """A peer that times out or whose connection broke (it died, restarted or
+    stalled) is an expected miss, logged without a stack trace."""
+    try:
+        yield
+    except (TimeoutError, PeerUnavailable):
+        raise
+    except Exception as e:  # noqa: BLE001
+        if type(e).__module__.startswith("nixl"):
+            raise PeerUnavailable(f"[peer-ssd-nixl] {peer}: {e!r}") from e
+        raise
 
 
 def _env_int(name: str, default: int) -> int:
@@ -615,12 +630,14 @@ class NixlRemoteSSDReader:
         if layer_id != 0 or layer_end < self._worker.num_layers:
             raise ValueError("the NIXL SSD reader moves whole blocks only")
         agent, ip, port = self._ready_peer(int(peer_rank))
-        self.endpoint.read(agent, src_ssd_blocks.tolist(), dst_cpu_blocks.tolist(), self._timeout)
+        with _peer_errors_expected(agent):
+            self.endpoint.read(agent, src_ssd_blocks.tolist(), dst_cpu_blocks.tolist(), self._timeout)
 
     def write(self, peer_rank: int, pool_id: PoolId, src_cpu_blocks: torch.Tensor,
               dst_ssd_blocks: torch.Tensor) -> None:
         agent, ip, port = self._ready_peer(int(peer_rank))
-        self.endpoint.write(agent, src_cpu_blocks.tolist(), dst_ssd_blocks.tolist(), self._timeout)
+        with _peer_errors_expected(agent):
+            self.endpoint.write(agent, src_cpu_blocks.tolist(), dst_ssd_blocks.tolist(), self._timeout)
 
     def _ready_peer(self, peer_rank: int) -> Tuple[str, str, int]:
         if not self._ready.is_set():
