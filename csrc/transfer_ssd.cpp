@@ -342,14 +342,22 @@ void transfer_kv_blocks_ssd(
       (block_stride_in_bytes > ssd_layer_stride_in_bytes);
   IOUring &iouring = ioctx.get_iouring();
 
-  auto is_4k_aligned = [](int64_t v) -> bool { return v % 4096 == 0; };
-  const bool base_aligned =
-      (static_cast<uintptr_t>(cpu_tensor_ptr) % 4096 == 0);
+  // Reads only need the device's direct-I/O alignment (512 on most NVMe);
+  // writes keep 4 KiB so ext4 never serializes sub-block direct writes.
+  const int64_t direct_align = is_read ? ioctx.get_read_direct_align() : 4096;
+  auto is_4k_aligned = [direct_align](int64_t v) -> bool {
+    return v % direct_align == 0;
+  };
+  const bool base_aligned = is_4k_aligned(static_cast<int64_t>(cpu_tensor_ptr));
   bool is_direct;
   if (enable_block_first_transfer) {
+    // One I/O per block covering [start_layer, start_layer + num_layers):
+    // only its start offsets and length have to be aligned.
+    const int64_t start_layer = cpu_layer_id_list_ptr[0];
     is_direct = base_aligned && is_4k_aligned(block_stride_in_bytes) &&
-                is_4k_aligned(cpu_layer_stride_in_bytes) &&
-                is_4k_aligned(ssd_layer_stride_in_bytes);
+                is_4k_aligned(start_layer * cpu_layer_stride_in_bytes) &&
+                is_4k_aligned(start_layer * ssd_layer_stride_in_bytes) &&
+                is_4k_aligned(num_layers * cpu_layer_stride_in_bytes);
   } else {
     is_direct = base_aligned && is_4k_aligned(block_stride_in_bytes) &&
                 is_4k_aligned(chunk_size_in_bytes) &&

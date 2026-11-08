@@ -636,3 +636,38 @@ def test_ssd_write_keeps_cpu_slots_a_concurrent_put_published_first():
         assert cpu.num_free_blocks == free + 8
         cb2()
         assert _hit(ssd, tok) == 8
+
+
+def test_ssd_read_of_unaligned_blocks_round_trips(tmp_path):
+    """DSv4.1-sized blocks (512- but not 4096-aligned) are read with O_DIRECT where
+    the files allow it and written buffered; the bytes read must be the bytes written."""
+    import mmap
+
+    from flexkv import c_ext
+
+    block, layers, nblocks = 512 * 3265, 2, 8          # 1671680 B, two layers per block
+    path = os.path.join(os.environ.get("FLEXKV_TEST_SSD_DIR", str(tmp_path)), "unaligned.bin")
+    with open(path, "wb") as f:
+        f.truncate(block * nblocks)
+    buf = [mmap.mmap(-1, block * nblocks) for _ in range(2)]   # page-aligned bases
+    try:
+        src, dst = (torch.frombuffer(b, dtype=torch.uint8).view(nblocks, block) for b in buf)
+        src.copy_(torch.randint(0, 256, (nblocks, block), dtype=torch.uint8))
+        ioctx = c_ext.SSDIOCTX({0: [path]}, 1, 0, 0)
+
+        def xfer(cpu, ssd_ids, cpu_ids, is_read):
+            c_ext.transfer_kv_blocks_ssd(
+                ioctx, torch.arange(layers, dtype=torch.int32), cpu.data_ptr(),
+                torch.tensor(ssd_ids, dtype=torch.int64), torch.tensor(cpu_ids, dtype=torch.int64),
+                block // layers, 0, block // layers, 0, block // layers, block, is_read, nblocks,
+                kv_dim=1)
+
+        xfer(src, list(range(nblocks)), list(range(nblocks)), False)
+        order = [5, 0, 7, 2]
+        xfer(dst, order, [0, 1, 2, 3], True)
+        for i, s in enumerate(order):
+            assert torch.equal(dst[i], src[s])
+    finally:
+        del src, dst
+        for b in buf:
+            b.close()
