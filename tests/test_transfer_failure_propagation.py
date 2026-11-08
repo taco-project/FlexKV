@@ -150,8 +150,13 @@ class _EngineHarness:
         self.pin_buffer = None
         self.completed_queue = Queue()
         self.scheduler = TransferScheduler()
+        self._op_worker = {}
+        self._dead_workers = set()
 
     _handle_failed_op = TransferEngine._handle_failed_op
+    _submit_to = TransferEngine._submit_to
+    _mark_worker_dead = TransferEngine._mark_worker_dead
+    _fail_ops_of_dead_workers = TransferEngine._fail_ops_of_dead_workers
     _discard_failed_op = TransferEngine._discard_failed_op
     _finalize_or_discard = TransferEngine._finalize_or_discard
     _emit_drained_graph_failures = TransferEngine._emit_drained_graph_failures
@@ -226,6 +231,52 @@ def test_failed_op_fails_graph_and_emits_after_drain():
     assert message.is_graph_failed()
     assert message.graph_id == graph.graph_id
     assert not engine._failed_graph_ids
+
+
+class _Worker:
+    def __init__(self, alive=True, broken=False):
+        self.worker_id = 9
+        self.process = type("P", (), {"is_alive": lambda _: alive, "exitcode": None if alive else -11})()
+        self.broken = broken
+        self.sent = []
+
+    def submit_transfer(self, op):
+        if self.broken:
+            raise BrokenPipeError(32, "Broken pipe")
+        self.sent.append(op.op_id)
+
+
+def test_a_gone_worker_fails_its_ops_instead_of_hanging_them():
+    """A transfer worker process that died (a native crash leaves no Python
+    trace) fails the ops sent to it and every later one, so their graphs
+    fail and roll back instead of waiting forever."""
+    engine = _EngineHarness()
+    graph, ops = _make_chain_graph(3)
+    engine.scheduler.add_transfer_graph(graph)
+    engine.scheduler.schedule([])
+    dying = _Worker()
+    ops[0].pending_count = 1
+    engine.op_id_to_op[ops[0].op_id] = ops[0]
+    engine._submit_to(dying, ops[0])
+    assert dying.sent == [ops[0].op_id]
+
+    dying.process = _Worker(alive=False).process          # it crashes with the op in flight
+    engine._fail_ops_of_dead_workers()
+    assert graph.graph_id in engine._failed_graph_ids
+    assert not engine._op_worker
+    engine._emit_drained_graph_failures()
+    assert engine.completed_queue.get_nowait().is_graph_failed()
+
+    broken = _Worker(broken=True)                         # the pipe to it is already closed
+    graph2, ops2 = _make_chain_graph(2)
+    engine.scheduler.add_transfer_graph(graph2)
+    engine.scheduler.schedule([])
+    for op in ops2:
+        op.pending_count = 1
+        engine.op_id_to_op[op.op_id] = op
+        engine._submit_to(broken, op)
+    assert graph2.graph_id in engine._failed_graph_ids
+    assert id(broken) in engine._dead_workers and not engine._op_worker
 
 
 def test_failed_replica_discards_parent_when_replicas_drain():

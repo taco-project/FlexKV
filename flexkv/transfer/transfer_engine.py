@@ -236,6 +236,11 @@ class TransferEngine:
         # Ops with at least one failed replica: must be discarded, not
         # finalized, when their pending_count drains to zero.
         self._failed_parent_op_ids: Set[int] = set()
+        # Worker each dispatched op (or replica) went to, until it reports back,
+        # so a worker process that dies fails its ops instead of hanging them.
+        self._op_worker: Dict[int, Any] = {}
+        self._dead_workers: Set[int] = set()
+        self._next_liveness_check = 0.0
         # GET inherit: skip-io DISK2H waits for prefetch DISK2H (graph_id, op_id).
         self._completed_op_keys: Set[Tuple[int, int]] = set()
         self._parked_skip_io: Dict[int, TransferOp] = {}
@@ -1016,12 +1021,17 @@ class TransferEngine:
         sel.register(self.shutdown_read_fd, selectors.EVENT_READ, data="shutdown")
 
         flexkv_logger.info("TransferEngine scheduler loop started with ZERO-LATENCY selector (timeout=None)")
+        # Dead-worker bookkeeping (see _submit_to); harness engines skip __init__.
+        self.__dict__.setdefault("_op_worker", {})
+        self.__dict__.setdefault("_dead_workers", set())
+        self.__dict__.setdefault("_next_liveness_check", 0.0)
 
         while self._running:
             try:
                 # Complete blocking with NO TIMEOUT for zero latency!
                 # Shutdown via pipe signal instead of timeout
-                events = sel.select(timeout=None)
+                # Ops in flight: wake up now and then to notice a dead worker.
+                events = sel.select(timeout=1.0 if self._op_worker else None)
 
                 new_graphs_num = 0
                 finished_ops: List[TransferOp] = []
@@ -1082,6 +1092,7 @@ class TransferEngine:
                                         op_id = first
                                 else:
                                     op_id = payload
+                                self._op_worker.pop(op_id, None)
                                 if not op_succeeded:
                                     # Keep trace state consistent even on failure.
                                     trace.dec_inflight()
@@ -1127,6 +1138,10 @@ class TransferEngine:
                 # Exit loop if shutdown requested
                 if should_shutdown:
                     break
+
+                if self._op_worker and time.monotonic() >= self._next_liveness_check:
+                    self._next_liveness_check = time.monotonic() + 1.0
+                    self._fail_ops_of_dead_workers()
 
                 # End NVTX ranges for finished ops
                 for op in finished_ops:
@@ -1540,7 +1555,7 @@ class TransferEngine:
                     f"graph_id: {replica.graph_id}, worker_key={wk}",
                     color=get_nvtx_range_color(replica.graph_id))
                 op.pending_count += 1
-                worker[wk].submit_transfer(replica)
+                self._submit_to(worker[wk], replica)
                 flexkv_logger.debug(
                     f"[TransferEngine] {label} fan-out: "
                     f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
@@ -1555,7 +1570,44 @@ class TransferEngine:
                 color=get_nvtx_range_color(op.graph_id),
             )
             op.pending_count += 1
-            worker.submit_transfer(op)
+            self._submit_to(worker, op)
+
+    def _submit_to(self, worker: Any, op: TransferOp) -> None:
+        """Hand ``op`` to ``worker``; a worker that is gone fails it at once."""
+        # setdefault: harness engines are built without __init__.
+        dead = self.__dict__.setdefault("_dead_workers", set())
+        in_flight = self.__dict__.setdefault("_op_worker", {})
+        if id(worker) not in dead:
+            in_flight[op.op_id] = worker
+            try:
+                worker.submit_transfer(op)
+                return
+            except (BrokenPipeError, EOFError, ConnectionError, OSError) as e:
+                in_flight.pop(op.op_id, None)
+                self._mark_worker_dead(worker, repr(e))
+        self._handle_failed_op(op.op_id)
+
+    def _mark_worker_dead(self, worker: Any, why: str) -> None:
+        if id(worker) in self._dead_workers:
+            return
+        self._dead_workers.add(id(worker))
+        process = getattr(worker, "process", None)
+        flexkv_logger.error(
+            f"[TransferEngine] transfer worker {getattr(worker, 'worker_id', '?')} is gone "
+            f"(exitcode={getattr(process, 'exitcode', None)}, {why}); its in-flight and "
+            f"future ops fail")
+
+    def _fail_ops_of_dead_workers(self) -> None:
+        dead = {}
+        for op_id, worker in list(self._op_worker.items()):
+            process = getattr(worker, "process", None)
+            if id(worker) in self._dead_workers or (process is not None and not process.is_alive()):
+                dead.setdefault(id(worker), (worker, []))[1].append(op_id)
+        for worker, op_ids in dead.values():
+            self._mark_worker_dead(worker, "process exited")
+            for op_id in op_ids:
+                self._op_worker.pop(op_id, None)
+                self._handle_failed_op(op_id)
 
     def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:
         """Submit a transfer graph for execution"""
