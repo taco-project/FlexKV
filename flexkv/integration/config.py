@@ -3,7 +3,7 @@ import json
 import os
 import torch
 import tempfile
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 from dataclasses import dataclass, field
 
 from flexkv.common.debug import flexkv_logger
@@ -160,6 +160,26 @@ class FlexKVConfig:
             self.gpu_register_port = self.server_recv_port + "_gpu_register"
 
     @staticmethod
+    def resolve_sglang_dp(server_args: object) -> Tuple[int, bool]:
+        """Return ``(dp_size, enable_dp_attention)`` in FlexKV's legacy meaning.
+
+        Newer SGLang spells DP attention ``--attn-dp-size N``, which resolves
+        to ``attn_dp_size=N, dp_size=1, enable_dp_attention=False``. Older
+        SGLang spells it ``--dp-size N --enable-dp-attention``. FlexKV treats
+        both as N DP shards with DP attention enabled. SGLang does not run DP
+        attention inside replicas, so at most one of the two widths is > 1.
+        """
+        dp_size = max(1, int(getattr(server_args, "dp_size", 1) or 1))
+        attn_dp_size = max(1, int(getattr(server_args, "attn_dp_size", 1) or 1))
+        if attn_dp_size > 1:
+            if dp_size > 1:
+                raise ValueError(
+                    "[FlexKV SGLang] dp_size and attn_dp_size cannot both be > 1 "
+                    f"(dp_size={dp_size}, attn_dp_size={attn_dp_size})")
+            return attn_dp_size, True
+        return dp_size, bool(getattr(server_args, "enable_dp_attention", False))
+
+    @staticmethod
     def get_sglang_node_local_dp_size(
         server_args: object,
     ) -> Optional[int]:
@@ -171,12 +191,12 @@ class FlexKVConfig:
 
         ``None`` keeps the existing cross-node TP/PP topology unchanged.
         """
-        dp_size = max(1, int(getattr(server_args, "dp_size", 1) or 1))
+        dp_size, enable_dp_attention = FlexKVConfig.resolve_sglang_dp(server_args)
         pp_size = max(1, int(getattr(server_args, "pp_size", 1)))
         nnodes = max(1, int(getattr(server_args, "nnodes", 1)))
 
         if (
-            not bool(getattr(server_args, "enable_dp_attention", False))
+            not enable_dp_attention
             or dp_size == 1
             or nnodes == 1
             or pp_size != 1
@@ -452,7 +472,7 @@ class FlexKVConfig:
         # Combined-KV models (3D, kv_dim=1) use a single head shared across
         # ranks; multi-head backends (packed/plain MHA) scale by tp_size so
         # the CPU/SSD layout holds one contiguous slice per TP rank.
-        if kv_dim != 1 or physical_num_heads_per_rank != 1:
+        if len(cache_shape) != 3:
             self.model_config.num_kv_heads *= self.model_config.tp_size
         self.model_config.head_size = physical_head_size
         self.model_config.kv_dim = kv_dim
@@ -469,7 +489,7 @@ class FlexKVConfig:
         kv_cache_config: "KVCacheConfig",
     ) -> None:
         """Populate the packed storage layout from vLLM resolved KV specs."""
-        from vllm.v1.kv_cache_interface import AttentionSpec, iter_layer_specs
+        from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec, iter_layer_specs
 
         layouts = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -507,6 +527,7 @@ class FlexKVConfig:
                         spec.state_content_size_bytes // element_size,
                         spec.dtype,
                         spec.block_size,
+                        isinstance(spec, MLAAttentionSpec),
                     )
                 )
 
@@ -516,9 +537,7 @@ class FlexKVConfig:
                 f"got {sorted(map(str, layouts))}"
             )
 
-        physical_num_heads_per_rank, physical_head_size, dtype, block_size = (
-            layouts.pop()
-        )
+        physical_num_heads_per_rank, physical_head_size, dtype, block_size, kv_shared_across_ranks = layouts.pop()
         if block_size != self.cache_config.tokens_per_block:
             raise ValueError(
                 "vLLM KV spec block size disagrees with cache config: "
@@ -531,7 +550,7 @@ class FlexKVConfig:
             )
 
         self.model_config.num_kv_heads = physical_num_heads_per_rank
-        if physical_num_heads_per_rank != 1:
+        if not kv_shared_across_ranks:
             self.model_config.num_kv_heads *= self.model_config.tp_size
         self.model_config.head_size = physical_head_size
         # vLLM standardized [B, H, N, C] layout packs K/V in C.
@@ -590,10 +609,10 @@ class FlexKVConfig:
         # Extract parallelism params from server_args
         sglang_tp_size = int(server_args.tp_size)  # raw sglang tp_size (composite)
         pp_size = int(server_args.pp_size)
-        sglang_dp_size = int(server_args.dp_size if server_args.dp_size is not None else 1)
+        # Accepts both `--attn-dp-size N` and legacy `--dp-size N --enable-dp-attention`.
+        sglang_dp_size, enable_dp_attention = self.resolve_sglang_dp(server_args)
         nnodes = server_args.nnodes
         node_rank = server_args.node_rank
-        enable_dp_attention = bool(server_args.enable_dp_attention)
         attn_cp_size = int(getattr(server_args, 'attn_cp_size', 1))
         kv_cache_dtype = getattr(server_args, 'kv_cache_dtype', None)
         local_dp_size = self.get_sglang_node_local_dp_size(server_args)

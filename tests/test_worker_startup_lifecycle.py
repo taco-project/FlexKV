@@ -106,13 +106,10 @@ def test_connector_ready_wait_has_deadline(monkeypatch):
 
 
 @pytest.mark.parametrize("fail_wrap", [False, True])
-def test_hugepage_failure_removes_owned_file_and_closes_fd(tmp_path, monkeypatch, fail_wrap):
-    path = tmp_path / "owned-hugepage"
-    untouched = tmp_path / "unrelated"
-    untouched.write_text("keep")
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+def test_hugepage_failure_closes_owned_memfd(tmp_path, monkeypatch, fail_wrap):
+    fd = os.open(tmp_path / "stand-in-memfd", os.O_CREAT | os.O_RDWR, 0o600)
     mapping = Mock()
-    monkeypatch.setattr(allocator, "_create_hugetlbfs_file", lambda _: (str(path), fd))
+    monkeypatch.setattr(allocator, "_create_hugepage_memfd", lambda *_: fd)
     with patch.object(allocator.mmap, "mmap", return_value=mapping) as mmap_call:
         if not fail_wrap:
             mmap_call.side_effect = RuntimeError("injected mmap failure")
@@ -121,7 +118,6 @@ def test_hugepage_failure_removes_owned_file_and_closes_fd(tmp_path, monkeypatch
             pytest.raises(RuntimeError, match="injected"),
         ):
             allocator.alloc_hugepage_tensor(16, torch.int64, shareable=True)
-    assert not path.exists() and untouched.read_text() == "keep"
     with pytest.raises(OSError):
         os.fstat(fd)
     assert mapping.close.call_count == int(fail_wrap)

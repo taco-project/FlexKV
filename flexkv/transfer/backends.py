@@ -55,7 +55,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
+from flexkv.common import numa
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.numa import (
+    plan_cpu_pool_numa_regions,
+    query_page_nodes,
+    touch_pages,
+)
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferType
 from flexkv.transfer.geometry import EdgeGeometry, HostSide
@@ -69,20 +75,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from flexkv.transfer.workers import TransferWorkerBase
 
 
-def op_layer_range(op: "WorkerTransferOp", num_layers: int) -> Tuple[int, int]:
+def op_layer_range(op: WorkerTransferOp, num_layers: int) -> Tuple[int, int]:
     """``(layer_id, layer_granularity)`` for an op, defaulting to all layers.
 
-    Layer-sliced ops are a read-path feature that no producer currently emits:
-    ``WorkerTransferOp`` (and the ``TransferOp`` it is built from) carry no
-    ``layer_id``/``layer_granularity``, and the one function that would have
-    set them -- ``cache.transfer_pattern.convert_read_graph_to_layer_wise_graph``
-    -- has no live caller.  Reading the attributes directly therefore raises
-    ``AttributeError`` on every production op, so read them defensively: a
-    backend that supports slicing keeps working the day the fields come back,
-    and moves whole blocks until then.
-
-    ``-1`` is the "unset" sentinel the old worker used, kept so a revived
-    producer can leave either field out.
+    ``-1`` is the unset sentinel: CacheConfig.layer_granularity ``<= 0`` and
+    unsliced ops leave both fields at the TransferOp defaults, so a backend
+    that supports slicing still moves whole blocks until a producer sets them.
     """
     layer_id = getattr(op, "layer_id", -1)
     layer_granularity = getattr(op, "layer_granularity", -1)
@@ -114,8 +112,8 @@ class StorageBackend(ABC):
     #: engine had attached -- the one direction a backend must not push in.
     bytes_per_block: int = 0
 
-    def attach(
-        self, worker: "TransferWorkerBase", geometry: "EdgeGeometry"
+    def attach(  # noqa: B027 - optional lifecycle hook with a no-op default
+        self, worker: TransferWorkerBase, geometry: EdgeGeometry
     ) -> None:
         """Open sessions / register memory.  Called once, at worker init.
 
@@ -146,8 +144,8 @@ class StorageBackend(ABC):
     @abstractmethod
     def transfer(
         self,
-        worker: "TransferWorkerBase",
-        op: "WorkerTransferOp",
+        worker: TransferWorkerBase,
+        op: WorkerTransferOp,
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> int:
@@ -162,8 +160,8 @@ class StorageBackend(ABC):
 
     def transfer_blocks(
         self,
-        worker: "TransferWorkerBase",
-        op: "WorkerTransferOp",
+        worker: TransferWorkerBase,
+        op: WorkerTransferOp,
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> Tuple[Tuple[bool, ...], int]:
@@ -179,7 +177,7 @@ class StorageBackend(ABC):
             f"{type(self).__name__} sets reports_block_results but does not "
             "implement transfer_blocks")
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> None:  # noqa: B027 - optional lifecycle hook with a no-op default
         """Release whatever ``attach`` took.  Must tolerate a failed attach."""
 
 
@@ -245,7 +243,7 @@ class NixlFileBackend(StorageBackend):
         self._session: Any = None
 
     def attach(
-        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
+        self, worker: TransferWorkerBase, geometry: EdgeGeometry
     ) -> None:
         from flexkv.transfer.nixlutil import NixlAgentSession
 
@@ -323,7 +321,7 @@ class NixlFileBackend(StorageBackend):
             raise RuntimeError("NIXL: prepare_vram_gpu failed")
 
     def _attach_cpu(
-        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
+        self, worker: TransferWorkerBase, geometry: EdgeGeometry
     ) -> None:
         """POSIX / HF3FS: bind to the edge's CPU pool."""
         cpu = geometry.require_cpu(f"NIXL {self.nixl_backend}")
@@ -364,8 +362,8 @@ class NixlFileBackend(StorageBackend):
 
     def transfer(
         self,
-        worker: "TransferWorkerBase",
-        op: "WorkerTransferOp",
+        worker: TransferWorkerBase,
+        op: WorkerTransferOp,
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> int:
@@ -507,7 +505,7 @@ class PcfsRemoteBackend(StorageBackend):
         self.pcfs: Any = None
 
     def attach(
-        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
+        self, worker: TransferWorkerBase, geometry: EdgeGeometry
     ) -> None:
         from flexkv import c_ext
         # Deliberately the ``worker`` façade, not ``workers``: this is a c_ext
@@ -618,8 +616,8 @@ class PcfsRemoteBackend(StorageBackend):
 
     def transfer(
         self,
-        worker: "TransferWorkerBase",
-        op: "WorkerTransferOp",
+        worker: TransferWorkerBase,
+        op: WorkerTransferOp,
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> int:
@@ -936,7 +934,7 @@ class MooncakeStoreBackend(StorageBackend):
             getattr(cache_config, 'mooncake_store_total_layers', 0) or 0)
 
     def attach(
-        self, worker: "TransferWorkerBase", geometry: EdgeGeometry
+        self, worker: TransferWorkerBase, geometry: EdgeGeometry
     ) -> None:
         from flexkv.external.mooncake_store_utils import (
             MooncakeStoreClient,
@@ -989,39 +987,73 @@ class MooncakeStoreBackend(StorageBackend):
         # >= the logical pool. Only a HugePage handle knows it; a plain tensor
         # pool maps exactly what it holds.
         mapped_size = cpu.mapped_size
-        if mapped_size is None:
-            return [(base_ptr, logical_size)]
-
         hugepage_size = int(self.cache_config.hugepage_size_bytes)
         size_alignment = int(os.getenv(
             "FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES", str(hugepage_size)))
-        regions = _split_mooncake_registration_regions(
-            base_ptr=base_ptr,
-            logical_size=logical_size,
-            mapped_size=int(mapped_size),
-            block_size=self.block_size_bytes,
-            max_mr_size=int(self.cache_config.mooncake_max_mr_size_bytes),
-            size_alignment=size_alignment,
-            pointer_alignment=hugepage_size,
-            mr_split_policy=self.cache_config.mooncake_mr_split_policy,
+
+        # One MR per NUMA region of the pool (same plan the allocator used,
+        # see flexkv.common.numa). Mooncake labels each MR with the node of its
+        # first page, so every region is served by NICs local to its node.
+        numa_regions = plan_cpu_pool_numa_regions(
+            logical_size,
+            self.block_size_bytes,
+            numa.PAGE_SIZE if mapped_size is None
+            else math.lcm(hugepage_size, size_alignment),
         )
+        if not numa_regions:
+            numa_regions = [(0, logical_size, -1)]
+        total_mapped = logical_size if mapped_size is None else int(mapped_size)
+
+        regions: List[Tuple[int, int]] = []
+        for i, (off, length, _node) in enumerate(numa_regions):
+            is_last = i == len(numa_regions) - 1
+            region_mapped = total_mapped - off if is_last else length
+            if mapped_size is None:
+                regions.append((base_ptr + off, region_mapped))
+                continue
+            regions.extend(_split_mooncake_registration_regions(
+                base_ptr=base_ptr + off,
+                logical_size=length,
+                mapped_size=region_mapped,
+                block_size=self.block_size_bytes,
+                max_mr_size=int(self.cache_config.mooncake_max_mr_size_bytes),
+                size_alignment=size_alignment,
+                pointer_alignment=hugepage_size,
+                mr_split_policy=self.cache_config.mooncake_mr_split_policy,
+            ))
+
+        locations = ["*"] * len(regions)
+        if len(numa_regions) > 1:
+            # Mooncake resolves an MR's location from its first page, which
+            # must therefore be mapped in this process (an unmapped page reads
+            # as "*"). touch_pages only reads, so it never races with writers.
+            starts = [ptr for ptr, _ in regions]
+            touch_pages(starts)
+            try:
+                locations = [f"cpu:{s}" if s >= 0 else "*"
+                             for s in query_page_nodes(starts)]
+            except OSError as e:
+                flexkv_logger.warning(
+                    f"[MooncakeStoreBackend] cannot query MR NUMA nodes: {e}")
         flexkv_logger.info(
             "[MooncakeStoreBackend] registering external MRs: "
             f"logical_size={logical_size} mapped_size={mapped_size} "
             f"mr_split_policy={self.cache_config.mooncake_mr_split_policy} "
-            f"regions={regions}")
+            f"numa_regions={numa_regions} "
+            f"regions={[(hex(p), s, loc) for (p, s), loc in zip(regions, locations)]}")
         return regions
 
     def shutdown(self) -> None:
         client = self.mooncake_client
         if client is None:
             return
+        client.shutdown_get_workers()
         _unregister_mooncake_regions(client, self._registered_regions)
         self._registered_regions = []
 
     def _keys_and_ptrs(
         self,
-        op: "WorkerTransferOp",
+        op: WorkerTransferOp,
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> Tuple[List[int], List[int], List[str]]:
@@ -1067,8 +1099,8 @@ class MooncakeStoreBackend(StorageBackend):
 
     def transfer(
         self,
-        worker: "TransferWorkerBase",
-        op: "WorkerTransferOp",
+        worker: TransferWorkerBase,
+        op: WorkerTransferOp,
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> int:
@@ -1078,8 +1110,8 @@ class MooncakeStoreBackend(StorageBackend):
 
     def transfer_blocks(
         self,
-        worker: "TransferWorkerBase",
-        op: "WorkerTransferOp",
+        worker: TransferWorkerBase,
+        op: WorkerTransferOp,
         src_block_ids: torch.Tensor,
         dst_block_ids: torch.Tensor,
     ) -> Tuple[Tuple[bool, ...], int]:

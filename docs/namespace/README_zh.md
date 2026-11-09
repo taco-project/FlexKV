@@ -4,6 +4,14 @@
 
 ## 版本要求
 
+### SGLang
+
+FlexKV connector 的 `lookup_kv`、`store_kv` 和 `prefetch_async` 接收
+`namespace: Optional[List[str]]`；调用方必须在各操作中传入相同身份，
+`None` 保留无 namespace 的键。当前分段预取路径也传递 namespace。
+配套 SGLang adapter 只有在 `supports_cache_namespace` 为 true 时才启用隔离复用；
+应联合验证部署版本，不能仅凭 FlexKV 侧接口推断端到端隔离。
+
 ### vLLM
 
 - 对于 vLLM，请使用 `examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector-namespace.patch` 补丁以支持 namespace 功能

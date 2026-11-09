@@ -13,11 +13,12 @@ FlexKV 当前支持两类 HugePage 配置项：
 
 两类开关可以独立启用，也可以同时启用。
 
-当前实现上有一个重要限制：
+当前实现上的共享方式：
 
-- `use_hugepage_cpu_buffer` 对主 CPU KV cache 的生效路径，必须依赖 `hugetlbfs` 挂载文件来保证在 `spawn` worker 场景下仍然保持 HugePage backing。
-- 纯匿名 `MAP_HUGETLB` 只用于单进程或不可共享场景；一旦主 CPU cache 被传给 `TransferEngine` 的子进程，PyTorch 会把普通 CPU tensor 序列化成新的 shared-memory storage，匿名映射无法继续作为跨进程共享后端，因此不能满足主 CPU cache 的目标语义。
-- `use_hugepage_tmp_buffer` 仍然可以走匿名 HugePage 或 hugetlbfs，两者都不会经过上述主 cache 的跨进程共享问题。
+- `use_hugepage_cpu_buffer` 的主 CPU KV cache 由 TransferManager 用匿名 hugetlb memfd（`memfd_create(MFD_HUGETLB)`）分配，不依赖 hugetlbfs 挂载点，也不会在任何目录下创建文件。`spawn` 出来的 worker 通过 `/proc/<TransferManager pid>/fd/<fd>` 重新打开同一个 memfd 并 mmap，因此仍是同一块 HugePage-backed 映射。
+- 进程无论如何退出（包括 SIGKILL），内核都会关闭 fd、解除映射，最后一个引用消失后大页自动归还池中，不会残留文件或占用。
+- 纯匿名 `MAP_HUGETLB` 只用于单进程或不可共享场景；一旦主 CPU cache 被传给 `TransferEngine` 的子进程，PyTorch 会把普通 CPU tensor 序列化成新的 shared-memory storage，因此主 CPU cache 不走这条路径。
+- `use_hugepage_tmp_buffer` 优先走匿名 `MAP_HUGETLB`，失败时回退到 hugetlb memfd，不涉及跨进程共享。
 
 ---
 
@@ -27,7 +28,7 @@ FlexKV 当前支持两类 HugePage 配置项：
 
 - CPU KV Cache 容量较大，希望降低页表和 TLB 开销。
 - 已启用 `enable_p2p_ssd=true`，并希望优化 `SSD -> CPU -> GPU` 数据路径中的临时 staging buffer。
-- 已完成宿主机 HugePage 预留和 hugetlbfs 挂载，具备稳定的系统运行条件。
+- 已完成宿主机 HugePage 预留，具备稳定的系统运行条件。
 
 如果机器没有预留 HugePage，或者当前并不依赖 CPU KV Cache / p2p SSD 路径上的性能收益，不建议启用。
 
@@ -55,31 +56,18 @@ sudo sysctl -w vm.nr_hugepages=4096
 default_hugepagesz=1G hugepagesz=1G hugepages=N
 ```
 
-### 3.2 宿主机已挂载 hugetlbfs
+多 NUMA 机器上开启 `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`（默认关闭）后，会把 CPU KV 池按节点均分，并在启动时逐节点预分配大页。因此每个节点都要预留足够的大页，可通过 `/sys/devices/system/node/node*/hugepages/hugepages-*/nr_hugepages` 按节点查看或设置。某节点不足时会打印告警，超出部分溢出到其他节点。详见 [配置指南 · CPU KV 池 NUMA 分布](../flexkv_config_reference/README_zh.md)。
 
-FlexKV 默认使用 `/mnt/hugepages` 作为 hugetlbfs 挂载点。
+### 3.2 无需挂载 hugetlbfs
 
-说明：对于 `use_hugepage_cpu_buffer`，这一步不是“建议”，而是必须条件。如果 `FLEXKV_HUGETLBFS_DIR` 指向普通文件系统，FlexKV 现在会直接判定失败并回退，不再把普通 4 KiB 页误判成 HugePage 成功。
+大页通过 `memfd_create(MFD_HUGETLB)` 直接从内核大页池申请，页大小由 `hugepage_size_bytes` 显式指定，不需要 hugetlbfs 挂载点。旧版本使用的 `FLEXKV_HUGETLBFS_DIR` 已不再生效。
 
-检查挂载状态：
+要求：
 
-```bash
-mount | grep hugetlbfs
-ls -ld /mnt/hugepages
-```
+- Linux >= 4.14（支持 `MFD_HUGETLB` 及按页大小选择），Python >= 3.8（`os.memfd_create`）。
+- TransferManager 与其 transfer worker 处于同一 PID namespace、同一 uid（父子进程天然满足），worker 需能打开 `/proc/<pid>/fd/<fd>`。
 
-如果尚未挂载，可执行：
-
-```bash
-sudo mkdir -p /mnt/hugepages
-sudo mount -t hugetlbfs none /mnt/hugepages
-```
-
-如果实际挂载点不是 `/mnt/hugepages`，需要显式设置：
-
-```bash
-export FLEXKV_HUGETLBFS_DIR=/path/to/hugetlbfs
-```
+升级前的旧版本若被强杀，可能在 `/dev/hugepages` 或 `/mnt/hugepages` 下残留 `flexkv_hugepage_*` 文件，确认对应进程已退出后可手动删除。
 
 ### 3.3 tmp buffer 场景需要 CUDA 运行时
 
@@ -98,9 +86,7 @@ print(torch.cuda.is_available())
 PY
 ```
 
-说明：`use_hugepage_cpu_buffer` 不依赖 `cudaHostRegister`。
-
-补充说明：`use_hugepage_cpu_buffer` 虽然不依赖 CUDA runtime，但依赖可写的 hugetlbfs 挂载点，因为主 CPU KV cache 需要通过该文件在 `spawn` worker 间重新打开同一块 HugePage-backed 映射。
+主 CPU HugePage 池的分配本身使用 hugetlb memfd，`spawn` worker 通过 `/proc/<pid>/fd/<fd>` 重新打开它。GPU/CPU 传输 worker 随后会对 CPU 池调用 `cudaHostRegister`，因此将该池用于 GPU 传输仍需要可用的 CUDA runtime 和合适的注册限制。
 
 ---
 
@@ -171,7 +157,7 @@ export FLEXKV_HUGEPAGE_SIZE_BYTES=1073741824
 
 首次接入建议按以下顺序进行：
 
-1. 先在宿主机准备 2 MiB HugePage，并确认 hugetlbfs 挂载正常。
+1. 先在宿主机准备 2 MiB HugePage。
 2. 先只启用 `use_hugepage_cpu_buffer=true`，验证通用 CPU KV Cache 可正常工作。
 3. 如果还需要验证 p2p SSD 路径，再启用 `use_hugepage_tmp_buffer=true`。
 4. 在确认功能稳定后，再根据机器环境评估是否切换到 1 GiB HugePage。
@@ -202,11 +188,13 @@ HugePage allocate total_size: ... GB (page_size=2MiB)
 [PEER2CPUTransferWorker] HugePage allocation for tmp_cpu_buffer failed (...); falling back to torch.empty(pin_memory=True).
 ```
 
-如果 `use_hugepage_cpu_buffer=true` 但 hugetlbfs 挂载不正确，日志会出现类似信息：
+如果 `use_hugepage_cpu_buffer=true` 但所需页大小的大页池不可用（未配置该页大小，或空闲大页不足），日志会出现类似信息：
 
 ```text
-HugePage allocation failed (HugePage: /path is not a hugetlbfs mount ...); falling back to regular CPU memory.
+HugePage allocation failed (HugePage: memfd_create(MFD_HUGETLB, page_size=...) failed: ...); falling back to regular CPU memory.
 ```
+
+运行期间可通过 `ls -l /proc/<TransferManager pid>/fd | grep memfd:flexkv_hugepage` 查看大页池对应的 memfd。
 
 ### 6.2 检查 HugePage 计数
 
@@ -248,8 +236,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q tests/hugepage -rs
 
 - 是否同时设置了 `enable_p2p_ssd=true`
 - 宿主机是否预留了足够的 HugePage
-- hugetlbfs 是否已挂载
-- `FLEXKV_HUGETLBFS_DIR` 是否指向正确挂载点
 - CUDA runtime 是否可用
 - `memlock` 限制是否过小
 
@@ -261,8 +247,8 @@ FlexKV 对 HugePage 采用的是“失败自动回退”策略，因此不能仅
 
 另外需要区分两类原因：
 
-- `use_hugepage_cpu_buffer` 场景下，如果没有可写 hugetlbfs 挂载点，即使系统里预留了 HugePage，也不会被视为可用配置。
-- `use_hugepage_tmp_buffer` 场景下，如果匿名 HugePage 成功，可能不依赖 hugetlbfs 挂载。
+- `use_hugepage_cpu_buffer` 场景下，`hugepage_size_bytes` 对应页大小的大页池必须已配置且空闲页充足，否则 memfd 分配或 mmap 失败并回退。
+- `use_hugepage_tmp_buffer` 场景下，同样依赖对应页大小的大页池。
 
 ### 7.3 使用 1 GiB HugePage 后启动失败或无法生效
 

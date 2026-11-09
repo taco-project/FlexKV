@@ -3,6 +3,7 @@
  * All rights reserved. SPDX-License-Identifier: Apache-2.0
  */
 #include "device_thread_pool.h"
+#include "cuda_stream_lifetime.h"
 
 #include <stdexcept>
 
@@ -153,7 +154,25 @@ void DeviceThreadPool::run_on_all(const std::function<void(int)> &body,
     }
   }
   if (!error_msg.empty()) {
+    drain_all_streams_on_error();
     throw std::runtime_error(std::string(what) + " failed: " + error_msg);
+  }
+}
+
+void DeviceThreadPool::drain_all_streams_on_error() {
+  // Do not use run_on_all here: that function calls us on failure.
+  std::vector<std::future<void>> futures;
+  futures.reserve(device_ids_.size());
+  for (int i = 0; i < size(); ++i) {
+    futures.emplace_back(enqueue(i, []() {
+      // The fallback per-group launcher may already have submitted an earlier
+      // group on another pool's streams. Drain this device's whole context,
+      // not only this pool, before its shared operation can release blocks.
+      drain_device_or_abort("transfer error recovery");
+    }));
+  }
+  for (auto &future : futures) {
+    future.get();
   }
 }
 

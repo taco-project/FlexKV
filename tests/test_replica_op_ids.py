@@ -60,6 +60,8 @@ def engine(monkeypatch):
     e._child_to_parent_op_id = {}
     e._failed_graph_ids = set()
     e._failed_parent_op_ids = set()
+    e._parked_skip_io = {}
+    e._completed_op_keys = set()
     e.pin_buffer = None
     e.model_config = NS(token_size_in_bytes=16, num_layers=1)
     e.cache_config = NS(tokens_per_block=16)

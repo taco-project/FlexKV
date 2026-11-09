@@ -55,6 +55,36 @@ Python 指标由 `GlobalCacheEngine` 在 `cache_engine.py` 中记录，通过 `F
 
 ---
 
+采集器还提供 Mooncake Full+SWA 预取的
+`flexkv_py_joint_prefetch_outcomes_total`（标签 `outcome`）和
+`flexkv_py_joint_prefetch_swa_slot_alloc_failed_total`。这两项描述联合预取，
+不代表所有请求或所有预取失败。
+
+#### 分段预取指标（`flexkv_prefetch_*`）
+
+启用分段预取和指标后，Python exporter 会记录：
+
+| 指标名称 | 类型 | 标签 | 描述 |
+|---|---|---|---|
+| `flexkv_prefetch_sessions_total` | Counter | `policy`, `reason`, `outcome` | 所有已接收分段排空后，每个会话计数一次 |
+| `flexkv_prefetch_loaded_tokens_total` | Counter | `policy` | 终态时租约仍有效的可复用前缀中，已发布的 L3 token 数 |
+| `flexkv_prefetch_elapsed_seconds` | Histogram | `policy`, `reason` | 从接纳到终态的耗时 |
+| `flexkv_prefetch_drain_seconds` | Histogram | `policy`, `reason` | 从封口到终态的排空耗时 |
+
+例如，按策略查询 p95 排空时间（秒）：
+
+```promql
+histogram_quantile(0.95, sum by (le, policy) (rate(flexkv_prefetch_drain_seconds_bucket[5m])))
+```
+
+提前释放、重置或关闭会使结果租约失效，此类会话不计入 loaded tokens。
+未知的自定义策略和停止原因统一归为 `other`。这些计数不代表 H2D 完成或模型
+实际使用；原有传输及联合预取计数也不能覆盖所有分段预取完成。当前指标不提供
+reserved/pinned 字节、在途会话状态或运行时健康度的 gauge。
+
+
+---
+
 ### 2.2 C++ 运行时指标 (`flexkv_cpp_*`)
 
 C++ 指标由 `MetricsManager` 单例管理，主要在 RadixTree 缓存操作和数据传输中埋点。

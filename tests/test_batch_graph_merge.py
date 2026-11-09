@@ -132,3 +132,40 @@ def test_ssd_ids_land_on_a_standalone_disk2h():
     assert not hasattr(lw, "src_block_ids_disk2h")
     assert lw.predecessors == {hoisted[0].op_id}
     np.testing.assert_array_equal(lw.src_block_ids_h2d, [10, 11])
+
+
+def test_layerwise_one_disk2h_span_one_layerwise():
+    graph = TransferOpGraph()
+    disk_a = _op(
+        graph, TransferType.DISK2H, [90, 91], [10, 11],
+        layer_id=0, layer_granularity=3,
+    )
+    disk_b = _op(
+        graph, TransferType.DISK2H, [90, 91], [10, 11],
+        layer_id=3, layer_granularity=3,
+    )
+    h2d = _op(graph, TransferType.H2D, [10, 11], [0, 1])
+    graph.add_dependency(h2d.op_id, disk_a.op_id)
+    graph.add_dependency(h2d.op_id, disk_b.op_id)
+
+    merged, end_id, _ = _merge([graph], [h2d.op_id], layerwise_transfer=True)
+
+    hoisted = [op for op in merged._op_map.values()
+               if op.transfer_type == TransferType.DISK2H]
+    assert len(hoisted) == 2, "each SSD span must stay an independent DISK2H"
+    spans = sorted((op.layer_id, op.layer_granularity) for op in hoisted)
+    assert spans == [(0, 3), (3, 3)]
+
+    layerwise_ops = [op for op in merged._op_map.values()
+                     if op.transfer_type == TransferType.LAYERWISE]
+    assert len(layerwise_ops) == 2
+    for lw in layerwise_ops:
+        matching = [op for op in hoisted
+                    if (op.layer_id, op.layer_granularity)
+                    == (lw.layer_id, lw.layer_granularity)]
+        assert len(matching) == 1
+        assert matching[0].op_id in lw.predecessors
+        other = [op for op in hoisted if op is not matching[0]]
+        assert other[0].op_id not in lw.predecessors
+    end_op = merged._op_map[end_id]
+    assert {lw.op_id for lw in layerwise_ops}.issubset(end_op.predecessors | {end_id})

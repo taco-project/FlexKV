@@ -16,23 +16,25 @@ Dynamo是NVIDIA专为大规模分离式部署而设计的框架，支持TensorRT
 
 ### 安装 Dynamo
 
+PR #5858 已于 2026 年 3 月 3 日合并。请与所用 FlexKV、vLLM 和 CUDA 版本一起选择并验证 Dynamo 版本；PR 已合入不代表任意组合均已验证。
+
 ```bash
-# 1. 准备 Dynamo 代码
+# 1. 获取 Dynamo，并选择包含 PR #5858 的兼容版本或 commit
 git clone https://github.com/ai-dynamo/dynamo.git
+cd dynamo
+export DYNAMO_WORKSPACE="$PWD"
+# git checkout <已验证的版本或 commit>
 
-# 2. 按照 PR #5858 更新代码
-gh pr checkout 5858 # 确保已安装 GitHub CLI
-
-# 3. 安装 NIXL
+# 2. 安装 NIXL
 uv pip install 'nixl[cu12]' # 或 'nixl[cu13]'
 
-# 4. 安装 Dynamo
+# 3. 安装 Dynamo
 cd $DYNAMO_WORKSPACE/lib/bindings/python
 maturin develop --uv
 cd ../../..
 uv pip install -e . # 因为 vLLM 已安装，所以无需指定后端
 
-# 5. 安装 nats-server 和 etcd
+# 4. 安装 nats-server 和 etcd
 ```
 
 ### FlexKV代码准备
@@ -54,7 +56,7 @@ cd FlexKV && ./build.sh
 
 ### FlexKV 验证
 
-请参考[vLLM online serving](../../docs/vllm_adapter/README_zh.md#%E7%A4%BA%E4%BE%8B)里的测试脚本。
+请参考[vLLM online serving](../vllm_adapter/README_zh.md)里的测试脚本。
 
 ## 2. 启动和验证Dynamo服务
 
@@ -95,13 +97,13 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
     GPU_START=$((i*2))
     GPU_END=$((i*2+1))
 
+    KV_ENDPOINT="tcp://*:2008${i}"
+    KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")"
     if [ $i -lt $((NUM_WORKERS-1)) ]; then
         # 多个worker时注意Flexkv的端口应不同，否则会卡在flexkv init这一步
         # 通过环境变量 `FLEXKV_SERVER_RECV_PORT` 设置Flexkv的端口
         FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/worker_${i}" \
         FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" \
-        KV_ENDPOINT="tcp://*:2008${i}" \
-        KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")" \
         CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} \
         python3 -m dynamo.vllm \
         --model $YOUR_MODEL \
@@ -111,8 +113,6 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
     else
         FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/worker_${i}" \
         FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" \
-        KV_ENDPOINT="tcp://*:2008${i}" \
-        KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")" \
         CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} \
         python3 -m dynamo.vllm \
         --model $YOUR_MODEL \
@@ -134,7 +134,7 @@ done
 curl localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": 你的模型,
+    "model": "YOUR_MODEL",
     "messages": [
     {
         "role": "user",
@@ -148,7 +148,7 @@ curl localhost:8000/v1/chat/completions \
 
 ## 4. Benchmark
 
-我们使用 [`aiperf`](https://github.com/ai-dynamo/aiperf) 作为benchmark工具、[mooncake trace](https://github.com/kvcache-ai/Mooncake?tab=readme-ov-file#-open-source-trace)作为数据集来评估Dynamo + FlexKV的性能。
+我们使用 [`aiperf`](https://github.com/ai-dynamo/aiperf) 作为benchmark工具、[mooncake trace](https://github.com/kvcache-ai/Mooncake/tree/main/FAST25-release)作为数据集来评估Dynamo + FlexKV的性能。
 
 Mooncake Trace 是一个开源请求记录文件，以jsonl格式保存。它记录了请求到达的时间戳、输入文本长度、输出文本长度以及与缓存有关的hash id等信息，包含了1小时内的23608个请求。我们的实验资源是4个LLaMA-70B worker，mooncake trace对于该配置来说并发太高了，于是我们从mooncake trace里每6个抽取1个request，构建了用于benchmark的数据集。
 

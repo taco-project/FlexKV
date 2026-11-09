@@ -325,7 +325,6 @@ def _cpu_pipe_worker(command, result, shared, allow):
 
 def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
     from collections import OrderedDict
-    import multiprocessing as mp
     from flexkv.kvtask import KVTaskEngine
     from flexkv.transfer_manager import (
         TransferManagerInterProcessHandle,
@@ -333,25 +332,18 @@ def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
     )
     from flexkv.prefetch.runtime import TaskRuntime, QueuedTransferHandle
 
-    ctx = mp.get_context("spawn")
-    commands, worker_commands = ctx.Pipe()
-    results, worker_results = ctx.Pipe()
+    ipc = TransferManagerInterProcessHandle(
+        env.engine.model_config, env.engine.cache_config, gpu_register_port=""
+    )
+    ctx = ipc.mp_ctx
+    worker_commands, worker_results = ipc.command_child_conn, ipc.result_child_conn
     shared = ctx.RawArray("B", 64 * 16)
     allow = ctx.Event()
     worker = ctx.Process(
         target=_cpu_pipe_worker, args=(worker_commands, worker_results, shared, allow)
     )
     worker.start()
-    ipc = TransferManagerInterProcessHandle.__new__(TransferManagerInterProcessHandle)
-    ipc._worker_error = None
-    ipc.error_parent_conn = NS(poll=lambda: False, close=lambda: None)
-    ipc.error_child_conn = NS(close=lambda: None)
-    ipc.command_child_conn, ipc.result_child_conn = worker_commands, worker_results
-    ipc.command_parent_conn, ipc.result_parent_conn, ipc.process = (
-        commands,
-        results,
-        worker,
-    )
+    ipc.process = worker
     handle = TransferManagerHandle.__new__(TransferManagerHandle)
     handle._handle = ipc
     queued = QueuedTransferHandle(handle)
@@ -409,6 +401,7 @@ def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
         engine.shutdown()
     # shutdown joins and closes the multiprocessing Process handle.
     assert ipc.process is None
+    assert ipc.command_parent_conn.closed and ipc.result_parent_conn.closed
     assert not engine.transfer_handles[0].thread.is_alive()
 
 

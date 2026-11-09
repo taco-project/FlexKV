@@ -325,6 +325,9 @@ cpp_sources = [
 ]
 
 hpp_sources = [
+    "csrc/host_registration.h",
+    "csrc/host_dma.h",
+    "csrc/cuda_stream_lifetime.h",
     "csrc/logging.h",
     "csrc/ce_trace.h",
     "csrc/cache_utils.h",
@@ -364,7 +367,6 @@ if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
 print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
 
 extra_compile_args = [
-    "-std=c++17",
     "-O3",
     f'-DFLEXKV_GIT_COMMIT="{build_git_commit}"',
 ]

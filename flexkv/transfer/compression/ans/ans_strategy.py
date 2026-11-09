@@ -215,6 +215,17 @@ class NvcompCpuSsdStrategy(CompressionStrategy):
             )
 
     def run(self, worker, op, src_block_ids, dst_block_ids) -> None:
+        from flexkv.transfer.backends import op_layer_range
+        _, gran = op_layer_range(op, worker.num_layers)
+        if gran < worker.num_layers:
+            # Compressed SSD tables are laid out over all layers of a block.
+            # A partial span would read the wrong byte offsets, so fall back.
+            from flexkv.transfer.compression.common.strategy import (
+                NullCompressionStrategy,
+            )
+            NullCompressionStrategy().run(
+                worker, op, src_block_ids, dst_block_ids)
+            return
         start_time = time.time()
         transfer_size = self._dispatch(
             worker, src_block_ids, dst_block_ids, op.transfer_type)

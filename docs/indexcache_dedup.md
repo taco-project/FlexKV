@@ -1,5 +1,7 @@
 # IndexCache deduplication for GLM5.2
 
+[中文文档](indexcache_dedup_zh.md)
+
 DSA models can reuse an earlier layer's Index-K cache on layers marked
 `skip_topk`. Registering those aliases as separate physical layers stores and
 transfers the same Index-K payload repeatedly.

@@ -59,7 +59,9 @@ class PrefetchCoordinator:
         max_reserved_bytes=512 * 1024 * 1024,
         result_ttl_s=60.0,
         max_batch_graphs=32,
+        max_data_sessions=0,
         epoch=None,
+        metrics=None,
     ):
         if (
             max_sessions <= 0
@@ -68,6 +70,14 @@ class PrefetchCoordinator:
             or result_ttl_s <= 0
         ):
             raise ValueError("prefetch runtime limits must be positive")
+        if (
+            isinstance(max_data_sessions, bool)
+            or not isinstance(max_data_sessions, int)
+            or max_data_sessions < 0
+        ):
+            raise ValueError("max_data_sessions must be a nonnegative integer")
+        self.max_data_sessions = max_data_sessions
+        self._data_sessions = set()
         self.backend = backend
         self.clock = clock
         self.max_sessions = max_sessions
@@ -75,6 +85,7 @@ class PrefetchCoordinator:
         self.result_ttl_s = result_ttl_s
         self.max_batch_graphs = max_batch_graphs
         self.epoch = epoch or uuid.uuid4().hex
+        self.metrics = metrics
         self.sessions: Dict[PrefetchHandle, Session] = OrderedDict()
         # Released/expired terminal snapshots only: never retain a context or
         # charge an admission slot after the caller has relinquished its lease.
@@ -216,6 +227,15 @@ class PrefetchCoordinator:
             self.seal(session, "complete")
             self._finalize(session)
             return None
+        # Finish a bounded wave of real reads before opening more sessions.
+        # Every request keeps its metadata future, deadline and result lease;
+        # waiting for this slot is not a capacity miss.
+        if (
+            self.max_data_sessions
+            and session.handle not in self._data_sessions
+            and len(self._data_sessions) >= self.max_data_sessions
+        ):
+            return None
         if len(session.chunks) >= session.options.max_inflight_chunks:
             return None
         chunk = self.backend.reserve(
@@ -226,8 +246,11 @@ class PrefetchCoordinator:
             self.max_reserved_bytes - self.reserved_bytes,
         )
         if chunk is None:
-            # Do not wait for capacity held by our own pinned prefix.
-            if not session.chunks:
+            # Outstanding graphs hold temporary byte credits. A late session
+            # without its first chunk must wait for those graphs to drain,
+            # rather than turn transient contention into an empty cache miss.
+            # With no reserved I/O, retain the permanent-capacity fallback.
+            if not session.chunks and not self.reserved_bytes:
                 self.seal(session, "capacity")
                 self._finalize(session)
             return None
@@ -250,6 +273,7 @@ class PrefetchCoordinator:
         if chunk.nbytes > self.max_reserved_bytes - self.reserved_bytes:
             self.backend.discard(session.context, chunk)
             raise RuntimeError("prefetch backend exceeded reservation budget")
+        self._data_sessions.add(session.handle)
         session.chunks[chunk.graph.graph_id] = chunk
         self.graphs[chunk.graph.graph_id] = session
         self.reserved_bytes += chunk.nbytes
@@ -313,8 +337,17 @@ class PrefetchCoordinator:
         if session.reason is None or session.chunks or session.terminal_at is not None:
             return
         session.terminal_at = self.clock()
+        # No submitted graph remains here; releasing a data slot does not
+        # release the separately retained CPU result/pin lease.
+        self._data_sessions.discard(session.handle)
         session.version += 1
-        logging.getLogger(__name__).info(
+        snapshot = self.snapshot(session.handle)
+        elapsed_s = session.terminal_at - session.created
+        drain_s = session.terminal_at - (
+            session.sealed_at if session.sealed_at is not None else session.terminal_at
+        )
+        logger = logging.getLogger(__name__)
+        logger.info(
             "[FlexKV-Prefetch] epoch=%s session_id=%d policy=%s reason=%s "
             "submitted_chunks=%d sealed_submit_seq=%d loaded_tokens=%d "
             "elapsed_ms=%.3f drain_ms=%.3f error=%r",
@@ -324,19 +357,19 @@ class PrefetchCoordinator:
             session.reason,
             session.submitted,
             session.sealed_seq,
-            self.snapshot(session.handle).loaded_tokens,
-            (session.terminal_at - session.created) * 1000,
-            (
-                session.terminal_at
-                - (
-                    session.sealed_at
-                    if session.sealed_at is not None
-                    else session.terminal_at
-                )
-            )
-            * 1000,
+            snapshot.loaded_tokens,
+            elapsed_s * 1000,
+            drain_s * 1000,
             session.error,
         )
+        if self.metrics is not None:
+            try:
+                self.metrics.record_prefetch_terminal(
+                    session.options.policy, session.reason, snapshot.outcome,
+                    snapshot.loaded_tokens if snapshot.lease_valid else 0, elapsed_s, drain_s,
+                )
+            except Exception:
+                logger.exception("Failed to record chunked prefetch metrics")
         if session.released or session.discard_result:
             self._retire(session)
 

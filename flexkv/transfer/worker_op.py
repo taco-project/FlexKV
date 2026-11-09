@@ -33,6 +33,8 @@ class WorkerTransferOp:
     # selects the pool binding on the worker side, instead of being inferred
     # from which worker the engine happened to pick.
     pool_id: PoolId = PoolId.FULL_KV
+    layer_id: int = 0
+    layer_granularity: int = -1
     prof_submitted_ns: int = 0
 
     @property
@@ -52,6 +54,9 @@ class WorkerTransferOp:
         self.mooncake_store_block_hashes = transfer_op.mooncake_store_block_hashes
         self.mooncake_store_swa_block_hashes = transfer_op.mooncake_store_swa_block_hashes
         self.pool_id = getattr(transfer_op, "pool_id", PoolId.FULL_KV)
+        self.layer_id = int(getattr(transfer_op, "layer_id", 0) or 0)
+        self.layer_granularity = int(
+            getattr(transfer_op, "layer_granularity", -1) or -1)
 
         if self.src_slot_id == -1 or self.dst_slot_id == -1:
             self.src_block_ids = transfer_op.src_block_ids
@@ -78,6 +83,8 @@ class WorkerLayerwiseTransferOp:
     swa_src_block_ids_h2d: np.ndarray
     swa_dst_block_ids_h2d: np.ndarray
     counter_id: int  # Counter set index for triple buffering eventfd notification
+    layer_id: int = 0
+    layer_granularity: int = -1
     prof_submitted_ns: int = 0
 
     def __init__(self, transfer_op: LayerwiseTransferOp):
@@ -90,3 +97,6 @@ class WorkerLayerwiseTransferOp:
         self.swa_src_block_ids_h2d = transfer_op.swa_src_block_ids_h2d
         self.swa_dst_block_ids_h2d = transfer_op.swa_dst_block_ids_h2d
         self.counter_id = transfer_op.counter_id
+        self.layer_id = int(getattr(transfer_op, "layer_id", 0) or 0)
+        self.layer_granularity = int(
+            getattr(transfer_op, "layer_granularity", -1) or -1)

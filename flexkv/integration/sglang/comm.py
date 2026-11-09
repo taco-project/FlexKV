@@ -24,6 +24,7 @@ This file provides:
 from __future__ import annotations
 
 import ctypes
+from contextlib import suppress
 import errno
 import logging
 import os
@@ -31,7 +32,6 @@ import pickle
 import socket
 import struct
 import time
-from datetime import timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -48,6 +48,7 @@ class FlexKVScatterChannel(str, Enum):
 
     LOOKUP = "lookup"
     LAYERWISE_MANIFEST = "layerwise_manifest"
+    LAYERWISE_BATCH = "layerwise_batch"
     STORE_COMPLETION = "store_completion"
     PREFETCH_START = "prefetch_start"
     PREFETCH_PROGRESS = "prefetch_progress"
@@ -67,6 +68,7 @@ _SCATTER_CHANNEL_OFFSETS = {
     FlexKVScatterChannel.STORE_START: 7,
     FlexKVScatterChannel.STORE_RESET: 8,
     FlexKVScatterChannel.STORE_READY: 9,
+    FlexKVScatterChannel.LAYERWISE_BATCH: 10,
 }
 _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.LOOKUP: dict,
@@ -78,6 +80,7 @@ _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.STORE_START: dict,
     FlexKVScatterChannel.STORE_RESET: dict,
     FlexKVScatterChannel.STORE_READY: list,
+    FlexKVScatterChannel.LAYERWISE_BATCH: dict,
 }
 
 
@@ -110,15 +113,12 @@ class FlexKVComm:
     _TAG_PP_BARRIER_BCAST = int.from_bytes(b"FxB3", byteorder="big")
     _TAG_AR_BCAST = int.from_bytes(b"FxAR", byteorder="big")
 
-    # Adaptive async-work reaper. gloo's isend Work objects do not auto-
-    # advance their "completed" state on poll, so a pure poll-based reaper
-    # leaks. We actively wait() the oldest works with a tiny timeout;
-    # the watermark grows on stuck reaps (slow / asymmetric peer) and
-    # shrinks back on clean reaps.
+    # Gloo P2P Work completion is advanced by wait(), not by polling.
+    # A short wait(timeout) expiry aborts the shared Gloo transport. Bound
+    # retained work by applying backpressure to the oldest send using the
+    # normal process-group timeout, and propagate actual communication errors.
     _REAP_HIGH_BASE = 1024
-    _REAP_HIGH_MAX = 32768
     _REAP_MAX_DRAIN = 512
-    _REAP_PROBE = timedelta(milliseconds=1)
     _REAP_LOG_EVERY = 64
 
     def __init__(
@@ -136,7 +136,6 @@ class FlexKVComm:
         self._async_works: List = []
         self._reap_high: int = self._REAP_HIGH_BASE
         self._reap_calls: int = 0
-        self._reap_stuck_total: int = 0
         self._reap_drained_total: int = 0
 
         # Accept either GroupCoordinator wrappers (has ``.cpu_group``) or
@@ -205,6 +204,14 @@ class FlexKVComm:
         self._pp_stage_member_ranks = list(
             range(pp_stage_offset, pp_stage_offset + stride)
         )
+
+        # Enable only on a homogeneous node-local fan-out. Every rank must
+        # use the same framing; leave cross-node PP on the established wire.
+        self._control_inline_bytes = int(os.getenv("FLEXKV_CONTROL_INLINE_BYTES", "0"))
+        if self._control_inline_bytes not in (0, 256, 512, 1024, 4096):
+            raise ValueError("FLEXKV_CONTROL_INLINE_BYTES must be 0/256/512/1024/4096")
+        if self._control_inline_bytes and self.pp_size > 1:
+            raise ValueError("inline control framing requires node-local PP=1")
 
         self.needs_sync = (
             self.pp_size > 1 or self.attn_tp_size > 1 or self.attn_cp_size > 1
@@ -402,8 +409,11 @@ class FlexKVComm:
         if is_leader:
             dsts = [r for r in group_ranks if r != self.world_rank]
             works = []
+            # Serialize once for the whole fan-out. The tensors remain immutable
+            # and each Gloo Work retains its send buffers through completion.
+            buffers = self._pack_control_payload(data) if dsts else []
             for dst in dsts:
-                works.extend(self._isend(dst, data, tag, self._world_cpu_group))
+                works.extend(self._isend_buffers(dst, buffers, tag, self._world_cpu_group))
             if blocking:
                 for w in works:
                     w.wait()
@@ -419,48 +429,23 @@ class FlexKVComm:
             return
 
         drained = 0
-        stuck = False
         for _ in range(self._REAP_MAX_DRAIN):
             if not self._async_works:
                 break
             w = self._async_works[0]
-            try:
-                w.wait(self._REAP_PROBE)
-            except RuntimeError:
-                stuck = True
-                break
+            w.wait()
             self._async_works.pop(0)
             drained += 1
 
         self._reap_calls += 1
         self._reap_drained_total += drained
-        if stuck:
-            self._reap_stuck_total += 1
-
-        prev_high = self._reap_high
-        if stuck:
-            self._reap_high = min(self._REAP_HIGH_MAX, self._reap_high * 2)
-        else:
-            self._reap_high = max(self._REAP_HIGH_BASE, self._reap_high // 2)
-        if self._reap_high != prev_high:
-            logger.debug(
-                "[FlexKV] reap watermark rank=%d %d->%d "
-                "(stuck=%s drained=%d backlog=%d)",
-                self.world_rank,
-                prev_high,
-                self._reap_high,
-                stuck,
-                drained,
-                n,
-            )
         if self._reap_calls % self._REAP_LOG_EVERY == 0:
             logger.debug(
-                "[FlexKV] reap stats rank=%d calls=%d drained=%d stuck=%d "
+                "[FlexKV] reap stats rank=%d calls=%d drained=%d "
                 "backlog=%d high=%d",
                 self.world_rank,
                 self._reap_calls,
                 self._reap_drained_total,
-                self._reap_stuck_total,
                 len(self._async_works),
                 self._reap_high,
             )
@@ -469,19 +454,39 @@ class FlexKVComm:
     # Low-level send / recv on the world cpu group
     # ------------------------------------------------------------------
 
-    def _isend(self, dst: int, data: Any, tag: int = 0, group=None) -> list:
+    def _pack_control_payload(self, data: Any) -> list:
         serialized = bytearray(pickle.dumps(data))
-        t_size = torch.tensor([len(serialized)], dtype=torch.long)
-        t_data = torch.frombuffer(serialized, dtype=torch.uint8)
-        return [
-            dist.isend(t_size, dst=dst, tag=tag, group=group),
-            dist.isend(t_data, dst=dst, tag=tag, group=group),
-        ]
+        inline_bytes = getattr(self, "_control_inline_bytes", 0)
+        if inline_bytes:
+            frame = bytearray(inline_bytes)
+            struct.pack_into("!Q", frame, 0, len(serialized))
+            header = torch.frombuffer(frame, dtype=torch.uint8)
+            if len(serialized) <= inline_bytes - 8:
+                frame[8:8 + len(serialized)] = serialized
+                return [header]
+            return [header, torch.frombuffer(serialized, dtype=torch.uint8)]
+        return [torch.tensor([len(serialized)], dtype=torch.long),
+                torch.frombuffer(serialized, dtype=torch.uint8)]
+
+    def _isend_buffers(self, dst: int, buffers: list, tag: int = 0, group=None) -> list:
+        return [dist.isend(buffer, dst=dst, tag=tag, group=group) for buffer in buffers]
+
+    def _isend(self, dst: int, data: Any, tag: int = 0, group=None) -> list:
+        return self._isend_buffers(dst, self._pack_control_payload(data), tag, group)
 
     def _recv(self, src: int, tag: int = 0, group=None) -> Any:
-        t_size = torch.tensor([0], dtype=torch.long)
-        dist.irecv(t_size, src=src, tag=tag, group=group).wait()
-        size = int(t_size.item())
+        inline_bytes = getattr(self, "_control_inline_bytes", 0)
+        if inline_bytes:
+            header = torch.empty(inline_bytes, dtype=torch.uint8)
+            dist.irecv(header, src=src, tag=tag, group=group).wait()
+            raw = header.numpy().tobytes()
+            size = struct.unpack_from("!Q", raw)[0]
+            if 0 < size <= inline_bytes - 8:
+                return pickle.loads(raw[8:8 + size])
+        else:
+            t_size = torch.tensor([0], dtype=torch.long)
+            dist.irecv(t_size, src=src, tag=tag, group=group).wait()
+            size = int(t_size.item())
         if size <= 0:
             raise RuntimeError(
                 "[FlexKV] received invalid serialized payload size: "
@@ -748,17 +753,13 @@ class FlexKVLayerLoadingEvent:
 
     def close(self) -> None:
         for fd in self.load_event_fds:
-            try:
+            with suppress(Exception):
                 os.close(fd)
-            except Exception:
-                pass
         self.load_event_fds.clear()
 
     def __del__(self) -> None:
-        try:
+        with suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 class FlexKVLayerDoneCounter:
@@ -766,9 +767,10 @@ class FlexKVLayerDoneCounter:
 
     The KV pool calls ``wait_until(layer_id)`` once per layer during forward.
     All restores collected while SGLang builds one prefill batch share a
-    producer slot. The layer hook consumes one eventfd signal per restore for
-    each layer. Producer rotation therefore happens per prefill batch, not per
-    request, and the fixed-size ring remains sufficient for large batches.
+    producer slot. The layer hook consumes one eventfd signal per submitted
+    operation for each layer. The connector coalesces prepared request counts
+    to one before submitting a merged operation. Producer rotation happens per
+    prefill batch, and the fixed-size ring remains sufficient for large batches.
     """
 
     def __init__(self, num_layers: int, num_counters: int = 3, world_rank: int = -1):
@@ -910,6 +912,26 @@ class FlexKVLayerDoneCounter:
             if self.consumer_index == producer_id:
                 self.consumer_index = -1
             event.mark_reusable()
+
+    def validate_prepared_batch(self, task_ids: List[int], producer_id: int) -> None:
+        """Require one complete, unlaunched consumer batch before coalescing."""
+        if not task_ids or len(set(task_ids)) != len(task_ids):
+            raise RuntimeError("A layerwise batch needs distinct prepared tasks")
+        if self.consumer_index != producer_id:
+            raise RuntimeError("Layerwise batch is not the active consumer")
+        if self._consumer_task_ids != task_ids:
+            raise RuntimeError("Layerwise batch does not cover all prepared transfers")
+        if self.events[producer_id].pending_transfers() != len(task_ids):
+            raise RuntimeError("Layerwise batch transfer count differs from its members")
+
+    def coalesce_prepared_batch(self, task_ids: List[int], producer_id: int) -> None:
+        """One merged LAYERWISE op emits one signal per layer, not per child.
+
+        The connector must complete all-rank preflight first, and no member
+        may have been submitted to a transfer worker yet.
+        """
+        self.validate_prepared_batch(task_ids, producer_id)
+        self.events[producer_id].wait_remaining = [1] * self.num_layers
 
     def abort_unregistered_selection(self, producer_id: int) -> None:
         """Release a freshly selected leader counter before registration."""

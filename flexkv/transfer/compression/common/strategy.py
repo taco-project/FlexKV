@@ -46,11 +46,19 @@ class NullCompressionStrategy(CompressionStrategy):
         dst_block_ids: "torch.Tensor",
     ) -> None:
         start_time = time.time()
-        worker._transfer_impl(src_block_ids, dst_block_ids, op.transfer_type)
+        from flexkv.transfer.backends import op_layer_range
+        layer_id, gran = op_layer_range(op, worker.num_layers)
+        worker._transfer_impl(
+            src_block_ids,
+            dst_block_ids,
+            op.transfer_type,
+            layer_id=layer_id,
+            layer_granularity=gran,
+        )
         end_time = time.time()
         transfer_size = (
             worker.chunk_size_in_bytes
-            * worker.num_layers
+            * gran
             * op.valid_block_num
             * worker.kv_dim
         )

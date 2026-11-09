@@ -169,14 +169,15 @@ class MooncakeChunkPlanner(ChunkPlannerBase):
                 min(ready, int(local.swa_hit_blocks)) if context.swa_aware else ready
             )
             start *= self.block_size
-            if not self._pin_prefix(context, start):
-                raise PrefetchCapacityExhausted(
-                    "prefetch pinned-prefix capacity exhausted"
-                )
+            if not self._pin_prefix(context, start, initial=True):
+                # Accepted reads still own their credits, including after
+                # cancellation. Retry metadata admission once they drain.
+                return None
         return start, max(start, matched * self.block_size)
 
     def _pin_prefix(
-        self, context: MooncakePrefetchContext, end: int, reserved_to_release: int = 0
+        self, context: MooncakePrefetchContext, end: int, reserved_to_release: int = 0,
+        *, initial: bool = False,
     ) -> bool:
         cpu = self.cache.cpu_cache_engine
         prefix = copy(context.sequence)
@@ -200,6 +201,11 @@ class MooncakeChunkPlanner(ChunkPlannerBase):
         delta = amount - context.pinned_bytes
         reserved = self.engine._prefetch.reserved_bytes - reserved_to_release
         if self.pinned_bytes + delta + reserved > self.max_pinned_bytes:
+            if initial and self.pinned_bytes + delta > self.max_pinned_bytes:
+                # Waiting for I/O cannot make the retained prefix leases fit.
+                raise PrefetchCapacityExhausted(
+                    "prefetch pinned-prefix capacity exhausted"
+                )
             return False
         if node is not None:
             cpu.lock_node(node)

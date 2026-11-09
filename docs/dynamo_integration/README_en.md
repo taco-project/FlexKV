@@ -16,23 +16,25 @@ Refer to vLLM adaptation [README](../vllm_adapter/README_en.md).
 
 ### Install Dynamo
 
+PR #5858 was merged on March 3, 2026. Choose and test a Dynamo revision with your FlexKV, vLLM and CUDA versions; merging the PR alone does not validate a specific combination.
+
 ```bash
-# 1. Clone Dynamo repo
+# 1. Clone Dynamo and select a compatible release or commit containing PR #5858
 git clone https://github.com/ai-dynamo/dynamo.git
+cd dynamo
+export DYNAMO_WORKSPACE="$PWD"
+# git checkout <tested-release-or-commit>
 
-# 2. Apply PR #5858
-gh pr checkout 5858 # Make sure GitHub CLI is installed first
-
-# 3. Install NIXL
+# 2. Install NIXL
 uv pip install 'nixl[cu12]' # Or 'nixl[cu13]'
 
-# 4. Install Dynamo
+# 3. Install Dynamo
 cd $DYNAMO_WORKSPACE/lib/bindings/python
 maturin develop --uv
 cd ../../..
 uv pip install -e . # No need to specify backend as vLLM is already installed
 
-# 5. Install nats-server and etcd
+# 4. Install nats-server and etcd
 ```
 
 ### FlexKV Code Preparation
@@ -54,7 +56,7 @@ cd FlexKV && ./build.sh
 
 ### FlexKV Verification
 
-Please refer to the test scripts in [vLLM online serving](../../docs/vllm_adapter/README_zh.md#%E7%A4%BA%E4%BE%8B).
+Please refer to the test scripts in [vLLM online serving](../vllm_adapter/README_en.md).
 
 ## 2. Starting and Verifying Dynamo Services
 
@@ -95,13 +97,13 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
     GPU_START=$((i*2))
     GPU_END=$((i*2+1))
 
+    KV_ENDPOINT="tcp://*:2008${i}"
+    KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")"
     if [ $i -lt $((NUM_WORKERS-1)) ]; then
         # When using multiple workers, ensure FlexKV ports are different to avoid hanging at flexkv init
         # Set FlexKV port via the `FLEXKV_SERVER_RECV_PORT` environment variable
         FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/worker_${i}" \
         FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" \
-        KV_ENDPOINT="tcp://*:2008${i}" \
-        KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")" \
         CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} \
         python3 -m dynamo.vllm \
         --model $YOUR_MODEL \
@@ -111,8 +113,6 @@ for i in $(seq 0 $((NUM_WORKERS-1))); do
     else
         FLEXKV_SSD_CACHE_DIR="/data/flexkv_ssd/worker_${i}" \
         FLEXKV_SERVER_RECV_PORT="ipc:///tmp/flexkv_server_${i}" \
-        KV_ENDPOINT="tcp://*:2008${i}" \
-        KV_EVENTS_CONFIG="$(printf '{"publisher":"zmq","topic":"kv-events","endpoint":"%s","enable_kv_cache_events":true}' "$KV_ENDPOINT")" \
         CUDA_VISIBLE_DEVICES=${GPU_START},${GPU_END} \
         python3 -m dynamo.vllm \
         --model $YOUR_MODEL \
@@ -134,7 +134,7 @@ You can verify that the Dynamo service has started correctly with the following 
 curl localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": YOUR MODEL,
+    "model": "YOUR_MODEL",
     "messages": [
     {
         "role": "user",
@@ -148,7 +148,7 @@ curl localhost:8000/v1/chat/completions \
 
 ## 4. Benchmark
 
-We use [`aiperf`](https://github.com/ai-dynamo/aiperf) as our benchmarking tool and [mooncake trace](https://github.com/kvcache-ai/Mooncake?tab=readme-ov-file#-open-source-trace) as our dataset to evaluate the performance of Dynamo + FlexKV.
+We use [`aiperf`](https://github.com/ai-dynamo/aiperf) as our benchmarking tool and [mooncake trace](https://github.com/kvcache-ai/Mooncake/tree/main/FAST25-release) as our dataset to evaluate the performance of Dynamo + FlexKV.
 
 Mooncake Trace is an open-source request file saved in jsonl format. It records timestamps of request arrivals, ISL, OSL, and KV cache-related hash IDs, containing 23,608 requests over a 1-hour period. For our experiment with 4 LLaMA-70B workers, the concurrency in the mooncake trace was too high, so we sampled every 6th request from the trace to build our benchmark dataset.
 

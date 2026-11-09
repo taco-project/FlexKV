@@ -59,7 +59,7 @@ pytestmark = pytest.mark.unit
 如果一个匹配文件都没有，工作流会直接失败。筛选出的测试通过以下命令执行：
 
 ```bash
-timeout 10m python -m pytest -q --maxfail=1 <selected-test-files>
+timeout 10m python -m pytest -q --maxfail=1 -o pythonpath= "${unit_test_files[@]}"
 ```
 
 要把新测试加入这个 CI 层级，需要：
@@ -95,7 +95,7 @@ PY
 
 ci_test_dir=$(mktemp -d)
 cd "$ci_test_dir"
-timeout 10m python -m pytest -q --maxfail=1 "${unit_test_files[@]}"
+timeout 10m python -m pytest -q --maxfail=1 -o pythonpath= "${unit_test_files[@]}"
 ```
 
 `timeout` 和 `mapfile` 是 GNU/Linux 命令。如需完全复现工作流，请使用 Ubuntu 环境。

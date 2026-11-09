@@ -1,4 +1,5 @@
 #include "ce_trace.h"
+#include "host_registration.h"
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -411,6 +412,8 @@ bool create_gds_file_binding(GDSManager &manager, const std::string &filename,
 #endif
 
 PYBIND11_MODULE(c_ext, m) {
+  m.def("_register_host_region", &flexkv::register_host_region);
+  m.def("_unregister_host_region", &flexkv::unregister_host_region);
   m.def("ce_trace_enabled", &flexkv::ce_trace_enabled);
   m.def("ce_trace_set_enabled", &flexkv::ce_trace_set_enabled);
   m.def("ce_trace_shutdown", &flexkv::ce_trace_shutdown,

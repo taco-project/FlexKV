@@ -225,7 +225,8 @@ class KVServer:
                        cache_config: CacheConfig,
                        gpu_register_port: str,
                        server_recv_port: str) -> None:
-
+        from flexkv.common.numa import reset_inherited_numa_binding
+        reset_inherited_numa_binding("KVServer")
         server = KVServer(model_config, cache_config, gpu_register_port, server_recv_port)
         server.run()
 
@@ -279,6 +280,8 @@ class KVServer:
                 import pickle
                 import sys
                 sys.path.insert(0, "{flexkv_root}")
+                from flexkv.common.numa import reset_inherited_numa_binding
+                reset_inherited_numa_binding("KVServer")
                 from flexkv.server.server import KVServer
 
                 args_data = {args_data!r}
@@ -328,10 +331,14 @@ class KVServer:
                 self._drain_pending_waits()
                 if self._pending_waits and not self.recv_from_client.poll(2):
                     continue
-                flexkv_logger.info("start waiting for req")
+                flexkv_logger.debug("start waiting for req")
                 req = self.recv_from_client.recv_pyobj()
-                flexkv_logger.info(f"recv req: {type(req)} from DP client "
-                                   f"(dp_client_id={req.dp_client_id})")
+                # TryWait is a non-blocking poll issued from scheduler ticks;
+                # logging it at INFO floods the log at thousands of lines/s.
+                log_recv = (flexkv_logger.debug if isinstance(req, TryWaitRequest)
+                            else flexkv_logger.info)
+                log_recv(f"recv req: {type(req)} from DP client "
+                         f"(dp_client_id={req.dp_client_id})")
 
                 # Use dispatch table for request handling
                 req_type = type(req)

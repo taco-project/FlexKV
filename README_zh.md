@@ -8,7 +8,7 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 ## Updates
 
-- **2026 年 10 月 9 日**：FlexKV 完成 DeepSeek-V4.1 适配（[#303](https://github.com/taco-project/FlexKV/pull/303)），已合入 `main`。配套 SGLang 适配尚未合入官方主干；在 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 合入前，请拉取该 PR 并固定到最新 commit。部署使用当前 FlexKV `main`。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)。
+- **2026 年 10 月 9 日**：FlexKV 完成 DeepSeek-V4.1 适配（[#303](https://github.com/taco-project/FlexKV/pull/303)），已合入 `main`。配套 SGLang 适配尚未合入官方主干；在 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 合入前，请拉取该 PR 并使用集成说明中固定的 commit。部署使用当前 FlexKV `main`。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)。
 
 - **2026 年 7–8 月**：传输性能与可运维性全面增强，包括 [GPU↔CPU 自适应多路径传输](https://github.com/taco-project/FlexKV/pull/203)、[可靠性与运行日志增强](https://github.com/taco-project/FlexKV/pull/233)、[优雅退出](https://github.com/taco-project/FlexKV/pull/238)、[分块注册 Host Memory](https://github.com/taco-project/FlexKV/pull/240)、[SSD 向量化 I/O](https://github.com/taco-project/FlexKV/pull/242) 和 [Op 级传输 Trace](https://github.com/taco-project/FlexKV/pull/247)。
 
@@ -34,38 +34,69 @@ FlexKV 采用 **Apache-2.0 开源协议**，详细信息请参见 [LICENSE](LICE
 
 - **2025 年 11 月**：FlexKV 从 client-server 模式升级为**可直接调用的库函数**（commit [0290841](https://github.com/taco-project/FlexKV/commit/0290841dce65ae9b036a23d733cf94e47e814934)），消除进程间通信开销，即 v1.0.0 API。
 
-## 最新版本主要变更
-### 功能
-通用功能:
-- 添加本地 get/put 的操作级回调 [#13](https://github.com/taco-project/FlexKV/pull/13)
-- 添加分布式 KV Cache 共享支持，支持 CPU 和 SSD 之间的 KV Cache 共享，以及 PCFS 的分布式共享 ([#17](https://github.com/taco-project/FlexKV/pull/17))
-- 添加 GDS (GPU Direct Storage) 支持 ([#25](https://github.com/taco-project/FlexKV/pull/25))
-- TP16 支持 ([#26](https://github.com/taco-project/FlexKV/pull/26))
-- 支持更多 kv cache 布局。现在包括：vLLM、SGLang、TensorRT-LM ([#27](https://github.com/taco-project/FlexKV/pull/27))
-- GDS 重构和 gtensor 支持 ([#42](https://github.com/taco-project/FlexKV/pull/42))
-- 支持直接从 CUDA IPC Handle 构造 TensorSharedHandle ([#44](https://github.com/taco-project/FlexKV/pull/44))
+版本变更请参阅[更新日志](CHANGELOG_zh.md)。
 
+## 本分支的缓存恢复改进
 
-针对 vLLM:
-- 在 vLLM 集成中支持 dp > 1 ([#18](https://github.com/taco-project/FlexKV/pull/18))
-- 添加 vLLM 适配的启动脚本 ([#47](https://github.com/taco-project/FlexKV/pull/47))
-- 支持 vLLM+FlexKV 的 TP16 ([#59](https://github.com/taco-project/FlexKV/pull/59))
+这些改动由 [FlexKV #323](https://github.com/taco-project/FlexKV/pull/323) 提供。
+准入后合并恢复还需要 [SGLang 配套 #17](https://github.com/XingLiu1/sglang/pull/17)，
+其目标是上游 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 使用的适配分支。
+在 PR 审核期间，请使用相互匹配的源码版本。
 
-针对 SGLang:
-- SGLang `v0.5.16` 及以上版本已原生内置 FlexKV backend，无需再应用 patch（[sglang#29701](https://github.com/sgl-project/sglang/pull/29701)）
-- 支持 DeepSeek-V4 异构 C4/C128/indexer KV group、FullKV + SWA 双缓存、compress-state sidecar 和逐层恢复（[#225](https://github.com/taco-project/FlexKV/pull/225)）。在配套的 SGLang 适配合入前，请使用 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 并固定到 [`ee0465a`](https://github.com/sgl-project/sglang/commit/ee0465a09196421a6e4d53a3103eccdef1dd32ac)。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)
-- 支持 DeepSeek-V4.1（[#303](https://github.com/taco-project/FlexKV/pull/303)），FlexKV 使用当前 `main`。配套 SGLang 适配尚未合入官方主干；在 [sglang#31781](https://github.com/sgl-project/sglang/pull/31781) 合入前，请拉取该 PR 并固定到最新 commit。该 commit 与 V4 使用的 `ee0465a` 不同。详见 [SGLang 集成说明](flexkv/integration/sglang/README_zh.md)
+启用相关开关后的路径示意：
 
-针对 TensorRT-LLM
-- 在 TensorRT-LLM 上支持使用 FlexKV ([#48](https://github.com/taco-project/FlexKV/pull/48))
-- 支持 TensorRT-LLM+FlexKV 的 TP16 ([#53](https://github.com/taco-project/FlexKV/pull/53))
-### 优化
-- MLA d2h 传输优化 ([#19](https://github.com/taco-project/FlexKV/pull/19))
-- 优化 SSD I/O ([#33](https://github.com/taco-project/FlexKV/pull/33))
-- 增强缓存淘汰机制，引入频率感知的宽限时间 ([#38](https://github.com/taco-project/FlexKV/pull/38))
-- 在 RadixTree 中使用 std::unordered_map 替代 std::map ([#41](https://github.com/taco-project/FlexKV/pull/41))
+```mermaid
+flowchart TB
+    subgraph Control[请求控制]
+        direction LR
+        A[分配槽位并投票] --> P[准备映射<br/>尚未提交 DMA] --> B[合并为一次启动]
+    end
+    subgraph Data[缓存数据]
+        direction LR
+        S[远端 Store] -->|有界 Get| H[CPU Host Cache]
+        H -->|符合条件时直接二维 CE| G[GPU KV]
+    end
+    Control -.->|提交 H2D| Data
+```
 
-更多详细信息，请参阅 [CHANGELOG](CHANGELOG.md)
+“请求控制”表示准备与启动的顺序，“缓存数据”表示层级间的数据流，虚线表示 H2D 提交。
+Store 预取可提前运行，图示不代表测得的耗时。
+[中文图解](docs/cache_restore_optimizations_zh.md)逐项对照优化前后的启动、拷贝和通信路径，
+并区分性能改进与正确性保护。
+
+| 范围 | 原有行为 | 修改后的行为与实现位置 |
+| --- | --- | --- |
+| 准入后的逐层恢复 | 每个请求在准入过程中分别发起恢复。 | 先准备映射而不提交 DMA，再将最终准入的请求合并为一次启动，每层只发送一次完成信号。见 [`connector.py`](flexkv/integration/sglang/connector.py)。 |
+| 跨 rank 分配与控制 | 某个 rank 分配失败时可能与其他 rank 走入不同流程；轮询完成状态可能长期保留异步 Gloo 发送。 | 恢复 collective 前先投票确认分配成功；达到发送保留上限时，用正常的 `Work.wait()` 回收最早的发送。见 [`comm.py`](flexkv/integration/sglang/comm.py)。 |
+| CE Host/Device 拷贝 | DMA 可能跨越独立注册的 Host 分块；部分 BlockFirst H2D 恢复需要中转和转置。 | 按实际注册边界拆分 DMA，符合条件时直接使用二维 H2D 拷贝。提交失败后先排空已接受的工作，再允许复用缓存块。见 [`host_dma.h`](csrc/host_dma.h) 和 [`ce_transfer.cu`](csrc/ce_transfer.cu)。 |
+| 远端预取 | Store 串行读取，数据会话受已有的会话数和字节预算限制。 | 可选的有界并行 Get 和数据会话限流；临时信用不足时保留等待，已提交工作排空前保留源数据租约。见[详细说明](docs/cache_tier_performance_controls.md)。 |
+
+性能相关开关默认不启用：
+
+| 设置 | 默认值 | 适用范围 |
+| --- | --- | --- |
+| `FLEXKV_ENABLE_LAYERWISE_TRANSFER` | `0` | 启用 SGLang 进程内逐层恢复路径。 |
+| `FLEXKV_BATCH_LAYERWISE_RESTORE` | `0` | 配套 SGLang 的普通缓存 IP adapter；需要 connector 的合并恢复 API。旧 connector 继续立即启动。 |
+| `FLEXKV_USE_CE_TRANSFER_H2D` / `FLEXKV_USE_CE_TRANSFER_D2H` | 分别为 `0` | 按方向独立选择 CE 拷贝。 |
+| `FLEXKV_CUDAHOST_CHUNK_SIZE_GB` | `0` | Host 注册分块大小，单位 GiB；零表示整块注册。它不设置缓存容量。 |
+
+安装匹配的两侧实现后，例如：
+
+```bash
+export FLEXKV_ENABLE_LAYERWISE_TRANSFER=1
+export FLEXKV_BATCH_LAYERWISE_RESTORE=1
+# 可选：CE 拷贝可以与准入后合并恢复分别评估。
+export FLEXKV_USE_CE_TRANSFER_H2D=1
+export FLEXKV_USE_CE_TRANSFER_D2H=1
+```
+
+合并恢复适用于普通 IP adapter；MP 和 hybrid adapter 保留现有启动路径。
+CE 和远端读取开关可分别评估。更新注册边界感知的 CE 实现后，需要重新编译并安装
+native extension。所有 rank 必须使用一致的通信设置；内联控制帧仅支持 PP=1。
+
+[详细说明](docs/cache_tier_performance_controls.md)包含远端预算、prepare/flush/cancel
+契约与复现命令。CPU/mock 生命周期测试与 CUDA 字节、完成通知测试的验证范围不同；
+模型输出一致性、跨机性能和持续容量需要单独验证。
 
 ## 如何使用
 
@@ -84,6 +115,10 @@ apt install libhiredis-dev
 #./build.sh --release for cython package
 ```
 
+### 在 SGLang 中使用 FlexKV
+
+参阅 [SGLang 集成指南](flexkv/integration/sglang/README_zh.md)。
+
 ### 在 vLLM 中使用 FlexKV
 
 见[docs/vllm_adapter/README_zh.md](docs/vllm_adapter/README_zh.md)
@@ -95,6 +130,12 @@ apt install libhiredis-dev
 ### FlexKV和Dynamo框架的集成
 
 见[docs/dynamo_integration/README_zh.md](docs/dynamo_integration/README_zh.md)
+
+### 文档导航
+
+- [配置参考](docs/flexkv_config_reference/README_zh.md) · [命令行工具](docs/cli/README_zh.md) · [监控](docs/monitoring/README_zh.md)
+- [多实例模式](docs/multi_instance/README_zh.md) · [分布式复用](docs/dist_reuse/README_zh.md) · [命名空间隔离](docs/namespace/README_zh.md)
+- [驱逐策略](docs/eviction_policy/README_zh.md) · [GDS](docs/gds/README_zh.md) · [HugePage](docs/hugepage/README_zh.md) · [持续集成](docs/ci/README_zh.md) · [参与贡献](CONTRIBUTING_zh.md)
 
 ## 设计框架
 

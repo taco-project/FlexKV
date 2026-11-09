@@ -79,6 +79,8 @@ logger = logging.getLogger(__name__)
 _SGLANG_REQ_ID_UNSET = object()
 _INFO_STATUSES = {"hit", "miss", "skipped", "success"}
 _WARNING_STATUSES = {"cancelled", "failed", "missing", "not_found", "timeout"}
+# Minimum gap between idle engine nudges in non-chunked mode (seconds).
+_IDLE_DRIVE_INTERVAL_S = 0.1
 
 
 @dataclass
@@ -87,6 +89,16 @@ class _CacheOpContext:
     sglang_req_id: Optional[str]
     start_ns: int
     task_id: int = -1
+
+
+@dataclass
+class _PreparedLayerwiseLoad:
+    task_id: int
+    producer_id: int
+    slot_mapping: torch.Tensor
+    swa_slot_mapping: Optional[torch.Tensor]
+    context: _CacheOpContext
+    start_ns: int
 
 
 @dataclass(frozen=True)
@@ -480,6 +492,8 @@ class FlexKVConnector:
         self._inflight_loads: Dict[int, int] = {}  # producer_id -> rid hashlike
         self._completed_layerwise: List[int] = []
         self._launched_load_tids: List[int] = []  # leader-only, for periodic drain
+        self._prepared_layerwise_loads: Dict[str, _PreparedLayerwiseLoad] = {}
+        self._layerwise_batch_launch_error: Optional[str] = None
         self._launched_load_contexts: Dict[int, _CacheOpContext] = {}
         # Stores
         self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
@@ -784,9 +798,27 @@ class FlexKVConnector:
             self._release_prefetch_result(rid)
         return fkv_task_id, hit_length
 
+    def sync_load_ready(self, local_ready: bool) -> bool:
+        """Agree on allocation before any rank prepares a restore collective."""
+        if self._sync_ctx.needs_sync:
+            return bool(self._sync_ctx.all_reduce_min(int(local_ready)))
+        return bool(local_ready)
+
     def release_pending(self, rid: str) -> None:
         """Cancel the task held by an earlier ``lookup_kv(rid=...)`` that
         won't be followed by a ``retrieve_kv`` (e.g. allocation failed)."""
+        prepared = getattr(self, "_prepared_layerwise_loads", {}).get(rid)
+        if prepared is not None:
+            if getattr(self, "_layerwise_batch_launch_error", None):
+                raise RuntimeError("Cannot cancel a layerwise batch with unknown launch status")
+            if self._sync_ctx.is_sync_leader:
+                self.kv_manager.cancel([prepared.task_id])
+            self.layer_done_counter.rollback_prepared_transfer(
+                prepared.task_id, prepared.producer_id, transfer_added=True
+            )
+            del self._prepared_layerwise_loads[rid]
+            self._log_cache_op(prepared.context, "complete", "cancelled",
+                               reason="prepared_layerwise_cancel")
         fkv_task_id = self._pending_lookups.pop(rid, -1)
         context = getattr(self, "_pending_lookup_contexts", {}).pop(rid, None)
         if fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
@@ -896,6 +928,8 @@ class FlexKVConnector:
         self,
         rid: str,
         slot_mapping: torch.Tensor,
+        *,
+        defer_launch: bool = False,
     ) -> Tuple[int, int]:
         """Layerwise load. Fires ``launch(layerwise_transfer=True)`` and
         returns ``(n_slots, producer_id)`` after registering the producer
@@ -904,6 +938,10 @@ class FlexKVConnector:
             "start_load_kv_layerwise called but layerwise transfer is "
             "disabled. Set FLEXKV_ENABLE_LAYERWISE_TRANSFER=1."
         )
+        if getattr(self, "_layerwise_batch_launch_error", None):
+            raise RuntimeError("Previous layerwise batch has unknown launch status")
+        if rid in getattr(self, "_prepared_layerwise_loads", {}):
+            raise RuntimeError(f"Duplicate prepared layerwise load: rid={rid}")
         fkv_task_id = self._pending_lookups.pop(rid, -1)
         context = self._pop_context(
             "_pending_lookup_contexts", rid, "load", fkv_task_id
@@ -1106,6 +1144,15 @@ class FlexKVConnector:
             expected_signal_count=expected_signal_count,
         )
 
+        if defer_launch:
+            if not hasattr(self, "_prepared_layerwise_loads"):
+                self._prepared_layerwise_loads = {}
+            self._prepared_layerwise_loads[rid] = _PreparedLayerwiseLoad(
+                fkv_task_id, producer_id, slot_mapping_cpu, swa_slot_mapping,
+                context, load_start_ns,
+            )
+            return n, producer_id
+
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 launched_task_ids = self.kv_manager.launch(
@@ -1152,16 +1199,112 @@ class FlexKVConnector:
 
         return n, producer_id
 
+    def flush_layerwise_loads(self, request_ids: List[str]) -> None:
+        """Submit the admitted compute batch through the existing graph merger.
+
+        Preparation retains each request's destinations and runs the existing
+        all-rank preflight, but submits no DMA. The scheduler calls this once
+        after admission and before preparing/executing the forward batch.
+        """
+        prepared = getattr(self, "_prepared_layerwise_loads", {})
+        if not prepared:
+            return
+        if getattr(self, "_layerwise_batch_launch_error", None):
+            raise RuntimeError("Previous layerwise batch has unknown launch status")
+        members = [prepared[rid] for rid in request_ids if rid in prepared]
+        task_ids = [m.task_id for m in members]
+        producer_id = members[0].producer_id if members else -1
+        entries = [
+            (rid, prepared[rid].task_id, prepared[rid].producer_id,
+             int(prepared[rid].slot_mapping.numel()),
+             0 if prepared[rid].swa_slot_mapping is None else
+             int(prepared[rid].swa_slot_mapping.numel()))
+            for rid in request_ids if rid in prepared
+        ]
+        manifest = {"entries": entries}
+        if self._sync_ctx.needs_sync:
+            manifest = self._sync_ctx.scatter(
+                manifest, channel=FlexKVScatterChannel.LAYERWISE_BATCH
+            )
+        local_error = None
+        try:
+            if manifest != {"entries": entries}:
+                raise RuntimeError("Layerwise batch members differ across ranks")
+            if len(set(request_ids)) != len(request_ids):
+                raise RuntimeError("Duplicate request in admitted layerwise batch")
+            if set(prepared) - set(request_ids):
+                raise RuntimeError("Prepared restore was not admitted to this batch")
+            if any(m.producer_id != producer_id for m in members):
+                raise RuntimeError("Layerwise batch spans multiple producer counters")
+            self.layer_done_counter.validate_prepared_batch(task_ids, producer_id)
+        except Exception as exc:
+            local_error = str(exc)
+        ready = int(local_error is None)
+        if self._sync_ctx.needs_sync:
+            ready = self._sync_ctx.all_reduce_min(ready)
+        if not ready:
+            # Nothing was submitted. Retain prepared records for cancellation
+            # or reset; never let the model consume an incomplete batch.
+            raise RuntimeError(local_error or "Another rank rejected the layerwise batch")
+
+        self.layer_done_counter.coalesce_prepared_batch(task_ids, producer_id)
+        result = {"error": None, "task_ids": []}
+        # From this point, failure may mean the server accepted the launch.
+        # Retain mappings and refuse reset unless launch was acknowledged.
+        self._layerwise_batch_launch_error = "Layerwise batch launch is unresolved"
+        if self._sync_ctx.is_sync_leader:
+            try:
+                result["task_ids"] = self.kv_manager.launch(
+                    task_ids=task_ids,
+                    slot_mappings=[m.slot_mapping for m in members],
+                    swa_slot_mappings=[m.swa_slot_mapping for m in members],
+                    as_batch=True, layerwise_transfer=True, counter_id=producer_id,
+                )
+                if len(result["task_ids"]) != 1:
+                    raise RuntimeError("Layerwise merge did not return one batch task")
+                self._launched_load_tids.extend(result["task_ids"])
+                for tid in result["task_ids"]:
+                    self._launched_load_contexts[tid] = replace(
+                        members[0].context, task_id=tid,
+                        start_ns=min(m.start_ns for m in members),
+                    )
+            except Exception as exc:
+                result["error"] = str(exc)
+        if self._sync_ctx.needs_sync:
+            result = self._sync_ctx.scatter(
+                result, channel=FlexKVScatterChannel.LAYERWISE_BATCH, blocking=True
+            )
+        if result["error"]:
+            self._layerwise_batch_launch_error = result["error"]
+            raise RuntimeError(f"Layerwise batch launch failed: {result['error']}")
+        self._layerwise_batch_launch_error = None
+        prepared.clear()
+        for m in members:
+            self._log_cache_op(
+                m.context, "launch", "running", direction="H2D",
+                flexkv_batch_task_ids=result["task_ids"], transfer_mode="layerwise",
+                slots=int(m.slot_mapping.numel()), producer_id=producer_id,
+                merged_requests=len(members), expected_signal_count=1,
+            )
+
     def drain_launched_loads(self, threshold: int = 1) -> None:
         """Periodic non-blocking sweep on long-lived launched tasks so the
         FlexKV pipe doesn't accumulate. No-op on non-leader ranks."""
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
             return
-        # Drive detached/cancelled prefetch completion even when no requests
-        # or stores remain. Otherwise the final graph can keep CPU blocks pinned
-        # until the next request happens to poll the engine.
         if not self._launched_load_tids:
-            self.kv_manager.try_wait(task_ids=[])
+            # Without chunked prefetch the engine only advances when a client
+            # polls it, so a cancelled graph would keep its CPU blocks pinned
+            # until the next request arrives. Nudge it at a bounded rate: the
+            # scheduler calls this every idle tick, which would otherwise be
+            # thousands of synchronous RPCs per second. Chunked prefetch runs
+            # the TaskRuntime thread, which already drains graphs on its own.
+            if not getattr(self, "_chunked_prefetch", False):
+                now = time.monotonic()
+                last = getattr(self, "_last_idle_drive_ts", None)
+                if last is None or now - last >= _IDLE_DRIVE_INTERVAL_S:
+                    self._last_idle_drive_ts = now
+                    self.kv_manager.try_wait(task_ids=[])
             return
         if len(self._launched_load_tids) < threshold:
             return
@@ -1841,6 +1984,13 @@ class FlexKVConnector:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
+        if getattr(self, "_layerwise_batch_launch_error", None):
+            raise RuntimeError(
+                "Cannot reset after an unacknowledged layerwise batch launch: "
+                + self._layerwise_batch_launch_error
+            )
+        for rid in list(getattr(self, "_prepared_layerwise_loads", {})):
+            self.release_pending(rid)
         if getattr(self, "_chunked_prefetch", False):
             for rid in list(self._prefetch_sessions):
                 self.cancel_prefetch(rid)

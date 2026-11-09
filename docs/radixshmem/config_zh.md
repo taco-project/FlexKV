@@ -1,8 +1,6 @@
 # radixshmem 模式配置
 
-> **两机落地部署（SGLang + FlexKV + radixshmem + NIXL）** 见同目录
-> [deploy_2node_nixl_zh.md](./deploy_2node_nixl_zh.md)。环境编译排错见工作区
-> [`docs/env_setup_zh.md`](../../../docs/env_setup_zh.md)。
+[English](config_en.md)
 
 FlexKV 以 radixshmem 作为 CPU 层（索引 + SlotStore + 跨节点拉取）。配置分两处：
 
@@ -42,33 +40,9 @@ attach 的其余参数是 `flexkv/server/shm_radix_bootstrap.py` 里的常量：
 | 常量 | 值 | 含义 |
 |---|---|---|
 | `READY_TIMEOUT_S` | 600 | 等 server 可达且 ready 的总时长，覆盖 server 晚起、SlotStore prefault、集群 rendezvous；server 的 `--bootstrap-timeout` 不要超过它。 |
-| `PREFETCH_TIMEOUT_MS` | 5000 | 单次 `pull_async` 的服务端传输硬超时（与策略层 budget 解耦）；可用 `FLEXKV_RADIXSHMEM_CHUNK_TIMEOUT_MS` 或 `prefetch_options.chunk_timeout_ms` 覆盖。到期后该次 job 以本地命中的部分完成。 |
+| `PREFETCH_TIMEOUT_MS` | 5000 | 一次 prefetch 拉取的服务端超时，到期后 job 以本地命中的部分完成。 |
 | `PREFETCH_MAX_INFLIGHT` | 128 | 每个 KVTaskEngine 在飞的 peer 拉取上限，达到后新的 prefetch 跳过 peer 查询。 |
 | `MAX_OUTSTANDING` | 256 | 一个 `RadixClient` 在飞的 peer 拉取 job 上限（job 完成即释放名额）。FlexKV 以 `block=False` 提交，达到上限时新 job 立即以本地命中完成。 |
-
-## 2.1 Prefetch 三策略（对齐 Mooncake chunked）
-
-设计说明（架构、前缀分段约束、实现映射）见
-[design/radixshmem_chunked_prefetch.md](../design/radixshmem_chunked_prefetch.md)。
-
-与 Mooncake 分布式后端相同，radixshmem 支持 `wait_complete` / `timeout` / `best_effort`，复用 `PrefetchCoordinator` 与 SGLang 的 `--hicache-storage-prefetch-policy`（或 `FLEXKV_PREFETCH_OPTIONS`）。
-
-| 策略 | 路径 | 行为 |
-|---|---|---|
-| `wait_complete` | 关 chunked，整段 `pull_async`（现有 legacy） | 等 peer 拉取完成再 admission |
-| `timeout` | `FLEXKV_ENABLE_CHUNKED_PREFETCH=1` + 分段 `pull_async` | 会话 budget 到期后停止下发新 chunk，drain 已提交的 pull |
-| `best_effort` | 同上 | scheduler 首次 `demand` 时 seal，再 drain inflight |
-
-示例：
-
-```bash
-export FLEXKV_ENABLE_RADIXSHMEM=1
-export FLEXKV_ENABLE_CHUNKED_PREFETCH=1
-export FLEXKV_PREFETCH_OPTIONS='{"policy":"timeout","chunk_max_blocks":64,"timeout_base_s":2.0}'
-# 或依赖 SGLang: --hicache-storage-prefetch-policy best_effort
-```
-
-`policy=wait_complete` 时 FlexKV connector 会自动关闭 chunked，行为与今天一致。分段路径为 Full-KV；若模型带 paged SWA pool 却开启 radixshmem chunked，connector **启动时 Fail-fast**（请改用 `wait_complete` 或关闭 `FLEXKV_ENABLE_CHUNKED_PREFETCH`）。
 
 ## 3. 几何与 slot 数
 
