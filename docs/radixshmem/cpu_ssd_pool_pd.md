@@ -37,8 +37,8 @@ peer SSD, dedup writes).
 
 | Component | Branch | Notes |
 |---|---|---|
-| FlexKV | `linhu-nv/FlexKV` `linhu/rsm-ssd-pool` | this branch |
-| SGLang | `linhu-nv/sglang` `linhu/flexkv-pd-rsm-ssd` | FlexKV PD decode integration, decode store stride, two fixes (see section 8) |
+| FlexKV | `linhu-nv/FlexKV` `linhu/rsm-ssd-pool-main` | this branch (upstream main + this work) |
+| SGLang | `linhu-nv/sglang` `linhu/flexkv-1026-pd-ssdpool` (based on `rebase_main_1026`) | FlexKV PD decode integration, decode store stride, batched layerwise restore, two fixes (see section 9) |
 | radixshmem | `feat/pd-support` (validated at `5e32312`) | build with RDMA and the Mooncake transfer backend |
 | NIXL | 1.4 or 1.5 Python wheel with the UCX and POSIX plugins | used for peer SSD reads and writes |
 
@@ -128,6 +128,11 @@ export UCX_TLS=rc,ud,self,cuda_copy
 # SSD global dedup (recommended)
 export FLEXKV_SSD_WRITE_MODE=global_dedup
 
+# layerwise transfer with batched restore (recommended)
+export FLEXKV_ENABLE_LAYERWISE_TRANSFER=1
+export FLEXKV_BATCH_LAYERWISE_RESTORE=1
+export FLEXKV_LAYERWISE_EVENTFD_SOCKET=/tmp/flexkv_lw_nodeA.sock   # unique per instance on a host
+
 # process / startup
 export FLEXKV_ENABLE_MPS=0
 export FLEXKV_SERVER_RECV_PORT=ipc:///tmp/flexkv_nodeA   # unique per instance on a host
@@ -170,7 +175,52 @@ endpoints as usual. Other models work the same way; drop the DSv4-specific flags
    tokens and FlexKV logs `DISK2H` / `PEERSSD2H` / peer pulls; the answer is the same as the first time.
 4. Metrics: `flexkv_py_transfer_blocks_total{transfer_type=...}` grows for the transfer types in use.
 
-## 5. Configuration reference
+## 5. Configuration guide
+
+Three levels: get the **minimal configuration** running, deploy with the **recommended configuration**, then **tune per scenario**. Each switch lists its cost and how to observe it.
+
+### 5.1 Minimal configuration
+
+The deployment steps in section 4 are the minimal configuration: two radix-servers per node, the FlexKV config file, the environment of 4.4 (without the optional parts) and `--enable-flexkv` on SGLang. Section 4.6 tells you it works.
+
+### 5.2 Recommended configuration
+
+| Setting | Recommended | Notes |
+|---|---|---|
+| CPU pool `radix-server --data-bytes` | as large as host memory allows, and at least *concurrent requests x new blocks per request* | The CPU pool is also the staging area for SSD reads, peer pulls and SSD writes. When it is too small FlexKV silently skips stores and prefetches (no errors, lower hit rate); the log shows `skipped: CPU ... slots available` / `no CPU room to stage` |
+| SWA pool share `--swa-ratio` (SWA models) | 0.2 | raise it if many sessions run out of SWA slots |
+| SSD capacity `ssd_cache_gb` / `swa.num_ssd_slots` | disk size / 4096 | — |
+| Peer SSD transport `FLEXKV_REMOTE_SSD_READER` | `flexkv.transfer.workers.peer_ssd_nixl:make_reader` | the default implementation only works when the SSD files are on a shared filesystem |
+| NIXL NICs `FLEXKV_NIXL_UCX_DEVICES` / `UCX_TLS` | RDMA NIC on the CPU pool's NUMA node / `rc,ud,self,cuda_copy` | — |
+| SSD global dedup `FLEXKV_SSD_WRITE_MODE` | `global_dedup` | DeepSeek-V4.1: cross-node SSD duplicates 60.6% -> 1.7%, SSD writes -60%, throughput/TTFT/TPOT within 2% |
+| Share of writes kept local `FLEXKV_SSD_DEDUP_LOCAL_FRACTION` | 0 | see the scenarios below |
+| Layerwise transfer `FLEXKV_ENABLE_LAYERWISE_TRANSFER` | 1 | overlaps loading with compute layer by layer; give each instance on a host its own `FLEXKV_LAYERWISE_EVENTFD_SOCKET` |
+| Batched layerwise restore `FLEXKV_BATCH_LAYERWISE_RESTORE` | 1 | merges the restores of a batch into a few transfers instead of one request after another; up to 1.8x faster with TP>1 and short hits, neutral otherwise |
+| Decode store stride `SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE` | short outputs: 0; agentic / long outputs (thousands of tokens): 512-1024 | D's KV becomes reusable earlier and the store at finish writes only the tail; costs some D2H during decode |
+| Peer back-off `FLEXKV_SSD_DEDUP_PEER_BACKOFF_S` / `FLEXKV_NIXL_SSD_RETRY_S` | 10 / 10 | usually unchanged |
+| SSD O_DIRECT | automatic (default) | reads and writes bypass the page cache at the device alignment (512 B on most NVMe); DeepSeek-V4 blocks read locally at 18-22 GB/s instead of 5. Override with `FLEXKV_NIXL_SSD_DIRECT_READ=0` / `FLEXKV_NIXL_SSD_DIRECT_ALIGN` when debugging |
+| radixshmem CPU dedup after pulls (`RADIXSHMEM_DISABLE_AUTO_DEDUP`) | default (on) | validated with the default |
+| radix-server `--decode` (prefill eviction written back to decode) | off | not validated with this pipeline yet |
+| FlexKV process mode | default (`dp_size>1`: one KVServer per node, DP ranks are clients) | with the SSD tier a node runs one FlexKV backend (`FLEXKV_INSTANCE_NUM>1` is rejected) |
+| Routing | session-sticky if available | sticky routing cuts cross-node traffic to about 1/3 of random routing; peer SSD reads near 0 |
+| Startup timeouts `FLEXKV_READY_TIMEOUT_S` / `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` / `SGLANG_DISAGGREGATION_WAITING_TIMEOUT` | 3600 | the first start waits for every node |
+| SGLang (DeepSeek-V4.1) | `--mem-fraction-static 0.93 --chunked-prefill-size 4096 --page-size 256` | do not use `--disaggregation-enable-kv-checksum` (not supported for DeepSeek-V4.x) |
+
+### 5.3 Tuning per scenario
+
+- **A few nodes take much more SSD writes or space** (hot prefixes concentrate on the node that stored them first): set `FLEXKV_SSD_DEDUP_LOCAL_FRACTION` to 0.1-0.3 so that share of writes skips the global check and writes locally, at the cost of some duplicates.
+- **Network bandwidth is tight and disk space is not**: `FLEXKV_SSD_WRITE_MODE=local`.
+- **CPU hit rate below expectation**: look for the CPU slot warnings above; raise `--data-bytes` or lower concurrency.
+- **Long outputs / multi-turn agentic workloads**: enable the decode store stride (512-1024).
+
+### 5.4 What to watch
+
+- Transfers: `flexkv_py_transfer_blocks_total{transfer_type=...}`, especially `DISK2H`, `PEERSSD2H` (peer SSD reads) and `H2PEERSSD` (dedup writes to a peer).
+- Dedup: one line per minute `[FlexKV-IO] operation=ssd_dedup act=stats` with `puts_skipped` (whole prefix already on a peer), `puts_remote` (remainder written to a peer), `fallback_*` (wrote locally instead) and `remote_write_failed`.
+- Hits: SGLang `cached_tokens` (`--enable-cache-report`).
+- Health: radix-server health in its log; `transfer failed` and worker death/restart lines (with class, pid, exit code) in the FlexKV log.
+
+## 6. Configuration reference
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -186,10 +236,14 @@ endpoints as usual. Other models work the same way; drop the DSv4-specific flags
 | `FLEXKV_SSD_WRITE_MODE` | `local` | `global_dedup` enables SSD global dedup |
 | `FLEXKV_SSD_DEDUP_LOCAL_FRACTION` | 0 | fraction of SSD writes that skip the global check and write locally (spreads write load) |
 | `FLEXKV_SSD_DEDUP_PEER_BACKOFF_S` | 10 | after a failed remote write, write locally instead of to that peer for this long |
+| `FLEXKV_NIXL_SSD_DIRECT_ALIGN` | probed | O_DIRECT alignment of the SSD files used by the NIXL endpoint (normally probed, 512 on most NVMe) |
+| `FLEXKV_ENABLE_LAYERWISE_TRANSFER` | 0 | load KV layer by layer, overlapped with compute |
+| `FLEXKV_LAYERWISE_EVENTFD_SOCKET` | — | eventfd socket of layerwise transfer; unique per instance on a host |
+| `FLEXKV_BATCH_LAYERWISE_RESTORE` | 0 | merge the layerwise restores of the requests admitted in one batch |
 | `FLEXKV_RADIXSHMEM_SSD_READY_TIMEOUT_S` | 3600 | how long FlexKV waits for the SSD cluster to become ready |
 | `SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE` | 0 | D also stores every N generated tokens (page-aligned); 0 = store at finish only. SWA models store FULL KV only mid-decode |
 
-## 6. Sizing and operations
+## 7. Sizing and operations
 
 - **CPU pool size**: the CPU pool is also the staging area for SSD reads, peer pulls and SSD writes. Size it to at
   least *concurrent requests x new blocks per request*; when it is too small, FlexKV silently skips stores and
@@ -206,11 +260,11 @@ endpoints as usual. Other models work the same way; drop the DSv4-specific flags
   (up to 8 times per engine).
 - DeepSeek-V4.x does not support `--disaggregation-enable-kv-checksum`.
 
-## 7. Validation and performance (summary)
+## 8. Validation and performance (summary)
 
 Validated on H20 nodes with Qwen3-8B (1P1D) and DeepSeek-V4.1 (1P1D, and 2P1D across two machines with attention
 DP4 + MoE EP4): 1 h and 4 h runs with random and sticky routing, 20% client aborts, hot-prefix bursts, P/D restart,
-NIXL endpoint stall, 64k-100k contexts, layerwise on/off, forced retraction, decode store stride, dedup on/off. All
+NIXL endpoint stall, 64k-100k contexts, layerwise on/off (including batched restore across machines), forced retraction, decode store stride, dedup on/off. All
 with 0 unexpected request errors, correct needle answers and no garbled outputs on cache hits.
 
 | Metric | Result |
@@ -222,9 +276,9 @@ with 0 unexpected request errors, correct needle answers and no garbled outputs 
 | TTFT, DeepSeek-V4.1, 16k prompt (median of 5) | recompute 4572 ms; local CPU 189; local SSD 206; peer CPU 262; peer SSD 197 |
 | TTFT, DeepSeek-V4.1, 64k prompt (median of 5) | recompute 20390 ms; local CPU 217; local SSD 262; peer CPU 222; peer SSD 228 |
 
-## 8. Known limitations
+## 9. Known limitations
 
-- A radix-server restarted on its own does not rejoin until FlexKV restarts (section 6).
+- A radix-server restarted on its own does not rejoin until FlexKV restarts (section 7).
 - With `global_dedup`, P and D writing the same new prefix at the same moment can still both write it (a few
   percent duplicates); prefixes concentrate on the node that first stored them, which shifts some SSD reads from
   local to peer.
