@@ -193,7 +193,7 @@ python3 -m sglang.launch_server --model-path /models/DeepSeek-V4.1 --trust-remot
 | 批量 layerwise 恢复 `FLEXKV_BATCH_LAYERWISE_RESTORE` | 1 | 同一 batch 的多个请求合并成少量传输，而不是逐个请求串行恢复。TP>1 且命中较短时最多快 1.8 倍，其他情况持平 |
 | decode 分段存储 `SGLANG_FLEXKV_DECODE_OFFLOAD_STRIDE` | 输出较短：0；agentic / 长输出（数千 token）：512-1024 | 让 D 生成的 KV 更早可被复用，结束时只存尾部；代价是 decode 期间多一些 D2H |
 | 对端退避 `FLEXKV_SSD_DEDUP_PEER_BACKOFF_S` / `FLEXKV_NIXL_SSD_RETRY_S` | 10 / 10 | 一般不改 |
-| SSD O_DIRECT | 自动（默认） | 按设备对齐（NVMe 一般 512 B）读写都绕过页缓存。DeepSeek-V4 块本地读 5 -> 18-22 GB/s。排查问题时可用 `FLEXKV_NIXL_SSD_DIRECT_READ=0`、`FLEXKV_NIXL_SSD_DIRECT_ALIGN` 覆盖 |
+| SSD O_DIRECT | 自动（默认） | 按设备对齐（NVMe 一般 512 B）读写都绕过页缓存。块大小是对齐值的整数倍时生效：DeepSeek-V4.1 的 SWA 块（5990400 B）以及 TP 部署下的 FULL 块（1671680 B）本地冷读 5 -> 18-22 GB/s；attention-DP 部署下 FULL 块是 417920 B（不满足 512 对齐），仍走页缓存（对端读用对齐区间 O_DIRECT，不受影响）。排查问题时可用 `FLEXKV_NIXL_SSD_DIRECT_READ=0`、`FLEXKV_NIXL_SSD_DIRECT_ALIGN` 覆盖 |
 | radixshmem CPU 层拉取后去重（`RADIXSHMEM_DISABLE_AUTO_DEDUP`） | 默认（开） | 已在默认值下验证 |
 | radix-server `--decode`（prefill 淘汰写回 decode） | 不开 | 尚未与本方案一起验证 |
 | FlexKV 进程模式 | 默认（`dp_size>1` 时每节点一个 KVServer，各 DP rank 为 client） | 开 SSD 层时每节点只能有一个 FlexKV backend（`FLEXKV_INSTANCE_NUM>1` 会报错） |
