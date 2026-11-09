@@ -89,13 +89,36 @@ def _round_up(n: int, align: int) -> int:
     return (int(n) + align - 1) // align * align
 
 
-def use_direct_io(block_bytes: int) -> bool:
-    """Whether served reads bypass the page cache. Same rule as FlexKV's own
-    io_uring engine (csrc/transfer_ssd.cpp): O_DIRECT only for 4 KiB-aligned
-    blocks. Otherwise that engine writes the blocks through the page cache
-    too (DeepSeek-V4's 1671680 B blocks), and serving them buffered reads the
-    same, current pages."""
-    return int(block_bytes) % _DIRECT_IO_ALIGN == 0
+def probe_direct_align(path: str) -> int:
+    """Offset/length/address alignment an O_DIRECT I/O needs on ``path``: the
+    device's logical block size (512 on most NVMe), else 4096 -- the same probe
+    as FlexKV's io_uring engine (SSDIOCTX.get_direct_align).
+    ``FLEXKV_NIXL_SSD_DIRECT_ALIGN`` overrides it."""
+    forced = os.getenv("FLEXKV_NIXL_SSD_DIRECT_ALIGN", "")
+    if forced:
+        return int(forced)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    except OSError:
+        return _DIRECT_IO_ALIGN
+    buf = mmap.mmap(-1, 2 * _DIRECT_IO_ALIGN)
+    try:
+        # 512-aligned but not 4096-aligned in offset and address.
+        return 512 if os.preadv(fd, [memoryview(buf)[512:1024]], 512) == 512 else _DIRECT_IO_ALIGN
+    except OSError:
+        return _DIRECT_IO_ALIGN
+    finally:
+        os.close(fd)
+        buf.close()
+
+
+def use_direct_io(block_bytes: int, direct_align: int = _DIRECT_IO_ALIGN) -> bool:
+    """Whether served reads and writes bypass the page cache: the same rule as
+    FlexKV's own io_uring engine (csrc/transfer_ssd.cpp), O_DIRECT when blocks
+    are multiples of the device's direct-I/O alignment. Writing a block buffered
+    while the engine writes its neighbour (they share a page) with O_DIRECT
+    could leave a stale page that a later writeback puts back on disk."""
+    return int(block_bytes) % int(direct_align) == 0
 
 
 def ssd_block_location(files: Dict[int, List[str]], block: int, block_bytes: int) -> Tuple[str, int]:
@@ -159,9 +182,11 @@ class NixlSSDEndpoint:
         # This node's CPU pool: where peers write the blocks it reads.
         agent.register_memory([(self._cpu_ptr, self._cpu_bytes, 0, "cpu")], "DRAM",
                               backends=["UCX"])
-        # This node's SSD files: what it serves, bypassing the page cache
-        # whenever FlexKV's own writer does (use_direct_io).
-        self.direct_io = use_direct_io(self.block_bytes)
+        # This node's SSD files: what it serves and stores, bypassing the page
+        # cache whenever FlexKV's own engine does (use_direct_io).
+        paths = [p for ps in self._files.values() for p in ps]
+        self.direct_align = probe_direct_align(paths[0]) if paths else _DIRECT_IO_ALIGN
+        self.direct_io = use_direct_io(self.block_bytes, self.direct_align)
         flags = os.O_RDWR | (os.O_DIRECT if self.direct_io else 0)
         self._fds: Dict[str, int] = {}
         for paths in self._files.values():
@@ -171,11 +196,12 @@ class NixlSSDEndpoint:
         # Blocks each file holds: a block past them must fail, not read short.
         self._file_size = {path: os.fstat(fd).st_size for path, fd in self._fds.items()}
         self._file_blocks = {path: size // self.block_bytes for path, size in self._file_size.items()}
-        # Blocks that are not 4 KiB-aligned are written through the page cache,
-        # and buffered reads of them crawl (~2 GB/s however many run at once).
-        # Served reads instead read the 4 KiB-aligned span around each block
-        # with O_DIRECT, which writes the span's dirty pages back first, so
-        # they see what the buffered writer wrote. Writes stay buffered.
+        # Blocks that are not multiples of the direct-I/O alignment (a 4 KiB
+        # device) are written through the page cache, like the engine writes
+        # them, and buffered reads of them crawl (~2 GB/s however many run at
+        # once). Served reads instead read the 4 KiB-aligned span around each
+        # block with O_DIRECT, which writes the span's dirty pages back first,
+        # so they see what the buffered writers wrote.
         self.direct_read = (not self.direct_io and bool(self._fds)
                             and os.getenv("FLEXKV_NIXL_SSD_DIRECT_READ", "1") != "0")
         self._dfds: Dict[str, int] = {}
@@ -219,7 +245,8 @@ class NixlSSDEndpoint:
             f"[peer-ssd-nixl] endpoint {name} on port {self.port}: CPU pool {self._cpu_bytes >> 20} MB, "
             f"{len(self._fds)} SSD files, block {self.block_bytes} B, chunk {self.chunk_blocks} blocks "
             f"x {num_chunks} per server x {num_servers} servers, ucx_devices={ucx_devices or 'auto'}, "
-            f"ssd_io={'direct' if self.direct_io else 'buffered (block not 4 KiB-aligned, like the local writer)'}"
+            f"ssd_io={'direct' if self.direct_io else 'buffered (block not direct-I/O aligned, like the local writer)'}"
+            f" (align {self.direct_align})"
             f"{', aligned direct reads' if self.direct_read else ''}")
 
     def close(self) -> None:

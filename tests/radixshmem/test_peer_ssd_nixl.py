@@ -36,7 +36,7 @@ except Exception as exc:  # pragma: no cover - environment-dependent
     pytest.skip(f"flexkv.c_ext / NIXL endpoint unavailable: {exc}", allow_module_level=True)
 
 BLOCK = 8192           # 4 KiB-aligned: served with O_DIRECT
-BLOCK_512 = 8192 + 512  # only 512 B-aligned (like DeepSeek-V4's 1671680 B): served buffered
+BLOCK_512 = 8192 + 512  # only 512 B-aligned (like DeepSeek-V4's 1671680 B): direct on a 512 B device
 _port = [20000 + os.getpid() % 5000 * 2]
 
 
@@ -74,11 +74,13 @@ def test_block_location_matches_the_io_uring_layout(tmp_path):
             assert np.array_equal(np.frombuffer(fh.read(BLOCK), np.uint8), _pattern(i)), i
 
 
-@pytest.fixture(params=[(BLOCK, "1"), (BLOCK_512, "1"), (BLOCK_512, "0")],
-                ids=["direct", "buffered-aligned-reads", "buffered"])
+@pytest.fixture(params=[(BLOCK, "1", ""), (BLOCK_512, "1", ""), (BLOCK_512, "1", "4096"),
+                        (BLOCK_512, "0", "4096")],
+                ids=["direct", "direct-512", "buffered-aligned-reads", "buffered"])
 def pair(tmp_path, request, monkeypatch):
-    block, direct_read = request.param
+    block, direct_read, align = request.param
     monkeypatch.setenv("FLEXKV_NIXL_SSD_DIRECT_READ", direct_read)
+    monkeypatch.setenv("FLEXKV_NIXL_SSD_DIRECT_ALIGN", align)
     files, n = _write_with_io_uring(tmp_path, devices=1, files_per_device=2, blocks_per_file=16,
                                     block=block)
     port = _port[0]
@@ -91,8 +93,10 @@ def pair(tmp_path, request, monkeypatch):
     client = NixlSSDEndpoint(f"t-cli-{os.getpid()}-{port}", port=port + 1,
                              cpu_ptr=dst_buf.ctypes.data, cpu_bytes=dst_buf.nbytes,
                              block_bytes=block, ssd_files={})
-    assert server.direct_io == (block % 4096 == 0)
-    assert server.direct_read == (block % 4096 != 0 and direct_read == "1")
+    if align:
+        assert server.direct_align == int(align)
+    assert server.direct_io == (block % server.direct_align == 0)
+    assert server.direct_read == (not server.direct_io and direct_read == "1")
     client.connect(server.name, "127.0.0.1", port, 30)
     yield server, client, dst_buf, n, block
     client.close()
@@ -319,3 +323,50 @@ def test_an_expired_write_is_not_stored(pair):
     with pytest.raises(RuntimeError, match="expired"):
         client.write(server.name, [0], [2], 30, write_window_s=-1)
     assert np.array_equal(_file_block(server, 2, bs), _pattern(2, bs))
+
+
+def test_endpoint_writes_and_engine_writes_of_neighbour_blocks_stay_byte_exact(tmp_path, monkeypatch):
+    """Neighbouring 512 B-aligned blocks share a page. The endpoint stores its
+    blocks (H2PEERSSD) with O_DIRECT whenever FlexKV's engine does, so writing
+    even blocks through it while the engine writes the odd ones in between
+    leaves no stale page behind: every block reads back byte-exact."""
+    monkeypatch.setenv("FLEXKV_NIXL_SSD_DIRECT_ALIGN", "")
+    bs, per_file = BLOCK_512, 64
+    files, n = _write_with_io_uring(tmp_path, devices=1, files_per_device=1, blocks_per_file=per_file,
+                                    block=bs)
+    port = _port[0]
+    _port[0] += 2
+    src_buf = np.zeros(bs * n, dtype=np.uint8)
+    server = NixlSSDEndpoint(f"t-srv-{os.getpid()}-{port}", port=port, cpu_ptr=src_buf.ctypes.data,
+                             cpu_bytes=src_buf.nbytes, block_bytes=bs, ssd_files=files,
+                             chunk_blocks=4, num_chunks=2)
+    writer_buf = np.zeros(bs * n, dtype=np.uint8)
+    writer = NixlSSDEndpoint(f"t-cli-{os.getpid()}-{port}", port=port + 1,
+                             cpu_ptr=writer_buf.ctypes.data, cpu_bytes=writer_buf.nbytes,
+                             block_bytes=bs, ssd_files={})
+    try:
+        if not server.direct_io:
+            pytest.skip("device needs 4 KiB direct I/O: the engine writes these blocks buffered too")
+        writer.connect(server.name, "127.0.0.1", port, 30)
+        ioctx = c_ext.SSDIOCTX(files, len(files), 64, 0)
+        engine_cpu = torch.zeros(n * bs, dtype=torch.uint8)
+        for r in range(6):
+            even = list(range(0, n, 2))
+            odd = list(range(1, n, 2))
+            for b in even:
+                writer_buf[b * bs:(b + 1) * bs] = _pattern(10_000 * r + b, bs)
+            for b in odd:
+                engine_cpu[b * bs:(b + 1) * bs] = torch.from_numpy(_pattern(10_000 * r + b, bs))
+            ids = torch.tensor(odd, dtype=torch.int64)
+            t = threading.Thread(target=lambda: writer.write(server.name, even, even, 30))
+            t.start()
+            transfer_kv_blocks_ssd(ioctx, torch.tensor([0], dtype=torch.int32), engine_cpu.data_ptr(),
+                                   ids, ids, bs, 0, bs, 0, bs, bs, False, per_file, 1, 4, 1,
+                                   ssd_io_opt=True)
+            t.join()
+            os.posix_fadvise(os.open(files[0][0], os.O_RDONLY), 0, 0, os.POSIX_FADV_DONTNEED)
+            for b in range(n):
+                assert np.array_equal(_file_block(server, b, bs), _pattern(10_000 * r + b, bs)), (r, b)
+    finally:
+        writer.close()
+        server.close()
