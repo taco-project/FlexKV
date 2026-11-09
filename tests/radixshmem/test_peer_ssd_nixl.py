@@ -370,3 +370,13 @@ def test_endpoint_writes_and_engine_writes_of_neighbour_blocks_stay_byte_exact(t
     finally:
         writer.close()
         server.close()
+
+
+def test_a_peer_timeout_is_a_quiet_miss():
+    """A peer that does not answer in time is an expected miss: still a
+    TimeoutError for callers, but marked quiet so workers log no stack trace."""
+    from flexkv.transfer.workers.peer_ssd_nixl import PeerTimeout, _peer_errors_expected
+    with pytest.raises(TimeoutError) as info:
+        with _peer_errors_expected("peer"):
+            raise TimeoutError("did not answer a 1-block read in 30s")
+    assert isinstance(info.value, PeerTimeout) and info.value.quiet

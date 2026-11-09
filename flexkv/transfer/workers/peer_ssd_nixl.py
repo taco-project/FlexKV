@@ -57,14 +57,24 @@ class PeerUnavailable(RuntimeError):
     quiet = True
 
 
+class PeerTimeout(TimeoutError):
+    """A peer that did not answer in time (stalled, restarting): an expected
+    miss like PeerUnavailable, logged without a stack trace."""
+    quiet = True
+
+
 @contextlib.contextmanager
 def _peer_errors_expected(peer: str):
     """A peer that times out or whose connection broke (it died, restarted or
     stalled) is an expected miss, logged without a stack trace."""
     try:
         yield
-    except (TimeoutError, PeerUnavailable):
+    except PeerUnavailable:
         raise
+    except TimeoutError as e:
+        if getattr(e, "quiet", False):
+            raise
+        raise PeerTimeout(str(e)) from e
     except Exception as e:  # noqa: BLE001
         if type(e).__module__.startswith("nixl"):
             raise PeerUnavailable(f"[peer-ssd-nixl] {peer}: {e!r}") from e
