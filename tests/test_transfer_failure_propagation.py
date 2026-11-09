@@ -157,6 +157,8 @@ class _EngineHarness:
     _submit_to = TransferEngine._submit_to
     _mark_worker_dead = TransferEngine._mark_worker_dead
     _fail_ops_of_dead_workers = TransferEngine._fail_ops_of_dead_workers
+    _respawn_worker = TransferEngine._respawn_worker
+    _swap_in_respawned_workers = TransferEngine._swap_in_respawned_workers
     _discard_failed_op = TransferEngine._discard_failed_op
     _finalize_or_discard = TransferEngine._finalize_or_discard
     _emit_drained_graph_failures = TransferEngine._emit_drained_graph_failures
@@ -278,6 +280,36 @@ def test_a_gone_worker_fails_its_ops_instead_of_hanging_them():
         engine._submit_to(broken, op)
     assert graph2.graph_id in engine._failed_graph_ids
     assert id(broken) in engine._dead_workers and not engine._op_worker
+
+
+def test_a_dead_peer_ssd_worker_is_started_again_in_place():
+    """A worker with a factory (the peer-SSD worker) is restarted after its
+    process died, and the new handle replaces the dead one for every key."""
+    import queue
+    import threading
+
+    engine = _EngineHarness()
+    dead = _Worker(alive=False)
+    fresh = _Worker()
+    fresh.ready_event = threading.Event()
+    fresh.ready_event.set()
+    engine._workers = {PoolId.FULL_KV: {TransferType.PEERSSD2H: dead, TransferType.H2PEERSSD: dead}}
+    engine._respawn_factories = {id(dead): lambda: fresh}
+    engine._respawned = queue.Queue()
+    engine._respawns_pending = 0
+    engine._respawns_left = 1
+    engine._mark_worker_dead(dead, "process exited")
+    for _ in range(100):
+        if not engine._respawned.empty():
+            break
+        threading.Event().wait(0.05)
+    engine._swap_in_respawned_workers()
+    assert engine._workers[PoolId.FULL_KV] == {TransferType.PEERSSD2H: fresh,
+                                               TransferType.H2PEERSSD: fresh}
+    assert engine._respawns_pending == 0 and id(fresh) in engine._respawn_factories
+    # The restart budget is spent: a second death leaves the worker down.
+    engine._mark_worker_dead(fresh, "process exited")
+    assert engine._respawns_pending == 0
 
 
 def test_failed_replica_discards_parent_when_replicas_drain():
