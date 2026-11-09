@@ -342,9 +342,11 @@ void transfer_kv_blocks_ssd(
       (block_stride_in_bytes > ssd_layer_stride_in_bytes);
   IOUring &iouring = ioctx.get_iouring();
 
-  // Reads only need the device's direct-I/O alignment (512 on most NVMe);
-  // writes keep 4 KiB so ext4 never serializes sub-block direct writes.
-  const int64_t direct_align = is_read ? ioctx.get_read_direct_align() : 4096;
+  // Reads and writes only need the device's direct-I/O alignment (512 on most
+  // NVMe). ext4 serializes direct writes that are not 4 KiB-aligned per inode,
+  // but they still beat buffered writes of the same blocks several times over
+  // (and buffered writes take the same inode lock).
+  const int64_t direct_align = ioctx.get_direct_align();
   auto is_4k_aligned = [direct_align](int64_t v) -> bool {
     return v % direct_align == 0;
   };

@@ -552,7 +552,8 @@ PYBIND11_MODULE(c_ext, m) {
 
   py::class_<flexkv::SSDIOCTX>(m, "SSDIOCTX")
       .def(
-          py::init<std::map<int, std::vector<std::string>> &, int, int, int>());
+          py::init<std::map<int, std::vector<std::string>> &, int, int, int>())
+      .def("get_direct_align", &flexkv::SSDIOCTX::get_direct_align);
 
   py::class_<flexkv::TPTransferThreadGroup> tp_thread_group(
       m, "TPTransferThreadGroup");

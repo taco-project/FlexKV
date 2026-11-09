@@ -298,7 +298,7 @@ public:
 
         fds_buffer_io[i].push_back(fd_buffer_io);
         fds_direct_io[i].push_back(fd_direct_io);
-        read_direct_align = std::max(read_direct_align, probe_read_align(fd_direct_io));
+        direct_align = std::max(direct_align, probe_direct_align(fd_direct_io));
       }
     }
   }
@@ -323,9 +323,9 @@ public:
 
   int get_num_devices() { return num_devices; }
 
-  // Offset/length/address alignment an O_DIRECT read needs on these files:
-  // the device's logical block size (512 on most NVMe), else 4096.
-  int64_t get_read_direct_align() const { return read_direct_align; }
+  // Offset/length/address alignment an O_DIRECT read or write needs on these
+  // files: the device's logical block size (512 on most NVMe), else 4096.
+  int64_t get_direct_align() const { return direct_align; }
 
   int get_num_files_per_device() { return num_files_per_device; }
 
@@ -340,7 +340,7 @@ public:
   }
 
 private:
-  static int64_t probe_read_align(int fd) {
+  static int64_t probe_direct_align(int fd) {
     void *buf = nullptr;
     if (posix_memalign(&buf, 4096, 8192) != 0) {
       return 4096;
@@ -353,7 +353,7 @@ private:
 
   int num_devices;
   int num_files_per_device;
-  int64_t read_direct_align = 512;
+  int64_t direct_align = 512;
 
   IOUring iouring;
   std::vector<std::vector<int>> fds_buffer_io;
