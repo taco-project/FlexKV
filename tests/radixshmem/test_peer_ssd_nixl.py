@@ -260,6 +260,27 @@ def test_a_drop_backs_off_but_keeps_the_peer(pair):
     assert np.array_equal(dst[4 * bs:5 * bs], _pattern(9, bs))
 
 
+def test_a_broken_connection_is_rebuilt(pair, monkeypatch):
+    """A send that fails means UCX keeps a failed endpoint: the requester
+    removes the peer's metadata and the next connect fetches it afresh."""
+    server, client, dst, n, bs = pair
+    client.read(server.name, [1], [1], 30)
+    send = client.agent.send_notif
+
+    def _broken(peer, msg):
+        monkeypatch.setattr(client.agent, "send_notif", send)
+        raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
+    monkeypatch.setattr(client.agent, "send_notif", _broken)
+    client.retry_s = 0.5
+    with pytest.raises(RuntimeError, match="DISCONNECT"):
+        client.read(server.name, [2], [2], 10)
+    assert not client.agent.check_remote_metadata(server.name)
+    time.sleep(0.6)
+    client.connect(server.name, "127.0.0.1", server.port, 10)
+    client.read(server.name, [10], [5], 10)
+    assert np.array_equal(dst[5 * bs:6 * bs], _pattern(10, bs))
+
+
 def _file_block(server, block: int, bs: int) -> np.ndarray:
     path, off = ssd_block_location(server._files, block, bs)
     with open(path, "rb") as fh:
