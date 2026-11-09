@@ -8,7 +8,8 @@ polled (no transfer-engine pipe).
 
 from __future__ import annotations
 
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
+from copy import copy
 from dataclasses import dataclass, field
 import threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,7 +20,7 @@ from flexkv.common.block import SequenceMeta
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import TransferOpGraph
 from flexkv.prefetch.base_planner import ChunkPlannerBase
-from flexkv.prefetch.types import PrefetchCapacityExhausted
+from flexkv.prefetch.types import PrefetchBusy, PrefetchCapacityExhausted
 from flexkv.server.shm_radix_bootstrap import PREFETCH_MAX_INFLIGHT, PREFETCH_TIMEOUT_MS
 
 
@@ -54,17 +55,20 @@ class RadixPrefetchChunk:
     block_begin: int = 0
     block_end: int = 0
     published_end: int = 0
+    submit_future: Optional[Future] = None
+    error: Optional[str] = None
 
 
 class _FakeCompletion:
     """Mirrors CompletedOp fields the coordinator's on_completion expects."""
 
-    __slots__ = ("graph_id", "op_id", "failed")
+    __slots__ = ("graph_id", "op_id", "failed", "error")
 
-    def __init__(self, graph_id: int, *, failed: bool = False):
+    def __init__(self, graph_id: int, *, failed: bool = False, error=None):
         self.graph_id = graph_id
         self.op_id = -1
         self.failed = failed
+        self.error = error
 
 
 class RadixShmemChunkPlanner(ChunkPlannerBase):
@@ -81,6 +85,9 @@ class RadixShmemChunkPlanner(ChunkPlannerBase):
             chunk_timeout_ms if chunk_timeout_ms is not None else PREFETCH_TIMEOUT_MS
         )
         self._inflight: Dict[int, RadixPrefetchChunk] = {}
+        self._submit_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="flexkv-radix-prefetch-submit"
+        )
         from flexkv.cache.radix_shmem_engine import COMPONENT_MASK_FULL
 
         self._default_mask = COMPONENT_MASK_FULL
@@ -147,7 +154,7 @@ class RadixShmemChunkPlanner(ChunkPlannerBase):
         target = max(start, cluster_blocks * self.block_size)
         if not self._pin_prefix(context, start):
             raise PrefetchCapacityExhausted("prefetch pinned-prefix capacity exhausted")
-        return start, target
+        return context.reusable_end, target
 
     def _pin_prefix(
         self, context: RadixPrefetchContext, end: int, reserved_to_release: int = 0
@@ -156,23 +163,25 @@ class RadixShmemChunkPlanner(ChunkPlannerBase):
             context.reusable_end = 0
             return True
         cpu = self._cpu()
-        prefix = SequenceMeta(
-            context.tokens[:end], self.block_size, context.namespace
-        )
+        prefix = copy(context.sequence)
+        prefix.token_ids = prefix.token_ids[:end]
+        prefix.block_hashes = prefix.block_hashes[:end // self.block_size]
         matched = cpu.match(prefix, component_mask=context.component_mask)
         ready = int(matched.num_matched_blocks) * self.block_size
-        if ready < end:
-            matched.release()
-            # Peer publish may still be catching up; pin what is resident.
-            end = ready
-            if end <= 0:
-                return True
-            matched = cpu.match(
-                SequenceMeta(context.tokens[:end], self.block_size, context.namespace),
-                component_mask=context.component_mask,
-            )
+        # Keep this match pinned: releasing and matching again opens another
+        # eviction race. The query result, not the earlier metadata, is truth.
+        end = min(end, ready)
         blocks = int(matched.num_matched_blocks)
-        amount = blocks * self.block_bytes
+        # Native refs protect entire compressed nodes, including their tail
+        # past a short request. Charge a conservative bound on that tail.
+        granularity = int(getattr(cpu, "register_chunk_blocks", 1))
+        if granularity > 0:
+            covered = ((blocks + granularity - 1) // granularity) * granularity
+        else:
+            from radixshmem import _core
+            covered = blocks + int(_core.MAX_REGISTER_CHUNK_SIZE) - 1 if blocks else 0
+        covered = min(covered, int(getattr(cpu, "num_total_blocks", covered)))
+        amount = covered * self.block_bytes
         delta = amount - context.pinned_bytes
         reserved = self.engine._prefetch.reserved_bytes - reserved_to_release
         if self.pinned_bytes + delta + reserved > self.max_pinned_bytes:
@@ -193,7 +202,7 @@ class RadixShmemChunkPlanner(ChunkPlannerBase):
         # Growing radix-tree prefixes must not overlap in flight: each pull is
         # hashes[:block_end], so concurrent chunks would race on the same path.
         if self._inflight:
-            return None
+            raise PrefetchBusy("radixshmem prefix pull is already claimed")
         if self._prefetch_inflight_jobs() >= PREFETCH_MAX_INFLIGHT:
             raise PrefetchCapacityExhausted("radixshmem prefetch inflight limit reached")
         remaining_pin = (
@@ -222,19 +231,21 @@ class RadixShmemChunkPlanner(ChunkPlannerBase):
             block_begin=block_begin,
             block_end=block_end,
         )
+        self._inflight[graph.graph_id] = chunk
         return chunk
 
     def submit_batch(self, chunks: List[RadixPrefetchChunk]):
         cpu = self._cpu()
         for chunk in chunks:
-            if chunk.job is not None:
+            if chunk.submit_future is not None:
                 continue
             sequence = chunk.pending
             if not isinstance(sequence, SequenceMeta):
                 raise RuntimeError("radixshmem prefetch chunk missing sequence metadata")
             # Prefix pull to chunk.end: local_hit covers [0, begin) already in
             # the tree, so only the missing remote suffix is transferred.
-            job = cpu.prefetch(
+            chunk.submit_future = self._submit_executor.submit(
+                cpu.prefetch,
                 sequence,
                 component_mask=self._default_mask,
                 query_end=chunk.block_end,
@@ -242,16 +253,6 @@ class RadixShmemChunkPlanner(ChunkPlannerBase):
                 hash_start=0,
                 hash_end=chunk.block_end,
             )
-            if job is None:
-                chunk.done = True
-                chunk.failed = True
-                chunk.published_end = chunk.begin
-            else:
-                chunk.job = job
-                if job.done():
-                    chunk.done = True
-                    chunk.published_end = self._clamp_published(chunk, job.published_hit)
-            self._inflight[chunk.graph.graph_id] = chunk
 
     def _clamp_published(self, chunk: RadixPrefetchChunk, common_hit_blocks: int) -> int:
         """Map absolute common_hit (blocks from radix root) into this chunk's span."""
@@ -263,6 +264,21 @@ class RadixShmemChunkPlanner(ChunkPlannerBase):
         for graph_id, chunk in list(self._inflight.items()):
             if getattr(chunk, "_completion_emitted", False):
                 continue
+            if chunk.submit_future is None:
+                continue  # claimed, but not handed to the submit worker yet
+            if chunk.job is None:
+                if not chunk.submit_future.done():
+                    continue
+                try:
+                    chunk.job = chunk.submit_future.result()
+                    if chunk.job is None:
+                        chunk.failed = True
+                        chunk.published_end = chunk.begin
+                except Exception as exc:
+                    flexkv_logger.warning("radixshmem prefetch submission failed: %s", exc)
+                    chunk.error = f"{type(exc).__name__}: {exc}"
+                    chunk.failed = True
+                    chunk.published_end = chunk.begin
             job = chunk.job
             if job is not None and not job.done() and not chunk.done:
                 continue
@@ -274,6 +290,7 @@ class RadixShmemChunkPlanner(ChunkPlannerBase):
                     chunk.published_end = self._clamp_published(chunk, result.common_hit)
                     result.finalize()
                 except Exception as exc:  # noqa: BLE001
+                    chunk.error = f"{type(exc).__name__}: {exc}"
                     flexkv_logger.warning(
                         "radixshmem prefetch chunk graph=%s failed: %s", graph_id, exc
                     )
@@ -282,7 +299,7 @@ class RadixShmemChunkPlanner(ChunkPlannerBase):
             chunk.done = True
             chunk.failed = failed
             chunk._completion_emitted = True  # type: ignore[attr-defined]
-            done.append(_FakeCompletion(graph_id, failed=failed))
+            done.append(_FakeCompletion(graph_id, failed=failed, error=chunk.error))
         return done
 
     def complete(self, chunk, completion):
@@ -305,22 +322,26 @@ class RadixShmemChunkPlanner(ChunkPlannerBase):
         if end > chunk.begin:
             if not self._pin_prefix(context, end, reserved_to_release=chunk.nbytes):
                 return chunk.begin
-        return end
+            end = min(end, context.reusable_end)
+        return max(chunk.begin, end)
 
     def discard(self, context, chunk: RadixPrefetchChunk):
         if chunk.resolved:
             return
+        if chunk.submit_future is not None and not chunk.done:
+            raise RuntimeError("cannot discard an undrained radixshmem pull")
         chunk.resolved = True
         self._inflight.pop(chunk.graph.graph_id, None)
         job = chunk.job
-        if job is not None and not job.done() and not getattr(job, "cancelled", False):
-            try:
-                job.cancel()
-            except Exception:  # noqa: BLE001
-                pass
+        if job is not None:
+            job.cancel()  # idempotently releases an unconsumed completed result
 
     def result_end(self, context: RadixPrefetchContext, committed: int) -> int:
-        return min(committed, context.reusable_end) if context.reusable_end else committed
+        return min(committed, context.reusable_end)
+
+    def shutdown(self) -> None:
+        self._submit_executor.shutdown(wait=True, cancel_futures=False)
+        super().shutdown()
 
     def release(self, context: RadixPrefetchContext) -> None:
         if context.released:

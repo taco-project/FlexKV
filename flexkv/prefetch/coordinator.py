@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 from .policy import freeze_policies, get_policy
 from .types import (
     PrefetchCapacityExhausted,
+    PrefetchBusy,
     PrefetchHandle,
     PrefetchOptions,
     PrefetchSnapshot,
@@ -145,6 +146,13 @@ class PrefetchCoordinator:
         if callable(poll):
             for completion in poll():
                 self.on_completion(completion)
+        # Return completed claims before trying *any* waiting session. Otherwise
+        # the previous owner can commit and reclaim midway through this loop,
+        # repeatedly jumping ahead of a waiter visited just before it.
+        for session in list(self.sessions.values()):
+            if session.terminal_at is None:
+                self._commit_ready(session)
+                self._finalize(session)
         batch = []
         # Rotate active requests for fair bounded admission.
         for handle in list(self.sessions):
@@ -166,6 +174,9 @@ class PrefetchCoordinator:
                 chunk = self._plan_and_claim(session)
                 if chunk is not None:
                     batch.append(chunk)
+                    self.sessions.move_to_end(handle)
+            except PrefetchBusy:
+                pass
             except PrefetchCapacityExhausted:
                 self.seal(session, "capacity")
                 self._finalize(session)
@@ -173,7 +184,6 @@ class PrefetchCoordinator:
                 session.error = f"{type(exc).__name__}: {exc}"
                 self.seal(session, "backend_error")
                 self._finalize(session)
-            self.sessions.move_to_end(handle)
         if batch:
             # The backend must either accept all descriptors into its bounded
             # outbox or report a known-not-submitted failure. Ambiguous transport
@@ -256,6 +266,8 @@ class PrefetchCoordinator:
             return False
         chunk = session.chunks[completion.graph_id]
         self.backend.complete(chunk, completion)
+        if getattr(completion, "error", None):
+            session.error = completion.error
         session.version += 1
         return True
 

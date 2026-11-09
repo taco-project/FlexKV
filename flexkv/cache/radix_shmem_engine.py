@@ -287,7 +287,9 @@ class CacheEngineRadixShmem:
         """
         if not self.peer_enabled:
             return None
-        hashes = self._hashes(sequence_meta, query_end)
+        # Remote RHT registration can be coarser than an individual chunk.
+        # Discover with the full path; pull_async clips staging to hash_end.
+        hashes = self._hashes(sequence_meta, None)
         job = self._client.pull_async(
             hashes,
             component_mask,
@@ -295,7 +297,8 @@ class CacheEngineRadixShmem:
             timeout_ms=int(timeout_ms),
             block=False,
             start=int(hash_start),
-            end=None if hash_end is None else int(hash_end),
+            end=(int(hash_end) if hash_end is not None else
+                 (int(query_end) if query_end is not None else None)),
         )
         flexkv_logger.debug(
             f"radixshmem prefetch on {self.shm_name}: mask={component_mask:#x} "

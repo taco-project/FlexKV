@@ -343,6 +343,10 @@ def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
     )
     worker.start()
     ipc = TransferManagerInterProcessHandle.__new__(TransferManagerInterProcessHandle)
+    ipc._worker_error = None
+    ipc.error_parent_conn = NS(poll=lambda: False, close=lambda: None)
+    ipc.error_child_conn = NS(close=lambda: None)
+    ipc.command_child_conn, ipc.result_child_conn = worker_commands, worker_results
     ipc.command_parent_conn, ipc.result_parent_conn, ipc.process = (
         commands,
         results,
@@ -403,7 +407,8 @@ def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
     finally:
         allow.set()
         engine.shutdown()
-    assert worker.exitcode == 0
+    # shutdown joins and closes the multiprocessing Process handle.
+    assert ipc.process is None
     assert not engine.transfer_handles[0].thread.is_alive()
 
 

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from flexkv.prefetch.coordinator import PrefetchCoordinator
-from flexkv.prefetch.types import PrefetchOptions
+from flexkv.prefetch.types import PrefetchBusy, PrefetchOptions
 
 
 class Clock:
@@ -25,6 +25,7 @@ class FakeJob:
         self._common = planned_hit if common_hit is None else common_hit
         self._done = False
         self.cancelled = False
+        self.wait_count = 0
         self.job_id = id(self)
 
     def done(self):
@@ -41,6 +42,7 @@ class FakeJob:
 
     def wait(self, timeout=None):
         assert self._done
+        self.wait_count += 1
         return NS(common_hit=self._common, finalize=lambda: None)
 
     def cancel(self):
@@ -118,9 +120,12 @@ def planner(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
 
     p.executor = ThreadPoolExecutor(max_workers=1)
+    p._submit_executor = ThreadPoolExecutor(max_workers=1)
     p._inflight = {}
     p._default_mask = 1
-    return p, engine
+    yield p, engine
+    p._submit_executor.shutdown(wait=True)
+    p.executor.shutdown(wait=True)
 
 
 def test_reserve_serializes_inflight(planner):
@@ -130,7 +135,8 @@ def test_reserve_serializes_inflight(planner):
     c1 = p.reserve(ctx, 0, 16, options, 10_000)
     assert c1 is not None and c1.begin == 0 and c1.end == 4
     p._inflight[c1.graph.graph_id] = c1
-    assert p.reserve(ctx, 4, 16, options, 10_000) is None
+    with pytest.raises(PrefetchBusy):
+        p.reserve(ctx, 4, 16, options, 10_000)
 
 
 def test_submit_and_poll_advances_published_end(planner):
@@ -145,6 +151,7 @@ def test_submit_and_poll_advances_published_end(planner):
     options = PrefetchOptions(chunk_max_blocks=4)
     chunk = p.reserve(ctx, 0, 16, options, 10_000)
     p.submit_batch([chunk])
+    chunk.submit_future.result(timeout=5)
     assert len(engine.cpu.prefetch_calls) == 1
     assert engine.cpu.prefetch_calls[0]["hash_end"] == 4
     job = engine.cpu._jobs[0]
@@ -183,7 +190,10 @@ def test_coordinator_timeout_with_radix_backend(planner):
 
     p.begin = begin  # type: ignore[method-assign]
     p.resolve = lambda ctx: (0, 20)  # type: ignore[method-assign]
-    p._pin_prefix = lambda *a, **k: True  # type: ignore[method-assign]
+    def pin(ctx, end, **kw):
+        ctx.reusable_end = end
+        return True
+    p._pin_prefix = pin  # type: ignore[method-assign]
     p.release = lambda ctx: None  # type: ignore[method-assign]
     p.cancel_query = lambda ctx: None  # type: ignore[method-assign]
     p.result_end = lambda ctx, committed: committed  # type: ignore[method-assign]
@@ -195,6 +205,8 @@ def test_coordinator_timeout_with_radix_backend(planner):
         tokens, PrefetchOptions(policy="timeout", chunk_max_blocks=4, timeout_budget_s=5)
     )
     coord.tick()
+    for chunk in p._inflight.values():
+        chunk.submit_future.result(timeout=5)
     assert len(engine.cpu._jobs) == 1
     clock.now = 5
     coord.tick()
@@ -231,7 +243,10 @@ def test_coordinator_best_effort_demand(planner):
 
     p.begin = begin  # type: ignore[method-assign]
     p.resolve = lambda ctx: (0, 20)  # type: ignore[method-assign]
-    p._pin_prefix = lambda *a, **k: True  # type: ignore[method-assign]
+    def pin(ctx, end, **kw):
+        ctx.reusable_end = end
+        return True
+    p._pin_prefix = pin  # type: ignore[method-assign]
     p.release = lambda ctx: None  # type: ignore[method-assign]
     p.cancel_query = lambda ctx: None  # type: ignore[method-assign]
     p.result_end = lambda ctx, committed: committed  # type: ignore[method-assign]
@@ -243,6 +258,8 @@ def test_coordinator_best_effort_demand(planner):
         tokens, PrefetchOptions(policy="best_effort", chunk_max_blocks=4)
     )
     coord.tick()
+    for chunk in p._inflight.values():
+        chunk.submit_future.result(timeout=5)
     coord.demand([handle])
     coord.tick()
     assert coord.snapshot(handle).stop_reason == "demand"
@@ -280,3 +297,155 @@ def test_begin_rejects_swa_aware(planner):
             client_id=0,
             options=PrefetchOptions(swa_aware=True),
         )
+
+
+def _session_setup(p, engine, *, target=12, local=0):
+    from concurrent.futures import Future
+    from flexkv.common.block import SequenceMeta
+    from flexkv.prefetch.radixshmem_planner import RadixPrefetchContext
+
+    def begin(tokens, namespace, client_id, options):
+        ctx = RadixPrefetchContext(tokens, namespace, client_id, component_mask=1)
+        ctx.sequence = SequenceMeta(tokens, p.block_size, namespace)
+        ctx.future = Future()
+        ctx.future.set_result((ctx.sequence, local, target))
+        return ctx
+
+    p.begin = begin
+    engine.cpu.match = lambda seq, **kw: NS(
+        num_matched_blocks=len(seq.token_ids) // p.block_size, release=lambda: None
+    )
+    coord = PrefetchCoordinator(p, max_reserved_bytes=10000)
+    engine._prefetch = coord
+    return coord
+
+
+def _finish_jobs(p, engine, coord):
+    for chunk in list(p._inflight.values()):
+        if chunk.submit_future is not None:
+            chunk.submit_future.result(timeout=5)
+    for job in engine.cpu._jobs:
+        if not job.done():
+            job.complete()
+    coord.tick()
+
+
+def test_batch_claim_busy_retry_and_fairness(planner):
+    p, engine = planner
+    coord = _session_setup(p, engine)
+    opts = PrefetchOptions(policy="wait_complete", chunk_max_blocks=4)
+    a = coord.start(np.arange(12, dtype=np.int64), opts)
+    b = coord.start(np.arange(12, dtype=np.int64), opts)
+    coord.tick()
+    assert len(p._inflight) == 1
+    assert coord.snapshot(b).stop_reason is None
+    # B must get the next claim, before A can reserve its second chunk.
+    _finish_jobs(p, engine, coord)
+    assert coord.snapshot(b).submitted_chunks == 1
+    for _ in range(10):
+        _finish_jobs(p, engine, coord)
+        if coord.snapshot(a).terminal and coord.snapshot(b).terminal:
+            break
+    assert coord.snapshot(a).loaded_tokens == 12
+    assert coord.snapshot(b).loaded_tokens == 12
+    coord.release(a)
+    coord.release(b)
+    assert coord.reserved_bytes == p.pinned_bytes == 0
+    assert not p._inflight
+
+
+@pytest.mark.parametrize("resident", [0, 3, 8])
+def test_resolve_uses_current_pinned_prefix(planner, resident):
+    p, engine = planner
+    coord = _session_setup(p, engine, target=8, local=8)
+    engine.cpu.match = lambda seq, **kw: NS(
+        num_matched_blocks=resident, release=lambda: None
+    )
+    h = coord.start(np.arange(8, dtype=np.int64))
+    ctx = coord.sessions[h].context
+    assert p.resolve(ctx) == (resident, 8)
+    assert p.result_end(ctx, 8) == resident
+    assert ctx.pinned_bytes == resident
+    p.release(ctx)
+    assert p.pinned_bytes == 0
+
+
+def test_already_done_job_consumed_once(planner):
+    p, engine = planner
+    coord = _session_setup(p, engine, target=4)
+    job = FakeJob(0, 4)
+    job.complete()
+    engine.cpu.prefetch = lambda *a, **kw: job
+    h = coord.start(np.arange(4, dtype=np.int64))
+    coord.tick()
+    _finish_jobs(p, engine, coord)
+    assert coord.snapshot(h).terminal
+    assert coord.snapshot(h).loaded_tokens == 4
+    assert job.wait_count == 1
+    coord.tick()
+    assert job.wait_count == 1
+
+
+@pytest.mark.parametrize("limit,accepted", [(3, False), (4, True)])
+def test_pin_budget_includes_compressed_node_tail(planner, limit, accepted):
+    p, engine = planner
+    coord = _session_setup(p, engine, target=1, local=1)
+    engine.cpu.register_chunk_blocks = 4
+    p.max_pinned_bytes = limit
+    h = coord.start(np.arange(1, dtype=np.int64))
+    ctx = coord.sessions[h].context
+    assert p._pin_prefix(ctx, 1) is accepted
+    assert ctx.pinned_bytes == (4 if accepted else 0)
+    p.release(ctx)
+    assert p.pinned_bytes == 0
+
+
+def test_submit_failure_is_session_local(planner):
+    p, engine = planner
+    coord = _session_setup(p, engine, target=4)
+    def fail(*a, **kw):
+        raise RuntimeError("index unavailable")
+    engine.cpu.prefetch = fail
+    h = coord.start(np.arange(4, dtype=np.int64))
+    coord.tick()
+    for chunk in p._inflight.values():
+        with pytest.raises(RuntimeError):
+            chunk.submit_future.result(timeout=5)
+    coord.tick()
+    assert coord.snapshot(h).terminal
+    assert coord.snapshot(h).loaded_tokens == 0
+    assert coord.snapshot(h).outcome == "failed"
+    assert "index unavailable" in coord.snapshot(h).error
+    assert coord.reserved_bytes == 0
+    engine.cpu.prefetch = lambda *a, **kw: None
+    other = coord.start(np.arange(4, dtype=np.int64))
+    coord.tick()
+    _finish_jobs(p, engine, coord)
+    assert coord.snapshot(other).terminal
+
+
+def test_blocked_submit_does_not_block_demand_and_drains(planner):
+    import threading
+    p, engine = planner
+    coord = _session_setup(p, engine, target=12)
+    entered, unblock = threading.Event(), threading.Event()
+    original = engine.cpu.prefetch
+    def blocked(*a, **kw):
+        entered.set()
+        assert unblock.wait(5)
+        return original(*a, **kw)
+    engine.cpu.prefetch = blocked
+    h = coord.start(np.arange(12, dtype=np.int64),
+                    PrefetchOptions(policy="best_effort", chunk_max_blocks=4))
+    try:
+        coord.tick()
+        assert entered.wait(5)
+        coord.demand([h])
+        coord.tick()
+        assert coord.snapshot(h).state == "draining"
+    finally:
+        unblock.set()
+    _finish_jobs(p, engine, coord)
+    assert coord.snapshot(h).terminal
+    assert coord.snapshot(h).stop_reason == "demand"
+    assert coord.snapshot(h).loaded_tokens == 4

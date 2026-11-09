@@ -53,15 +53,19 @@ SGLang scheduler 门控不变：仍轮询 `check_prefetch_progress` / `pop_prefe
 **两层超时解耦：**
 
 - **策略层** `PrefetchOptions.budget()`：决定还能否 claim 新 chunk。
-- **传输层** `PREFETCH_TIMEOUT_MS` / `FLEXKV_RADIXSHMEM_CHUNK_TIMEOUT_MS` / `prefetch_options.chunk_timeout_ms`：单次 `pull_async` 的服务端 job deadline；到期后该次 job 以本地命中部分完成。
+- **传输层** `PREFETCH_TIMEOUT_MS` / `FLEXKV_RADIXSHMEM_CHUNK_TIMEOUT_MS` / `prefetch_options.chunk_timeout_ms`：单次 `pull_async` 的服务端 job deadline。到期后仍须等待底层传输真正结束且 release 不再返回 EBUSY，再以本地命中部分完成；不能提前回收 RDMA 仍可能写入的目标 slot。两层超时均不是硬性的请求延迟上限。
 
 ## 5. 前缀分段约束
 
 Mooncake REMOTE2H 按 block hash 内容寻址，任意子区间可独立拉取。radixshmem 的 index query 是 **从根出发的前缀路径**：
 
-- 每个 chunk 必须 `pull_async(hashes[:block_end])`（绝对前缀到 chunk 终点），不能切 `hashes[begin:end]` 作为独立路径。
+- 每个 chunk 的搬运范围必须是从根到 `block_end` 的绝对前缀，不能切 `hashes[begin:end]` 作为独立路径。Full-KV 使用完整 hashes 做远端发现，再以 `end=block_end` 限制 staging；否则 chunk 小于 RHT 注册粒度时会误判 miss。
 - 本地已命中 `[0, begin)` 时，transfer 只搬远端后缀；`common_hit` 仍为相对 radix 根的绝对块数。
-- 同前缀的并发 pull 会竞态，因此 `RadixShmemChunkPlanner` **串行 inflight**（有未完成 chunk 时 `reserve` 返回 `None`）。
+- 当前 planner 全局串行 pull；在 reserve 时就记录 claim，覆盖同批次尚未提交的工作。繁忙抛出 `PrefetchBusy`，coordinator 保留 session 并公平重试；真正的预算不足才结束为 capacity。
+
+提交由独立、单 worker 的 executor 执行，owner 线程只检查 future 和 job 完成，不同步等待 query/staging/Submit RPC。同步与异步完成统一消费一次 `wait(0)` 并 finalize。本地可复用边界以实际持有的 match 为准，metadata query 的旧命中不能作为结果租约。pin 预算还会保守计入压缩节点超出请求边界的尾部；未启用注册对齐时按原生节点最大长度估算。
+
+遇到暂时的 WaitAny RPC 错误时继续保留在途任务；持续失联 30 秒（另加当前 RPC 的返回等待）后显式失败并隔离 buffer，避免永久无反馈地等待。Submit 响应丢失或未知 ticket 无法证明传输结束时，RadixClient 显式报错并隔离其 slot、源 pin 和 outstanding credit；不会按普通失败回收。这种状态需要人工确认数据面已静止后恢复/重建专用进程与区域，不能以重试分配 slot 隐藏故障。
 
 ## 6. 关键实现映射
 
@@ -118,6 +122,10 @@ export FLEXKV_RADIXSHMEM_CHUNK_TIMEOUT_MS=5000
 | 既有策略回归 | `FlexKV/tests/prefetch/test_coordinator.py` |
 | Legacy / chunked 跳过整段 pull | `FlexKV/tests/radixshmem/test_radix_shmem_engine.py` |
 | PullJob 进度 API | `radixshmem/python/tests/test_pull_job_progress.py` |
+| 原生 staging、RPC、超时 drain | `radixshmem/python/tests/test_server_rpc.py` |
+| 双机策略、slot 字节和 GPU 交接 | `FlexKV/tests/prefetch/radixshmem_two_node.py`（writer → reader → gpu） |
+
+双机脚本仅用于独立测试集群：几何为 8 tokens/block、4096 bytes/Full slot，节点各分配 64 MiB；先在源节点运行 writer，再在目标节点运行 reader 和 gpu。gpu 进程需设置 `FLEXKV_ENABLE_RADIXSHMEM=1`、`FLEXKV_RADIXSHMEM_SERVER_NAME=/prefetch_review_20261026`。支持 NIXL/RDMA 的安装需要正确设置其 UCX 插件路径；此脚本不创建或重置用户生产区域。完整验收日志应区分 native/mock 测试与真实传输测试。
 
 ## 10. 相关文档
 

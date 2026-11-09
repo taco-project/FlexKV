@@ -9,6 +9,10 @@ class PrefetchCapacityExhausted(RuntimeError):
     """Expected admission stop when existing prefixes exhaust the pin budget."""
 
 
+class PrefetchBusy(RuntimeError):
+    """Temporary backend contention; retry without sealing the session."""
+
+
 @dataclass(frozen=True)
 class PrefetchHandle:
     epoch: str
