@@ -104,22 +104,23 @@ flowchart LR
         direction TB
         A1[Get 批次 1] --> A2[Get 批次 2] --> A3[Get 批次 3]
     end
-    subgraph After[有界并行窗口]
+    subgraph After[有界滚动并发]
         direction TB
         W[检查 client 的<br/>在途字节预算] --> B1[Get 批次 1]
         W --> B2[Get 批次 2]
         W --> B3[Get 批次 3]
-        B1 --> J[排空已接受的<br/>SDK 调用]
+        B1 --> J[已完成调用<br/>释放并发容量]
         B2 --> J
         B3 --> J
-        J --> N[下一窗口]
+        J --> N[准入下一个待执行调用]
     end
     Before ~~~ After
 ```
 
 三个批次仅用于示意等待重叠。`FLEXKV_MOONCAKE_GET_CONCURRENCY` 默认 `1`，允许
 1–8；query-only client 保持串行。并发读取受每个 data client 的 padded-byte 总预算
-约束，原有 `max_get_batch_bytes` 原始字节批量限制也继续生效。结果按原顺序返回，短读
+约束，实际并发数会按最大对象和总预算下调。任务完成后即可补充新任务，不必等待
+较慢任务；原有 `max_get_batch_bytes` 原始字节批量限制继续生效。结果按原顺序返回，短读
 不能记为成功，失败后也要等待已经接受的调用排空。
 
 数据路径仍为 **Store → CPU Host Cache → GPU**。并行 Get 本身不建立 Store-to-GPU
