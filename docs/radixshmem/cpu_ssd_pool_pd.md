@@ -220,6 +220,7 @@ with 0 unexpected request errors, correct needle answers and no garbled outputs 
 | Throughput / TTFT / TPOT, `global_dedup` vs local | within 2% (DeepSeek-V4.1 1P1D, c8-c32, 3 alternating repeats) |
 | Peer SSD read (NIXL, cross-machine, 1.67-9.4 MB blocks) | 6-27 GB/s depending on request size and concurrency |
 | TTFT, DeepSeek-V4.1, 16k prompt (median of 5) | recompute 4572 ms; local CPU 189; local SSD 206; peer CPU 262; peer SSD 197 |
+| TTFT, DeepSeek-V4.1, 64k prompt (median of 5) | recompute 20390 ms; local CPU 217; local SSD 262; peer CPU 222; peer SSD 228 |
 
 ## 8. Known limitations
 

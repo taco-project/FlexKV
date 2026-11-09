@@ -213,6 +213,7 @@ python3 -m sglang.launch_server --model-path /models/DeepSeek-V4.1 --trust-remot
 | 吞吐 / TTFT / TPOT，`global_dedup` vs local | 差距 2% 以内（DeepSeek-V4.1 1P1D，并发 8-32，3 轮交替） |
 | 对端 SSD 读（NIXL，跨机，1.67-9.4 MB 块） | 6-27 GB/s，随请求大小和并发变化 |
 | TTFT，DeepSeek-V4.1，16k prompt（5 次中位数） | 重新计算 4572 ms；本地 CPU 189；本地 SSD 206；对端 CPU 262；对端 SSD 197 |
+| TTFT，DeepSeek-V4.1，64k prompt（5 次中位数） | 重新计算 20390 ms；本地 CPU 217；本地 SSD 262；对端 CPU 222；对端 SSD 228 |
 
 ## 8. 已知限制
 
