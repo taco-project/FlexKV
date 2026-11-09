@@ -18,6 +18,9 @@ FlexKV 只实例化 `radixshmem.RadixClient`：第一个 client 把几何（每 
 实现：`flexkv/server/shm_radix_bootstrap.py`（几何、attach、采纳、固定参数）。
 radixshmem 侧接口见 radixshmem 仓库的 `README.md` 与 `docs/api.md`，`radix-server --help` 列出全部参数。
 
+`wait_complete`、`timeout` 和 `best_effort` 的行为、分段大小与 stop/drain 资源约定，统一见
+[RadixShmem 预取设计](../design/radixshmem_chunked_prefetch.md)。
+
 ## 1. 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -40,8 +43,8 @@ attach 的其余参数是 `flexkv/server/shm_radix_bootstrap.py` 里的常量：
 | 常量 | 值 | 含义 |
 |---|---|---|
 | `READY_TIMEOUT_S` | 600 | 等 server 可达且 ready 的总时长，覆盖 server 晚起、SlotStore prefault、集群 rendezvous；server 的 `--bootstrap-timeout` 不要超过它。 |
-| `PREFETCH_TIMEOUT_MS` | 5000 | 一次 prefetch 拉取的服务端超时，到期后 job 以本地命中的部分完成。 |
-| `PREFETCH_MAX_INFLIGHT` | 128 | 每个 KVTaskEngine 在飞的 peer 拉取上限，达到后新的 prefetch 跳过 peer 查询。 |
+| `PREFETCH_TIMEOUT_MS` | 5000 | 单次 peer pull 的默认服务端 deadline；到期后仍须 drain 才能回收 slot，可用 `chunk_timeout_ms` 或 `FLEXKV_RADIXSHMEM_CHUNK_TIMEOUT_MS` 覆盖。 |
+| `PREFETCH_MAX_INFLIGHT` | 128 | Legacy 路径每个 KVTaskEngine 的 peer pull 上限；chunked planner 还在每个 planner 内全局串行 claim。 |
 | `MAX_OUTSTANDING` | 256 | 一个 `RadixClient` 在飞的 peer 拉取 job 上限（job 完成即释放名额）。FlexKV 以 `block=False` 提交，达到上限时新 job 立即以本地命中完成。 |
 
 ## 3. 几何与 slot 数
