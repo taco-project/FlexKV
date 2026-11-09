@@ -61,6 +61,30 @@ The collector also exposes `flexkv_py_joint_prefetch_outcomes_total` (label
 Mooncake Full+SWA prefetch. These describe joint-prefetch outcomes, not all
 requests or every prefetch failure.
 
+#### Chunked prefetch metrics (`flexkv_prefetch_*`)
+
+When chunked prefetch and metrics are enabled, the Python exporter records:
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `flexkv_prefetch_sessions_total` | Counter | `policy`, `reason`, `outcome` | Sessions counted once after all claimed chunks drain |
+| `flexkv_prefetch_loaded_tokens_total` | Counter | `policy` | Published L3 tokens in the reusable prefix at terminal while its lease is valid |
+| `flexkv_prefetch_elapsed_seconds` | Histogram | `policy`, `reason` | Time from admission to terminal |
+| `flexkv_prefetch_drain_seconds` | Histogram | `policy`, `reason` | Time from seal to terminal |
+
+For example, the p95 drain time per policy in seconds is:
+
+```promql
+histogram_quantile(0.95, sum by (le, policy) (rate(flexkv_prefetch_drain_seconds_bucket[5m])))
+```
+
+An early release, reset or shutdown invalidates the result lease; such a session
+adds no loaded tokens. Unknown custom policies and stop reasons are labelled
+`other`. These counters do not measure H2D completion or model consumption, and
+the legacy transfer and joint-prefetch counters do not cover all chunked
+prefetch completions. Reserved/pinned bytes, inflight/state and runtime health
+gauges are not yet provided by these metrics.
+
 
 ---
 
