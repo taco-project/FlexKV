@@ -38,6 +38,73 @@ FlexKV is released under the **Apache-2.0 License**. See the [LICENSE](LICENSE) 
 
 For release history, see [CHANGELOG.md](CHANGELOG.md).
 
+## Cache restore improvements in this branch
+
+These changes are proposed in [FlexKV #323](https://github.com/taco-project/FlexKV/pull/323).
+Admission batching additionally requires the [SGLang companion #17](https://github.com/XingLiu1/sglang/pull/17),
+which targets the adaptation branch used by [sglang#31781](https://github.com/sgl-project/sglang/pull/31781).
+Use matching source revisions while these PRs are under review.
+
+With the relevant controls enabled:
+
+```mermaid
+flowchart TB
+    subgraph Control[Request control]
+        direction LR
+        A[Allocate and vote] --> P[Prepare without DMA] --> B[One batch launch]
+    end
+    subgraph Data[Cache data]
+        direction LR
+        S[Remote Store] -->|Bounded Get| H[CPU host cache]
+        H -->|Eligible direct 2D CE| G[GPU KV]
+    end
+    Control -.->|Submit H2D| Data
+```
+
+`Request control` shows preparation and launch order; `Cache data` shows
+movement through the tiers. The dashed edge submits H2D. These are mechanism
+diagrams, not measured timing; Store prefetch can start before this submission. The
+[illustrated guide](docs/cache_tier_performance_controls.md) shows the old and
+new launch, copy and communication paths, with their limits.
+
+| Area | Previous behavior | Changed behavior and implementation |
+| --- | --- | --- |
+| Admitted layerwise restores | Each request starts its own restore during admission. | Prepare mappings without DMA, then merge the final admitted members into one launch. Each layer has one completion signal. See [`connector.py`](flexkv/integration/sglang/connector.py). |
+| Cross-rank allocation and control | Ranks can diverge on allocation failure; completion polling can leave asynchronous sends retained. | Vote on allocation readiness before restore collectives, and reap the oldest send with normal `Work.wait()` at the retention limit. See [`comm.py`](flexkv/integration/sglang/comm.py). |
+| CE host/device copies | A copy can span independently registered host chunks; eligible partial BlockFirst H2D restores use staging and a transpose. | Split DMA at actual registration boundaries and use direct pitched H2D copies where eligible. Failed submissions drain accepted work before blocks can be reused. See [`host_dma.h`](csrc/host_dma.h) and [`ce_transfer.cu`](csrc/ce_transfer.cu). |
+| Remote prefetch | Store reads are serial and data sessions share existing session/byte limits. | Optional bounded parallel Get calls and data-session limits retain temporary credit waits and source leases until submitted work drains. See [`cache_tier_performance_controls.md`](docs/cache_tier_performance_controls.md). |
+
+The performance switches remain opt-in:
+
+| Setting | Default | Scope |
+| --- | --- | --- |
+| `FLEXKV_ENABLE_LAYERWISE_TRANSFER` | `0` | Enables the SGLang in-process layerwise path. |
+| `FLEXKV_BATCH_LAYERWISE_RESTORE` | `0` | Companion SGLang ordinary-cache IP adapter; requires the connector's batching API. Older connectors keep immediate launch. |
+| `FLEXKV_USE_CE_TRANSFER_H2D` / `FLEXKV_USE_CE_TRANSFER_D2H` | `0` each | Selects CE for each direction independently. |
+| `FLEXKV_CUDAHOST_CHUNK_SIZE_GB` | `0` | Host registration chunk size in GiB; zero registers the whole range. It does not set cache capacity. |
+
+For example, with both matching integrations installed:
+
+```bash
+export FLEXKV_ENABLE_LAYERWISE_TRANSFER=1
+export FLEXKV_BATCH_LAYERWISE_RESTORE=1
+# Optional: evaluate CE independently of admitted batching.
+export FLEXKV_USE_CE_TRANSFER_H2D=1
+export FLEXKV_USE_CE_TRANSFER_D2H=1
+```
+
+Batching applies to the ordinary IP adapter; MP and hybrid adapters keep their
+existing launch path. CE and remote-read controls can be evaluated separately.
+Rebuild/reinstall the native extension after updating the registration-aware CE
+implementation. Use the same communication settings on every rank; inline
+control framing is supported only for PP=1.
+
+The [detailed guide](docs/cache_tier_performance_controls.md) explains remote
+budgets, the prepare/flush/cancel contract and reproduction commands. CPU/mock
+lifecycle tests and CUDA byte/completion tests have separate scopes;
+model-output equivalence, cross-host performance and sustained capacity require
+their own validation.
+
 ## How to Use
 
 ### Install Dependencies
