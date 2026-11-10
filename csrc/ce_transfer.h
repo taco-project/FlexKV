@@ -78,6 +78,29 @@ CEPath choose_path(const CEAnalysis &ce_analysis, const CETransferConfig &ce_con
                    bool is_host_to_device = false,
                    bool is_full_block = false);
 
+struct CEMemcpyStagingOptions {
+  bool enabled = false;
+  size_t tile_bytes = 16 * 1024 * 1024;
+};
+const CEMemcpyStagingOptions &ce_memcpy_staging_options();
+
+inline void ce_check_cuda(cudaError_t status, const char *operation) {
+  TORCH_CHECK(status == cudaSuccess, operation, " failed: code=",
+              static_cast<int>(status), " ", cudaGetErrorString(status));
+}
+
+template <BackendType Type>
+void ce_transfer_memcpy_staged(
+    int num_blocks, int start_layer_id, int num_layers, int kv_dim,
+    int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
+    int64_t gpu_startoff_inside_chunks_int64,
+    int64_t *cpu_block_ids, int64_t *cpu_ptr_int64,
+    int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
+    int64_t cpu_block_stride_int64,
+    int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
+    cudaStream_t stream, bool is_host_to_device,
+    const CEAnalysis &ce_analysis, const CETransferConfig &ce_config);
+
 void *get_cached_host_buffer(size_t size);
 void *get_cached_device_buffer(size_t size, int slot = 0);
 

@@ -27,6 +27,7 @@ from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
 from flexkv.prefetch.types import PrefetchCapabilities, PrefetchHandle, PrefetchOptions, PrefetchSnapshot
 from flexkv.common.config import ModelConfig, CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
+from flexkv.common.platform import ce_only_mode
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.common.debug import eviction_log_aggregator, flexkv_logger
 from flexkv.cache.redis_meta import RedisMeta
@@ -172,6 +173,8 @@ class KVManager:
 
     def start(self) -> None:
         if self.owns_mps:
+            if ce_only_mode():
+                raise RuntimeError("MPS is forbidden when FLEXKV_ENABLE_CE_ONLY=1")
             # try to start MPS
             subprocess.run(['nvidia-cuda-mps-control', '-d'], check=False)
             flexkv_logger.debug("MPS started")

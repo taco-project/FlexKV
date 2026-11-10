@@ -3,6 +3,10 @@ import glob
 import os
 import sys
 
+from flexkv.common.platform import apply_ce_only_env_presets
+
+apply_ce_only_env_presets()
+
 
 # Add package lib directory to system library path
 def _setup_library_path() -> None:

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ce_only.h"
 #include "cuda_stream_lifetime.h"
 #include "host_registration.h"
 #include <cuda_runtime.h>
@@ -19,6 +20,8 @@ inline void checked_host_memcpy2d_async_impl(void *dst, size_t dpitch,
                                              size_t width, size_t height,
                                              cudaMemcpyKind kind,
                                              cudaStream_t stream) {
+  if (ce_only_mode())
+    throw std::runtime_error("cudaMemcpy2DAsync is forbidden in CE-only mode");
   const bool h2d = kind == cudaMemcpyHostToDevice;
   const bool d2h = kind == cudaMemcpyDeviceToHost;
   const uintptr_t host = reinterpret_cast<uintptr_t>(h2d ? src : dst);

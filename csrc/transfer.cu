@@ -24,9 +24,15 @@
 #include "ce_trace.h"
 #include "ce_transfer.h"
 #include "logging.h"
+#include "ce_only.h"
+
+#ifndef FLEXKV_ENABLE_KERNEL_TRANSFER
+#define FLEXKV_ENABLE_KERNEL_TRANSFER 1
+#endif
 
 namespace flexkv {
 
+#if FLEXKV_ENABLE_KERNEL_TRANSFER
 #define FLOAT4_PTR(ptr) reinterpret_cast<float4 *>(ptr)
 
 constexpr int kFloat4AlignBytes = 16;
@@ -158,6 +164,8 @@ __global__ void transfer_kv_blocks_kernel(
   }
 }
 
+#endif
+
 // ============================================================================
 // Main host function
 // ============================================================================
@@ -174,8 +182,10 @@ void transfer_kv_blocks(
     int64_t gpu_block_stride_in_bytes, bool sync,
     const CETransferConfig &ce_config, bool enable_trace) {
 
-  int block_size = 1024;
-  int block_count = transfer_num_cta;
+  TORCH_CHECK(!ce_only_mode() || use_ce_transfer,
+              "Custom kernel transfers are forbidden in CE-only mode");
+  TORCH_CHECK(!ce_only_mode() || !ce_config.enable_memcpy2d,
+              "CE-only transfers require memcpy2d disabled");
 
   int64_t *cpu_ptr_int64 = reinterpret_cast<int64_t *>(cpu_ptr);
   int64_t cpu_kv_stride_int64 = cpu_kv_stride_in_bytes / sizeof(int64_t);
@@ -185,10 +195,11 @@ void transfer_kv_blocks(
       cpu_startoff_inside_chunks / sizeof(int64_t);
   int64_t gpu_startoff_inside_chunks_int64 =
       gpu_startoff_inside_chunks / sizeof(int64_t);
+#if FLEXKV_ENABLE_KERNEL_TRANSFER
   int64_t chunk_size_in_int64 = chunk_size_in_bytes / sizeof(int64_t);
-
-  dim3 blockDim(block_size);
-  dim3 gridDim(block_count);
+  dim3 blockDim(1024);
+  dim3 gridDim(transfer_num_cta);
+#endif
 
   // Capture after rank-sharing/region geometry has been resolved. This one
   // hook also covers direct bindings and legacy TP thread groups.
@@ -242,7 +253,19 @@ void transfer_kv_blocks(
       }
 
       record(path, &analysis);
-      switch (path) {
+      const auto &staging = ce_memcpy_staging_options();
+      TORCH_CHECK(!ce_only_mode() || staging.enabled,
+                  "CE-only transfers require FLEXKV_CE_GATHER_BACKEND=memcpy");
+      if (staging.enabled && path != CEPath::CONTIG_DIRECT &&
+          path != CEPath::SEGMENT_DIRECT) {
+        ce_transfer_memcpy_staged<Type>(
+            num_blocks, start_layer_id, num_layers, kv_dim,
+            gpu_block_ids, gpu_tensor_handler,
+            gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
+            cpu_kv_stride_int64, cpu_layer_stride_int64,
+            cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+            chunk_size_in_bytes, stream, is_host_to_device, analysis, ce_config);
+      } else switch (path) {
         case CEPath::CONTIG_DIRECT:
           ce_transfer_contig_direct<Type>(
               num_blocks, start_layer_id, num_layers, kv_dim,
@@ -296,6 +319,7 @@ void transfer_kv_blocks(
     }  // end else (path_opt_enabled)
   } else {
     record(CEPath::PER_BLOCK, nullptr);
+#if FLEXKV_ENABLE_KERNEL_TRANSFER
     // Custom kernel transfer. Choose the float4 (16B) vs int64 (8B) copy path
     // based on alignment; the 8b path handles kv_shared_across_ranks D2H (num_kv_heads==1) where per-TP
     // shard offsets are 8-aligned but not 16-aligned (e.g. DSv4).
@@ -318,6 +342,9 @@ void transfer_kv_blocks(
           cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
           chunk_size_in_int64, kv_dim, is_host_to_device);
     }
+#else
+    TORCH_CHECK(false, "Kernel transfer was not compiled; enable CE transfer");
+#endif
   }
   if (sync) {
     auto sync_t0 = std::chrono::steady_clock::now();

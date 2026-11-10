@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import mmap
 import os
 import time
 import threading
@@ -12,6 +13,7 @@ import numpy as np
 import torch
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.platform import ce_only_mode
 from flexkv.storage.allocator import (
     alloc_hugepage_tensor,
     free_hugepage_tensor,
@@ -64,6 +66,33 @@ CUDA_HOST_ALLOC_MAPPED = 0x02
 
 
 _FLEXKV_CUDAHOST_REGISTER_PORTABLE = 1  # cudaHostRegisterPortable
+
+
+def _get_cudahost_register_flags() -> int:
+    """Resolve the cudaHostRegister flags.
+
+    Default (NVIDIA): Portable|Mapped, unchanged. FLEXKV_CUDAHOST_REGISTER_FLAGS
+    overrides it. With FLEXKV_ENABLE_CE_ONLY=1 the CE path only needs
+    page-locked memory, so Portable|Mapped are forbidden and never passed on.
+    """
+    raw = os.environ.get("FLEXKV_CUDAHOST_REGISTER_FLAGS", "").strip()
+    if raw:
+        try:
+            flags = int(raw, 0)
+        except ValueError as exc:
+            raise ValueError(
+                f"FLEXKV_CUDAHOST_REGISTER_FLAGS must be an int (got {raw!r})"
+            ) from exc
+    elif ce_only_mode():
+        flags = 0
+    else:
+        flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED
+    if ce_only_mode() and flags != 0:
+        raise ValueError(
+            "FLEXKV_ENABLE_CE_ONLY=1 requires FLEXKV_CUDAHOST_REGISTER_FLAGS=0")
+    return flags
+
+
 _FLEXKV_CUDAHOST_CHUNK_SAFETY_MARGIN_BYTES = 4 * 1024  # 4 KiB cushion for CUDA internal alignment
 
 
@@ -86,7 +115,7 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
     cudart = _get_cudart()
     ptr_base = tensor.data_ptr()
     total_size = tensor.numel() * tensor.element_size()
-    flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED
+    flags = _get_cudahost_register_flags()
     chunk_size = _get_cudahost_chunk_bytes()
     api = _host_region_api()
     if chunk_size and api is None and any(
@@ -133,12 +162,16 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
     """Unregister a CPU tensor from CUDA, matching the chunked register layout."""
-    cudart = _get_cudart()
     ptr_base = tensor.data_ptr()
     with _registered_ranges_lock:
         recorded = _registered_ranges.get(ptr_base)
     total_size, chunk_size, api = recorded or (
         tensor.numel() * tensor.element_size(), _get_cudahost_chunk_bytes(), None)
+    _unregister_host_range(ptr_base, total_size, chunk_size, api)
+
+
+def _unregister_host_range(ptr_base, total_size, chunk_size, api) -> None:
+    cudart = _get_cudart()
     all_unregistered = True
     for offset in range(0, total_size, chunk_size or total_size):
         ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr_base + offset))
@@ -216,6 +249,10 @@ class HostBufferHandle:
 
 def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Tensor:
     """cudaHostAlloc(PORTABLE|MAPPED) buffer writable from device kernels."""
+    if ce_only_mode():
+        raise RuntimeError(
+            "cudaHostAlloc(Portable|Mapped) is forbidden when "
+            "FLEXKV_ENABLE_CE_ONLY=1; use alloc_registered_host_tensor")
     cudart = _get_cudart()
     num_bytes = num_elements * dtype.itemsize
     host_ptr = ctypes.c_void_p()
@@ -239,7 +276,47 @@ def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Ten
     return tensor
 
 
+def alloc_registered_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Tensor:
+    """Page-aligned anonymous memory pinned with ``cudaHostRegister(flags=0)``.
+
+    CE-only replacement for :func:`alloc_mapped_host_tensor`: no
+    Portable|Mapped bits and no ``cudaHostAlloc``.
+    """
+    if num_elements <= 0:
+        return torch.empty(num_elements, dtype=dtype, device="cpu")
+    num_bytes = num_elements * dtype.itemsize
+    mm = mmap.mmap(-1, num_bytes)
+    np_arr = np.frombuffer(mm, dtype=np.uint8, count=num_bytes)
+    tensor = (
+        torch.frombuffer(np_arr, dtype=torch.uint8, count=num_bytes)
+        .view(dtype)[:num_elements]
+    )
+    cudaHostRegister(tensor)
+    weakref.finalize(np_arr, _release_registered_mapping, tensor.data_ptr(), mm)
+    return tensor
+
+
+_failed_registered_mappings = {}
+
+
+def _release_registered_mapping(ptr: int, mapping: mmap.mmap) -> None:
+    """Unpin after the last storage view dies, retaining memory on failure."""
+    try:
+        with _registered_ranges_lock:
+            recorded = _registered_ranges.get(ptr)
+        if recorded is not None:
+            _unregister_host_range(ptr, *recorded)
+        with _registered_ranges_lock:
+            if ptr in _registered_ranges:
+                _failed_registered_mappings[ptr] = mapping
+    except Exception:
+        _failed_registered_mappings[ptr] = mapping
+        flexkv_logger.exception("Failed to unregister host mapping; retaining memory")
+
+
 def _allocate_pinned_cpu_tensor(num_elements: int, dtype: torch.dtype) -> HostBufferHandle:
+    if ce_only_mode():
+        return HostBufferHandle.pinned(alloc_registered_host_tensor(num_elements, dtype))
     return HostBufferHandle.pinned(alloc_mapped_host_tensor(num_elements, dtype))
 
 

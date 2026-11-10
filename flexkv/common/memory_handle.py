@@ -10,6 +10,9 @@ import torch.multiprocessing.reductions as reductions
 import zmq
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.platform import ce_only_mode, is_emulated_cuda_backend
+
+_IS_XMLIR = is_emulated_cuda_backend()
 
 
 class cudaIpcMemHandle_t(ctypes.Structure):
@@ -38,13 +41,16 @@ except:
 # Load CUDA driver library. CuMemAllocator's cuMemCreate + cuMemMap live in
 # libcuda, not libcudart, so we need both. Setting to None on ImportError
 # keeps the legacy code path working on systems without the driver stub.
-try:
-    libcuda = ctypes.CDLL("libcuda.so")
-except OSError:
+if ce_only_mode() or _IS_XMLIR:
+    libcuda = None
+else:
     try:
-        libcuda = ctypes.CDLL("libcuda.so.1")
+        libcuda = ctypes.CDLL("libcuda.so")
     except OSError:
-        libcuda = None
+        try:
+            libcuda = ctypes.CDLL("libcuda.so.1")
+        except OSError:
+            libcuda = None
 
 
 # CUDA IPC handle size (64 bytes on Linux)
@@ -499,7 +505,8 @@ def _is_vmm_pointer(data_ptr: int) -> bool:
     the caller falls back to the existing cudaIpc path (which then errors
     out cleanly on a truly non-shareable allocation).
     """
-    if libcuda is None:
+    if (ce_only_mode() or _IS_XMLIR or libcuda is None
+            or os.environ.get("FLEXKV_DISABLE_VMM_PROBE", "0") == "1"):
         return False
     legacy_ok = ctypes.c_uint(0)
     result = libcuda.cuPointerGetAttribute(
@@ -601,6 +608,20 @@ class TensorSharedHandle:
         if not tensor.is_cuda:
             raise ValueError("Only support CUDA tensor sharing")
 
+        if ce_only_mode() or _IS_XMLIR:
+            self.device = tensor.device if device_id == -1 else torch.device(f"cuda:{device_id}")
+            if self.device != tensor.device:
+                raise ValueError("CE-only IPC must retain the owner's logical device")
+            try:
+                self.rebuild_func, self.rebuild_args, _ = self._export_tensor_handle(tensor)
+            except Exception as exc:
+                raise RuntimeError(
+                    "CE-only IPC reduce_tensor export failed; VMM/direct IPC fallback is disabled"
+                ) from exc
+            self.use_direct_ipc = False
+            self.handle_type = "torch_reduce"
+            return
+
         # VMM allocations (vLLM CuMemAllocator etc.) cannot be exported via
         # cudaIpcGetMemHandle at all — the legacy IPC API rejects them. We
         # must detect this up front and route to the driver-API export path,
@@ -629,8 +650,19 @@ class TensorSharedHandle:
                 self.handle_type = "torch_reduce"
                 return
             except RuntimeError as e:
+                # The fallback changes the failure mode (cuda_ipc opens one
+                # mapping per tensor and can exhaust the per-process limit),
+                # so allow surfacing the original export error instead.
+                if os.environ.get("FLEXKV_STRICT_IPC_MODE", "0").strip().lower() in (
+                        "1", "true", "yes"):
+                    raise RuntimeError(
+                        "torch_reduce export failed and FLEXKV_STRICT_IPC_MODE=1 "
+                        f"forbids the fallback to cuda_ipc: {e}") from e
                 flexkv_logger.warning(f"PyTorch CUDA IPC export failed: {e}")
-                flexkv_logger.info("Attempting direct CUDA IPC export...")
+                flexkv_logger.warning(
+                    "[FlexKV-IPC-MODE] falling back to direct CUDA IPC "
+                    "(handle_type=cuda_ipc); set FLEXKV_STRICT_IPC_MODE=1 to "
+                    "surface the torch_reduce error instead")
 
         try:
             ## Try direct CUDA IPC export
@@ -663,6 +695,8 @@ class TensorSharedHandle:
         auxiliary UDS channel that the FlexKV control plane does not
         currently expose.
         """
+        if ce_only_mode() or _IS_XMLIR:
+            raise RuntimeError("VMM export is forbidden in CE-only mode")
         assert libcuda is not None
         data_ptr = tensor.data_ptr()
 
@@ -856,6 +890,15 @@ class TensorSharedHandle:
         raise ValueError(f"Unsupported tensor dtype: {dtype}")
 
     def get_tensor(self) -> torch.Tensor:
+        if (ce_only_mode() or _IS_XMLIR) and (
+                self.use_direct_ipc or self.handle_type != "torch_reduce"):
+            raise RuntimeError("CE-only IPC requires a torch_reduce handle")
+        tensor = self._get_tensor_impl()
+        if hasattr(self, "gdr_target"):
+            tensor._flexkv_gdr = self.gdr_target
+        return tensor
+
+    def _get_tensor_impl(self) -> torch.Tensor:
         if self.handle_type == "vmm_fabric":
             return self._import_vmm_handle(
                 self.ipc_handle,
@@ -923,6 +966,8 @@ class TensorSharedHandle:
         The returned tensor owns no storage. Its process-local VMM mapping is
         tracked until ``release_vmm_tensor`` is called before exporter sleep.
         """
+        if ce_only_mode() or _IS_XMLIR:
+            raise RuntimeError("VMM import is forbidden in CE-only mode")
         if libcuda is None:
             raise RuntimeError(
                 "libcuda not available; cannot import a VMM shareable handle."
@@ -1078,6 +1123,9 @@ class TensorSharedHandle:
     ) -> Tuple[Callable, Tuple[Any], torch.device]:
         device = tensor.device
         rebuild_func, rebuild_args = reductions.reduce_tensor(tensor)
+        if ce_only_mode() or _IS_XMLIR:
+            from flexkv.common.ipc_uuid import wrap_rebuild
+            rebuild_func, rebuild_args = wrap_rebuild(rebuild_func, rebuild_args, device)
         return rebuild_func, rebuild_args, device
 
     ## Import tensor handle
@@ -1086,10 +1134,17 @@ class TensorSharedHandle:
         rebuild_func: Callable, rebuild_args: Tuple[Any], device: torch.device
     ) -> torch.Tensor:
         try:
+            from flexkv.common.ipc_uuid import rebuild_by_uuid, device_from_uuid
+            if rebuild_func is rebuild_by_uuid:
+                device = device_from_uuid(rebuild_args[3])
             tensor = rebuild_func(*rebuild_args)
             assert isinstance(tensor, torch.Tensor)
 
             if tensor.device != device:
+                if ce_only_mode() or _IS_XMLIR:
+                    raise RuntimeError(
+                        f"CE-only IPC returned {tensor.device}, expected owner device {device}; "
+                        "copying would break the shared allocation alias")
                 flexkv_logger.warning(
                     f"Tensor device {tensor.device} is not the same as the target device {device}"
                 )

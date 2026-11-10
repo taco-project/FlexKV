@@ -4,6 +4,7 @@
  */
 #include "layer_notify.h"
 
+#include "ce_only.h"
 #include "logging.h"
 
 #include <chrono>
@@ -14,6 +15,8 @@
 namespace flexkv {
 
 LayerNotifyMode parse_layer_notify_mode(const std::string &s) {
+  if (ce_only_mode() && s != "polling")
+    throw std::invalid_argument("CE-only layer notification requires polling");
   return s == "polling" ? LayerNotifyMode::POLLING : LayerNotifyMode::HOSTFUNC;
 }
 
