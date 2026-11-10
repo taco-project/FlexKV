@@ -202,6 +202,9 @@ class ModelConfig:
     layer_groups: Optional[List[LayerGroupSpec]] = None
 
     local_dp_size: Optional[int] = None
+    h2d_layer_holders: Optional[List[int]] = None
+    cp_cache_node_rank: Optional[int] = None
+    layer_shard_enabled: bool = False
 
     # ------------------------------------------------------------------
     # Freeze mechanism: after post_init, ModelConfig must not be mutated
@@ -776,6 +779,8 @@ class CacheConfig:
     mooncake_store_node_layer_start: int = 0
     mooncake_store_node_layer_end: int = 0
     mooncake_store_total_layers: int = 0
+    mooncake_store_cp_nodes: int = 1
+    mooncake_store_cp_node_rank: int = 0
 
     # Stored for deferred recomputation when layer_groups become known
     _user_cpu_cache_gb: float = 0
@@ -1146,6 +1151,12 @@ def block_size_in_bytes_for_cache(
     estimate from ``rank_info``.
     """
     if model_config.layer_groups is not None:
+        if (model_config.layer_shard_enabled and model_config.nnodes > 1
+                and model_config.cp_cache_node_rank is None):
+            from flexkv.common.cp_shard import cp_node_cache_model
+            return max(block_size_in_bytes_for_cache(
+                cp_node_cache_model(model_config, node)[0], cache_config, rank_info)
+                for node in range(model_config.nnodes))
         # Match KVCacheLayout._compute_kv_shape exactly.  Computing a rounded
         # per-token size first and multiplying it by tokens_per_block loses
         # bytes for compressed groups whenever the group contribution is not

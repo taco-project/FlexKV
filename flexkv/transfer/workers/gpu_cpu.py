@@ -215,7 +215,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                  # fan-out, plus a per-layer eventfd post. WHOLE (the default)
                  # never opens the UDS and never records a marker.
                  completion: Union[str, CompletionContract, None] = None,
-                 layerwise_eventfd_socket: Optional[str] = None):
+                 layerwise_eventfd_socket: Optional[str] = None,
+                 h2d_layer_holders: Optional[List[int]] = None,
+                 layer_shard_enabled: bool = False):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         from flexkv.common.gdr_config import worker_gdr_config
@@ -276,6 +278,21 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             cpu_kv_layout.num_layer if layer_groups is not None
             else self.num_layers
         )
+        self.h2d_layer_holders = (
+            None if h2d_layer_holders is None else list(h2d_layer_holders)
+        )
+        self.layer_shard_enabled = bool(layer_shard_enabled)
+        if self.layer_shard_enabled and self.h2d_layer_holders is None:
+            raise ValueError("Physical CP requires a layer owner map")
+        if self.h2d_layer_holders is not None:
+            if (len(self.h2d_layer_holders) != self._num_original_layers
+                    or self.num_kv_heads != 1 or self.kv_dim != 1
+                    or swa_cpu_blocks is not None
+                    or GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode == "all_write"
+                    or any(type(owner) is not int or not -1 <= owner < tp_group_size
+                           for owner in self.h2d_layer_holders)
+                    or (not self.layer_shard_enabled and -1 in self.h2d_layer_holders)):
+                raise ValueError("CP holders require a shared single-KV pool and valid local ranks")
 
         self.transfer_num_cta_h2d = transfer_num_cta_h2d
         self.transfer_num_cta_d2h = transfer_num_cta_d2h
@@ -382,6 +399,16 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         if self._gdr_config["enabled"]:
             from flexkv.transfer.gdr_runtime import configure_worker_gdr
             configure_worker_gdr(self)
+        self._owner_d2h_share_mode = None
+        if self.h2d_layer_holders is not None:
+            from flexkv import c_ext
+            if (self.region_batch is None
+                    or not hasattr(c_ext.RegionRequest(), "h2d_rank")
+                    or self._compressor.needs_gpu_cpu_thread_group):
+                raise RuntimeError(
+                    "CP owner routing requires the region-batch H2D holder ABI and no compressed fallback")
+            if self.layer_shard_enabled:
+                self._owner_d2h_share_mode = rank_share_mode("rank0_only")
         # Before attach(): a compressor that transfers through the thread group
         # reads ``worker.tp_transfer_thread_group`` in attach() itself.
         self._materialize_thread_groups()
@@ -1127,8 +1154,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
     def _whole_region_requests(self, pool, gpu_block_ids, cpu_block_ids,
                                is_h2d, transfer_num_cta, use_ce_transfer):
-        holders = None
-        physical = False
+        holders = getattr(self, "h2d_layer_holders", None)
+        physical = getattr(self, "layer_shard_enabled", False)
         if holders is None or (not is_h2d and not physical):
             return make_requests(
                 self.region_batch.num_regions, gpu_block_ids, cpu_block_ids, is_h2d,
@@ -1146,7 +1173,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 requests.extend(make_requests(
                     self.region_batch.num_regions, gpu_block_ids, cpu_block_ids, is_h2d,
                     transfer_num_cta=transfer_num_cta, use_ce_transfer=use_ce_transfer,
-                    share_mode=(self._rank_share_mode if is_h2d else None),
+                    share_mode=(self._rank_share_mode if is_h2d else self._owner_d2h_share_mode),
                     designated_rank=owner if not is_h2d else 0,
                     h2d_rank=owner if is_h2d else -1,
                     region_indices=[pool.region_indices[region_ordinal]],
@@ -1286,7 +1313,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         # Per shape, not per worker: an op with no SWA blocks leaves every
         # SWA-only layer uncovered too.
         empty_layers: List[int] = []
-        holders = None
+        holders = getattr(self, "h2d_layer_holders", None)
         for layer, members in enumerate(self._layer_milestones):
             owner = -1 if holders is None else holders[layer]
             live = [m for m in members

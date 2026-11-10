@@ -44,7 +44,8 @@ def _groups(compress_ratio: int):
     ]
 
 
-def test_connector_describes_one_indexer_row_per_page():
+@pytest.mark.parametrize("page_major", [False, True])
+def test_connector_describes_one_indexer_row_per_page(page_major):
     connector = FlexKVConnector.__new__(FlexKVConnector)
     connector.page_size = PAGE_SIZE
     connector.rank_info = SimpleNamespace(num_layers_per_pp_stage=NUM_LAYERS)
@@ -58,8 +59,10 @@ def test_connector_describes_one_indexer_row_per_page():
         [False] * NUM_LAYERS,
         layer_shard_enabled=False,
     )
+    shape = ((1, 1, PAGE_SIZE, MAIN_HEAD_SIZE) if page_major
+             else (PAGE_SIZE, 1, MAIN_HEAD_SIZE))
     specs = connector._build_indexer_layer_group_specs(
-        [torch.empty((1, 1, MAIN_HEAD_SIZE), dtype=torch.bfloat16)], group
+        [torch.empty(shape, dtype=torch.bfloat16)], group
     )
 
     assert specs[1].head_size == INDEX_HEAD_SIZE
@@ -114,6 +117,34 @@ def test_connector_resolves_only_the_selected_indexer_layout(dedup):
         assert group.buffers[0] is group.buffers[1]
     # Resolution must not replace the pool's skip-layer placeholders.
     assert cache.index_k_with_scale_buffer[1].shape[0] == 0
+
+
+def test_indexer_preflight_rejects_partial_overlap():
+    storage = torch.empty((24, INDEX_HEAD_SIZE), dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="overlap"):
+        FlexKVConnector._compact_indexer_buffers(
+            [storage[:16], storage[8:]], [False, False], layer_shard_enabled=False)
+
+
+def test_indexer_preflight_accepts_none_for_skipped_layer():
+    active = torch.empty((2, INDEX_HEAD_SIZE), dtype=torch.uint8)
+    group = FlexKVConnector._compact_indexer_buffers(
+        [active, None], [False, True], layer_shard_enabled=False)
+    assert group.layer_indices == (0,)
+
+
+def test_indexer_preflight_rejects_noncontiguous_rows():
+    buffer = torch.empty((INDEX_HEAD_SIZE, 4), dtype=torch.uint8).t()
+    with pytest.raises(RuntimeError, match="contiguous"):
+        FlexKVConnector._compact_indexer_buffers(
+            [buffer], [False], layer_shard_enabled=False)
+
+
+def test_indexer_preflight_rejects_nonboolean_skip_mask():
+    with pytest.raises(ValueError, match="booleans"):
+        FlexKVConnector._compact_indexer_buffers(
+            [torch.empty((1, INDEX_HEAD_SIZE), dtype=torch.uint8)],
+            ["false"], layer_shard_enabled=False)
 
 
 def test_connector_rejects_indexer_dedup_with_cp_layer_split():

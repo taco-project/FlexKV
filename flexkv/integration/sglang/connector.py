@@ -26,6 +26,7 @@ Modes:
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import math
@@ -108,6 +109,11 @@ class _IndexerBufferGroup:
     buffers: Tuple[torch.Tensor, ...]
     layer_indices: Tuple[int, ...]
     logical_layer_count: int
+
+
+def _is_sparse_indexer_group(group: Optional[_IndexerBufferGroup]) -> bool:
+    """True when only a strict subset of logical indexer layers is cached."""
+    return bool(group is not None and len(group.buffers) < group.logical_layer_count)
 
 
 def _status_value(response: Any) -> str:
@@ -221,6 +227,9 @@ class FlexKVConnector:
     """
 
     _chunked_namespace_supported = True
+    # Read by SGLang's layer-broadcast scheduler: only a strict subset of
+    # indexer layers is cached, so inactive indexer broadcasts may be skipped.
+    sparse_indexer = False
 
     @property
     def supports_cache_namespace(self) -> bool:
@@ -299,6 +308,7 @@ class FlexKVConnector:
             pp_group=pp_group,
             attn_tp_group=attn_tp_group,
             attn_cp_group=attn_cp_group,
+            enable_collective_sync=GLOBAL_CONFIG_FROM_ENV.enable_collective_sync,
         )
         # Master switch: FLEXKV_ENABLE_COLLECTIVE_SYNC=0 disables all
         # cross-rank scatter/barrier/all_reduce. Every rank then acts
@@ -357,7 +367,47 @@ class FlexKVConnector:
                 self._label,
             )
 
-        kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
+        self._indexer_layer_ids = indexer_layer_ids
+        self._draft_kvcache = draft_kvcache
+        self._draft_groups = []
+        self._draft_namespace = None
+        self._agree_cache_geometry(
+            [bool(getattr(kvcache, "layer_shard_enabled", False)),
+             self._deduplicate_indexer_group, draft_kvcache is not None,
+             layer_split_plan is not None,
+             bool(getattr(kvcache, "index_k_with_scale_buffer", None)),
+             os.environ.get("FLEXKV_L3_PREFETCH_MAX_BLOCKS", "0").strip().lower()],
+            "cache feature selection",
+        )
+        kv_caches = []
+        indexer_group = None
+        buffer_error = None
+        try:
+            kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
+            if indexer_group is not None and not self._is_dsv4:
+                main = kv_caches[0]
+                if main.ndim not in (3, 4):
+                    raise ValueError("Indexer requires 3D/4D main KV buffers")
+                blocks = main.shape[0] // self.page_size if main.ndim == 3 else main.shape[0]
+                if indexer_group.buffers[0].shape[0] != blocks:
+                    raise ValueError("Indexer page count must match main KV blocks 1:1")
+        except (ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            buffer_error = str(exc)
+        self._require_cache_preflight(buffer_error, "GPU buffer validation")
+        if indexer_group is not None and self.model_config.pp_size == 1:
+            sample = indexer_group.buffers[0]
+            self._agree_cache_geometry(
+                [list(sample.shape), str(sample.dtype), sample.element_size(),
+                 list(indexer_group.layer_indices), indexer_group.logical_layer_count],
+                "Indexer buffer geometry",
+            )
+        self._configure_h2d_holders(layer_split_plan)
+        draft_error = None
+        try:
+            self._draft_groups = self._build_draft_groups(draft_kvcache, kv_caches)
+        except (ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            draft_error = str(exc)
+        self._require_cache_preflight(draft_error, "draft buffer validation")
         if self._swa_kv_pool is not None and self.cache_config.swa is not None:
             buffers = self._swa_kv_pool.kv_buffer
             snapshot_bytes = sum(
@@ -373,6 +423,15 @@ class FlexKVConnector:
         # Heterogeneous groups change the bytes represented by one logical
         # FlexKV block. Recompute CPU/SSD capacities before KVManager starts.
         self._apply_layer_groups_for_cache_sizing(kv_caches, indexer_group)
+        if self._draft_groups or getattr(self.model_config, "layer_shard_enabled", False):
+            layout = [(g.num_layers, g.num_kv_heads, g.head_size, g.compress_ratio,
+                       str(g.dtype), g.layer_indices) for g in self.model_config.layer_groups]
+            identity = ["hy4-target-draft-v1", getattr(server_args, "model_path", None),
+                        getattr(server_args, "speculative_draft_model_path", None),
+                        self.page_size, self.model_config.nnodes,
+                        self.model_config.layer_shard_enabled,
+                        self.model_config.h2d_layer_holders, layout]
+            self._draft_namespace = self._agree_cache_geometry(identity, "target/draft layout")
         if self._is_dsv4 and self.cache_config.swa is not None:
             _, _, swa_layer_groups, _, _ = self._build_dsv4_swa_registration()
             self.cache_config.swa.layer_groups = swa_layer_groups
@@ -497,6 +556,24 @@ class FlexKVConnector:
                 and _radixshmem_distributed(self.model_config, self.cache_config))
         )
         self._shutdown_done = False
+        self._l3_prefetch_window = None
+        if os.environ.get("FLEXKV_L3_PREFETCH_MAX_BLOCKS", "0").strip().lower() not in ("", "0"):
+            from flexkv.integration.sglang.prefetch_window import PrefetchWindow
+            window_error = None
+            try:
+                self._l3_prefetch_window = PrefetchWindow.from_connector(
+                    self, scatter_channels=FlexKVScatterChannel
+                )
+            except (ValueError, TypeError, AttributeError, RuntimeError) as exc:
+                window_error = str(exc)
+            self._require_cache_preflight(window_error, "L3 window configuration")
+            window = self._l3_prefetch_window
+            self._agree_cache_geometry(
+                None if window is None else
+                [window.max_blocks, window.max_inflight, window.max_entries,
+                 window.max_queued_blocks, window.poll_interval, window.wait_s,
+                 window.unconsumed_ttl], "L3 window limits",
+            )
 
         # Keep FlexKV lifecycle self-contained (avoid scattering hooks in
         # scheduler / tokenizer / http_server):
@@ -1255,7 +1332,16 @@ class FlexKVConnector:
                         start_ns=min(m.start_ns for m in members),
                     )
             except Exception as exc:
-                result["error"] = str(exc)
+                result["error"] = str(exc) or type(exc).__name__
+                actual_ids = getattr(exc, "launched_task_ids", None) or result["task_ids"]
+                for tid in actual_ids or ():
+                    if tid not in self._launched_load_tids:
+                        self._launched_load_tids.append(tid)
+                    self._launched_load_contexts[tid] = replace(
+                        members[0].context, task_id=tid,
+                        start_ns=min(m.start_ns for m in members),
+                    )
+                result["task_ids"] = list(actual_ids or ())
         if self._sync_ctx.needs_sync:
             result = self._sync_ctx.scatter(
                 result, channel=FlexKVScatterChannel.LAYERWISE_BATCH, blocking=True
@@ -2214,6 +2300,236 @@ class FlexKVConnector:
             )
         return resolved
 
+    def _require_cache_preflight(self, error: Optional[str], label: str) -> None:
+        ready = self._sync_ctx.all_reduce_min(int(error is None))
+        if not ready:
+            raise ValueError(f"FlexKV {label}: {error or 'rejected on another cache rank'}")
+
+    def _agree_cache_geometry(self, geometry: Any, label: str) -> str:
+        fingerprint = hashlib.sha256(
+            json.dumps(geometry, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        ).hexdigest()
+        value = int(fingerprint[:15], 16)
+        low = self._sync_ctx.all_reduce_min(value)
+        high = -self._sync_ctx.all_reduce_min(-value)
+        if low != high:
+            raise ValueError(f"FlexKV {label} differs across cache ranks")
+        return fingerprint
+
+    def _resolve_cp_kv_buffers(self, pool: Any):
+        """Validate original owner buffers before introducing scratch aliases."""
+        if self._is_dsv4 or self._swa_kv_pool is not None:
+            raise ValueError("Physical CP requires an NSA/MLA pool without SWA")
+        owner_of = getattr(pool, "_get_layer_owner_rank", None)
+        shard_size = int(getattr(pool, "layer_shard_size", 0))
+        shard_rank = int(getattr(pool, "layer_shard_rank", -1))
+        start = int(getattr(pool, "start_layer", 0))
+        main = list(getattr(pool, "kv_buffer", ()))
+        count = int(getattr(pool, "layer_num", 0))
+        if (not callable(owner_of) or not 0 <= shard_rank < shard_size
+                or count != self.rank_info.num_layers_per_pp_stage or len(main) != count):
+            raise ValueError("Physical CP requires a complete owner map and KV layer array")
+        owners = [owner_of(start + layer) for layer in range(count)]
+        if any(type(owner) is not int or not 0 <= owner < shard_size for owner in owners):
+            raise ValueError("Physical CP layer owner is outside the CP group")
+        scratch = getattr(pool, "remote_kv_buffer", None)
+        if (scratch is None or scratch.ndim not in (3, 4)
+                or scratch.numel() == 0 or not scratch.is_contiguous()
+                or scratch.shape[1] != 1
+                or scratch.shape[scratch.ndim - 1] * scratch.element_size() % 8
+                or (scratch.ndim == 4 and scratch.shape[2] != self.page_size)):
+            raise ValueError("Physical CP requires contiguous 3D/4D receive scratch")
+        if scratch.ndim == 3 and scratch.shape[0] % self.page_size:
+            raise ValueError("Physical CP token-major scratch must contain whole pages")
+        blocks = scratch.shape[0] // self.page_size if scratch.ndim == 3 else scratch.shape[0]
+        spans = []
+
+        def add_span(buffer, label):
+            pointer = int(buffer.data_ptr())
+            if pointer <= 0 or pointer % 8:
+                raise ValueError(f"Physical CP {label} has an invalid/unaligned pointer")
+            spans.append((pointer, pointer + buffer.numel() * buffer.element_size(), label))
+
+        def validate(buffer, sample, owned, label):
+            shape = tuple(sample.shape) if owned else (0, *tuple(sample.shape)[1:])
+            if (buffer is None or tuple(buffer.shape) != shape
+                    or buffer.dtype != sample.dtype or buffer.device != sample.device
+                    or not buffer.is_contiguous()):
+                raise ValueError(f"Physical CP {label} has inconsistent shape/dtype/device/stride")
+            if owned:
+                add_span(buffer, label)
+
+        add_span(scratch, "KV scratch")
+        resolved = []
+        for layer, buffer in enumerate(main):
+            owned = owners[layer] == shard_rank
+            validate(buffer, scratch, owned, f"KV layer {layer}")
+            resolved.append(buffer if owned else scratch)
+        original = getattr(pool, "index_k_with_scale_buffer", None)
+        if original is None or len(original) != count:
+            raise ValueError("Physical NSA CP requires an Indexer buffer for every layer")
+        skip = getattr(pool, "skip_topk_layers", None)
+        if skip is None:
+            skip = [False] * count
+        if len(skip) != count or any(type(value) is not bool for value in skip):
+            raise ValueError("Indexer skip_topk_layers must contain one bool per layer")
+        active = [i for i, shared in enumerate(skip) if not shared]
+        explicit_ids = getattr(self, "_indexer_layer_ids", None)
+        if (not active or (explicit_ids is not None and
+                (any(type(i) is not int for i in explicit_ids) or list(explicit_ids) != active))):
+            raise ValueError("Indexer active IDs disagree with skip_topk_layers")
+        index_scratch = getattr(pool, "remote_index_k_with_scale_buffer", None)
+        if (index_scratch is None or index_scratch.ndim != 2
+                or index_scratch.shape[0] != blocks or index_scratch.shape[1] <= 0
+                or not index_scratch.is_contiguous()
+                or index_scratch.shape[1] * index_scratch.element_size() % 8
+                or index_scratch.device != scratch.device):
+            raise ValueError("Physical CP Indexer scratch must map KV pages 1:1")
+        add_span(index_scratch, "Indexer scratch")
+        indices = active if self._deduplicate_indexer_group else list(range(count))
+        resolved_index = {}
+        for layer in active:
+            owned = owners[layer] == shard_rank
+            validate(original[layer], index_scratch, owned, f"Indexer layer {layer}")
+            resolved_index[layer] = original[layer] if owned else index_scratch
+        for layer in indices:
+            if layer not in resolved_index:
+                # Shared indexers are never model-owned storage. A scratch row
+                # preserves the legacy full layout when dedup is not requested.
+                resolved_index[layer] = index_scratch
+        spans.sort()
+        if any(previous[1] > current[0] for previous, current in zip(spans, spans[1:])):
+            raise ValueError("Physical CP owned buffers overlap each other or receive scratch")
+        return resolved, _IndexerBufferGroup(
+            buffers=tuple(resolved_index[layer] for layer in indices),
+            layer_indices=tuple(indices), logical_layer_count=count,
+        )
+
+    def _configure_h2d_holders(self, plan: Any) -> None:
+        config = self.model_config
+        pool = self._kvcache
+        physical = bool(getattr(pool, "layer_shard_enabled", False))
+        if not physical and plan is None:
+            return
+        holders = None
+        error = None
+        try:
+            eligible = (
+                self._sync_ctx.needs_sync and config.kv_dim == 1
+                and config.num_kv_heads == 1 and not self._is_dsv4
+                and self._swa_kv_pool is None
+                and GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode != "all_write"
+                and all(g.num_kv_heads == 1 for g in (config.layer_groups or []))
+            )
+            if physical:
+                eligible = (
+                    eligible and config.pp_size == 1
+                    and int(pool.layer_shard_size) == config.effective_tp_size > 1
+                    and int(pool.layer_shard_rank) == self.rank_info.effective_tp_rank
+                    and (config.nnodes == 1 or
+                         (config.dp_size == 1 and config.tp_size == 1 and config.instance_num == 1))
+                )
+                if not eligible:
+                    raise ValueError("Physical CP topology is incompatible with owner-only transfers")
+                holders = [int(pool._get_layer_owner_rank(int(getattr(pool, "start_layer", 0)) + i))
+                           for i in range(config.num_layers)]
+            else:
+                eligible = (
+                    eligible and GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer
+                    and config.nnodes == 1 and config.pp_size == 1
+                    and plan.cp_size == config.effective_tp_size > 1
+                    and plan.cp_rank == self.rank_info.effective_tp_rank
+                    and plan.num_layers == config.num_layers
+                    and int(getattr(pool, "start_layer", 0)) == 0
+                )
+                if eligible:
+                    plan.validate()
+                    holders = [int(plan.holder_of(i)) for i in range(config.num_layers)]
+            if holders is not None and any(not 0 <= owner < config.effective_tp_size for owner in holders):
+                raise ValueError("CP holder is outside the cache-sharing group")
+        except (ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            error = str(exc)
+        self._require_cache_preflight(error, "CP owner plan")
+        self._agree_cache_geometry([physical, holders], "CP owner plan")
+        config = replace(config, h2d_layer_holders=holders, layer_shard_enabled=physical)
+        config.freeze()
+        self.model_config = self.flexkv_config.model_config = config
+        self.rank_info = replace(self.rank_info, model_config=config)
+        if physical and config.nnodes > 1:
+            self.cache_config.mooncake_store_cp_nodes = config.nnodes
+
+    def _build_draft_groups(self, pool: Any, kv_caches: List[torch.Tensor]):
+        """Pack replicated NEXTN KV and Indexer into the target's cache block."""
+        if pool is None:
+            return []
+        if (self._is_dsv4 or self._swa_kv_pool is not None
+                or self.model_config.kv_dim != 1 or self.model_config.pp_size != 1
+                or getattr(pool, "layer_shard_enabled", False)
+                or int(getattr(pool, "layer_num", 0)) != 1):
+            raise ValueError("Draft piggyback requires a replicated one-layer NSA/MLA pool")
+        main = list(getattr(pool, "kv_buffer", ()))
+        index = list(getattr(pool, "index_k_with_scale_buffer", ()))
+        if len(main) != 1 or len(index) != 1:
+            raise ValueError("NEXTN piggyback requires one KV and one Indexer buffer")
+        draft, target = main[0], kv_caches[0]
+        if (draft.ndim not in (3, 4) or draft.ndim != target.ndim
+                or draft.device != target.device or draft.numel() == 0
+                or draft.shape[0] != target.shape[0] or draft.shape[1] != 1
+                or (draft.ndim == 4 and draft.shape[2] != self.page_size)
+                or (draft.ndim == 3 and draft.shape[0] % self.page_size)):
+            raise ValueError("Draft and target must share KV slot geometry")
+        if draft.shape[draft.ndim - 1] * draft.element_size() % 8:
+            raise ValueError("Draft KV rows must be 8-byte aligned")
+        blocks = draft.shape[0] // self.page_size if draft.ndim == 3 else draft.shape[0]
+        sidecar = index[0]
+        if (sidecar is None or sidecar.ndim != 2 or sidecar.shape[0] != blocks
+                or sidecar.shape[1] <= 0 or sidecar.shape[1] * sidecar.element_size() % 8
+                or sidecar.device != draft.device):
+            raise ValueError("Draft Indexer pages must map target KV blocks 1:1")
+        for tensor in (draft, sidecar):
+            if not tensor.is_contiguous() or tensor.data_ptr() <= 0 or tensor.data_ptr() % 8:
+                raise ValueError("Draft buffers must have contiguous aligned physical storage")
+        holders = getattr(self.model_config, "h2d_layer_holders", None)
+        if holders:
+            owners = sorted(set(holders))
+            if owners != list(range(self.model_config.effective_tp_size)):
+                raise ValueError("Draft piggyback needs a target layer for every CP owner")
+            representatives = sorted(holders.index(owner) for owner in owners)
+        else:
+            representatives = [0]
+        result = []
+        for tensor, tpb, ratio in ((draft, self.page_size, 1), (sidecar, 1, self.page_size)):
+            spec = LayerGroupSpec(
+                num_layers=len(representatives), num_kv_heads=1,
+                head_size=int(tensor.shape[tensor.ndim - 1]),
+                layer_indices=list(representatives), compress_ratio=ratio, dtype=tensor.dtype,
+            )
+            layout = KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST, num_layer=len(representatives),
+                num_block=blocks, tokens_per_block=tpb, num_head=1,
+                head_size=spec.head_size, kv_dim=1, num_kv_heads=1,
+            )
+            result.append((spec, layout, [tensor] * len(representatives)))
+        return result
+
+    def _cache_namespace(self, namespace):
+        fingerprint = getattr(self, "_draft_namespace", None)
+        if fingerprint is None:
+            return namespace
+        return [json.dumps(["target-draft-v1", fingerprint, namespace],
+                           ensure_ascii=True, separators=(",", ":"))]
+
+    @staticmethod
+    def _radix_key_input(token_ids, namespace, extra_key=None):
+        if hasattr(token_ids, "token_ids"):
+            if extra_key is None:
+                extra_key = getattr(token_ids, "extra_key", None)
+            token_ids = token_ids.token_ids
+        if extra_key is not None:
+            namespace = [json.dumps(["sglang-extra-key-v1", extra_key, namespace],
+                                    ensure_ascii=True, separators=(",", ":"))]
+        return token_ids, namespace
+
     @staticmethod
     def _compact_indexer_buffers(
         indexer_buffers: Sequence[torch.Tensor],
@@ -2230,7 +2546,9 @@ class FlexKVConnector:
         from tensor shape here.
         """
         buffers = list(indexer_buffers)
-        skip_mask = [bool(value) for value in skip_topk_layers]
+        if any(type(value) is not bool for value in skip_topk_layers):
+            raise ValueError("Indexer skip_topk_layers must contain booleans")
+        skip_mask = list(skip_topk_layers)
         if layer_shard_enabled:
             raise RuntimeError(
                 "FLEXKV_DEDUP_INDEXER_GROUP does not yet support "
@@ -2247,13 +2565,14 @@ class FlexKVConnector:
         active_layer_indices: List[int] = []
         sample: Optional[torch.Tensor] = None
         for layer_idx, (buffer, skip_topk) in enumerate(zip(buffers, skip_mask, strict=True)):
-            if buffer.ndim != 2:
-                raise RuntimeError(
-                    f"FlexKV indexer layer {layer_idx} expects a 2D buffer, "
-                    f"got shape={tuple(buffer.shape)}"
-                )
             if skip_topk:
                 continue
+            if buffer is None or buffer.ndim != 2:
+                raise RuntimeError(
+                    f"FlexKV active indexer layer {layer_idx} requires a 2D buffer")
+            if (not buffer.is_contiguous() or buffer.shape[1] <= 0
+                    or buffer.shape[1] * buffer.element_size() % 8):
+                raise RuntimeError("Indexer rows must be contiguous and 8-byte aligned")
             if buffer.shape[0] == 0:
                 raise RuntimeError(
                     "FlexKV active indexer layer has no physical buffer: "
@@ -2278,11 +2597,13 @@ class FlexKVConnector:
 
         if not active_buffers:
             raise RuntimeError("FlexKV indexer dedup found no active Index-K layers")
-        active_ptrs = [buffer.data_ptr() for buffer in active_buffers]
-        if len(set(active_ptrs)) != len(active_ptrs):
-            raise RuntimeError(
-                "FlexKV active indexer buffers unexpectedly alias each other"
-            )
+        spans = sorted(
+            (buffer.data_ptr(), buffer.data_ptr() + buffer.numel() * buffer.element_size())
+            for buffer in active_buffers)
+        if any(start <= 0 or start % 8 for start, _ in spans):
+            raise RuntimeError("Indexer buffer address must be nonzero and 8-byte aligned")
+        if any(previous[1] > current[0] for previous, current in zip(spans, spans[1:])):
+            raise RuntimeError("FlexKV active indexer buffers unexpectedly alias or overlap")
         return _IndexerBufferGroup(
             buffers=tuple(active_buffers),
             layer_indices=tuple(active_layer_indices),
@@ -2297,6 +2618,11 @@ class FlexKVConnector:
             print(f"attr: {attr}")
             print(f"value: {getattr(kvcache, attr)}")
             print("-"*100)
+        self.sparse_indexer = False
+        if getattr(kvcache, "layer_shard_enabled", False):
+            resolved, cp_indexer_group = self._resolve_cp_kv_buffers(kvcache)
+            self.sparse_indexer = _is_sparse_indexer_group(cp_indexer_group)
+            return resolved, cp_indexer_group
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
         if indexer_buffers:
             if self._deduplicate_indexer_group:
@@ -2307,6 +2633,12 @@ class FlexKVConnector:
                         getattr(kvcache, "layer_shard_enabled", False)
                     ),
                 )
+                explicit_ids = getattr(self, "_indexer_layer_ids", None)
+                if explicit_ids is not None and (
+                    any(type(i) is not int for i in explicit_ids)
+                    or tuple(explicit_ids) != indexer_group.layer_indices
+                ):
+                    raise ValueError("Indexer active IDs disagree with skip_topk_layers")
                 logger.info(
                     "[FlexKV] compacted indexer group: logical_layers=%d "
                     "physical_layers=%d skipped_layers=%d layer_indices=%s",
@@ -2324,6 +2656,7 @@ class FlexKVConnector:
                 )
         else:
             indexer_group = None
+        self.sparse_indexer = _is_sparse_indexer_group(indexer_group)
         if not self._is_dsv4:
             if hasattr(kvcache, "kv_buffer"):
                 return list(kvcache.kv_buffer), indexer_group
@@ -2624,7 +2957,10 @@ class FlexKVConnector:
         kv_caches: List[torch.Tensor],
         indexer_group: _IndexerBufferGroup,
     ) -> List[LayerGroupSpec]:
-        _, num_kv_heads, head_size = kv_caches[0].shape
+        kv_tensor = kv_caches[0]
+        if kv_tensor.ndim not in (3, 4):
+            raise ValueError(f"Expected 3D/4D KV cache tensor, got {kv_tensor.shape}")
+        num_kv_heads, head_size = kv_tensor.shape[1], kv_tensor.shape[kv_tensor.ndim - 1]
         if indexer_group.logical_layer_count != self.rank_info.num_layers_per_pp_stage:
             raise RuntimeError(
                 "FlexKV indexer logical layer count mismatch: "
@@ -2661,25 +2997,31 @@ class FlexKVConnector:
         kv_caches: List[torch.Tensor],
         indexer_group: Optional[_IndexerBufferGroup],
     ) -> None:
-        if self.model_config.layer_groups is None:
+        draft_groups = getattr(self, "_draft_groups", ())
+        error = None
+        model_config = self.model_config
+        try:
             layer_groups = None
             if self._is_dsv4:
                 layer_groups = self._build_dsv4_layer_group_specs()
             elif indexer_group is not None:
-                layer_groups = self._build_indexer_layer_group_specs(
-                    kv_caches, indexer_group
-                )
-            else:
-                return
-
-            # FlexKV freezes ModelConfig at the end of its SGLang adapter.
-            # Preserve that immutability contract by replacing the config
-            # rather than mutating the frozen instance in place.
-            model_config = replace(self.model_config, layer_groups=layer_groups)
-            model_config.freeze()
-            self.model_config = model_config
-            self.flexkv_config.model_config = model_config
-            self.rank_info = replace(self.rank_info, model_config=model_config)
+                layer_groups = self._build_indexer_layer_group_specs(kv_caches, indexer_group)
+            elif draft_groups:
+                raise ValueError("Draft piggyback requires target Indexer groups")
+            if layer_groups is not None:
+                layer_groups += [entry[0] for entry in draft_groups]
+                if model_config.layer_groups is None:
+                    model_config = replace(model_config, layer_groups=layer_groups)
+                    model_config.freeze()
+                elif draft_groups and model_config.layer_groups != layer_groups:
+                    raise ValueError("Explicit layer_groups conflict with draft piggyback layout")
+        except (ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            error = str(exc)
+        self._require_cache_preflight(error, "cache layer groups")
+        self.model_config = self.flexkv_config.model_config = model_config
+        self.rank_info = replace(self.rank_info, model_config=model_config)
+        if not model_config.layer_groups:
+            return
 
         old_cpu_blocks = self.cache_config.num_cpu_blocks
         if not recompute_cache_block_counts(self.model_config, self.cache_config):
@@ -2799,12 +3141,22 @@ class FlexKVConnector:
         kv_caches: List[torch.Tensor],
         indexer_group: Optional[_IndexerBufferGroup] = None,
     ) -> None:
-        assert (
-            kv_caches[0].ndim == 3
-        ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
+        kv_tensor = kv_caches[0]
+        if kv_tensor.ndim == 4:
+            num_blocks, physical_num_kv_heads, tokens_per_block, head_size = kv_tensor.shape
+            if tokens_per_block != self.page_size:
+                raise ValueError(
+                    f"KV page axis {tokens_per_block} does not match page_size={self.page_size}")
+            if any(t.shape != kv_tensor.shape or not t.is_contiguous() for t in kv_caches):
+                raise ValueError("Page-major KV tensors must have matching contiguous layouts")
+        elif kv_tensor.ndim == 3:
+            num_tokens, physical_num_kv_heads, head_size = kv_tensor.shape
+            num_blocks = num_tokens // self.page_size
+            tokens_per_block = self.page_size
+        else:
+            raise ValueError(f"Expected 3D/4D KV cache tensor, got {kv_tensor.shape}")
 
         kv_dim = self.model_config.kv_dim
-        num_blocks, physical_num_kv_heads, head_size = kv_caches[0].shape
         global_num_kv_heads = self.model_config.num_kv_heads
         # FlexKV uses num_kv_heads == 1 for KV shared across all TP ranks.
         # TODO: represent partial KV-head replication when 1 < global heads < TP.
@@ -2812,8 +3164,8 @@ class FlexKVConnector:
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=self.rank_info.num_layers_per_pp_stage,
-            num_block=num_blocks // self.page_size,
-            tokens_per_block=self.page_size,
+            num_block=num_blocks,
+            tokens_per_block=tokens_per_block,
             num_head=physical_num_kv_heads,
             head_size=head_size,
             kv_dim=kv_dim,
