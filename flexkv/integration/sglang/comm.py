@@ -56,6 +56,7 @@ class FlexKVScatterChannel(str, Enum):
     STORE_START = "store_start"
     STORE_RESET = "store_reset"
     STORE_READY = "store_ready"
+    LOAD_COMPLETION = "load_completion"
 
 
 _SCATTER_CHANNEL_OFFSETS = {
@@ -69,6 +70,7 @@ _SCATTER_CHANNEL_OFFSETS = {
     FlexKVScatterChannel.STORE_RESET: 8,
     FlexKVScatterChannel.STORE_READY: 9,
     FlexKVScatterChannel.LAYERWISE_BATCH: 10,
+    FlexKVScatterChannel.LOAD_COMPLETION: 11,
 }
 _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.LOOKUP: dict,
@@ -81,6 +83,7 @@ _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.STORE_RESET: dict,
     FlexKVScatterChannel.STORE_READY: list,
     FlexKVScatterChannel.LAYERWISE_BATCH: dict,
+    FlexKVScatterChannel.LOAD_COMPLETION: dict,
 }
 
 
@@ -129,6 +132,7 @@ class FlexKVComm:
         attn_tp_group=None,
         attn_cp_group=None,
         world_group=None,
+        enable_collective_sync: bool = True,
     ):
         model_config = rank_info.model_config
         self.world_rank = world_rank
@@ -168,42 +172,51 @@ class FlexKVComm:
         self.is_cp_leader = self.attn_cp_rank == 0
         self.is_tp_leader = self.attn_tp_rank == 0
 
-        # P2P routing tables (computed once).
-        stride = self.attn_tp_size * self.attn_cp_size
-        self._pp_stage_leader_ranks = [s * stride for s in range(self.pp_size)]
-        pp_stage_offset = self.pp_rank * stride
-        self._cp_leader_ranks = (
-            [
-                pp_stage_offset + cp * self.attn_tp_size
-                for cp in range(self.attn_cp_size)
-            ]
-            if self.attn_cp_size > 1
-            else []
-        )
-        if self.attn_tp_size > 1:
-            if self.attn_tp_cpu_group is None:
+        self.needs_sync = bool(enable_collective_sync and (
+            self.pp_size > 1 or self.attn_tp_size > 1 or self.attn_cp_size > 1
+        ))
+
+        # DP replicas need their actual framework rank sets, not offsets from 0.
+        def group_ranks(group, size, logical_rank, name):
+            if size <= 1 or not self.needs_sync:
+                return []
+            if group is None:
                 raise RuntimeError(
-                    f"[FlexKV] attn_tp_size={self.attn_tp_size} > 1 but "
-                    f"attn_tp_cpu_group is None — TP CPU group is required "
-                    f"for scatter/collectives."
-                )
-            self._tp_group_ranks = [
-                dist.get_global_rank(self.attn_tp_cpu_group, i)
-                for i in range(self.attn_tp_cpu_group.size())
-            ]
-        else:
-            self._tp_group_ranks = []
-        self._pp_group_global_ranks = (
-            [
-                dist.get_global_rank(self.pp_cpu_group, i)
-                for i in range(self.pp_cpu_group.size())
-            ]
-            if self.pp_size > 1 and self.pp_cpu_group is not None
-            else []
-        )
-        self._pp_stage_member_ranks = list(
-            range(pp_stage_offset, pp_stage_offset + stride)
-        )
+                    f"[FlexKV] {name} size={size} requires its CPU ProcessGroup")
+            ranks = [dist.get_global_rank(group, i) for i in range(group.size())]
+            if (len(ranks) != size or not 0 <= logical_rank < size
+                    or ranks[logical_rank] != world_rank):
+                raise RuntimeError(
+                    f"[FlexKV] {name} group/rank mismatch: members={ranks}, "
+                    f"logical_rank={logical_rank}, world_rank={world_rank}, size={size}")
+            return ranks
+
+        self._tp_group_ranks = group_ranks(
+            self.attn_tp_cpu_group, self.attn_tp_size, self.attn_tp_rank, "TP")
+        cp_ranks = group_ranks(
+            self.attn_cp_cpu_group, self.attn_cp_size, self.attn_cp_rank, "CP")
+        self._pp_group_global_ranks = group_ranks(
+            self.pp_cpu_group, self.pp_size, self.pp_rank, "PP")
+        self._cp_leader_ranks = cp_ranks if self.is_tp_leader else []
+        self._pp_stage_leader_ranks = (
+            self._pp_group_global_ranks if self.is_pp_stage_leader else [])
+        self._pp_stage_member_ranks = []
+        self._pp_stage_leader_rank = world_rank
+        if self.needs_sync and self.pp_size > 1:
+            tp_members = self._tp_group_ranks or [world_rank]
+            if self.attn_cp_size > 1 and self.attn_tp_size > 1:
+                cliques = [None] * self.attn_cp_size
+                dist.all_gather_object(cliques, tp_members, group=self.attn_cp_cpu_group)
+                members = [rank for clique in cliques for rank in clique]
+            elif self.attn_cp_size > 1:
+                members = cp_ranks
+            else:
+                members = tp_members
+            if (len(members) != self.attn_cp_size * self.attn_tp_size
+                    or len(set(members)) != len(members)):
+                raise RuntimeError(f"[FlexKV] inconsistent PP stage membership: {members}")
+            self._pp_stage_member_ranks = members
+            self._pp_stage_leader_rank = members[0]
 
         # Enable only on a homogeneous node-local fan-out. Every rank must
         # use the same framing; leave cross-node PP on the established wire.
@@ -213,11 +226,9 @@ class FlexKVComm:
         if self._control_inline_bytes and self.pp_size > 1:
             raise ValueError("inline control framing requires node-local PP=1")
 
-        self.needs_sync = (
-            self.pp_size > 1 or self.attn_tp_size > 1 or self.attn_cp_size > 1
+        self._world_cpu_group = (
+            self._resolve_world_cpu_group() if self.needs_sync else None
         )
-
-        self._world_cpu_group = self._resolve_world_cpu_group()
 
         self.pp_group = (
             self.pp_cpu_group
@@ -370,6 +381,8 @@ class FlexKVComm:
         support, and we take the MIN to land on a value everyone can
         honor).
         """
+        if not self.needs_sync:
+            return int(value)
         tensor = torch.tensor(value, dtype=torch.int64)
         if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
             dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.attn_tp_cpu_group)
@@ -382,6 +395,8 @@ class FlexKVComm:
         return int(tensor.item())
 
     def barrier(self) -> None:
+        if not self.needs_sync:
+            return
         if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
             dist.barrier(group=self.attn_tp_cpu_group)
         if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
@@ -510,7 +525,7 @@ class FlexKVComm:
         if not self.is_pp_stage_leader:
             self._recv_tensor(
                 tensor,
-                src=self._pp_stage_leader_ranks[self.pp_rank],
+                src=self._pp_stage_leader_rank,
                 tag=tag,
                 group=self._world_cpu_group,
             )
