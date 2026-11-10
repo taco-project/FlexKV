@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable
 import multiprocessing as mp
 import copy
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import numpy as np
 
 from flexkv.prefetch.types import PrefetchCapabilities, PrefetchHandle, PrefetchOptions, PrefetchSnapshot
@@ -532,6 +532,12 @@ class KVTaskManager:
             return
         nvtx.mark(f"launch task: task_id={task_id}, graph_id={transfer_graph.graph_id}")
         if transfer_graph.num_ops > 0:
+            from flexkv.transfer import put_trace
+            if put_trace.ENABLED:
+                operation = self.tasks[task_id].task_type.value.lower()
+                put_trace.bind_graph(transfer_graph, task_id,
+                                     put_trace.request_created(task_id, operation),
+                                     operation=operation)
             for transfer_handle in self.transfer_handles:
                 # For remote handles: deepcopy graph and clear GPU blocks when
                 # it's a cross-machine PP handle (different PP stages have
@@ -1730,6 +1736,33 @@ class KVTaskEngine(KVTaskManager):
         return batch_task_graph
 
     @on_runtime
+    def reject_launch(self, task_ids: List[int], batch_id: int, error: str) -> None:
+        """Make an asynchronous pre-submit rejection observable through wait.
+
+        The server-side launch RPC carries no reply, so a launch that raised
+        before submission would otherwise leave its READY tasks reporting
+        TIMEOUT forever. Only tasks that never left READY/UNREADY are failed
+        (through the normal fail-closed plan abort); a task that already runs
+        keeps its real terminal. A fresh batch ID that was never created stays
+        NOTFOUND, which wait already reports as terminal.
+        """
+        candidates = [batch_id] if batch_id >= 0 and batch_id in self.tasks else list(task_ids)
+        for task_id in candidates:
+            task = self.tasks.get(task_id)
+            if task is None or task.status not in (TaskStatus.UNREADY, TaskStatus.READY):
+                continue
+            flexkv_logger.error(f"[KVTaskEngine] launch of task {task_id} rejected: {error}")
+            if task.graph is None:
+                task.status = TaskStatus.FAILED
+                task.transfer_failed = True
+                task.shed_heavy_resources()
+                if hasattr(self, "_terminal_tasks"):
+                    self._terminal_tasks[task_id] = time.monotonic()
+                continue
+            task.transfer_failed = True
+            self._fail_task(task_id)
+
+    @on_runtime
     def launch_tasks(self,
                     task_ids: List[int],
                     slot_mappings: List[np.ndarray],
@@ -1774,6 +1807,13 @@ class KVTaskEngine(KVTaskManager):
 
         # Submit all graphs in batch to reduce IPC overhead
         if transfer_graphs:
+            from flexkv.transfer import put_trace
+            if put_trace.ENABLED:
+                for graph in transfer_graphs:
+                    tid = self.graph_to_task[graph.graph_id]
+                    operation = self._operation_name(self.tasks[tid].task_type)
+                    put_trace.bind_graph(graph, tid, put_trace.request_created(tid, operation),
+                                         operation=operation)
             for transfer_handle in self.transfer_handles:
                 transfer_handle.submit_batch(transfer_graphs)
 

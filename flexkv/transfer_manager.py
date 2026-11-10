@@ -13,7 +13,7 @@ from multiprocessing import Process, Pipe, Event
 from sympy.assumptions.assume import true
 import torch
 import zmq
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import tempfile
 import threading
 import numpy as np
@@ -413,6 +413,22 @@ class TransferManager:
             # self.recv_from_client.close()
             # self.context.term()
 
+    def _localize_cp_cache(self):
+        if not (self.model_config.layer_shard_enabled and self.model_config.nnodes > 1):
+            return None
+        from flexkv.common.cp_shard import cp_node_cache_model
+        ranks = sorted(key[1] for key in self.all_gpu_blocks)
+        if not ranks:
+            raise ValueError("Physical CP node has no GPU registrations")
+        width = self.model_config.effective_tp_size_per_node
+        node = ranks[0] // width
+        if ranks != list(range(node * width, (node + 1) * width)):
+            raise ValueError(f"Noncontiguous physical CP node registration: {ranks}")
+        self._cp_local_model, selections = cp_node_cache_model(self.model_config, node)
+        self.cache_config.mooncake_store_cp_nodes = self.model_config.nnodes
+        self.cache_config.mooncake_store_cp_node_rank = node
+        return selections
+
     def initialize_transfer_engine(self) -> None:
         flexkv_logger.info("Initializing TransferEngine...")
         self._register_gpu_blocks_via_socket()
@@ -428,6 +444,8 @@ class TransferManager:
         # main process — sglang DSv4 applies the same recompute before
         # KVManager; this path covers late discovery at GPU registration.
         recompute_cache_block_counts(self.model_config, self.cache_config)
+        selections = self._localize_cp_cache()
+        local_model = getattr(self, "_cp_local_model", self.model_config)
 
         radix_client = None
         if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
@@ -440,9 +458,9 @@ class TransferManager:
             adopt_geometry(self.cache_config, radix_client, label="TransferManager")
             self._radix_client = radix_client
         self.storage_engine = StorageEngine(
-            self.model_config,
+            local_model,
             self.cache_config,
-            num_layers_per_pp_stage,
+            local_model.num_layers // local_model.pp_size,
             swa_layer_groups=self.swa_layer_groups,
             radix_client=radix_client,
         )
@@ -550,9 +568,26 @@ class TransferManager:
          else None
          )
 
+        if selections is not None:
+            from flexkv.common.cp_shard import slice_cp_storage_handle
+            for key, ranks in grouped_gpu_blocks_per_group.items():
+                if not (len(ranks) == len(grouped_gpu_layouts_per_group[key])
+                        == len(grouped_gpu_handles[key])):
+                    raise ValueError("CP registration handle/layout rank count mismatch")
+                local_blocks, local_layouts, local_handles = [], [], []
+                for handle, blocks, layouts in zip(
+                        grouped_gpu_handles[key], ranks, grouped_gpu_layouts_per_group[key]):
+                    local_handle, selected, selected_layouts = slice_cp_storage_handle(
+                        handle, blocks, layouts, selections)
+                    local_blocks.append(selected)
+                    local_layouts.append(selected_layouts)
+                    local_handles.append(local_handle)
+                grouped_gpu_blocks_per_group[key] = local_blocks
+                grouped_gpu_layouts_per_group[key] = local_layouts
+                grouped_gpu_handles[key] = local_handles
         self.transfer_engine = TransferEngine(
             gpu_handles=grouped_gpu_handles,
-            model_config=self.model_config,
+            model_config=local_model,
             cache_config=self.cache_config,
             cpu_handle=cpu_handle,
             ssd_handle=ssd_handle,
@@ -1120,6 +1155,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         # to the parent as the reason the subprocess is gone, and exiting 0 would
         # make a crashed startup look like a clean shutdown.
         init_failed = False
+        transfer_manager = None
+        sel = None
         try:
             flexkv_logger.debug(f"_process_worker started, pid={os.getpid()}, "
                                f"gpu_register_port={gpu_register_port}")
@@ -1239,14 +1276,14 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                 error_conn.send(message)
         finally:
             # Cleanup selector (only if it was created)
-            if 'sel' in locals():
+            if sel is not None:
                 try:
                     sel.close()
                 except Exception as e:
                     flexkv_logger.error(f"Error closing selector: {e}")
 
             # Gracefully shut down transfer engine and its worker subprocesses
-            if 'transfer_manager' in locals():
+            if transfer_manager is not None:
                 try:
                     flexkv_logger.info("TransferManager process: shutting down transfer engine")
                     transfer_manager.shutdown()

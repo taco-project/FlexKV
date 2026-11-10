@@ -525,15 +525,24 @@ class KVServer:
 
     def _handle_launch_task_request(self, req: LaunchTaskRequest) -> None:
         """Handle LaunchTask request"""
-        self.kv_task_engine.launch_tasks(
-            task_ids=req.task_ids,
-            slot_mappings=req.slot_mappings,
-            swa_slot_mappings=req.swa_slot_mappings,
-            as_batch=req.as_batch,
-            batch_id=req.batch_id,
-            layerwise_transfer=req.layerwise_transfer,
-            counter_id=req.counter_id,
-        )
+        try:
+            self.kv_task_engine.launch_tasks(
+                task_ids=req.task_ids,
+                slot_mappings=req.slot_mappings,
+                swa_slot_mappings=req.swa_slot_mappings,
+                as_batch=req.as_batch,
+                batch_id=req.batch_id,
+                layerwise_transfer=req.layerwise_transfer,
+                counter_id=req.counter_id,
+            )
+        except Exception as exc:
+            # The client already returned from this fire-and-forget RPC and
+            # will wait on these IDs; turn the rejection into a FAILED terminal.
+            try:
+                self.kv_task_engine.reject_launch(list(req.task_ids), req.batch_id, str(exc))
+            except Exception as reject_exc:  # noqa: BLE001
+                flexkv_logger.error(f"reject_launch failed: {reject_exc}", exc_info=True)
+            raise
 
     def _handle_cancel_task_request(self, req: CancelTaskRequest) -> None:
         """Handle CancelTask request"""
