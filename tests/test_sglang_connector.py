@@ -37,7 +37,8 @@ def test_lookup_accepts_sglang_array_token_ids():
     connector._log_cache_op.assert_called_once()
 
 
-def test_registration_distinguishes_physical_and_global_kv_heads():
+@pytest.mark.parametrize("page_major", [False, True])
+def test_registration_distinguishes_physical_and_global_kv_heads(page_major):
     for physical_heads, global_heads in ((8, 32), (1, 4), (1, 1)):
         connector = FlexKVConnector.__new__(FlexKVConnector)
         connector.model_config = SimpleNamespace(
@@ -47,7 +48,9 @@ def test_registration_distinguishes_physical_and_global_kv_heads():
         connector.page_size = 16
         connector.tp_client = MagicMock()
         connector._label = "test"
-        kv_caches = [torch.empty(160, physical_heads, 128)] * 4
+        shape = ((10, physical_heads, 16, 128) if page_major
+                 else (160, physical_heads, 128))
+        kv_caches = [torch.empty(shape)] * 4
 
         connector._register_standard_to_server(kv_caches)
 
@@ -56,6 +59,18 @@ def test_registration_distinguishes_physical_and_global_kv_heads():
         ]
         assert layout.num_head == physical_heads
         assert layout.num_kv_heads == global_heads
+        assert layout.num_block == 10
+        assert layout.tokens_per_block == 16
+
+
+@pytest.mark.parametrize("shape", [(10, 2, 8, 128), (10, 128)])
+def test_registration_rejects_invalid_page_geometry(shape):
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector.page_size = 16
+    connector.tp_client = MagicMock()
+    with pytest.raises(ValueError):
+        connector._register_standard_to_server([torch.empty(shape)])
+    connector.tp_client.register_to_server.assert_not_called()
 
 
 def _idle_connector(chunked_prefetch):
