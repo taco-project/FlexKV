@@ -554,6 +554,91 @@ class KVServer:
             if closing:
                 self._control_replies.pop(key).close(linger=1000)
 
+    @staticmethod
+    def _expired_prefetch_snapshot(handle):
+        """Tombstone-shaped answer for a lease the server no longer tracks.
+
+        terminal=True with lease_valid=False lets the client stop polling and
+        rerun the prefill uncached, instead of waiting on a handle that can
+        never reach a terminal state again.
+        """
+        from flexkv.prefetch.types import PrefetchSnapshot
+
+        return PrefetchSnapshot(
+            handle=handle,
+            version=0,
+            state="expired",
+            terminal=True,
+            outcome="expired",
+            stop_reason=None,
+            planned_end_token=None,
+            reusable_prefix_end_token=0,
+            l3_loaded_spans=(),
+            inflight_chunks=0,
+            inflight_bytes=0,
+            submitted_chunks=0,
+            sealed_submit_seq=None,
+            lease_valid=False,
+        )
+
+    def _log_stale_prefetch_handle(self, req, action, handles):
+        """Record why a lease vanished. Diagnostics must never raise.
+
+        Reading the result tells the three causes apart:
+          * in_expired/in_sessions empty, epoch_mismatch empty, n_expired at
+            its 4*max_sessions cap -> the tombstone was evicted by handle count
+            before the client released the lease.
+          * epoch_mismatch non-empty -> reset_cache() rotated the epoch.
+          * in_sessions non-empty -> the ledger lost an owner whose session is
+            still live (GC or unregister bug).
+
+        Rate limited: a saturated tombstone history makes this a per-request
+        event, and each detailed report costs a round trip to the runtime
+        thread, which the control receiver would otherwise block on.
+        """
+        total = getattr(self, "_stale_prefetch_leases", 0) + len(handles)
+        self._stale_prefetch_leases = total
+        now = time.monotonic()
+        verbose = total <= 10 or now - getattr(self, "_stale_prefetch_logged_at", 0) >= 60
+        if not verbose:
+            return
+        self._stale_prefetch_logged_at = now
+        try:
+            coordinator = getattr(self.kv_task_engine, "_prefetch", None)
+            runtime = getattr(self.kv_task_engine, "_runtime", None)
+            ids = sorted(getattr(h, "session_id", -1) for h in handles)
+            state = {}
+            if coordinator is not None and runtime is not None:
+                # sessions/expired are owned by the runtime thread.
+                state = runtime.call(lambda: {
+                    "in_sessions": [
+                        getattr(h, "session_id", -1) for h in handles
+                        if h in coordinator.sessions
+                    ],
+                    "in_expired": [
+                        getattr(h, "session_id", -1) for h in handles
+                        if h in coordinator.expired
+                    ],
+                    "epoch_mismatch": [
+                        getattr(h, "session_id", -1) for h in handles
+                        if getattr(h, "epoch", None) != coordinator.epoch
+                    ],
+                    "n_sessions": len(coordinator.sessions),
+                    "n_expired": len(coordinator.expired),
+                    "expired_cap": coordinator.max_sessions * 4,
+                    "result_ttl_s": coordinator.result_ttl_s,
+                })
+            flexkv_logger.warning(
+                "[FlexKV] stale prefetch lease on '%s': sessions=%s dp_client_id=%s "
+                "ledger_size=%d total_stale=%d %s",
+                action, ids, req.dp_client_id, len(self._prefetch_clients), total, state,
+            )
+        except Exception as exc:  # noqa: BLE001
+            flexkv_logger.warning(
+                "[FlexKV] stale prefetch lease on '%s' (diagnostics unavailable: %s)",
+                action, exc,
+            )
+
     def _dispatch_control(self, req, action, payload):
         engine = self.kv_task_engine
         if action == "get_match":
@@ -599,11 +684,28 @@ class KVServer:
                 for match in matches
             )
             return matches
-        for handle in list(payload.get("handles", ())) + list(payload.get("demand_handles", ())):
-            if self._prefetch_clients.get(handle) != req.dp_client_id:
+        # A lease can vanish while its client still holds the handle: TTL reap
+        # retires the session, the bounded `expired` history drops the tombstone
+        # (its capacity counts handles, not seconds -- at a few hundred
+        # sessions/s that spans seconds, while the TTL is 60s), and the ledger
+        # GC above then forgets the owner. An absent entry is therefore not
+        # proof of a bogus handle and must not fail a caller that did nothing
+        # wrong: dead leases are answered in the tombstone shape and cleanups
+        # stay idempotent. Only a handle owned by a *different* live client is
+        # a real error.
+        stale = set()
+        for handle in (
+            list(payload.get("handles", ()))
+            + list(payload.get("demand_handles", ()))
+            + ([payload["handle"]] if "handle" in payload else [])
+        ):
+            owner = self._prefetch_clients.get(handle)
+            if owner is None:
+                stale.add(handle)
+            elif owner != req.dp_client_id:
                 raise ValueError("prefetch handle belongs to another client")
-        if "handle" in payload and self._prefetch_clients.get(payload["handle"]) != req.dp_client_id:
-            raise ValueError("unknown prefetch handle or client")
+        if stale:
+            self._log_stale_prefetch_handle(req, action, stale)
         if action == "capabilities":
             return engine.prefetch_capabilities()
         if action == "start":
@@ -612,10 +714,29 @@ class KVServer:
             self._prefetch_endpoints[handle] = req.reply_port
             return handle
         if action == "progress":
-            return engine.progress_prefetch(**payload)
+            # Keep dead leases out of the live query, then answer them as
+            # expired terminals. One stale handle must not fail the whole batch:
+            # that would mark every in-flight prefetch as failed at once.
+            if stale:
+                payload = {
+                    key: ([h for h in value if h not in stale]
+                          if key in ("handles", "demand_handles") else value)
+                    for key, value in payload.items()
+                }
+            snapshots = engine.progress_prefetch(**payload)
+            snapshots.update((h, self._expired_prefetch_snapshot(h)) for h in stale)
+            return snapshots
         if action == "stop":
+            if stale:
+                return self._expired_prefetch_snapshot(payload["handle"])
             return engine.stop_prefetch(**payload)
         if action == "release":
+            # PrefetchCoordinator.release() already returns early on an unknown
+            # handle, and the `close` path below calls release_prefetch()
+            # without any ownership check: releasing twice is a no-op, not an
+            # error.
+            if stale:
+                return None
             return engine.release_prefetch(**payload)
         if action == "legacy_start":
             task_id = engine.prefetch_async(dp_client_id=req.dp_client_id, **payload)

@@ -2450,13 +2450,44 @@ class FlexKVConnector:
         self._prefetch_retirements.append(retired)
 
     def _reap_prefetch_retirements(self):
-        pending = []
+        """Settle finished retirements without failing the calling request.
+
+        A retirement only releases a prefetch lease, so a failure here leaks
+        nothing the scheduler could repair: either the server already freed the
+        resources, or it retained them and its own TTL reap will.
+
+        Two reasons this must not propagate. First, retirements are reaped from
+        _poll_queued_prefetch(), which runs inside _check_chunked_prefetch(rid)
+        for an unrelated rid -- raising reports one request's cleanup failure as
+        another request's prefetch failure, and that error is then scattered to
+        every CP rank and kills the engine. Second, the pending list has to be
+        rebuilt before raising: the previous version raised beforehand, so a
+        failed Future stayed in the list forever and every later poll re-raised
+        it, leaving the connector permanently broken.
+        """
+        pending, failures = [], []
         for future in getattr(self, "_prefetch_retirements", ()):
-            if future.done():
-                future.result()
-            else:
+            if not future.done():
                 pending.append(future)
+                continue
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001
+                failures.append(exc)
         self._prefetch_retirements = pending
+        if not failures:
+            return
+        # Rate limited: a transport-level fault fails every queued retirement
+        # at once, and this runs on the scheduler's hot path once per tick.
+        total = getattr(self, "_retirement_failures", 0) + len(failures)
+        self._retirement_failures = total
+        now = time.monotonic()
+        if total - len(failures) < 5 or now - getattr(self, "_retirement_logged_at", 0) >= 60:
+            self._retirement_logged_at = now
+            logger.warning(
+                "[FlexKV] prefetch lease retirement failed (lease dropped, "
+                "total=%d): %s", total, failures[0],
+            )
 
     def _release_prefetch_result(self, rid):
         lookup = getattr(self, "_prepared_lookups", {}).pop(rid, None)
