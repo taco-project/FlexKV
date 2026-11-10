@@ -577,11 +577,13 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None,
-            swa_aware: bool = False) \
+            swa_aware: bool = False,
+            block_hashes: Optional[np.ndarray] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         if self._segments.replaced():
             return self._empty_result(token_mask)
-        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace,
+                                   block_hashes=block_hashes)
         if req.block_end_idx == 0:
             return self._empty_result(token_mask)
 
@@ -627,11 +629,13 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             slot_mapping: np.ndarray,
             dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
-            namespace: Optional[List[str]] = None) \
+            namespace: Optional[List[str]] = None,
+            block_hashes: Optional[np.ndarray] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
         if self._segments.replaced():
             return self._empty_result(token_mask)
-        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace,
+                                   block_hashes=block_hashes)
         assert req.block_start_idx == 0
         assert not temp_cache_strategy.ignore_gpu
         if req.block_end_idx == 0:

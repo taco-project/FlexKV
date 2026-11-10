@@ -1191,9 +1191,11 @@ class GlobalCacheEngine:
             dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None,
-            swa_aware: bool = False) \
+            swa_aware: bool = False,
+            block_hashes: Optional[np.ndarray] = None) \
                  -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
-        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace,
+                                   block_hashes=block_hashes)
         if req.block_end_idx == 0:
             transfer_graph = TransferOpGraph.create_empty_graph()
             return_mask = np.zeros_like(token_mask, dtype=np.bool_)
@@ -2173,9 +2175,11 @@ class GlobalCacheEngine:
             slot_mapping: np.ndarray,
             dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
-            namespace: Optional[List[str]] = None) \
+            namespace: Optional[List[str]] = None,
+            block_hashes: Optional[np.ndarray] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
-        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace,
+                                   block_hashes=block_hashes)
         block_start_idx, block_end_idx = req.block_start_idx, req.block_end_idx
         # the mask should has a prefix of True
         assert block_start_idx == 0
@@ -3622,7 +3626,8 @@ class GlobalCacheEngine:
                          token_ids: np.ndarray,
                          token_mask: np.ndarray,
                          slot_mapping: np.ndarray,
-                         namespace: Optional[List[str]]) -> RequestWindow:
+                         namespace: Optional[List[str]],
+                         block_hashes: Optional[np.ndarray] = None) -> RequestWindow:
         """Shared GET/PUT prologue.
 
         Validates the arrays, drops the trailing partial block (``token_mask``
@@ -3646,7 +3651,8 @@ class GlobalCacheEngine:
             slot_mapping, self.tokens_per_block)[:block_end_idx - block_start_idx]
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
                                      tokens_per_block=self.cache_config.tokens_per_block,
-                                     namespace=namespace)
+                                     namespace=namespace,
+                                     block_hashes=block_hashes)
         return RequestWindow(block_start_idx, block_end_idx, gpu_block_ids, sequence_meta)
 
     def _check_input(self,

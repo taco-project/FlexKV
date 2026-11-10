@@ -280,6 +280,9 @@ class RadixGeometry:
     swa_slot_bytes: int = 0
     swa_window_blocks: int = 0
     register_chunk_tokens: int = 0
+    # How blocks are named ("" = radixshmem's own XXH64 scheme); every client
+    # of a node and every node of a cluster must agree.
+    hash_scheme: str = ""
 
     @property
     def has_swa(self) -> bool:
@@ -300,6 +303,7 @@ class RadixGeometry:
             swa_window_blocks=int(self.swa_window_blocks) if self.has_swa else 0,
             slot_align=int(self.slot_align),
             register_chunk_tokens=int(self.register_chunk_tokens),
+            **({"hash_scheme": self.hash_scheme} if self.hash_scheme else {}),
         )
 
     def describe(self) -> str:
@@ -307,6 +311,8 @@ class RadixGeometry:
         if self.has_swa:
             s += f", SWA slot {self.swa_slot_bytes} B (window {self.swa_window_blocks})"
         s += f", slot_align={self.slot_align}"
+        if self.hash_scheme:
+            s += f", hash_scheme={self.hash_scheme}"
         if self.register_chunk_tokens:
             s += f", register_chunk_tokens={self.register_chunk_tokens}"
         return s
@@ -330,6 +336,7 @@ def expected_geometry(model_config: ModelConfig, cache_config: CacheConfig) -> R
     geo = RadixGeometry(
         tokens_per_block=int(cache_config.tokens_per_block),
         full_slot_bytes=cpu_block_bytes(model_config, cache_config),
+        hash_scheme=GLOBAL_CONFIG_FROM_ENV.hash_scheme,
     )
     swa = swa_pool_config(cache_config)
     if swa is not None:
@@ -521,6 +528,9 @@ def check_geometry(client: "radixshmem.RadixClient", expected: RadixGeometry,
             f"{label}: radix-server {client.name}'s register_chunk_tokens={chunk_tokens} is not a "
             f"multiple of tokens_per_block={expected.tokens_per_block}; the RHT registration "
             f"chunk is {register_chunk_blocks(chunk_tokens, expected.tokens_per_block)} blocks")
+    served_scheme = str(g.get("hash_scheme") or "xxh64-v1")
+    if served_scheme != (expected.hash_scheme or "xxh64-v1"):
+        diffs.append(f"hash_scheme server={served_scheme} flexkv={expected.hash_scheme or 'xxh64-v1'}")
     full = pools["full"]
     if int(full["slot_bytes"]) != expected.full_slot_bytes:
         diffs.append(f"FULL slot_bytes server={full['slot_bytes']} flexkv={expected.full_slot_bytes}")

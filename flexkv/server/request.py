@@ -76,6 +76,7 @@ class PutRequest:
     token_mask: Optional[np.ndarray]
     task_id: int = -1
     namespace: Optional[List[str]] = None
+    block_hashes: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -86,6 +87,7 @@ class GetRequest:
     token_mask: Optional[np.ndarray]
     task_id: int = -1
     namespace: Optional[List[str]] = None
+    block_hashes: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -94,6 +96,7 @@ class PrefetchRequest:
     token_ids: np.ndarray
     task_id: int = -1
     namespace: Optional[List[str]] = None
+    block_hashes: Optional[np.ndarray] = None
     # Joint Full+SWA prefetch (mooncake): plan SWA REMOTE2H alongside Full.
     swa_aware: bool = False
 
@@ -107,6 +110,7 @@ class PutMatchRequest:
     namespace: Optional[List[str]] = None
     # False: store Full KV only (no SWA/state snapshot).
     swa: bool = True
+    block_hashes: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -117,6 +121,7 @@ class GetMatchRequest:
     cpu_only: bool = False
     task_id: int = -1
     namespace: Optional[List[str]] = None
+    block_hashes: Optional[np.ndarray] = None
     # SWA-aware match: clamp the Full-KV transfer to the reusable SWA window; the
     # SWA window is the trailing block of the returned mask.
     swa_aware: bool = False

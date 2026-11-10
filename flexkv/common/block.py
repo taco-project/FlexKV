@@ -8,6 +8,11 @@ import torch
 from flexkv.common.hash_utils import HashType, Hasher, gen_hashes, get_hash_size
 
 
+def caller_hashes_required() -> bool:
+    from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
+    return bool(GLOBAL_CONFIG_FROM_ENV.hash_scheme)
+
+
 def _get_namespace_hash_key(namespace: Optional[List[str]]) -> Optional[np.ndarray]:
     if not namespace or len(namespace) == 0:
         return None
@@ -54,7 +59,8 @@ class SequenceMeta:
 
     namespace_id: Optional[int] = None
 
-    def __init__(self, token_ids: np.ndarray, tokens_per_block: int, namespace: Optional[List[str]] = None):
+    def __init__(self, token_ids: np.ndarray, tokens_per_block: int, namespace: Optional[List[str]] = None,
+                 *, block_hashes: Optional[np.ndarray] = None):
         assert token_ids.ndim == 1
         assert tokens_per_block > 0
         
@@ -66,7 +72,12 @@ class SequenceMeta:
 
         self._namespace = namespace
 
-        self.gen_hashes()
+        if block_hashes is not None:
+            self._adopt_hashes(block_hashes)
+        elif caller_hashes_required():
+            raise ValueError("FLEXKV_HASH_SCHEME is set but the request carries no block_hashes")
+        else:
+            self.gen_hashes()
 
     @property
     def num_blocks(self) -> int:
@@ -94,6 +105,17 @@ class SequenceMeta:
             return None
         assert self._has_hashes, "Hashes should be generated during initialization"
         return HashType(int(self.block_hashes[block_id].item()))
+
+    def _adopt_hashes(self, block_hashes: np.ndarray) -> None:
+        # Already prefix-chained (namespace included) by the caller.
+        hashes = np.ascontiguousarray(np.asarray(block_hashes).reshape(-1))
+        if hashes.dtype not in (np.int64, np.uint64):
+            raise TypeError(f"block_hashes must be int64 or uint64, got {hashes.dtype}")
+        if hashes.size < self.num_blocks:
+            raise ValueError(
+                f"block_hashes has {hashes.size} entries for {self.num_blocks} blocks")
+        self.block_hashes = hashes[:self.num_blocks].view(np.uint64)
+        self._has_hashes = True
 
     def gen_hashes(self) -> None:
         if self._has_hashes:

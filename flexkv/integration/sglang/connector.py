@@ -233,6 +233,13 @@ class FlexKVConnector:
             self, "_chunked_namespace_supported", False
         ) is True
 
+    @property
+    def wants_caller_block_hashes(self) -> bool:
+        """FLEXKV_HASH_SCHEME is set: every lookup/store/prefetch must pass
+        ``block_hashes``, one prefix-chained hash per full page."""
+        from flexkv.common.block import caller_hashes_required
+        return caller_hashes_required()
+
     def __init__(
         self,
         *,
@@ -643,6 +650,7 @@ class FlexKVConnector:
         rid: Optional[str] = None,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
+        block_hashes: Optional[np.ndarray] = None,
     ) -> Tuple[int, int]:
         """Page-aligned prefix lookup against FlexKV.
 
@@ -681,6 +689,7 @@ class FlexKVConnector:
                     cpu_only=getattr(self, "_chunked_prefetch", False),
                     swa_aware=self._swa_kv_pool is not None,
                     namespace=namespace,
+                    block_hashes=block_hashes,
                 )
             except Exception as exc:  # noqa: BLE001
                 lookup_error = exc
@@ -1368,6 +1377,7 @@ class FlexKVConnector:
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
         swa: bool = True,
+        block_hashes: Optional[np.ndarray] = None,
     ) -> int:
         """Schedule a write back from GPU into FlexKV.
 
@@ -1427,6 +1437,7 @@ class FlexKVConnector:
                     res = self.kv_manager.put_match(
                         token_ids=token_ids_np, token_mask=None, namespace=namespace,
                         **({} if swa else {"swa": False}),
+                        block_hashes=block_hashes,
                     )
             except Exception as exc:  # noqa: BLE001
                 match_error = exc
@@ -1702,11 +1713,13 @@ class FlexKVConnector:
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
         *, candidate_start_token: int = 0,
+        block_hashes: Optional[np.ndarray] = None,
     ) -> int:
         if not self._prefetch_enabled or not rid:
             return -1
         if getattr(self, "_chunked_prefetch", False):
-            return self._start_chunked_prefetch(rid, token_ids, candidate_start_token, namespace)
+            return self._start_chunked_prefetch(rid, token_ids, candidate_start_token, namespace,
+                                               block_hashes=block_hashes)
         context = self._new_op_context("prefetch", rid, sglang_req_id)
         task_id = -1
         planned_tokens = 0
@@ -1716,6 +1729,7 @@ class FlexKVConnector:
                 prefetch_result = self.kv_manager.prefetch_async(
                     token_ids=np.asarray(token_ids, dtype=np.int64),
                     namespace=namespace,
+                    block_hashes=block_hashes,
                     swa_aware=self._swa_kv_pool is not None,
                 )
                 # KVManager currently returns
@@ -1833,7 +1847,8 @@ class FlexKVConnector:
             )
         return done
 
-    def _start_chunked_prefetch(self, rid, token_ids, candidate_start_token=0, namespace=None):
+    def _start_chunked_prefetch(self, rid, token_ids, candidate_start_token=0, namespace=None,
+                                block_hashes=None):
         if rid in self._prefetch_sessions:
             return self._prefetch_sessions[rid].session_id
         self._release_prefetch_result(rid)
@@ -1848,6 +1863,7 @@ class FlexKVConnector:
                         swa_aware=self._swa_kv_pool is not None,
                     ),
                     namespace=namespace,
+                    block_hashes=block_hashes,
                 )
             except Exception as exc:
                 payload["error"] = str(exc)

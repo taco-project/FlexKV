@@ -432,6 +432,7 @@ class KVServer:
             token_mask=req.token_mask,
             dp_client_id=req.dp_client_id,
             namespace=req.namespace,
+            block_hashes=getattr(req, "block_hashes", None),
         )
 
     def _handle_put_request(self, req: PutRequest) -> None:
@@ -443,6 +444,7 @@ class KVServer:
             dp_client_id=req.dp_client_id,
             task_id=req.task_id,
             namespace=req.namespace,
+            block_hashes=getattr(req, "block_hashes", None),
         )
 
     def _handle_get_match_request(self, req: GetMatchRequest) -> None:
@@ -454,6 +456,7 @@ class KVServer:
             cpu_only=req.cpu_only,
             task_id=req.task_id,
             namespace=req.namespace,
+            block_hashes=getattr(req, "block_hashes", None),
             swa_aware=req.swa_aware,
         )
         response = Response(dp_client_id=req.dp_client_id,
@@ -470,6 +473,7 @@ class KVServer:
             task_id=req.task_id,
             namespace=req.namespace,
             swa=getattr(req, "swa", True),
+            block_hashes=getattr(req, "block_hashes", None),
         )
         response = Response(dp_client_id=req.dp_client_id,
                             task_id=req_id, mask=mask)
@@ -483,6 +487,7 @@ class KVServer:
             dp_client_id=req.dp_client_id,
             task_id=req.task_id,
             namespace=req.namespace,
+            block_hashes=getattr(req, "block_hashes", None),
             swa_aware=req.swa_aware,
         )
 

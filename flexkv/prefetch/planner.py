@@ -32,6 +32,7 @@ class PrefetchContext:
     node: Any = None
     swa_node: Any = None
     swa_aware: bool = False
+    block_hashes: Optional[np.ndarray] = None
     checkpoints: Tuple[int, ...] = ()
     reusable_end: int = 0
     pinned_bytes: int = 0
@@ -97,7 +98,7 @@ class MooncakeChunkPlanner:
         )
         self._query_client = None
 
-    def begin(self, tokens, namespace, client_id, options):
+    def begin(self, tokens, namespace, client_id, options, block_hashes=None):
         if options.swa_aware and not self.cache.swa_op_constructor.enabled:
             raise ValueError("SWA prefetch requires enabled SWA storage and transfer")
         tokens = np.asarray(tokens)
@@ -110,6 +111,7 @@ class MooncakeChunkPlanner:
             list(namespace) if namespace else None,
             client_id,
             swa_aware=options.swa_aware,
+            block_hashes=None if block_hashes is None else np.array(block_hashes, copy=True),
         )
         context.future = self.executor.submit(self._query, context)
         return context
@@ -125,7 +127,8 @@ class MooncakeChunkPlanner:
 
         if context.cancel_query.is_set():
             return None, 0
-        sequence = SequenceMeta(context.tokens, self.block_size, context.namespace)
+        sequence = SequenceMeta(context.tokens, self.block_size, context.namespace,
+                                block_hashes=context.block_hashes)
         if self._query_client is None:
             config = MooncakeStoreConfig.from_file(
                 self.engine.cache_config, override_global_segment_size=0

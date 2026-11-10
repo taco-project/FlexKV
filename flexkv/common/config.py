@@ -888,6 +888,9 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     ssd_dedup_local_fraction=float(os.getenv('FLEXKV_SSD_DEDUP_LOCAL_FRACTION', 0) or 0),
     # global_dedup: how long a peer whose allocate failed is written around.
     ssd_dedup_peer_backoff_s=float(os.getenv('FLEXKV_SSD_DEDUP_PEER_BACKOFF_S', 10) or 0),
+    # "" = FlexKV hashes token ids itself (XXH64). Otherwise the engine's hash scheme
+    # (e.g. "sglang-sha256-i64-v1"): every request must pass the engine's per-block hashes.
+    hash_scheme=os.getenv('FLEXKV_HASH_SCHEME', '').strip(),
 
     index_accel=bool(int(os.getenv('FLEXKV_INDEX_ACCEL', 1))),
     cpu_layout_type=KVCacheLayoutType(os.getenv('FLEXKV_CPU_LAYOUT', 'BLOCKFIRST').upper()),

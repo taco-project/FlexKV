@@ -93,7 +93,7 @@ class PrefetchCoordinator:
         self.accepting = True
         freeze_policies()
 
-    def start(self, tokens, options=None, namespace=None, client_id=0):
+    def start(self, tokens, options=None, namespace=None, client_id=0, block_hashes=None):
         options = options or PrefetchOptions()
         options.validate()
         if not self.accepting:
@@ -105,7 +105,9 @@ class PrefetchCoordinator:
         handle = PrefetchHandle(self.epoch, self._next_id)
         self._next_id += 1
         now = self.clock()
-        context = self.backend.begin(tokens, namespace, client_id, options)
+        # Only forward hashes when given, so backends without the argument keep working.
+        extra = {} if block_hashes is None else {"block_hashes": block_hashes}
+        context = self.backend.begin(tokens, namespace, client_id, options, **extra)
         n = max(0, len(tokens) - options.candidate_start_token)
         deadline = now + options.budget(n) if options.policy == "timeout" else None
         self.sessions[handle] = Session(handle, options, now, deadline, context)

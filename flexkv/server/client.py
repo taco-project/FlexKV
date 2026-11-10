@@ -156,6 +156,7 @@ class KVDPClient:
         slot_mapping: np.ndarray,
         token_mask: Optional[np.ndarray],
         namespace: Optional[List[str]] = None,
+        block_hashes: Optional[np.ndarray] = None,
     ) -> int:
         req = PutRequest(
             dp_client_id=self.dp_client_id,
@@ -164,6 +165,7 @@ class KVDPClient:
             token_mask=token_mask if token_mask is not None else None,
             task_id=self._get_task_id(),
             namespace=namespace,
+            block_hashes=block_hashes,
         )
         self.send_to_server.send_pyobj(req)
         return req.task_id
@@ -174,6 +176,7 @@ class KVDPClient:
         token_mask: Optional[np.ndarray],
         namespace: Optional[List[str]] = None,
         swa: bool = True,
+        block_hashes: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[int, np.ndarray]]:
         req = PutMatchRequest(
             dp_client_id=self.dp_client_id,
@@ -182,6 +185,7 @@ class KVDPClient:
             task_id=self._get_task_id(),
             namespace=namespace,
             swa=swa,
+            block_hashes=block_hashes,
         )
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
@@ -196,12 +200,14 @@ class KVDPClient:
         token_ids: np.ndarray,
         namespace: Optional[List[str]] = None,
         swa_aware: bool = False,
+        block_hashes: Optional[np.ndarray] = None,
     ) -> int:
         req = PrefetchRequest(
             dp_client_id=self.dp_client_id,
             token_ids=token_ids,
             task_id=self._get_task_id(),
             namespace=namespace,
+            block_hashes=block_hashes,
             swa_aware=swa_aware,
         )
         self.send_to_server.send_pyobj(req)
@@ -213,6 +219,7 @@ class KVDPClient:
         slot_mapping: np.ndarray,
         token_mask: Optional[np.ndarray],
         namespace: Optional[List[str]] = None,
+        block_hashes: Optional[np.ndarray] = None,
     ) -> int:
         req = GetRequest(
             dp_client_id=self.dp_client_id,
@@ -221,6 +228,7 @@ class KVDPClient:
             token_mask=token_mask if token_mask is not None else None,
             task_id=self._get_task_id(),
             namespace=namespace,
+            block_hashes=block_hashes,
         )
         self.send_to_server.send_pyobj(req)
         return req.task_id
@@ -232,6 +240,7 @@ class KVDPClient:
         cpu_only: bool = False,
         namespace: Optional[List[str]] = None,
         swa_aware: bool = False,
+        block_hashes: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[int, np.ndarray]]:
         req = GetMatchRequest(
             dp_client_id=self.dp_client_id,
@@ -240,6 +249,7 @@ class KVDPClient:
             cpu_only=cpu_only,
             task_id=self._get_task_id(),
             namespace=namespace,
+            block_hashes=block_hashes,
             swa_aware=swa_aware,
         )
         self.send_to_server.send_pyobj(req)
