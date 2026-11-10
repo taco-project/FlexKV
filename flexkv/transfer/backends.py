@@ -923,6 +923,10 @@ class MooncakeStoreBackend(StorageBackend):
         self.mooncake_client: Any = None
         self._cpu_buffer: Any = None
         self._registered_regions: List[Tuple[int, int]] = []
+        self.cp_nodes = int(getattr(cache_config, "mooncake_store_cp_nodes", 1))
+        self.cp_node_rank = int(getattr(cache_config, "mooncake_store_cp_node_rank", 0))
+        if self.cp_nodes < 1 or not 0 <= self.cp_node_rank < self.cp_nodes:
+            raise ValueError("CP storage node outside the shard set")
         # PP isolation + layer-range key suffix; see ``build_key``.
         self.pp_rank = int(getattr(cache_config, 'mooncake_store_pp_rank', 0) or 0)
         self.pp_size = int(getattr(cache_config, 'mooncake_store_pp_size', 1) or 1)
@@ -1092,6 +1096,8 @@ class MooncakeStoreBackend(StorageBackend):
                 node_layer_start=self.node_layer_start,
                 node_layer_end=self.node_layer_end,
                 total_layers=self.total_layers,
+                cp_nodes=getattr(self, "cp_nodes", 1),
+                cp_node_rank=getattr(self, "cp_node_rank", 0),
             )
             for h in raw[:len(ptrs)]
         ]

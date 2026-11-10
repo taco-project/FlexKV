@@ -22,7 +22,7 @@ from abc import ABC, abstractmethod
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import torch
 from torch.multiprocessing import Queue as MPQueue
 
@@ -684,6 +684,16 @@ class TransferWorkerBase(ABC):
                     if not isinstance(op, dict):
                         op._received_ns = time.perf_counter_ns()
                     batch_ops.append(op)
+                from flexkv.transfer import put_trace
+                if getattr(self, "_gdr_config", {}).get("enabled"):
+                    # Re-arm here: one owner producer fence then covers every
+                    # op of this drained batch (see gdr_runtime.maybe_fence_d2h).
+                    self._gdr_need_producer_fence = True
+                    from flexkv.transfer.gdr_batch import prepare_batch
+                    try:
+                        prepare_batch(self, batch_ops)
+                    except Exception:
+                        flexkv_logger.warning("GDR coalescing unavailable before DMA", exc_info=True)
                 for op in batch_ops:
                     if isinstance(op, dict) and op.get("type") == "control":
                         self._reply_control(op)
@@ -696,7 +706,13 @@ class TransferWorkerBase(ABC):
                                             f"graph_id: {op.transfer_graph_id}",
                                             color=get_nvtx_range_color(op.transfer_graph_id))
                         nvtx_pushed = True
+                        put_trace.worker_begin(op, transfer_start_ns)
                         transfer_status = self.launch_transfer(op)
+                        if os.environ.get("FLEXKV_CACHE_PROBE") == "1":
+                            if op.transfer_type == TransferType.LAYERWISE:
+                                transfer_status = self.wait_layerwise_completion()
+                            from flexkv.transfer.cache_probe import verify_transfer
+                            verify_transfer(self, op, transfer_status)
                     except Exception as e:
                         is_layerwise = op.transfer_type == TransferType.LAYERWISE
                         direction = "H2D" if is_layerwise else op.transfer_type.value
@@ -730,6 +746,10 @@ class TransferWorkerBase(ABC):
                     # batch*, hanging their graphs forever.
                     metrics = None
                     try:
+                        if put_trace.ENABLED:
+                            ok = (all(transfer_status.block_results) if isinstance(
+                                transfer_status, WorkerTransferResult) else bool(transfer_status))
+                            put_trace.worker_end(op, launched_ns, "ok" if ok else "failed")
                         is_h2d = (op.transfer_type == TransferType.H2D
                                   or op.transfer_type == TransferType.LAYERWISE)
                         metrics = trace.build_worker_metrics(

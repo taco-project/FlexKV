@@ -247,11 +247,16 @@ class FlexKVConnector:
         pp_group: Any = None,
         attn_tp_group: Any = None,
         attn_cp_group: Any = None,
+        layer_split_plan: Any = None,
+        indexer_layer_ids: Optional[List[int]] = None,
+        draft_kvcache: Any = None,
     ) -> None:
         self.page_size = int(page_size)
 
         # 1. Resolve FlexKV config from env + sglang server args.
         self.flexkv_config = FlexKVConfig.from_env()
+        from flexkv.common.gdr_config import publish_gdr_config
+        publish_gdr_config(self.flexkv_config.user_config.gdr)
         self.rank_info = self.flexkv_config.post_init_from_sglang_config(
             sglang_config=sgl_model_config,
             server_args=server_args,
@@ -306,6 +311,10 @@ class FlexKVConnector:
                 "(FLEXKV_ENABLE_COLLECTIVE_SYNC=0): "
                 "scatter/barrier/all_reduce are skipped."
             )
+
+        self._agree_cache_geometry(
+            json.loads(os.environ["FLEXKV_GDR_CONFIG"]), "GDR configuration"
+        )
 
         # 3. Align block counts across all ranks (MIN reduce) so each
         # rank's KVManager registers compatible sizes.
@@ -410,6 +419,8 @@ class FlexKVConnector:
             pp_rank=self.rank_info.pp_rank,
             intra_client_id=self.rank_info.intra_client_id,
             device_id=self.rank_info.local_rank,
+            gdr_local_rank=(self.rank_info.intra_client_id
+                            % self.model_config.effective_tp_size_per_node),
         )
         self._register_with_retry(kv_caches, indexer_group)
 
@@ -2142,6 +2153,9 @@ class FlexKVConnector:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] remote process shutdown: %s", exc)
             self._remote_process = None
+        tp_client = getattr(self, "tp_client", None)
+        if tp_client is not None:
+            tp_client.retire_gdr_owners()
         logger.info("[FlexKV] connector shutdown done %s", self._label)
 
     # ------------------------------------------------------------------

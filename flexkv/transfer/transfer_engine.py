@@ -22,7 +22,7 @@ import os
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import contextlib
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import numpy as np
 import torch
 
@@ -150,7 +150,11 @@ class TransferEngine:
         self.cache_config: CacheConfig = cache_config
 
         first_handles = next(iter(gpu_handles.values()))
-        self._num_layers_for_local_pp_stage = first_handles[0].kv_layout.num_layer
+        self._num_layers_for_local_pp_stage = (
+            model_config.num_layers
+            if getattr(model_config, "cp_cache_node_rank", None) is not None
+            else first_handles[0].kv_layout.num_layer
+        )
 
         # Use spawn context for CUDA compatibility
         self.mp_ctx = mp.get_context('spawn')
@@ -365,6 +369,8 @@ class TransferEngine:
             compressor=self._compressors["gpu_cpu"],
             completion=completion,
             layerwise_eventfd_socket=layerwise_eventfd_socket,
+            h2d_layer_holders=getattr(self.model_config, "h2d_layer_holders", None),
+            layer_shard_enabled=getattr(self.model_config, "layer_shard_enabled", False),
             **self._get_multi_group_kwargs(worker_key),
             **self._get_swa_kwargs(worker_key),
         )
@@ -451,6 +457,10 @@ class TransferEngine:
         }
         for _pool in _gpu_cpu_pools:
             self._register_worker(_pool, TransferType.D2H, self.d2h_workers)
+        if _enable_layerwise:
+            self.h2d_workers = self.d2h_workers
+            for _pool in _gpu_cpu_pools:
+                self._register_worker(_pool, TransferType.H2D, self.h2d_workers)
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
             # GPU register may copy a Recsys identity group onto model_config.
@@ -801,8 +811,8 @@ class TransferEngine:
 
         # Startup assertions: verify layerwise mode worker map consistency
         if _enable_layerwise:
-            assert TransferType.H2D not in self._worker_map, \
-                "H2D worker should not exist in layerwise mode (fused into layerwise worker)"
+            assert self.h2d_workers is self.d2h_workers, \
+                "Synchronous H2D must reuse the existing WHOLE-completion GPU/CPU worker"
             # DISK2H deliberately *is* registered under layerwise: the SSD read
             # is hoisted out of the LAYERWISE op (see merge_to_batch_graph)
             # because the PER_LAYER worker has no SSD binding to fuse it into,

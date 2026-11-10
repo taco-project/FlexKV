@@ -12,6 +12,7 @@ import torch
 
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.platform import apply_ce_only_env_presets
 
 
 def assert_mooncake_prefetch_ready(cache_config, prefetch_enabled: bool) -> None:
@@ -837,6 +838,8 @@ class CacheConfig:
             f", num_ssd_blocks={self.num_ssd_blocks})"
         )
 
+apply_ce_only_env_presets()
+
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
     instance_num=int(os.getenv('FLEXKV_INSTANCE_NUM', 1)),
@@ -1033,8 +1036,11 @@ class UserConfig:
     prefetch_max_reserved_bytes: int = 512 * 1024 * 1024
     prefetch_max_pinned_bytes: int = 2 * 1024 * 1024 * 1024
     prefetch_result_ttl_s: float = 60.0
+    gdr: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        from flexkv.common.gdr_config import parse_gdr_config
+        self.gdr = parse_gdr_config(self.gdr)
         if self.cpu_cache_gb <= 0:
             raise ValueError(f"Invalid cpu_cache_gb: {self.cpu_cache_gb}")
         if self.ssd_cache_gb < 0:
@@ -1093,6 +1099,7 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
 def load_user_config_from_env() -> UserConfig:
     swa_multi_group_env = os.getenv('FLEXKV_SWA_MULTI_GROUP')
     return UserConfig(
+        gdr=json.loads(os.getenv('FLEXKV_GDR_CONFIG', '{}')),
         enable_chunked_prefetch=bool(int(os.getenv('FLEXKV_ENABLE_CHUNKED_PREFETCH', 0))),
         prefetch_options=json.loads(os.getenv('FLEXKV_PREFETCH_OPTIONS', '{}')),
         prefetch_max_sessions=int(os.getenv('FLEXKV_PREFETCH_MAX_SESSIONS', 128)),
@@ -1400,10 +1407,26 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     if user_config.node_ttl_seconds is not None:
         cache_config.node_ttl_seconds = user_config.node_ttl_seconds
 
+    # The SGLang connector reads FLEXKV_ENABLE_LAYERWISE_TRANSFER from
+    # os.environ while the engine reads GLOBAL_CONFIG_FROM_ENV; a config-file
+    # override of only the engine side would split the two (an H2D op sent to an
+    # engine that built only LAYERWISE workers, or vice versa). An explicit
+    # FLEXKV_REGION_BATCH likewise stays authoritative over the file.
+    env_authoritative_keys = {'enable_layerwise_transfer'}
+    if os.environ.get('FLEXKV_REGION_BATCH') is not None:
+        env_authoritative_keys.add('region_batch')
+
     global_config_attrs = set(vars(GLOBAL_CONFIG_FROM_ENV).keys())
     for attr_name in dir(user_config):
         if attr_name.startswith('override_'):
             global_attr_name = attr_name[9:]  # len('override_') = 9
+            if global_attr_name in env_authoritative_keys:
+                flexkv_logger.info(
+                    f"Ignoring config-file value for '{global_attr_name}' "
+                    f"({getattr(user_config, attr_name)!r}); it is controlled by "
+                    f"FLEXKV_{global_attr_name.upper()} "
+                    f"(={getattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name)!r}).")
+                continue
             if global_attr_name in global_config_attrs:
                 attr_value = getattr(user_config, attr_name)
                 original_value = getattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name)

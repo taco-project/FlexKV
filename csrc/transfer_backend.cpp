@@ -18,6 +18,7 @@ const char *to_string(TransferBackendKind kind) {
   case TransferBackendKind::GDS: return "gds";
   case TransferBackendKind::NIXL: return "nixl";
   case TransferBackendKind::MOONCAKE: return "mooncake";
+  case TransferBackendKind::GDR: return "gdr";
   }
   return "unknown";
 }

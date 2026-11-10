@@ -163,6 +163,7 @@ def make_requests(
     share_mode: Optional["c_ext.RankShareMode"] = None,
     designated_rank: int = 0,
     region_indices: Optional[Sequence[int]] = None,
+    h2d_rank: int = -1,
 ) -> List["c_ext.RegionRequest"]:
     """One request per region, all moving the same blocks.
 
@@ -199,5 +200,7 @@ def make_requests(
         req.use_ce_transfer = use_ce_transfer
         req.rank_share_mode = mode
         req.designated_rank = designated_rank
+        if h2d_rank != -1:
+            req.h2d_rank = h2d_rank
         requests.append(req)
     return requests

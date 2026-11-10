@@ -77,6 +77,7 @@ enum class TransferBackendKind : int {
   GDS = 3,
   NIXL = 4,
   MOONCAKE = 5,
+  GDR = 6,
 };
 
 const char *to_string(TransferBackendKind kind);

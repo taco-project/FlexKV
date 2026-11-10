@@ -3,6 +3,8 @@
  * All rights reserved. SPDX-License-Identifier: Apache-2.0
  */
 #include "region_batch.h"
+#include "gdr/runtime.h"
+#include "ce_only.h"
 
 #include "logging.h"
 #include <algorithm>
@@ -168,6 +170,9 @@ RegionBatchGroup::RegionBatchGroup(const std::vector<int64_t> &gpu_device_ids,
 RegionBatchGroup::~RegionBatchGroup() {
   // Destroy the pool first: joining its threads guarantees nobody is still
   // reading the pointer tables freed below.
+  if (gdr_) {
+    try { close_gdr(); } catch (...) { std::terminate(); }
+  }
   pool_.reset();
   for (RegionState &st : regions_) {
     if (st.gpu_blocks != nullptr) {
@@ -254,6 +259,7 @@ bool RegionBatchGroup::rank_participates(const RegionRequest &req,
                                          int rank) const {
   const RegionDesc &d = regions_[req.region_index].desc;
   const int n_ranks = pool_->size();
+  if (req.is_host_to_device && req.h2d_rank >= 0) return rank == req.h2d_rank;
   if (d.num_kv_heads > 1 || req.is_host_to_device || n_ranks <= 1) {
     return true;
   }
@@ -276,6 +282,14 @@ RegionBatchGroup::prepare(const std::vector<RegionRequest> &requests_in,
                           std::vector<RegionRequest> &scratch) {
   const int n_ranks = pool_->size();
   for (const RegionRequest &req : requests_in) {
+    if (req.backend == TransferBackendKind::GDR)
+      throw std::invalid_argument("Select GDR through configure_gdr direction policy");
+    if (gdr_) {
+      for (const auto *ids : {&req.gpu_block_id_tensor, &req.cpu_block_id_tensor})
+        if (!ids->defined() || !ids->device().is_cpu() || ids->dim() != 1 ||
+            ids->scalar_type() != torch::kInt64 || !ids->is_contiguous())
+          throw std::invalid_argument("GDR block IDs must be contiguous 1D CPU int64 tensors");
+    }
     if (req.region_index < 0 || req.region_index >= num_regions()) {
       throw std::out_of_range("RegionRequest.region_index " +
                               std::to_string(req.region_index) +
@@ -283,6 +297,9 @@ RegionBatchGroup::prepare(const std::vector<RegionRequest> &requests_in,
                               std::to_string(num_regions()) + ")");
     }
     const RegionDesc &d = regions_[req.region_index].desc;
+    if (req.h2d_rank != -1 && (!req.is_host_to_device || req.h2d_rank < 0 ||
+        req.h2d_rank >= n_ranks || d.num_kv_heads != 1 || req.layer_granularity <= 0))
+      throw std::invalid_argument("H2D holder requires a shared region and valid rank/layer range");
     if (req.gpu_block_id_tensor.numel() != req.cpu_block_id_tensor.numel()) {
       throw std::invalid_argument(
           "region '" + d.name + "': gpu/cpu block id counts differ (" +
@@ -328,10 +345,26 @@ RegionBatchGroup::prepare(const std::vector<RegionRequest> &requests_in,
       break;
     }
   }
-  if (!needs_rotation) {
-    return requests_in;
+  if (gdr_ && n_ranks > 1) {
+    for (size_t i = 0; i < requests_in.size(); ++i) {
+      const auto &req = requests_in[i];
+      const auto &d = regions_[req.region_index].desc;
+      if (req.is_host_to_device || req.backend != TransferBackendKind::AUTO ||
+          d.num_kv_heads != 1 || req.rank_share_mode != RankShareMode::SHARDED) continue;
+      if (!std::all_of(d.gpu_chunk_sizes_in_bytes.begin(), d.gpu_chunk_sizes_in_bytes.end(),
+                      [&](int64_t n) { return n == d.gpu_chunk_sizes_in_bytes[0]; })) continue;
+      auto candidate = req;
+      candidate.rank_share_mode = RankShareMode::LAYER_PARALLEL;
+      if (gdr_->prefer_layer_parallel(build_args(candidate, 0))) {
+        if (scratch.empty()) scratch = requests_in;
+        scratch[i] = candidate;
+      }
+    }
   }
-  scratch = requests_in;
+  if (!needs_rotation) {
+    return scratch.empty() ? requests_in : scratch;
+  }
+  if (scratch.empty()) scratch = requests_in;
   for (RegionRequest &req : scratch) {
     const RegionDesc &d = regions_[req.region_index].desc;
     if (d.num_kv_heads == 1 && !req.is_host_to_device && n_ranks > 1 &&
@@ -360,9 +393,7 @@ void RegionBatchGroup::submit(const std::vector<RegionRequest> &requests_in,
           if (!rank_participates(req, rank)) {
             continue;
           }
-          RegionTransferArgs args = build_args(req, rank);
-          launch_region(req.backend, req.use_ce_transfer, args,
-                        pool_->stream(rank), ce_config_);
+          launch_request(req, rank);
           cudaError_t err = cudaGetLastError();
           if (err != cudaSuccess) {
             throw std::runtime_error(
@@ -441,9 +472,7 @@ void RegionBatchGroup::submit_layerwise(
           if (!rank_participates(req, rank)) {
             continue;
           }
-          RegionTransferArgs args = build_args(req, rank);
-          launch_region(req.backend, req.use_ce_transfer, args,
-                        pool_->stream(rank), ce_config_);
+          launch_request(req, rank);
           cudaError_t err = cudaGetLastError();
           if (err != cudaSuccess) {
             throw std::runtime_error(
@@ -479,10 +508,63 @@ bool RegionBatchGroup::wait_layer_completion(double timeout_s,
   return true;
 }
 
-void RegionBatchGroup::wait_all_streams() { pool_->sync_all_streams(); }
+void RegionBatchGroup::wait_all_streams() {
+  std::exception_ptr error;
+  if (gdr_) {
+    try { gdr_->drain(); } catch (...) { error = std::current_exception(); }
+  }
+  try { pool_->sync_all_streams(); } catch (...) {
+    pool_->drain_all_streams_on_error();
+    if (!error) error = std::current_exception();
+  }
+  if (error) std::rethrow_exception(error);
+}
+
+void RegionBatchGroup::close_gdr() {
+  wait_all_streams();
+  gdr_.reset();
+}
+
+void RegionBatchGroup::configure_gdr(const gdr::Config &config) {
+  if (ce_only_mode() && config.enabled &&
+      (config.h2d.path == gdr::Path::Kernel || config.d2h.path == gdr::Path::Kernel))
+    throw std::invalid_argument("GDR kernel override is forbidden in CE-only mode");
+  close_gdr();
+  if (config.enabled) gdr_ = std::make_unique<gdr::Context>(config, device_ids_);
+}
+
+gdr::Context &RegionBatchGroup::gdr_context() {
+  if (!gdr_) throw std::runtime_error("GDR is disabled");
+  return *gdr_;
+}
+
+std::map<std::string, uint64_t> RegionBatchGroup::gdr_statistics() const {
+  return gdr_ ? gdr_->statistics() : std::map<std::string, uint64_t>{};
+}
+
+void RegionBatchGroup::launch_request(const RegionRequest &req, int rank) {
+  auto args = build_args(req, rank);
+  auto backend = resolve_backend(req.backend, req.use_ce_transfer);
+  if (gdr_ && req.backend == TransferBackendKind::AUTO)
+    backend = gdr_->select(rank, args, backend);
+  if (backend == TransferBackendKind::GDR) {
+    if (!gdr_) throw std::runtime_error("GDR backend requested without configuration");
+    try {
+      gdr_->launch(rank, args, pool_->stream(rank));
+      gdr_->fence(rank, pool_->stream(rank));
+    } catch (...) {
+      try { gdr_->fence(rank, pool_->stream(rank)); } catch (...) {}
+      throw;
+    }
+  } else {
+    launch_region(backend, req.use_ce_transfer, args, pool_->stream(rank), ce_config_);
+  }
+}
 
 void RegionBatchGroup::update_region_gpu_ptrs(
     int region_index, const std::vector<int64_t> &gpu_block_ptrs_flat) {
+  if (gdr_)
+    throw std::runtime_error("GPU hot remap requires GDR registrations to be closed first");
   if (region_index < 0 || region_index >= num_regions()) {
     throw std::out_of_range("region_index out of range");
   }

@@ -46,6 +46,8 @@ class WorkerHandle:
             trace.set_submit_ns(op.op_id, submitted_ns)
         if trace._TRACE_ON:
             trace.inc_inflight()
+        from flexkv.transfer import put_trace
+        put_trace.submitted(op, worker_op, self.worker_id)
         self.transfer_conn.send(worker_op)
 
     def control(
