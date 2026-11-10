@@ -5,15 +5,24 @@ This edge has no native engine: every byte moves through a ``StorageBackend``
 geometry those backends read in ``attach``.
 """
 
+import math
+import os
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from multiprocessing.connection import Connection
 from typing import List, Union
 
 import torch
 from torch.multiprocessing import Queue as MPQueue
 
+from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import KVCacheLayout
+from flexkv.common.transfer import TransferType
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
+from flexkv.transfer import trace
 from flexkv.transfer.backends import StorageBackend
+from flexkv.transfer.completion import CompletionContract
 from flexkv.transfer.geometry import ChunkStrides, EdgeGeometry, HostSide
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerTransferResult
 from flexkv.transfer.workers.runtime import TransferWorkerBase
@@ -74,6 +83,20 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         )
 
         self._attach_backend(backend, self._build_geometry(cpu_kv_layout, dtype))
+        client = getattr(backend, "mooncake_client", None)
+        if getattr(client, "_use_parallel_channels", False):
+            workers = int(os.environ.get("FLEXKV_MOONCAKE_IO_WORKERS", "8"))
+            capacity = int(os.environ.get("FLEXKV_MOONCAKE_IO_MAX_PENDING_OPS", str(workers * 2)))
+            timeout = float(os.environ.get("FLEXKV_MOONCAKE_IO_TIMEOUT_S", "300"))
+            if not 1 <= workers <= 8 or not workers <= capacity <= 256:
+                raise ValueError("Mooncake requires 1 <= workers <= 8 and workers <= capacity <= 256")
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("Mooncake IO timeout must be finite and positive")
+            self._remote_capacity = capacity
+            self._remote_timeout = timeout
+            self._remote_pending = {}
+            self._remote_executor = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="flexkv-remote-op")
 
     def _build_geometry(
         self, cpu_kv_layout: KVCacheLayout, dtype: torch.dtype
@@ -126,3 +149,125 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         self, transfer_op: WorkerTransferOp
     ) -> Union[bool, WorkerTransferResult]:
         return self._run_backend(transfer_op)
+
+    def _execute_remote(self, op):
+        started_ns = time.perf_counter_ns()
+        started = time.time()
+        contract = getattr(op, "completion_contract", CompletionContract.WHOLE)
+        if contract not in (CompletionContract.WHOLE, CompletionContract.WHOLE.value):
+            raise ValueError("Remote host IO only implements CompletionContract.WHOLE")
+        if op.transfer_type not in (TransferType.REMOTE2H, TransferType.H2REMOTE):
+            raise ValueError("Remote pipeline only accepts host/store transfers")
+        backend = self._backend
+        client = backend.mooncake_client
+        client._channel_stats.transferred_bytes = 0
+        src, dst = self.get_transfer_block_ids(op, pinned=False)
+        block_results, _ = backend.transfer_blocks(self, op, src, dst)
+        moved = client._channel_stats.transferred_bytes
+        completed_ns = time.perf_counter_ns()
+        metrics = None
+        try:
+            self._log_transfer_performance(op, moved, started, time.time())
+            metrics = trace.build_worker_metrics(
+                op, getattr(op, "prof_submitted_ns", 0),
+                getattr(op, "_received_ns", started_ns), started_ns, completed_ns,
+                self.worker_id, self._trace_bytes_per_block(), self.kv_dim, False)
+        except Exception:
+            flexkv_logger.warning("Mooncake pipeline diagnostic failed", exc_info=True)
+        return WorkerTransferResult(op.transfer_op_id, tuple(block_results)), metrics
+
+    def _execute_admitted(self, op, gate, accepted):
+        gate.wait()
+        if accepted[0]:
+            return self._execute_remote(op)
+        return None
+
+    def _remote_fatal(self, reason):
+        self._remote_poisoned = True
+        flexkv_logger.error(reason + "; retaining all remote ownership until process exit")
+        os.abort()
+        raise RuntimeError(reason)
+
+    def _publish_remote(self, future):
+        op, _ = self._remote_pending[future]
+        try:
+            result, metrics = future.result()
+        except Exception:
+            flexkv_logger.error("Mooncake operation failed after drain", exc_info=True)
+            result = WorkerTransferResult(op.transfer_op_id, (False,) * op.valid_block_num)
+            metrics = None
+        except BaseException:
+            self._remote_fatal("Mooncake operation exited without a DMA completion certificate")
+        try:
+            self.finished_ops_queue.put((result, True, metrics))
+        except BaseException:
+            self._remote_fatal("Mooncake completion queue failed")
+        del self._remote_pending[future]
+
+    def _poll_remote(self, *, block=False):
+        if not self._remote_pending:
+            return
+        done, _ = wait(self._remote_pending, timeout=0.01 if block else 0,
+                       return_when=FIRST_COMPLETED)
+        for future in done:
+            self._publish_remote(future)
+        now = time.monotonic()
+        if any(now - submitted > self._remote_timeout
+               for _, submitted in self._remote_pending.values()):
+            self._remote_fatal("Mooncake request completion deadline exceeded")
+
+    def _drain_remote(self):
+        while self._remote_pending:
+            self._poll_remote(block=True)
+
+    def run(self):
+        if getattr(self, "_remote_executor", None) is None:
+            return super().run()
+        try:
+            while True:
+                self._poll_remote()
+                if len(self._remote_pending) >= self._remote_capacity:
+                    self._poll_remote(block=True)
+                    continue
+                if not self.transfer_conn.poll(timeout=0.01):
+                    continue
+                try:
+                    op = self.transfer_conn.recv()
+                except EOFError:
+                    return
+                if op is None:
+                    return
+                if isinstance(op, dict) and op.get("type") == "control":
+                    self._drain_remote()
+                    self._reply_control(op)
+                    continue
+                op._received_ns = time.perf_counter_ns()
+                gate, accepted = threading.Event(), [False]
+                future = None
+                try:
+                    future = self._remote_executor.submit(self._execute_admitted, op, gate, accepted)
+                    self._remote_pending[future] = (op, time.monotonic())
+                except Exception:
+                    self._remote_pending.pop(future, None)
+                    gate.set()
+                    self.finished_ops_queue.put((op.transfer_op_id, False, None))
+                    raise
+                except BaseException:
+                    gate.set()
+                    self._remote_unacknowledged_op = op
+                    self._remote_fatal("Mooncake operation submission interrupted")
+                accepted[0] = True
+                gate.set()
+        finally:
+            if not getattr(self, "_remote_poisoned", False):
+                self._drain_remote()
+
+    def shutdown(self):
+        executor = getattr(self, "_remote_executor", None)
+        if executor is not None:
+            if getattr(self, "_remote_poisoned", False):
+                self._remote_fatal("Refusing to unregister undrained remote buffers")
+            self._drain_remote()
+            executor.shutdown(wait=True)
+            self._remote_executor = None
+        super().shutdown()

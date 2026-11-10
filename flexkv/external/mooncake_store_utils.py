@@ -273,7 +273,10 @@ class MooncakeStoreClient:
         concurrency = int(os.getenv("FLEXKV_MOONCAKE_GET_CONCURRENCY", "1"))
         if not 1 <= concurrency <= 8:
             raise ValueError("FLEXKV_MOONCAKE_GET_CONCURRENCY must be in [1, 8]")
-        self._get_concurrency = 1 if query_only else concurrency
+        self._use_parallel_channels = (
+            not query_only and os.environ.get("FLEXKV_MOONCAKE_PARALLEL_IO", "0") == "1")
+        self._get_concurrency = 1 if query_only or self._use_parallel_channels else concurrency
+        self._channel_stats = threading.local() if self._use_parallel_channels else None
         self._get_max_inflight_bytes = int(
             os.getenv("FLEXKV_MOONCAKE_GET_MAX_INFLIGHT_BYTES", str(512 * 1024 * 1024))
         )
@@ -315,6 +318,11 @@ class MooncakeStoreClient:
             ) from exc
 
         cfg = self._config
+        if getattr(self, "_use_parallel_channels", False):
+            from flexkv.external.mooncake_parallel_io import ParallelStoreChannels
+            self._store = ParallelStoreChannels(cfg, store_cls=MooncakeDistributedStore)
+            self._is_setup = True
+            return
         protocol = "rpc_only" if self._query_only else cfg.protocol
         global_segment_size = 0 if self._query_only else cfg.global_segment_size
         local_segment_size = 0 if self._query_only else DEFAULT_LOCAL_BUFFER_SIZE
@@ -619,6 +627,9 @@ class MooncakeStoreClient:
             )
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
+        if getattr(self, "_use_parallel_channels", False):
+            self._channel_stats.transferred_bytes = sum(
+                buffer_sizes[i] for i in set_indices if set_results[i] == 0)
         return self._check_success(set_results, is_set_operate=True)
 
     def get(self, key: str, buffer_ptr: int, buffer_size: int) -> bool:
@@ -632,11 +643,26 @@ class MooncakeStoreClient:
             if self._get_executor is not None:
                 self._get_executor.shutdown(wait=True)
                 self._get_executor = None
+            if getattr(self, "_use_parallel_channels", False):
+                self._store.close()
 
     def batch_get(
         self, key_strs: list[str], buffer_ptrs: list[int], buffer_sizes: list[int]
     ) -> List[bool]:
-        # The aggregate credit is per client, including concurrent outer callers.
+        if getattr(self, "_use_parallel_channels", False):
+            if self._get_closed:
+                raise RuntimeError("Mooncake Get workers are closed")
+            self._validate_buffers(key_strs, buffer_ptrs, buffer_sizes)
+            limit = self._config.max_get_batch_bytes
+            if limit and any(size > limit for size in buffer_sizes):
+                raise ValueError(f"Mooncake block exceeds the {limit}-byte batch limit")
+            raw = self.zero_copy_get_impl(key_strs, buffer_ptrs, buffer_sizes)
+            self._check_result_count(raw, len(key_strs), "batch_get_into")
+            results = [actual == expected for actual, expected in zip(raw, buffer_sizes, strict=True)]
+            self._channel_stats.transferred_bytes = sum(
+                size for size, ok in zip(buffer_sizes, results) if ok)
+            return results
+        # The legacy parallel-Get path retains its own aggregate credit lock.
         with self._get_lock:
             if self._get_closed:
                 raise RuntimeError("Mooncake Get workers are closed")
@@ -850,6 +876,10 @@ class MooncakeStoreCacheEngine:
         cache_config: CacheConfig,
     ) -> None:
         self.tokens_per_block = cache_config.tokens_per_block
+        self.cp_nodes = int(getattr(cache_config, "mooncake_store_cp_nodes", 1))
+        self.cp_node_rank = int(getattr(cache_config, "mooncake_store_cp_node_rank", 0))
+        if self.cp_nodes < 1 or not 0 <= self.cp_node_rank < self.cp_nodes:
+            raise ValueError("CP storage node outside the shard set")
         # PP isolation + layer-range key suffix; see ``build_key`` docstring.
         # Single source of truth = cache_config (filled by
         # update_default_config_from_user_config + transfer_manager).
@@ -884,7 +914,8 @@ class MooncakeStoreCacheEngine:
     def swa_enabled(self) -> bool:
         return self._swa_enabled
 
-    def _build_pool_key(self, block_hash: str, kind: PoolKind) -> str:
+    def _build_pool_key(self, block_hash: str, kind: PoolKind,
+                        cp_node_rank: Optional[int] = None) -> str:
         return build_key(
             block_hash,
             kind,
@@ -893,6 +924,9 @@ class MooncakeStoreCacheEngine:
             node_layer_start=self.node_layer_start,
             node_layer_end=self.node_layer_end,
             total_layers=self.total_layers,
+            cp_nodes=getattr(self, "cp_nodes", 1),
+            cp_node_rank=(getattr(self, "cp_node_rank", 0)
+                          if cp_node_rank is None else cp_node_rank),
         )
 
     def _longest_kv_prefix(self, exists: List[int], n_blocks: int) -> int:
@@ -932,6 +966,21 @@ class MooncakeStoreCacheEngine:
         n_blocks = len(block_hashes)
         if n_blocks == 0:
             return 0, 0, 0
+        cp_nodes = getattr(self, "cp_nodes", 1)
+        if cp_nodes > 1:
+            if self._swa_enabled:
+                raise NotImplementedError("Cross-node CP cache requires full-KV layer groups")
+            keys = [self._build_pool_key(h, PoolKind.KV, node)
+                    for h in block_hashes for node in range(cp_nodes)]
+            statuses = self.mooncake_store_client.batch_exists_impl(keys)
+            if len(statuses) != len(keys):
+                raise RuntimeError("Mooncake CP query returned an invalid result count")
+            prefix = 0
+            for offset in range(0, len(keys), cp_nodes):
+                if not all(status == 1 for status in statuses[offset:offset + cp_nodes]):
+                    break
+                prefix += 1
+            return prefix, prefix, 0
         kv_keys = [self._build_pool_key(h, PoolKind.KV) for h in block_hashes]
         if not self._swa_enabled:
             kv_matched = self.mooncake_store_client.batch_exists(kv_keys)
