@@ -3194,14 +3194,16 @@ class FlexKVConnector:
 
         if indexer_group is not None and indexer_layout is not None:
             indexer_buffers = indexer_group.buffers
+            draft_groups = getattr(self, "_draft_groups", ())
+            handles = [list(kv_caches), list(indexer_buffers)] + [g[2] for g in draft_groups]
             self.tp_client.register_to_server(
-                kv_caches=list(kv_caches) + list(indexer_buffers),
+                kv_caches=[tensor for group in handles for tensor in group],
                 kv_layout=gpu_layout,
                 layer_groups=self._build_indexer_layer_group_specs(
                     kv_caches, indexer_group
-                ),
-                gpu_layouts=[gpu_layout, indexer_layout],
-                handles_per_group=[list(kv_caches), list(indexer_buffers)],
+                ) + [g[0] for g in draft_groups],
+                gpu_layouts=[gpu_layout, indexer_layout] + [g[1] for g in draft_groups],
+                handles_per_group=handles,
             )
         else:
             self.tp_client.register_to_server(
