@@ -2372,7 +2372,18 @@ class FlexKVConnector:
                 payload, channel=FlexKVScatterChannel.PREFETCH_PROGRESS,
             )
         if payload["error"]:
-            raise RuntimeError("FlexKV prefetch progress failed: " + payload["error"])
+            # A failed prefetch denies this request an accelerator, not a
+            # correct result: there is nothing for the scheduler to repair, and
+            # raising here kills an engine that could have served the prefill
+            # from scratch. Admission refusals ("prefetch session capacity
+            # exhausted", "prefetch admission is closed") are the common case
+            # and are expected under load, because the coordinator counts
+            # retained result leases towards max_sessions.
+            #
+            # Every rank took the same branch: `error` travelled through the
+            # scatter above, so abandoning here stays collective.
+            self._abandon_queued_prefetch(rid, payload["error"])
+            return True
         if not payload["done"]:
             return False
         self._prefetch_sessions.pop(rid)
@@ -2496,6 +2507,28 @@ class FlexKVConnector:
             admission = Future()
             admission.set_result(handle)
             self._retire_prefetch_admission(admission, lookup)
+
+    def _abandon_queued_prefetch(self, rid, error):
+        """Drop a failed prefetch and let the request prefill uncached.
+
+        Retires whatever the failed attempt may still own. A rejected
+        admission created no session, and _retire_prefetch_admission already
+        treats a failed admission Future as a no-op; an ambiguous transport
+        failure may have created one on the server, which its TTL reap
+        collects. Either way no lease can leak from here.
+        """
+        self.cancel_prefetch(rid)
+        # Rate limited: admission refusals are a per-request event once the
+        # coordinator is saturated, and this runs on the scheduler's hot path.
+        total = getattr(self, "_abandoned_prefetches", 0) + 1
+        self._abandoned_prefetches = total
+        now = time.monotonic()
+        if total <= 5 or now - getattr(self, "_abandoned_logged_at", 0) >= 60:
+            self._abandoned_logged_at = now
+            logger.warning(
+                "[FlexKV] prefetch abandoned, serving the prefill uncached "
+                "(total=%d): %s", total, error,
+            )
 
     def _drain_queued_prefetch(self):
         for future in getattr(self, "_prefetch_retirements", ()):
