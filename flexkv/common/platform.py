@@ -1,4 +1,4 @@
-"""Opt-in P800 runtime presets; GDR/XDR configuration is independent."""
+"""Opt-in runtime presets for some special machine types and scenarios; GDR/XDR configuration is independent."""
 
 import importlib.util
 import logging

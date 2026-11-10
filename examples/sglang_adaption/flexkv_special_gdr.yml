@@ -1,0 +1,125 @@
+# 在一些特殊机型和场景下 / XMLIR / XDR：SGLang + FlexKV 配置示例。
+# 保留原有模型/TP 等启动参数，增加：
+#   --enable-flexkv --flexkv-config-file examples/sglang_adaption/flexkv_special_gdr.yml
+#
+# 以下环境变量必须在启动 Python/SGLang 前设置，不能由本 YAML 代替：
+#   export BKCL_ENABLE_XDR=1                          # 是否启用 XDR 通信。
+#   export CUDA_ENABLE_P2P_NO_UVA=1                  # 是否禁用 P2P 的 UVA 支持。
+#   export CUDA_DEVICE_ORDER=OAM_ID                  # 设备排序方式。
+#   export MLX5_SCATTER_TO_CQE=0                  # 是否将 scatter 消息聚合到 CQE 中。
+#   export FLEXKV_ENABLE_LAYERWISE_TRANSFER=1     # H2D GET 要不要按层搬运并逐层通知。
+#   export FLEXKV_LOG_LEVEL=WARNING
+
+# 以下环境变量用于 GDR 的调优，如果需要修改，请在启动 Python/SGLang/测试之前设置，不能由本 YAML 代替：
+# export FLEXKV_KV_SHARED_ACROSS_RANKS_MODE=layer_parallel  # 是否按层搬运并逐层通知。
+# export OMP_NUM_THREADS=1                                    # 线程数。
+# export MKL_NUM_THREADS=1                                    # 线程数。
+# unset NIC_NAMES                                            # 网卡名称。
+# FLEXKV_CUDAHOST_REGISTER_FLAGS 缺省为 0，CE on some special machine types and scenarios/GDR 路径无需 Mapped；
+# 只有自定义 kernel 直接解引用 host pointer 时才应显式设为 3。
+
+# connector 目前直接读取逐层开关环境变量，因此下面的 YAML 同名配置不能替代它。
+# NIC_NAMES 仅影响测试脚本；运行测试时 unset NIC_NAMES 可清除旧的手工映射。
+#
+# 本示例两方向 path=gdr：优先强制走 GDR，但允许初始化失败回退 original。
+# 配置解析器的缺省值是 auto + avgbytes；需要自动选路时将 path 改为 auto。
+# H2D / D2H 分别配置：
+#   严格 GDR 对比：保持 path=gdr，将 on_init_failure 改为 error，禁止初始化回退。
+#   强制 CE 对比：将两方向 path 改为 ce。
+# CE-only on some special machine types and scenarios 构建不支持 kernel；本示例不使用 kernel 路径。
+
+cpu_cache_gb: 280                  # 示例 Host KV 容量；按模型和机器内存调整。
+mooncake_max_mr_size_bytes: 68719476736  # 单次 Mooncake MR 注册上限设为 64 GiB，避免 280 GiB 单块超大 MR。
+mooncake_mr_split_policy: block_boundary # 按完整 KV Block 边界切分多个 MR，防止单个块跨 MR 边界报错。
+# region_batch：把一次搬运涉及的多个 KV region（如主 KV、SWA、indexer）
+# 统一交给 C++ RegionBatchGroup 调度，减少 Python 逐组调用和重复 rank 分发。
+# 它不决定使用 CE 还是 GDR，也不是“合并多个用户请求”的开关；
+# 请求合并上限由下方各方向的 batch_requests 控制。
+# gdr.enabled=true 时，worker 会自动启用 RegionBatchGroup，即使这里写 false。
+# gdr.enabled=false 时，这个开关仍可独立启用 region batch，使用原始 CE 路径。
+region_batch: true
+# use_ce_transfer_h2d：指定 original H2D 后端为 CE，不是覆盖 GDR 的总开关。
+# 与 gdr.enabled / h2d.path 的关系：
+#   gdr:enabled=false                 -> 不启用 GDR 选路，按原始配置搬运；这里为 CE。
+#   gdr:enabled=true, gdr:h2d:path=original    -> 按原始配置搬运；这里为 CE。
+#   gdr:enabled=true, gdr:h2d:path=ce          -> 显式走 CE。
+#   gdr:enabled=true, gdr:h2d:path=gdr         -> 强制选择 GDR；这里的 true 不会将它改成 CE。
+#   gdr:enabled=true, gdr:h2d:path=auto        -> selector 决定 GDR 或 original；后者这里为 CE。
+# 若 GDR 初始化失败且 on_init_failure=original，则回到此开关指定的原始后端。
+# 因此 use_ce_transfer_h2d=true 与 gdr.enabled=true、h2d.path=gdr 不冲突，
+# 也不代表 CE 和 GDR 同时搬运同一份数据。[CE-only on some special machine types and scenarios 构建应保持此值 true]。
+use_ce_transfer_h2d: true
+# D2H 同理，由 gdr.d2h.path 独立选路；原始路径及初始化回退使用 CE。
+use_ce_transfer_d2h: true
+# 该键现在完全由环境变量 FLEXKV_ENABLE_LAYERWISE_TRANSFER 控制，此处的值会被
+# 忽略（config.py 的 override 循环显式跳过它）。原因：引擎侧读 GLOBAL_CONFIG_FROM_ENV，
+# SGLang 连接器侧直接读 os.environ，若让 config 文件只覆盖引擎侧会造成两侧劈叉——
+# 一侧发同步 H2D、另一侧只建 LAYERWISE worker，报 "Unsupported transfer type:
+# TransferType.H2D"。统一走 env 可保证两侧一致。
+# =0（默认）：load-back 走同步 no-layerwise retrieve_kv；=1：走 flexkv_radix_cache
+# 的 per-layer layerwise load（已接入，逐层通知 + counter 前向等待）。
+enable_layerwise_transfer: false   # 已被忽略，改用 FLEXKV_ENABLE_LAYERWISE_TRANSFER。
+layerwise_notify_mode: polling     # 在一些特殊机型和场景下，XMLIR 不支持 cudaLaunchHostFunc。
+enable_transfer_trace: false
+
+# PUT 全流程追踪：启用后直接追加写入指定 JSONL 文件，自动创建父目录。
+# 不依赖 FLEXKV_LOG_LEVEL，不需要重定向 stdout；每台机器写自己的本地文件。
+# 相对路径相对 FlexKV 仓库根目录，不跟 SGLang 启动时的 cwd。
+# output_file 支持环境变量；启动前需 export SGLANG_HICACHE_DIAG_DIR 为本次诊断目录。
+# rotate_on_start=true：同一次 SGLang 启动（各 TP rank / worker）追加同一文件；
+# 下一次重新启动写新文件 put-trace-<mode>-<MMDDHHMMSS>.jsonl，不接到上一次后面。
+# mode 自动由本文件的 gdr 配置推断：gdr.enabled=false 或两方向 path 均为 ce/original
+# 记为 ce；任一方向为 auto 记为 auto；否则记为 gdr（可用环境变量
+# FLEXKV_PUT_TRACE_MODE 覆盖）。
+# 控制事件由 sync leader 记录，D2H 由 TP-group worker 记录整组完成时间，
+# 不会按每个 TP rank 重复输出整条链路；多节点/PP/Full-SWA 的独立 worker 保留各自记录。
+# 记录阶段时间戳、payload 字节数和 block 数；合批数据按 physical ID 去重。
+# 与 enable_transfer_trace、下方 GDR diagnostics 相互独立。
+put_trace:
+  enabled: true            # 设为false即可关掉
+  output_file: "${SGLANG_HICACHE_DIAG_DIR}/put-trace.jsonl"  # 写入本次诊断目录
+  rotate_on_start: true    # 每次sglang serve写一个新文件
+  cache_details: false     # miss 归因实验设 true：已有 block hashes、ready、写回和淘汰；平时关闭
+
+gdr:
+  enabled: true                   # GDR 功能总开关；不代表每次搬运一定走 GDR，仍看各方向 path。
+  qp_count: 4                     # 每设备 QP 对数量，1..16。
+  use_dedicated_gdr_thread: true   # 每设备使用持久 GDR 线程。
+  nic_names: []                   # 按实际 PCIe 拓扑自动选择活跃 NIC。
+  # 如需覆盖，按进程可见的逻辑设备顺序填写；不要假设 XPU/NIC 编号相同（这里踩过坑）。
+
+  h2d:
+    path: gdr                     # 强制选择 H2D GDR；初始化失败是否回退由下一项策略决定。
+    selector: avgbytes             # 仅 path: auto 时生效; 可选值：avgbytes / segments。
+    on_init_failure: original     # gdr / auto 选中 GDR 时：初始化失败回退 CE；配置为 error=报错。
+    batch_requests: 4             # 移植到 main 后 H2D 不合并（保留 main 逐层 batch/counter 协议），此值仅被校验；D2H 合并见下。
+    max_batch_blocks: 8192        # 仅 gdr / auto 且 batch_requests>1：合并块数上限，不拆单请求。
+    # 平均连续段字节数严格小于此值才考虑 GDR；不是整次传输大小或攒批阈值。
+    # GPU 和 CPU block ID 均连续才属于同一段。524288 = 512 KiB。
+    gdr_when_ce_avg_bytes_below: 524288  # 仅 auto + avgbytes。
+    # 单 rank 的单 block 片段大小上限（含等号），超出走 original。
+    # 131072 = 128 KiB；不是 WQE 切块大小。
+    gdr_max_block_fragment_bytes: 131072  # 仅 auto，两种 selector 均生效；强制 gdr 不受此限制。
+    segment_threshold: 8          # 仅 auto + segments：段数至少为此值，且满足片段上限。
+
+  d2h:
+    path: gdr                    # 与 H2D 独立选路，可分别指定不同路径/算法。
+    selector: avgbytes             # 仅 auto；avgbytes / segments。
+    on_init_failure: original     # gdr / auto 选中 GDR 时：初始化失败回退 CE；error=报错。
+
+    # 【所有 rank 就绪且完整 chunk 仍选择 GDR 时，自动按层分工。 CE 不受这个选项的控制，只按照环境变量设置】
+    # 【如果环境变量中显式设置 FLEXKV_KV_SHARED_ACROSS_RANKS_MODE，则此处设置无效，按照环境变量为主】
+    auto_layer_parallel: true     # 【重要】放大每个 WQE 的数据大小
+
+    read_depth: 16                # 每 QP 在途 READ 上限；0=设备支持的最大 2 次幂。
+    batch_requests: 1             # 仅 gdr / auto；1=关闭 D2H 合并，允许 1..64。
+    max_batch_blocks: 8192        # 仅 gdr / auto 且 batch_requests>1；不拆单请求。
+    gdr_when_ce_avg_bytes_below: 524288  # 仅 auto + avgbytes。
+    gdr_max_block_fragment_bytes: 131072  # 仅 auto，两种 selector 均生效；强制 gdr 不受此限制。
+    segment_threshold: 8          # 仅 auto + segments。
+
+  diagnostics:
+    summary: false                # 选路/字节数等诊断；测试时可开启。
+    timing: false                 # 提交、verbs、CQ 等细分时间。
+    probe: false                  # D2H 阶段探针；采集工具读取结果。
+# 查看 INFO 诊断日志时同时设置 FLEXKV_LOG_LEVEL=INFO。

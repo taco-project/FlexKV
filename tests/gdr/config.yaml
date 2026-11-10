@@ -1,0 +1,53 @@
+# 合入已有 FlexKV YAML；其他模型/缓存配置继续使用原配置。
+cpu_cache_gb: 16
+region_batch: true
+
+gdr:
+  # 直接 RDMA 访问 owner 注册的最终 KV；无 GPU staging / gather-scatter kernel。
+  enabled: true                    # 缺省为 false：完全保留原传输路径。
+  qp_count: 4                      # 每个本地 GPU 的 RC QP 对数量，1..16。
+  use_dedicated_gdr_thread: true    # 每 GPU 增加一个持久 GDR 线程；不是描述符生产线程。
+  nic_names: []                    # 自动按 PCIe 距离选活跃 NIC；或按本地 GPU 顺序列出 mlx5_0 等。
+
+  h2d:
+    path: auto                     # original / ce / kernel / gdr / auto。
+    selector: avgbytes             # avgbytes / segments；仅 path=auto 时影响选路。
+    on_init_failure: original      # original：初始化失败走原路径；error：使任务失败。
+    batch_requests: 4              # 1=不合并；4≈gdropt，8≈gdrbatch8，也可16，上限64。
+    max_batch_blocks: 8192         # 合并后主 KV block 总数上限；不会拆分单个请求。
+    # 自动选路的“平均连续段字节数”阈值，单位 bytes，严格小于才考虑 GDR。
+    # avg_bytes = 本 rank 的单层、单 K/V、单 block 片段字节数 × block 数 / 连续段数。
+    # GPU 和 CPU block ID 都连续才属于同一段。这里不是整次调用的总字节数，
+    # 也不是等待攒够数据再提交的阈值。524288 = 512 KiB。
+    gdr_when_ce_avg_bytes_below: 524288
+    # 自动选路允许的单 block 片段大小上限，单位 bytes，包含等号。
+    # D2H 如果分 rank 写回，按该 rank 实际分到的片段计算。
+    # 大于此值则使用 original；不是把请求切成这么大的块。131072 = 128 KiB。
+    gdr_max_block_fragment_bytes: 131072
+    segment_threshold: 8           # selector=segments 时：段数 >= 8 且片段不超上述上限才选 GDR。
+
+  d2h:                             # 与 H2D 独立配置、独立选路入口。
+    auto_layer_parallel: true      # 仅所有 rank 就绪、完整 chunk 仍选 GDR 时自动分层；false 保留调用者分工。
+    read_depth: 16                 # 每 QP 在途 READ 上限；0=设备最大 2 次幂，显式值超限初始化失败。
+    batch_requests: 1              # 默认关闭；待端到端验证后可显式设为4，仅合并已到达请求。
+    max_batch_blocks: 8192         # 不同 pool/方向/目标重叠会分批，不拆分单个请求。
+    path: auto
+    selector: avgbytes
+    on_init_failure: original
+    gdr_when_ce_avg_bytes_below: 524288
+    gdr_max_block_fragment_bytes: 131072
+    segment_threshold: 8
+
+  diagnostics:
+    probe: false                  # D2H 聚合阶段探针；不逐请求打印，采集工具输出各 rank 的阶段数据。
+    summary: false                 # 选路次数/字节数、QP/NIC、合并信息。
+    timing: false                  # submit / verbs post / CQ 等细分时间。
+# 性能测试可显式启用 diagnostics，并设置 FLEXKV_LOG_LEVEL=INFO。
+# SGLang 正常使用建议保持二者 false，进程环境 FLEXKV_LOG_LEVEL=WARNING、
+# FLEXKV_TRANSFER_TRACE=0；不需要修改 SGLang。
+
+# PUT 生命周期追踪，适用于 CE / GDR；与 gdr.diagnostics 独立。
+# 开启后所有本机 worker 直接追加到此 JSONL 文件，不依赖终端重定向或日志级别。
+put_trace:
+  enabled: false
+  output_file: /tmp/flexkv/put-trace.jsonl

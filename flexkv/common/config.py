@@ -1042,10 +1042,13 @@ class UserConfig:
     prefetch_max_pinned_bytes: int = 2 * 1024 * 1024 * 1024
     prefetch_result_ttl_s: float = 60.0
     gdr: Dict[str, Any] = field(default_factory=dict)
+    put_trace: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         from flexkv.common.gdr_config import parse_gdr_config
         self.gdr = parse_gdr_config(self.gdr)
+        from flexkv.transfer.put_trace import parse_config as parse_trace_config
+        self.put_trace = parse_trace_config(self.put_trace)
         if self.cpu_cache_gb <= 0:
             raise ValueError(f"Invalid cpu_cache_gb: {self.cpu_cache_gb}")
         if self.ssd_cache_gb < 0:
@@ -1105,6 +1108,7 @@ def load_user_config_from_env() -> UserConfig:
     swa_multi_group_env = os.getenv('FLEXKV_SWA_MULTI_GROUP')
     return UserConfig(
         gdr=json.loads(os.getenv('FLEXKV_GDR_CONFIG', '{}')),
+        put_trace=json.loads(os.getenv('FLEXKV_PUT_TRACE_CONFIG', '{}')),
         enable_chunked_prefetch=bool(int(os.getenv('FLEXKV_ENABLE_CHUNKED_PREFETCH', 0))),
         prefetch_options=json.loads(os.getenv('FLEXKV_PREFETCH_OPTIONS', '{}')),
         prefetch_max_sessions=int(os.getenv('FLEXKV_PREFETCH_MAX_SESSIONS', 128)),

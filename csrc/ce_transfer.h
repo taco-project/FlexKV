@@ -21,7 +21,7 @@ struct CETransferConfig {
   bool path_opt_enabled = true;
   // -1 auto; 0-4 force path (tests only)
   int force_path = -1;
-  // cudaMemcpy2DAsync fast path: NVIDIA on, P800 off
+  // cudaMemcpy2DAsync fast path: NVIDIA on; off on some special machine types and scenarios
   bool enable_memcpy2d = false;
   // CPU layout: BLOCKFIRST vs LAYERFIRST
   bool is_blockfirst = false;

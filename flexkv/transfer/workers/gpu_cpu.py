@@ -605,6 +605,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 range(len(specs), len(specs) + len(pool.regions)))
             specs.extend(pool.regions)
 
+        if os.environ.get("FLEXKV_CACHE_PROBE") == "1":
+            from flexkv.transfer.cache_probe import register_regions
+            register_regions(self, specs, self._device_ids, cpu_kv_layout)
         if not ((GLOBAL_CONFIG_FROM_ENV.region_batch or self._gdr_config["enabled"])
                 and region_batch_available()):
             return

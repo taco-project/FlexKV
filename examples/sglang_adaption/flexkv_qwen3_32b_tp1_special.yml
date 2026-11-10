@@ -1,0 +1,59 @@
+# Qwen3-32B / 在一些特殊机型和场景下 / TP1：仅 GPU + Host，不启用 SSD 或 Mooncake Store。
+cpu_cache_gb: 16
+ssd_cache_gb: 0
+ssd_cache_dir: /data/flexkv_ssd
+enable_gds: false
+enable_nixl: false
+use_hugepage_cpu_buffer: false
+use_hugepage_tmp_buffer: false
+hugepage_size_bytes: 2097152
+use_mooncake_store_backend: false
+kv_cache_dtype: float16
+
+# CE on some special machine types and scenarios 作为 auto/original 路径及 GDR 初始化失败时的回退。
+region_batch: true
+use_ce_transfer_h2d: true
+use_ce_transfer_d2h: true
+ce_path_opt: true
+enable_ce_memcpy2d: false
+enable_mps: false
+
+# 该键现在完全由环境变量 FLEXKV_ENABLE_LAYERWISE_TRANSFER 控制，此处值被忽略
+# （config.py override 循环显式跳过），以保证引擎侧与 SGLang 连接器侧读同一值。
+enable_layerwise_transfer: false
+layerwise_notify_mode: polling
+enable_collective_sync: false
+enable_transfer_trace: false
+
+gdr:
+ enabled: true
+ qp_count: 4
+ use_dedicated_gdr_thread: true
+ nic_names: []
+
+ h2d:
+ path: auto
+ selector: avgbytes
+ on_init_failure: original
+ batch_requests: 1
+ max_batch_blocks: 8192
+ gdr_when_ce_avg_bytes_below: 524288
+ gdr_max_block_fragment_bytes: 131072
+ segment_threshold: 8
+
+ d2h:
+ path: auto
+ selector: avgbytes
+ on_init_failure: original
+ auto_layer_parallel: false
+ read_depth: 16
+ batch_requests: 1
+ max_batch_blocks: 8192
+ gdr_when_ce_avg_bytes_below: 524288
+ gdr_max_block_fragment_bytes: 131072
+ segment_threshold: 8
+
+ diagnostics:
+ summary: false
+ timing: false
+ probe: false
