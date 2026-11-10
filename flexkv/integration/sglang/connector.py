@@ -1366,6 +1366,9 @@ class FlexKVConnector:
         FlexKV pipe doesn't accumulate. No-op on non-leader ranks."""
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
             return
+        window = getattr(self, "_l3_prefetch_window", None)
+        if window is not None:
+            window.poll_idle()
         if not self._launched_load_tids:
             # Without chunked prefetch the engine only advances when a client
             # polls it, so a cancelled graph would keep its CPU blocks pinned
@@ -1866,6 +1869,9 @@ class FlexKVConnector:
         return task_id
 
     def check_prefetch_progress(self, rid: str) -> bool:
+        window = getattr(self, "_l3_prefetch_window", None)
+        if window is not None:
+            return window.check(rid)
         if getattr(self, "_chunked_prefetch", False):
             return self._check_chunked_prefetch(rid)
         if not self._prefetch_enabled:
@@ -2005,9 +2011,17 @@ class FlexKVConnector:
 
     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
         """Return the successfully materialized REMOTE2H prefix once."""
+        window = getattr(self, "_l3_prefetch_window", None)
+        if window is not None:
+            return int(window.pop_loaded(rid))
         return int(self._prefetch_loaded_tokens.pop(rid, 0))
 
     def cancel_prefetch(self, rid: str) -> None:
+        window = getattr(self, "_l3_prefetch_window", None)
+        if window is not None:
+            window.cancel(rid)
+            self.release_pending(rid)
+            return
         if getattr(self, "_chunked_prefetch", False):
             handle = self._prefetch_sessions.pop(rid, None)
             if handle is not None and self._sync_ctx.is_sync_leader:
@@ -2074,6 +2088,9 @@ class FlexKVConnector:
                 "Cannot reset after an unacknowledged layerwise batch launch: "
                 + self._layerwise_batch_launch_error
             )
+        window = getattr(self, "_l3_prefetch_window", None)
+        if window is not None:
+            window.drain()
         for rid in list(getattr(self, "_prepared_layerwise_loads", {})):
             self.release_pending(rid)
         if getattr(self, "_chunked_prefetch", False):
@@ -2225,6 +2242,9 @@ class FlexKVConnector:
         """Idempotent: unpin FlexKV CPU host buffers via kv_manager.shutdown()."""
         if getattr(self, "_shutdown_done", False):
             return
+        window = getattr(self, "_l3_prefetch_window", None)
+        if window is not None:
+            window.drain(collective=False)
         self._shutdown_done = True
         # print+flush: survives abrupt exit better than logger buffering into | tee.
         logger.info("[FlexKV] connector shutdown begin %s", self._label)
