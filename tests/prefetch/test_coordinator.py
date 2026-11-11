@@ -32,7 +32,7 @@ class Backend:
         self.reserve_hook = lambda: None
         self.capacity = True
 
-    def begin(self, tokens, namespace, client_id, options):
+    def begin(self, tokens, namespace, client_id, options, block_hashes=None):
         return object()
 
     def cancel_query(self, context):
