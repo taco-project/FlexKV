@@ -47,7 +47,7 @@ from flexkv.server.request import (
 )
 import contextlib
 
-_INHERITED_ENV_PREFIXES = ("CUDA_", "NCCL_", "UCX_", "NIXL_", "MC_")
+_INHERITED_ENV_PREFIXES = ("CUDA_", "NCCL_", "UCX_", "NIXL_", "MC_", "RADIXSHMEM_")
 
 
 class DPClient:
@@ -272,7 +272,8 @@ class KVServer:
                 # The device and transport setup the workers run under: without
                 # it they can number GPUs differently (CUDA_DEVICE_ORDER), join
                 # an MPS server the caller kept out of (CUDA_MPS_*), or lose the
-                # UCX/NIXL/Mooncake settings of the peer transfers.
+                # UCX/NIXL/Mooncake settings of the peer transfers and the
+                # radixshmem cluster settings (e.g. the Redis RHT password).
                 for key, val in os.environ.items():
                     if key.startswith(_INHERITED_ENV_PREFIXES) and key not in env:
                         env[key] = val
