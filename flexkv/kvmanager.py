@@ -119,6 +119,9 @@ class KVManager:
         self.local_dp_client_id = (
             dp_client_id if local_dp_client_id is None else local_dp_client_id
         )
+        if GLOBAL_CONFIG_FROM_ENV.dp_direct:
+            # Read by this rank's TE: it serves the node's SSD files on its own NIXL port.
+            os.environ["FLEXKV_LOCAL_DP_RANK"] = str(self.local_dp_client_id)
 
         flexkv_logger.info(
             f"[KVManager] instance_num={model_config.instance_num}, dp_size={model_config.dp_size}, "

@@ -25,6 +25,7 @@ FULL pool; SWA uses port + 1) / ``FLEXKV_NIXL_UCX_DEVICES`` /
 from __future__ import annotations
 
 import contextlib
+import glob
 import json
 import mmap
 import os
@@ -319,6 +320,10 @@ class NixlSSDEndpoint:
             self._connected.add(peer)
             self._down_until.pop(peer, None)
         flexkv_logger.info(f"[peer-ssd-nixl] {self.name} connected to {peer} ({ip}:{port})")
+
+    def backing_off(self, peer: str) -> bool:
+        with self._lock:
+            return self._down_until.get(peer, 0.0) > time.monotonic()
 
     def drop(self, peer: str, why: str, broken: bool = False) -> None:
         """Back off from ``peer``; the next `connect` after `retry_s` tries it
@@ -653,7 +658,11 @@ class NixlRemoteSSDReader:
 
     def _start(self) -> None:
         cpu = self._worker.cpu_blocks
-        port = _env_int("FLEXKV_NIXL_SSD_PORT", 5600) + (1 if self._pool == "swa" else 0)
+        # With FLEXKV_DP_DIRECT every DP rank's TE serves the node's shared SSD
+        # files: ports base + 2k (FULL) and + 1 (SWA) for local rank k.
+        rank = _env_int("FLEXKV_LOCAL_DP_RANK", 0)
+        port = (_env_int("FLEXKV_NIXL_SSD_PORT", 5600) + 2 * rank
+                + (1 if self._pool == "swa" else 0))
         t0 = time.monotonic()
         try:
             # One agent name per process: a peer still holding a restarted node's
@@ -669,7 +678,8 @@ class NixlRemoteSSDReader:
                 posix_params={"use_uring": os.getenv("FLEXKV_NIXL_POSIX_URING", "true")},
             )
             os.makedirs(self._dir, exist_ok=True)
-            path = os.path.join(self._dir, f"{self.node}.nixl-{self._pool}.json")
+            path = os.path.join(self._dir, f"{self.node}.nixl-{self._pool}"
+                                f"{f'.{rank}' if rank else ''}.json")
             with open(f"{path}.tmp", "w") as f:
                 json.dump({"agent": self.endpoint.name, "ip": _default_ip(), "port": port}, f)
             os.replace(f"{path}.tmp", path)
@@ -689,13 +699,22 @@ class NixlRemoteSSDReader:
         node = self._node_names.get(rank)
         if not node:
             raise RuntimeError(f"[peer-ssd-nixl] no SSD index node has rank {rank}")
-        path = os.path.join(self._dir, f"{node}.nixl-{self._pool}.json")
-        try:
-            with open(path) as f:
-                c = json.load(f)
-        except FileNotFoundError:
-            raise PeerUnavailable(f"[peer-ssd-nixl] {node} does not serve its SSD yet ({path})") from None
-        return c["agent"], c["ip"], int(c["port"])
+        # One contact per serving TE of the node (several with FLEXKV_DP_DIRECT);
+        # start at a different one per local rank and skip those backing off.
+        contacts = []
+        for path in sorted(glob.glob(os.path.join(self._dir, f"{node}.nixl-{self._pool}.json"))
+                           + glob.glob(os.path.join(self._dir, f"{node}.nixl-{self._pool}.*.json"))):
+            try:
+                with open(path) as f:
+                    c = json.load(f)
+            except (FileNotFoundError, ValueError):
+                continue
+            contacts.append((c["agent"], c["ip"], int(c["port"])))
+        if not contacts:
+            raise PeerUnavailable(f"[peer-ssd-nixl] {node} does not serve its SSD yet")
+        first = _env_int("FLEXKV_LOCAL_DP_RANK", 0) % len(contacts)
+        contacts = contacts[first:] + contacts[:first]
+        return next((c for c in contacts if not self.endpoint.backing_off(c[0])), contacts[0])
 
     def read(self, peer_rank: int, pool_id: PoolId, src_ssd_blocks: torch.Tensor,
              dst_cpu_blocks: torch.Tensor, layer_id: int, layer_end: int) -> None:
