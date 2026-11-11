@@ -51,6 +51,10 @@ class TransferManager:
         self.instance_num = self.model_config.instance_num
         # Calculate total expected GPUs on this node across all instances
         self.expected_gpus = self.instance_num * self.model_config.gpus_per_node
+        if GLOBAL_CONFIG_FROM_ENV.dp_direct:
+            # Each DP rank owns its TransferEngine: only that rank's TP x PP x CP GPUs register.
+            local_dp = max(1, self.model_config.dp_size // max(1, self.model_config.nnodes))
+            self.expected_gpus = max(1, self.model_config.gpus_per_node // local_dp)
 
         self.all_gpu_layouts: Dict[RegistrationKey, KVCacheLayout] = {}
         self.all_gpu_blocks: Dict[RegistrationKey, List[TensorSharedHandle]] = {}

@@ -96,6 +96,14 @@ class KVManager:
         self.server_client_mode = (model_config.dp_size > 1 or
                                    model_config.instance_num > 1 or
                                    GLOBAL_CONFIG_FROM_ENV.server_client_mode)
+        if GLOBAL_CONFIG_FROM_ENV.dp_direct:
+            if not self.enable_radixshmem:
+                raise ValueError("FLEXKV_DP_DIRECT needs radixshmem: the DP ranks share its index")
+            if model_config.nnodes > 1 and model_config.local_dp_size is None:
+                raise ValueError(
+                    "FLEXKV_DP_DIRECT needs every node to run its own DP ranks (local_dp_size); "
+                    "a replica whose ranks span nodes goes through TransferManagerOnRemote")
+            self.server_client_mode = False
         self.server_launch_mode = GLOBAL_CONFIG_FROM_ENV.server_launch_mode
         if self.server_launch_mode not in ("embedded", "external"):
             raise ValueError(
@@ -371,7 +379,7 @@ class KVManager:
         if self.server_client_mode:
             return self.dp_client.prefetch_control(
                 "start", token_ids=token_ids, options=options, namespace=namespace, block_hashes=block_hashes)
-        return self.kv_task_engine.start_prefetch(token_ids, options, namespace,
+        return self.kv_task_engine.start_prefetch(token_ids, options, namespace, self.dp_client_id,
                                                   block_hashes=block_hashes)
 
     def progress_prefetch(

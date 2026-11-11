@@ -397,6 +397,11 @@ class FlexKVConnector:
                 self._label,
             )
 
+        if GLOBAL_CONFIG_FROM_ENV.dp_direct:
+            # Each DP rank has its own TransferEngine and so its own registration endpoint.
+            self.flexkv_config.gpu_register_port = (
+                f"{self.flexkv_config.gpu_register_port}_dp{self.rank_info.dp_client_id}")
+
         # 6. Bring up KVManager on the sync leader only.
         self.kv_manager: Optional[KVManager] = None
         if self._sync_ctx.is_sync_leader:
