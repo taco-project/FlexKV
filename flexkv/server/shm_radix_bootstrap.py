@@ -33,6 +33,7 @@ strides of a plain tensor.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,7 +43,7 @@ import torch
 from flexkv.common.config import (GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec,
                                   ModelConfig, SWAPoolConfig)
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType, StorageHandle
 
 try:
     import radixshmem
@@ -55,6 +56,8 @@ _MAX_SLOT_ALIGN = 4096
 DEFAULT_SERVER_NAME = "/flexkv"
 READY_TIMEOUT_S = 600.0
 SSD_READY_TIMEOUT_S = float(os.getenv("FLEXKV_RADIXSHMEM_SSD_READY_TIMEOUT_S", "3600"))
+# Name of the SSD files every FlexKV of a node shares (the SWA pool adds "_swa").
+SSD_FILE_PREFIX = "flexkv_rsm_ssd"
 PREFETCH_TIMEOUT_MS = 5000
 PREFETCH_MAX_INFLIGHT = 128
 MAX_OUTSTANDING = 256
@@ -141,6 +144,77 @@ def attach_ssd_index_client(cache_config: CacheConfig,
         client.close()
         raise
     return client
+
+
+def ssd_marker_path(cache_dir) -> str:
+    """The marker next to the node's shared SSD files: ``{"index_id", "layout"}``
+    of the SSD index that last described them."""
+    first = cache_dir if isinstance(cache_dir, str) else cache_dir[0]
+    return os.path.join(first, f"{SSD_FILE_PREFIX}.json")
+
+
+def _ssd_files_entry(handle: StorageHandle) -> Dict[str, Any]:
+    return {"files": {str(k): list(v) for k, v in handle.get_file_list().items()},
+            "blocks_per_file": int(handle.num_blocks_per_file),
+            "num_blocks": int(handle.kv_layout.num_block),
+            "block_bytes": int(handle.kv_layout.get_elements_per_block() * handle.dtype.itemsize)}
+
+
+def claim_ssd_files(cache_config: CacheConfig, handles: Dict[str, Optional[StorageHandle]],
+                    label: str = "TransferManager-SSD") -> None:
+    """Make the SSD index describe what this node's SSD files hold before the TE
+    serves.
+
+    Every FlexKV of the node (FLEXKV_DP_DIRECT ranks, FLEXKV_INSTANCE_NUM > 1, a
+    restarted one) maps the same files, and the index-only SSD radix-server
+    outlives them. The marker next to the files names the index
+    (``NodeInfo.index_id``, new for each region and each reset) that last
+    described them and their layout. When both match, the index is kept;
+    otherwise its blocks were written under another layout, into files created
+    since (creating or resizing a file drops the marker), or the index started
+    over, so it is cleared and the marker rewritten. ``handles`` maps "full" /
+    "swa" to the SSD storage handles."""
+    from flexkv.storage.allocator import shared_ssd_files_lock
+
+    layout = {kind: _ssd_files_entry(h) for kind, h in handles.items() if h is not None}
+    path = ssd_marker_path(cache_config.ssd_cache_dir)
+    with shared_ssd_files_lock(path):
+        client = attach_ssd_index_client(cache_config, label=label)
+        try:
+            index_id = str(getattr(client.status(), "index_id", "") or "")
+            if not index_id:
+                raise RuntimeError(
+                    f"{label}: SSD radix-server {client.name} does not report an index id; "
+                    f"FlexKV's shared SSD files need a radixshmem with NodeInfo.index_id")
+            try:
+                with open(path) as f:
+                    marker = json.load(f)
+            except (FileNotFoundError, ValueError):
+                marker = None
+            if marker == {"index_id": index_id, "layout": layout}:
+                flexkv_logger.info(f"{label}: SSD index {client.name} ({index_id}) still describes "
+                                   f"the SSD files; keeping its {int(client.total_blocks())} blocks")
+                return
+            if marker is None:
+                why = "the SSD files are new or carry no marker"
+            elif marker.get("layout") != layout:
+                why = "the SSD files were laid out differently"
+            else:
+                why = f"the index started over since ({marker.get('index_id')} -> {index_id})"
+            stale = int(client.total_blocks())
+            if stale > 0:
+                flexkv_logger.warning(f"{label}: clearing {stale} blocks of SSD index {client.name}: {why}")
+            client.reset()
+            index_id = str(client.status().index_id)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump({"index_id": index_id, "layout": layout}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            flexkv_logger.info(f"{label}: SSD files claimed for index {client.name} ({index_id}): {why}")
+        finally:
+            client.close()
 
 
 def cpu_sizing_notice(cache_config: CacheConfig, server_name: str) -> Tuple[str, str]:

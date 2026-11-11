@@ -555,6 +555,8 @@ class TransferManager:
          )
         if (GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and ssd_handle is not None
                 and GLOBAL_CONFIG_FROM_ENV.radixshmem_ssd_server_name):
+            from flexkv.server.shm_radix_bootstrap import claim_ssd_files
+            claim_ssd_files(self.cache_config, {"full": ssd_handle, "swa": swa_ssd_handle})
             # Peers read this node's SSD blocks by the radixshmem SSD index:
             # tell them where the files are.
             from flexkv.transfer.workers.peer_ssd import publish_ssd_manifest

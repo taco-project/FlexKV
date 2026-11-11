@@ -348,11 +348,6 @@ def _check_cache_config(cache_config: CacheConfig) -> None:
                 "/flexkv_ssd` without --data-bytes)")
         if cache_config.enable_gds:
             raise ValueError("radix_shmem with the SSD tier does not support GDS")
-        if GLOBAL_CONFIG_FROM_ENV.instance_num > 1:
-            raise ValueError(
-                "radix_shmem with the SSD tier needs one FlexKV per node "
-                f"(FLEXKV_INSTANCE_NUM={GLOBAL_CONFIG_FROM_ENV.instance_num}): the SSD index "
-                "names this FlexKV's own SSD files")
     if cache_config.enable_p2p_cpu or cache_config.enable_p2p_ssd or cache_config.enable_kv_sharing:
         raise ValueError(
             "radix_shmem does its own peer reuse (etcd + RDMA inside the "
@@ -463,10 +458,9 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                                 event_collector: Optional[KVEventCollector]):
         """Attach to this node's index-only SSD radix-server.
 
-        Its slot ids are the SSD blocks of this FlexKV's TE, whose files carry
-        nothing an earlier run left: an index that survived a FlexKV restart
-        (the server outlives FlexKV) would hand out stale blocks, so a
-        non-empty index is cleared here, before the TE writes anything."""
+        Its slot ids are blocks of the SSD files every FlexKV of the node shares.
+        The TE checks, before it serves, that the index still describes them
+        and clears it when not (``shm_radix_bootstrap.claim_ssd_files``)."""
         client = attach_ssd_index_client(cache_config, label="RadixShmemCacheEngine-SSD")
         engine = CacheEngineRadixShmem(
             client.name,
@@ -477,12 +471,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             client=client,
             device_type=DeviceType.SSD,
         )
-        stale = int(client.total_blocks())
-        if stale > 0:
-            flexkv_logger.warning(
-                f"radixshmem SSD index {engine.shm_name} holds {stale} blocks from an "
-                f"earlier FlexKV run; clearing it (their SSD files are not trusted)")
-            engine.reset()
         flexkv_logger.info(
             f"radixshmem SSD tier: index {engine.shm_name}, {engine.num_total_blocks} blocks, "
             f"SWA={'on' if engine.swa_enabled else 'off'}, peers="

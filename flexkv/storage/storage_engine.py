@@ -523,10 +523,18 @@ class StorageEngine:
             else:
                 if not cache_dir:
                     raise ValueError("cache_dir is required for SSD allocator")
-                server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
-                hash_value = hashlib.md5(server_recv_port.encode()).hexdigest()
-                rand_suffix = f"{hash_value[:6]}"
-                file_prefix = f"flexkv_ssdcache_{rand_suffix}"
+                marker = None
+                if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and GLOBAL_CONFIG_FROM_ENV.radixshmem_ssd_server_name:
+                    # Every FlexKV of the node maps the same files, which the SSD
+                    # index outlives (see shm_radix_bootstrap.claim_ssd_files).
+                    from flexkv.server.shm_radix_bootstrap import SSD_FILE_PREFIX, ssd_marker_path
+                    file_prefix = SSD_FILE_PREFIX
+                    marker = ssd_marker_path(cache_dir)
+                else:
+                    server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
+                    hash_value = hashlib.md5(server_recv_port.encode()).hexdigest()
+                    rand_suffix = f"{hash_value[:6]}"
+                    file_prefix = f"flexkv_ssdcache_{rand_suffix}"
                 # Physically separate each non-default pool's SSD cache files
                 # from the main-KV ones: without this, both share the same
                 # prefix (server_recv_port is identical in-process) and
@@ -540,7 +548,8 @@ class StorageEngine:
                     dtype=dtype,
                     cache_dir=cache_dir,
                     file_prefix=file_prefix,
-                    max_file_size_gb=max_file_size_gb
+                    max_file_size_gb=max_file_size_gb,
+                    marker=marker,
                 )
         elif device_type == DeviceType.REMOTE:
             file_path = kwargs.get('file_path')

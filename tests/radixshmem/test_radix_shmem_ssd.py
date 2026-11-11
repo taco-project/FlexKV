@@ -5,8 +5,8 @@ Drives `RadixShmemCacheEngine` on real in-process servers (standalone, so the
 SSD matches are local; a peer's SSD run is forced through a synthetic match):
 PUT writes through (D2H -> H2DISK, each tier published by its own writers),
 GET falls back to the local SSD, PREFETCH stages the SSD tail into the CPU
-tree, SWA rides along, a stale index is cleared at attach, a replaced server
-segment turns the tiers off; plus the
+tree, SWA rides along, the index is kept only while it describes the node's
+shared SSD files, a replaced server segment turns the tiers off; plus the
 `KVTaskEngine` side of a prefetch carrying both a pull job and a graph.
 Skipped without radixshmem or `flexkv.c_ext`.
 """
@@ -325,15 +325,69 @@ def test_swa_rides_through_the_ssd():
         assert _hit(cpu, tok, JOINT_MASK) == 10
 
 
-def test_stale_ssd_index_is_cleared_at_attach():
+def _ssd_files(engine, tmp_path, head_size: int = 64):
+    """This node's shared SSD files for ``engine``'s SSD tier, as the TE makes them."""
+    from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+    from flexkv.storage.allocator import SSDAllocator
+
+    layout = KVCacheLayout(type=KVCacheLayoutType.BLOCKFIRST, num_layer=2,
+                           num_block=engine.cache_config.num_ssd_blocks, tokens_per_block=TPB,
+                           num_head=4, head_size=head_size, kv_dim=2)
+    engine.cache_config.ssd_cache_dir = str(tmp_path)
+    return SSDAllocator.allocate(layout, torch.float16, cache_dir=str(tmp_path),
+                                 file_prefix=bootstrap.SSD_FILE_PREFIX,
+                                 marker=bootstrap.ssd_marker_path(str(tmp_path)))
+
+
+def test_ssd_index_is_kept_only_while_it_describes_the_shared_files(tmp_path):
     with _engine() as (engine, ssd_server):
-        tok, mask, sm = _request(6)
+        def claim(head_size=64):
+            handle = _ssd_files(engine, tmp_path, head_size)
+            bootstrap.claim_ssd_files(engine.cache_config, {"full": handle, "swa": None})
+
+        old, mask, sm = _request(6)
+        _put(engine, old, mask, sm)
+        claim()                                          # new files: the index is cleared
+        assert _hit(engine.ssd_cache_engine, old) == 0
+        tok = _request(6, base=1000)[0]
         _put(engine, tok, mask, sm)
+        claim()                                          # another FlexKV of the node
         assert _hit(engine.ssd_cache_engine, tok) == 6
         engine.ssd_cache_engine.close()
         engine.ssd_cache_engine = None
         with _engine(reuse_ssd_server=ssd_server, tag="b") as (engine2, _):
+            engine = engine2
+            claim()                                      # a restarted FlexKV
+            assert _hit(engine2.ssd_cache_engine, tok) == 6
+            claim(head_size=32)                          # files laid out differently
             assert _hit(engine2.ssd_cache_engine, tok) == 0
+            tok = _request(6, base=2000)[0]
+            _put(engine2, tok, mask, sm)
+            engine2.ssd_cache_engine.reset()             # the index started over
+            tok = _request(6, base=3000)[0]
+            _put(engine2, tok, mask, sm)
+            assert _hit(engine2.ssd_cache_engine, tok) == 6
+            claim(head_size=32)
+            assert _hit(engine2.ssd_cache_engine, tok) == 0
+
+
+def test_shared_ssd_files_are_sized_from_the_configuration(tmp_path):
+    from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+    from flexkv.storage.allocator import SSDAllocator
+
+    layout = KVCacheLayout(type=KVCacheLayoutType.BLOCKFIRST, num_layer=2, num_block=8,
+                           tokens_per_block=TPB, num_head=4, head_size=64, kv_dim=2)
+    marker = str(tmp_path / "m.json")
+    allocate = lambda: SSDAllocator.allocate(layout, torch.float16, cache_dir=str(tmp_path),
+                                             file_prefix="p", marker=marker)
+    h = allocate()
+    assert h.num_blocks_per_file == 8 and h.get_file_list() == {0: [str(tmp_path / "p_0_0.bin")]}
+    with open(marker, "w") as f:
+        f.write("{}")
+    assert allocate().get_file_list() == h.get_file_list() and os.path.exists(marker)
+    os.truncate(str(tmp_path / "p_0_0.bin"), 1)
+    allocate()                                           # a file changed under the marker
+    assert not os.path.exists(marker)
 
 
 def test_a_replaced_radix_server_segment_turns_the_tiers_off():
