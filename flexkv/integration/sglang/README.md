@@ -206,13 +206,16 @@ for supported layouts and the limits of the existing validation.
 All participating ranks can call `pending_probe_plan(observed_times)` together
 to obtain the sync leader's rate-limited refresh indices, then call
 `peek_cpu_prefix_tokens(tokens, mask, namespace=...)` for each selected entry.
+Before building that mask, `sync_prefix_length(local_gpu_tokens)` agrees on the
+shortest device prefix so rank-local cache differences cannot change the
+collective sequence or overstate the reusable prefix.
 The latter queries CPU metadata only and releases temporary pins without
 changing request lookup/restore/prefetch ownership. `0` is a known miss;
 `None` means unavailable and must remain unknown in the load estimate.
 Failed cancellation retains at most one temporary task, retries it before
 another probe, and makes reset fail consistently across ranks until it can be
 released. Use the matching SGLang pending-prefix observer for FCFS load
-reporting; optional callers must capability-check both APIs.
+reporting; optional callers must capability-check all three observation APIs.
 
 `lookup_kv(..., cpu_only=True)` also permits explicit local-only admission
 preflight; it retains the normal held-lookup ownership contract.

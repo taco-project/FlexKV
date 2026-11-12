@@ -652,6 +652,12 @@ class FlexKVConnector:
             payload = self._sync_ctx.scatter(payload, channel=FlexKVScatterChannel.LOOKUP)
         return payload
 
+    def sync_prefix_length(self, local_length: int) -> int:
+        """Use the shortest local device prefix before a shared CPU probe."""
+        if self._sync_ctx.needs_sync:
+            return int(self._sync_ctx.all_reduce_min(int(local_length)))
+        return int(local_length)
+
     def peek_cpu_prefix_tokens(self, token_ids, token_mask, namespace=None):
         """CPU-only metadata probe with no retained restore/prefetch ownership.
 

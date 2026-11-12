@@ -34,6 +34,7 @@ def _probe_trace(rank, store):
         times = [0, now] if rank == 0 else [now + 10000, 0]
         plan = FlexKVConnector.pending_probe_plan(cache, times)
         assert plan["indices"] == [0]
+        assert FlexKVConnector.sync_prefix_length(cache, 64 + rank * 64) == 64
         assert FlexKVConnector.peek_cpu_prefix_tokens(
             cache, range(256), np.ones(256), namespace=["tenant"]
         ) == 192
