@@ -365,6 +365,11 @@ class TransferWorkerBase(ABC):
 
         try:
             worker = cls.__new__(cls)
+            default_device = os.getenv("FLEXKV_DEFAULT_CUDA_DEVICE", "")
+            if default_device:
+                # A worker that touches only host memory still makes a CUDA context
+                # (host register, streams): keep it off GPU 0 when the TE has its own GPU.
+                worker._ensure_cuda_device(int(default_device))
             worker.__init__(
                 worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs
             )

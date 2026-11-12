@@ -420,6 +420,12 @@ class TransferManager:
     def initialize_transfer_engine(self) -> None:
         flexkv_logger.info("Initializing TransferEngine...")
         self._register_gpu_blocks_via_socket()
+        if GLOBAL_CONFIG_FROM_ENV.dp_direct:
+            # One TE per DP rank: its contexts (and its workers') go on the rank's own GPU
+            # instead of all ranks' TEs piling onto GPU 0.
+            device = min(self.gpu_device_id_mapping.values())
+            torch.cuda.set_device(device)
+            os.environ["FLEXKV_DEFAULT_CUDA_DEVICE"] = str(device)
 
         assert len(self.all_gpu_layouts) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU layouts, got {len(self.all_gpu_layouts)}"
