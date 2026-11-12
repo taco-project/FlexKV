@@ -446,7 +446,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
                   dp_client_id: int) -> RadixPutPlan:
         """PUT: local only, like every PUT.
 
-        The one difference from ``GlobalCacheEngine._put_impl_local`` is WHEN
+        The one difference from ``GlobalCacheEngine._put_impl_cpu_ssd`` is WHEN
         the tree learns about the slots. radixshmem accepts them only once they
         hold data, so the insert moves into the graph-completion callback; an
         abort before launch hands the slots back instead.

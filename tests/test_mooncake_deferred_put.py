@@ -94,7 +94,7 @@ def _manager(remote_hit: int = 0, enable_ssd: bool = False):
     if manager.ssd_cache_engine is not None:
         manager.cache_engines[DeviceType.SSD] = manager.ssd_cache_engine
     manager.swa_op_constructor = SimpleNamespace(enabled=False)
-    manager.match_all = lambda sequence_meta, temp_cache_strategy: (
+    manager.match_cpu_ssd_remote = lambda sequence_meta, temp_cache_strategy: (
         manager.cpu_cache_engine.match(sequence_meta),
         (manager.ssd_cache_engine.match(sequence_meta)
          if manager.ssd_cache_engine is not None else MatchResult()),
@@ -108,7 +108,7 @@ def _manager(remote_hit: int = 0, enable_ssd: bool = False):
 def _plan(manager, request_id, sequence, gpu_blocks=None):
     if gpu_blocks is None:
         gpu_blocks = np.arange(sequence.num_blocks, dtype=np.int64) + 100
-    return manager._put_impl_global(
+    return manager._put_impl_with_remote(
         request_id=request_id,
         sequence_meta=sequence,
         block_mask_start=0,
