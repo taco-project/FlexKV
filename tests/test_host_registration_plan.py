@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 
 def test_registered_dma_partition_properties(tmp_path):
     compiler = shutil.which("c++")

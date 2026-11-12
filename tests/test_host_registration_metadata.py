@@ -5,6 +5,8 @@ import pytest
 
 from flexkv.transfer import host_buffer
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def registered(monkeypatch):
