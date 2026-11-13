@@ -5,7 +5,7 @@ import uuid
 from multiprocessing import Lock, Queue
 from multiprocessing.connection import Connection
 from queue import Queue as ThreadQueue
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import tempfile
 import torch
@@ -342,6 +342,7 @@ class KVTPClient:
         self.send_to_server = get_zmq_socket(
             context, zmq.SocketType.PUSH, gpu_register_port, False
         )
+        self._gpu_control_endpoint = f"{gpu_register_port}_control"
         self.gpu_control_socket = get_zmq_socket(
             context, zmq.SocketType.REQ,
             f"{gpu_register_port}_control", False,
@@ -387,6 +388,28 @@ class KVTPClient:
                 f"KVTPClient {self.device_id}: set_slot_mapping sent (blocking retry) "
                 f"for task_id={task_id}"
             )
+
+    def gpu_route_control(self, action: str, generation: int = 0) -> Dict[str, Any]:
+        """Fence/rebuild workers for this still-live GPU exporter only."""
+        if action not in ("fence", "recover"):
+            raise ValueError(f"Unknown GPU route action {action}")
+        # A timed-out REQ cannot send again, and a delayed old reply must not
+        # be mistaken for the next generation's acknowledgement. Use a fresh
+        # connection for each uncommon lifecycle operation.
+        with self.gpu_control_socket.context.socket(zmq.REQ) as control:
+            control.setsockopt(zmq.LINGER, 0)
+            control.setsockopt(zmq.RCVTIMEO, 120000)
+            control.setsockopt(zmq.SNDTIMEO, 120000)
+            control.connect(self._gpu_control_endpoint)
+            control.send_pyobj({
+                "type": f"{action}_gpu_route",
+                "registration_key": (self.dp_client_id, self.intra_client_id),
+                "generation": generation,
+            })
+            response = control.recv_pyobj()
+        if not response.get("ok"):
+            raise RuntimeError(f"GPU route {action} failed: {response.get('error')}")
+        return response
 
     def suspend_gpu_mappings(self) -> int:
         request = {

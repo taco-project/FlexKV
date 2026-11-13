@@ -240,7 +240,8 @@ def test_duplicate_lookup_cancels_replaced_held_task():
 
 
 def test_store_completion_clears_nonleader_tracking():
-    connector = _follower_connector(["request"])
+    connector = _follower_connector(
+        {"rids": ["request"], "bypass": False, "error": None, "generation": 0})
     connector._sync_ctx.is_sync_leader = False
     connector._inflight_stores = {"request": 17}
     connector._inflight_store_contexts = {"request": object()}
@@ -248,7 +249,9 @@ def test_store_completion_clears_nonleader_tracking():
     assert connector.check_completed_stores() == ["request"]
     assert connector._inflight_stores == {}
     assert connector._inflight_store_contexts == {}
-    connector._sync_ctx.scatter.assert_called_once_with([], channel=FlexKVScatterChannel.STORE_COMPLETION)
+    connector._sync_ctx.scatter.assert_called_once_with(
+        {"rids": [], "bypass": False, "generation": 0, "error": None},
+        channel=FlexKVScatterChannel.STORE_RESULT)
 
 
 def test_store_ready_uses_leader_payload_and_dedicated_channel():
