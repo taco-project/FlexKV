@@ -17,6 +17,19 @@ if TYPE_CHECKING:
 logger = flexkv_logger
 
 
+def _is_sglang_dsv4(config: object) -> bool:
+    """Recognize current HF architecture metadata and the legacy SGLang flag."""
+    if bool(getattr(config, "is_deepseek_v4_arch", False)):
+        return True
+    hf_config = getattr(config, "hf_config", config)
+    architectures = getattr(hf_config, "architectures", None) or []
+    return bool(architectures) and architectures[0] in (
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
+        "DeepseekV4ForCausalLMDSpark",
+    )
+
+
 def _dsv4_swa_transfer_enabled_from_env() -> bool:
     return bool(int(os.getenv("FLEXKV_ENABLE_SWA_TRANSFER", "1")))
 
@@ -654,14 +667,17 @@ class FlexKVConfig:
         # use a combined kv_buffer (K/V latent, no separate V) → kv_dim=1.
         # Plain MHA models (Llama, Qwen, etc.) lack qk_nope_head_dim and use
         # separate k_buffer/v_buffer → kv_dim=2.
-        has_combined_kv = hasattr(sglang_config, "qk_nope_head_dim")
+        is_dsv4 = _is_sglang_dsv4(sglang_config)
+        has_combined_kv = is_dsv4 or hasattr(sglang_config, "qk_nope_head_dim")
 
         if has_combined_kv:
             # Combined kv_buffer: K/V latent stored in a single buffer.
             # MLA with kv_lora_rank uses kv_lora_rank + qk_rope_head_dim;
             kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
             qk_rope_head_dim = int(getattr(sglang_config, "qk_rope_head_dim", 0))
-            if kv_lora_rank > 0:
+            if is_dsv4:
+                combined_head_size = int(sglang_config.qk_nope_head_dim) + qk_rope_head_dim
+            elif kv_lora_rank > 0:
                 # MLA (DeepSeek V2/V3, etc.)
                 combined_head_size = kv_lora_rank + qk_rope_head_dim
             else:
@@ -701,7 +717,12 @@ class FlexKVConfig:
             framework="sglang",
         )
 
-        if has_combined_kv and getattr(sglang_config, "index_head_dim", None) is not None:
+        # DSv4 registers its physical widths per group, not as an NSA latent.
+        if (
+            not is_dsv4
+            and has_combined_kv
+            and getattr(sglang_config, "index_head_dim", None) is not None
+        ):
             kv_lora_rank = int(getattr(sglang_config, "kv_lora_rank", 0))
             qk_rope_head_dim = int(getattr(sglang_config, "qk_rope_head_dim", 0))
             if self.model_config.dtype == torch.float8_e4m3fn:
@@ -789,7 +810,6 @@ class FlexKVConfig:
         # in DeepSeekV4SingleKVPool. Without this config, cache_config.swa
         # stays None -> the cache engine never builds an SWA pool -> a SWA-aware
         # get finds no SWA, so SWA KV is never matched/reused for this all-SWA model.
-        is_dsv4 = bool(getattr(sglang_config, "is_deepseek_v4_arch", False))
         # Debug: log kv_dim derivation for verification
         flexkv_logger.info(
             f"[FlexKV SGLang] is_dsv4={is_dsv4}, "
@@ -933,7 +953,9 @@ class FlexKVConfig:
             else:
                 # plain MHA: K/V separate + multi head (kv_dim=2, num_kv_heads=H).
                 if hasattr(hf_config, 'num_key_value_heads'):
-                    assert hf_config.num_attention_heads != hf_config.num_key_value_heads, f"{hf_config.num_attention_heads=}, {hf_config.num_key_value_heads=}"
+                    assert hf_config.num_attention_heads != hf_config.num_key_value_heads, (
+                        f"{hf_config.num_attention_heads=}, {hf_config.num_key_value_heads=}"
+                    )
                     self.model_config.head_size = hf_config.head_dim
                     self.model_config.num_kv_heads = hf_config.num_key_value_heads
                 else:

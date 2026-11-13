@@ -6,10 +6,68 @@ import pytest
 import torch
 
 import flexkv.integration.sglang.connector as connector_module
+from flexkv.common.config import UserConfig
+from flexkv.integration.config import FlexKVConfig
 from flexkv.integration.sglang.comm import FlexKVScatterChannel
 from flexkv.integration.sglang.connector import FlexKVConnector
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize('architecture,legacy', [
+    ('DeepseekV4ForCausalLM', False),
+    ('DeepseekV4ForCausalLMNextN', False),
+    ('DeepseekV4ForCausalLMDSpark', False),
+    (None, True),
+])
+def test_dsv4_config_without_removed_sglang_arch_flag(monkeypatch, architecture, legacy):
+    """Modern SGLang's ModelConfig has no legacy V4 boolean. Its indexed
+    compressed KV must still get a SWA pool and must not use NSA's byte width.
+    """
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    model = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=[architecture] if architecture else []),
+        num_hidden_layers=4, qk_nope_head_dim=448, qk_rope_head_dim=64,
+        index_head_dim=128, dtype=torch.bfloat16,
+    )
+    if legacy:
+        model.is_deepseek_v4_arch = True
+    args = SimpleNamespace(tp_size=4, pp_size=1, dp_size=1, attn_dp_size=1,
+        nnodes=1, node_rank=0, attn_cp_size=1, kv_cache_dtype='fp8_e4m3')
+    config = FlexKVConfig(user_config=UserConfig(cpu_cache_gb=1))
+    config.post_init_from_sglang_config(model, args, page_size=256)
+    assert config.model_config.head_size == 512
+    assert config.model_config.kv_dim == 1
+    assert config.cache_config.swa is not None
+    assert config.cache_config.swa.bytes_per_token_per_layer == 585
+
+
+def test_non_dsv4_nsa_keeps_packed_kv_width(monkeypatch):
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    model = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=['DeepseekV32ForCausalLM']),
+        num_hidden_layers=4, qk_nope_head_dim=128, qk_rope_head_dim=64,
+        kv_lora_rank=512, index_head_dim=128, dtype=torch.bfloat16,
+    )
+    args = SimpleNamespace(tp_size=4, pp_size=1, dp_size=1, nnodes=1,
+        node_rank=0, kv_cache_dtype='fp8_e4m3')
+    config = FlexKVConfig(user_config=UserConfig(cpu_cache_gb=1))
+    config.post_init_from_sglang_config(model, args, page_size=256)
+    assert config.model_config.head_size == 656
+    assert config.cache_config.swa is None
+
+
+def test_resolving_buffers_does_not_format_kv_tensor_contents():
+    class PrivateBuffer:
+        def __repr__(self):
+            raise AssertionError('KV contents must not be formatted')
+    buffer = PrivateBuffer()
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._is_dsv4 = False
+    cache = SimpleNamespace(k_buffer=[buffer], v_buffer=[buffer], private_state=buffer)
+    buffers, indexer = connector._resolve_kv_buffers(cache)
+    assert buffers[0] is buffer and buffers[1] is buffer
+    assert indexer is None
 
 
 def test_lookup_accepts_sglang_array_token_ids():

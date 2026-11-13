@@ -56,7 +56,7 @@ from flexkv.common.config import (
 )
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
-from flexkv.integration.config import FlexKVConfig
+from flexkv.integration.config import FlexKVConfig, _is_sglang_dsv4
 from flexkv.kvmanager import KVManager
 from flexkv.server.client import KVTPClient
 from flexkv.transfer.layer_eventfd import build_layerwise_eventfd_socket_path
@@ -328,7 +328,7 @@ class FlexKVConnector:
         # MLA/MHA models keep the single-layout path.
         self._kvcache = kvcache
         self._swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
-        self._is_dsv4 = getattr(sgl_model_config, "is_deepseek_v4_arch", False)
+        self._is_dsv4 = _is_sglang_dsv4(sgl_model_config)
         self._dsv4_layer_groups: List[Dict[str, Any]] = []
         self._dsv4_state_groups: List[Dict[str, Any]] = []
         self._deduplicate_indexer_group = os.getenv(
@@ -2279,10 +2279,6 @@ class FlexKVConnector:
         self, kvcache: Any
     ) -> Tuple[List[torch.Tensor], Optional[_IndexerBufferGroup]]:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
-        for attr in kvcache.__dict__:
-            print(f"attr: {attr}")
-            print(f"value: {getattr(kvcache, attr)}")
-            print("-"*100)
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
         if indexer_buffers:
             if self._deduplicate_indexer_group:
