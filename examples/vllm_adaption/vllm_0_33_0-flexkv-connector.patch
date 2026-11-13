@@ -1,5 +1,5 @@
 diff --git a/tests/v1/kv_connector/unit/test_flexkv_connector.py b/tests/v1/kv_connector/unit/test_flexkv_connector.py
-index 061ec3f..206dfe7 100644
+index 061ec3f..3861994 100644
 --- a/tests/v1/kv_connector/unit/test_flexkv_connector.py
 +++ b/tests/v1/kv_connector/unit/test_flexkv_connector.py
 @@ -125,6 +125,45 @@ class TestFlexKVConnectorImportError:
@@ -48,7 +48,7 @@ index 061ec3f..206dfe7 100644
  class TestFlexKVConnectorDelegation:
      """All public API methods should be forwarded to the impl."""
  
-@@ -229,3 +268,28 @@ class TestFlexKVConnectorDelegation:
+@@ -229,3 +268,35 @@ class TestFlexKVConnectorDelegation:
          connector, impl = connector_and_impl
          connector.wait_for_layer_load("layer_0")
          impl.wait_for_layer_load.assert_called_once_with("layer_0")
@@ -77,8 +77,15 @@ index 061ec3f..206dfe7 100644
 +        impl.reset_cache.return_value = result
 +        assert connector.reset_cache() is result
 +        impl.reset_cache.assert_called_once()
++
++    @pytest.mark.parametrize("result", [True, False])
++    def test_has_pending_push_work(self, connector_and_impl, result):
++        connector, impl = connector_and_impl
++        impl.has_pending_push_work.return_value = result
++        assert connector.has_pending_push_work() is result
++        impl.has_pending_push_work.assert_called_once()
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
-index bbb64cf..8610e30 100644
+index bbb64cf..872e692 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 @@ -53,6 +53,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
@@ -177,7 +184,38 @@ index bbb64cf..8610e30 100644
      # ==============================
      # Scheduler-side methods
      # ==============================
-@@ -268,3 +296,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -184,7 +212,7 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+         self,
+         request: "Request",
+         num_computed_tokens: int,
+-    ) -> tuple[int, bool]:
++    ) -> tuple[int | None, bool]:
+         """Get the number of new tokens that can be loaded from the
+         external KV cache beyond ``num_computed_tokens``.
+ 
+@@ -196,7 +224,8 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+         Returns:
+             Tuple of (num_external_tokens, is_ready) where
+             num_external_tokens is the number of additional tokens that
+-            can be loaded from the external KV cache.
++            can be loaded from the external KV cache, or None while FlexKV
++            still prefetches the request's prefix (ask again later).
+ 
+         """
+         return self._flexkv_connector.get_num_new_matched_tokens(
+@@ -252,6 +281,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+         """
+         return self._flexkv_connector.request_finished(request, block_ids)
+ 
++    def has_pending_push_work(self) -> bool:
++        """Whether FlexKV transfers still complete only while the engine
++        keeps stepping (e.g. an SSD write after the request finished)."""
++        return self._flexkv_connector.has_pending_push_work()
++
+     def take_events(self) -> Iterable["KVCacheEvent"]:
+         """Collect buffered KV cache events.
+ 
+@@ -268,3 +302,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
      def get_block_ids_with_load_errors(self) -> set[int]:
          """Get the block ids that have failed to load."""
          return self._flexkv_connector.get_block_ids_with_load_errors()

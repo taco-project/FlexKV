@@ -484,6 +484,15 @@ class KVManager:
         else:
             return self.kv_task_engine.wait(task_ids, timeout, completely)
 
+    def has_running_graphs(self) -> bool:
+        """Whether the caller must keep polling (``try_wait``) although it waits
+        for no task: a graph still runs after its task was returned, like a
+        PUT's SSD write. False when another loop drives the engine (the
+        chunked-prefetch runtime) and in server-client mode."""
+        if self.server_client_mode or self.kv_task_engine._runtime is not None:
+            return False
+        return self.kv_task_engine.has_running_graphs()
+
     def try_wait(self, task_ids: Union[int, List[int]]) -> Dict[int, KVResponse]:
         if isinstance(task_ids, int):
             task_ids = [task_ids]

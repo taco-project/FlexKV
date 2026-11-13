@@ -17,6 +17,7 @@ from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
 from flexkv.integration.config import FlexKVConfig
 from flexkv.integration.dynamo.collector import KVEventCollector
+from flexkv.server.shm_radix_bootstrap import radix_server_is_distributed
 from flexkv.integration.vllm.layerwise_sync import (
     LayerwiseCounterPool,
     LayerwiseLoadMetadata,
@@ -304,7 +305,18 @@ class FlexKVSchedulerConnector:
             logger.info("Waiting for flexkv init...")
             time.sleep(5)
 
-        logger.info("Finish init FlexKVSchedulerConnector")
+        # A radixshmem GET reads only the local tiers: a peer's CPU or SSD
+        # blocks reach a request through a prefetch into the local CPU tier,
+        # started while it waits (as the SGLang connector does).
+        self.enable_prefetch = bool(GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and (
+            self.cache_config.enable_ssd or radix_server_is_distributed(
+                rank_info.model_config, self.cache_config,
+                label="FlexKVSchedulerConnector")))
+        # request_id -> prefetch task id, while the request waits for it
+        self.prefetch_tasks: dict[str, int] = {}
+        self.prefetched_req_ids: set[str] = set()
+
+        logger.info(f"Finish init FlexKVSchedulerConnector, prefetch={self.enable_prefetch}")
 
     def is_ready(
         self,
@@ -327,7 +339,7 @@ class FlexKVSchedulerConnector:
         request has a task in flight; the caller retries once the scheduler has
         reported their completions and freed their GPU blocks.
         """
-        if self.req_id_to_task_dict:
+        if self.req_id_to_task_dict or self.prefetch_tasks:
             return False
         self.flexkv_manager.reset()
         self.failed_block_ids.clear()
@@ -341,7 +353,7 @@ class FlexKVSchedulerConnector:
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[Optional[int], bool]:
         """
         Args:
             request: Request to get.
@@ -349,10 +361,13 @@ class FlexKVSchedulerConnector:
                                 which means not need to transfer from flexkv.
 
         Returns:
-            tuple[int, bool]: A tuple containing an integer and a bool representing the
-                            number of new matched tokens and whether it is necessary
-                            to get the new matched blocks from flexkv, respectively.
+            tuple[Optional[int], bool]: The number of new matched tokens (None
+                            while the request's prefetch runs: vLLM asks again)
+                            and whether it is necessary to get the new matched
+                            blocks from flexkv.
         """
+        if self.enable_prefetch and not self._prefetch_done(request, num_computed_tokens):
+            return None, False
         task_id, num_new_matched_tokens = self._get_match(request=request,
                                                           num_computed_tokens=num_computed_tokens)
         self.flexkv_stats.record_get(num_prompt_tokens=request.num_tokens,
@@ -365,6 +380,45 @@ class FlexKVSchedulerConnector:
             return 0, False
 
         return num_new_matched_tokens, True
+
+    def _prefetch_done(self, request: "Request", num_computed_tokens: int) -> bool:
+        """Start the prefetch of a waiting request's prompt (peer CPU, local and
+        peer SSD into the local CPU tier) on first sight, then tell whether it
+        has finished; the GET that follows reads what it brought."""
+        req_id = request.request_id
+        if req_id in self.prefetched_req_ids:
+            return True
+        task_id = self.prefetch_tasks.get(req_id)
+        if task_id is None:
+            num_tokens = request.num_tokens // self.block_size * self.block_size
+            if num_tokens > num_computed_tokens:
+                try:
+                    task_id = self.flexkv_manager.prefetch_async(
+                        token_ids=np.asarray(request.all_token_ids[:num_tokens], dtype=np.int64),
+                        namespace=self._extract_namespace(request))
+                except Exception as e:  # noqa: BLE001 - serve from the local tiers
+                    logger.warning(f"FlexKV prefetch of {req_id} failed: {e}")
+            if task_id is None or task_id < 0:
+                self.prefetched_req_ids.add(req_id)
+                return True
+            self.prefetch_tasks[req_id] = task_id
+        if task_id not in self.flexkv_manager.try_wait([task_id]):
+            return False
+        del self.prefetch_tasks[req_id]
+        self.prefetched_req_ids.add(req_id)
+        return True
+
+    def _forget_prefetch(self, req_id: str) -> None:
+        self.prefetched_req_ids.discard(req_id)
+        task_id = self.prefetch_tasks.pop(req_id, None)
+        if task_id is not None:
+            # A running prefetch keeps its blocks until its graph drains.
+            self.flexkv_manager.cancel(task_ids=[task_id])
+
+    def has_pending_work(self) -> bool:
+        """Whether vLLM must keep stepping with no request left: a returned
+        task's graph (a PUT's SSD write) completes only when polled."""
+        return self.flexkv_manager.has_running_graphs()
 
     def _extract_namespace(self, request: "Request") -> Optional[List[str]]:
         """
@@ -530,6 +584,7 @@ class FlexKVSchedulerConnector:
             True if a FlexKV transfer still needs the request's blocks and
             vLLM must defer freeing them; False if the blocks can be freed.
         """
+        self._forget_prefetch(request.request_id)
         # A GET task still owns the blocks until its graph completion callback
         # runs. In layer-wise mode this is normally only a short tail after the
         # final eventfd; query_finished_task() will return this finished request
@@ -769,6 +824,8 @@ class FlexKVSchedulerConnector:
             list[FlexKVResponse]: Responses of finished tasks.
         """
         if len(self.req_id_to_task_dict) == 0:
+            if self.flexkv_manager.has_running_graphs():
+                self.flexkv_manager.try_wait([])
             return set(), set()
         # logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
         task_ids = list(self.get_tasks.keys()) + list(self.put_tasks.keys())
@@ -1444,7 +1501,7 @@ class FlexKVConnectorV1Impl:
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[Optional[int], bool]:
         """
         Get number of new tokens that can be loaded from the
         external KV cache beyond the num_computed_tokens.
@@ -1456,7 +1513,8 @@ class FlexKVConnectorV1Impl:
 
         Returns:
             the number of tokens that can be loaded from the
-            external KV cache beyond what is already computed.
+            external KV cache beyond what is already computed, or None
+            while the request's prefetch is still running.
         """
         matched_tokens, needs_load = self.connector.get_num_new_matched_tokens(
             request, num_computed_tokens)
@@ -1554,6 +1612,12 @@ class FlexKVConnectorV1Impl:
             returned by the engine.
         """
         return self.connector.request_finished(request, block_ids), None
+
+    def has_pending_push_work(self) -> bool:
+        """Keep vLLM stepping while a FlexKV graph completes only when polled."""
+        if self.role != KVConnectorRole.SCHEDULER:
+            return False
+        return self.connector.has_pending_work()
 
     def take_events(self) -> Iterable['KVCacheEvent']:
         '''

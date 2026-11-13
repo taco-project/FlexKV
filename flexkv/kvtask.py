@@ -563,6 +563,12 @@ class KVTaskManager:
                 else:
                     transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
 
+    def has_running_graphs(self) -> bool:
+        """Whether a submitted graph still runs; its completion (e.g. a PUT's
+        SSD insert after the task was returned) happens only when polled."""
+        return any(self.tasks[tid].status == TaskStatus.RUNNING
+                   for tid in self.graph_to_task.values())
+
     def _update_tasks(self, timeout: float = 0.001) -> None:
         self._poll_prefetch_jobs()
         completed_ops = self._get_completed_ops(timeout)
@@ -1292,8 +1298,7 @@ class KVTaskEngine(KVTaskManager):
     def _next_runtime_wakeup(self, poll_s):
         # Held GET plans have no submitted I/O. Only RUNNING graphs require
         # completion polling, including async PUT tails after request return.
-        if any(self.tasks[tid].status == TaskStatus.RUNNING
-               for tid in self.graph_to_task.values()):
+        if self.has_running_graphs():
             return poll_s
         delay = self._prefetch.next_wakeup(poll_s)
         if self._terminal_tasks:
