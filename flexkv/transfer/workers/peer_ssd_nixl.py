@@ -50,6 +50,14 @@ _IDLE_SLEEP_S = 50e-6
 _DIRECT_IO_ALIGN = 4096
 _NOT_READY_LOG_EVERY_S = 30.0
 _SENDER_METADATA_WAIT_S = 2.0   # a request may arrive just before its sender's metadata
+# A peer restarted at the same address never answers the first metadata
+# exchange after it (cross-host, measured with NIXL 1.5); a repeated one does.
+# Each repeat waits twice as long as the last, up to the cap: NIXL runs all of
+# an agent's exchanges on one thread, and a send to an unreachable host holds
+# it for its 1 s connect timeout, so repeating every second would queue sends
+# faster than the thread drains them and hold up every other peer's exchange.
+_METADATA_RESEND_S = 1.0
+_METADATA_RESEND_MAX_S = 8.0
 
 
 class PeerUnavailable(RuntimeError):
@@ -308,13 +316,20 @@ class NixlSSDEndpoint:
             # wait out the metadata timeout of a peer that may still be down.
             raise PeerUnavailable(f"[peer-ssd-nixl] {peer} was dropped; reconnecting in {wait:.0f}s")
         self.agent.send_local_metadata(ip, port)
-        if not self.agent.check_remote_metadata(peer):
-            self.agent.fetch_remote_metadata(peer, ip, port)
         deadline = time.monotonic() + timeout_s
+        fetched_at = None
+        resend_s = _METADATA_RESEND_S
         while not self.agent.check_remote_metadata(peer):
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if now > deadline:
                 self.drop(peer, "no metadata")
                 raise TimeoutError(f"[peer-ssd-nixl] no metadata from {peer} at {ip}:{port}")
+            if fetched_at is None or now - fetched_at >= resend_s:
+                if fetched_at is not None:
+                    self.agent.send_local_metadata(ip, port)
+                    resend_s = min(2 * resend_s, _METADATA_RESEND_MAX_S)
+                self.agent.fetch_remote_metadata(peer, ip, port)
+                fetched_at = now
             time.sleep(0.01)
         with self._lock:
             self._connected.add(peer)
