@@ -223,20 +223,23 @@ class HierarchyLRCacheEngine:
             time.sleep(self.reset_barrier_poll_ms / 1000.0)
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
-        """Match a sequence against the cache index.
+        """Match this storage tier against local and distributed indexes.
 
-        This method provides a simple interface similar to CacheEngine.match(),
-        delegating to match_all() for consistency.
-
-        Args:
-            sequence_meta: The sequence metadata to match
-
-        Returns:
-            MatchResultAccel: The match result
+        Delegate to match_all(), which selects the longer prefix rather than
+        combining local and peer matches.
         """
         return self.match_all(sequence_meta)
-    #match all will be called for get
+
     def match_all(self, sequence_meta: SequenceMeta, gpu_matched_blocks: int = 0) -> MatchResultAccel:
+        """Match this tier's local index and distributed snapshot for GET.
+
+        Select the longer prefix, preferring the local result on a tie. Fall
+        back to the local result when the distributed match lacks usable peer
+        or remote-file identifiers. The two matches are not concatenated.
+
+        This selects a source within one tier, not across CPU/SSD/REMOTE tiers.
+        gpu_matched_blocks contributes to reuse statistics.
+        """
         sequence_meta.gen_hashes()
         block_hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
         num_blocks = sequence_meta.num_blocks
@@ -373,8 +376,13 @@ class HierarchyLRCacheEngine:
             f_idx = (block_id // rr) % remote_file_num
             out[i] = np.uint32(file_list[f_idx])
         return out
-    #match local will only be called for put
+
     def match_local(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
+        """Match only this node's authoritative index for this storage tier.
+
+        Do not consult the distributed snapshot or return peer block IDs.
+        Use this result for local PUT source buffers and insertion anchors.
+        """
         sequence_meta.gen_hashes()
         block_hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
         num_blocks = sequence_meta.num_blocks

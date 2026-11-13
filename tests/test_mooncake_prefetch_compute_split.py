@@ -1,4 +1,4 @@
-"""M0: mooncake REMOTE2H is prefetch-only; compute GET stays local."""
+"""M0: mooncake REMOTE2H is prefetch-only; compute GET uses CPU/SSD tiers."""
 
 import threading
 from types import SimpleNamespace
@@ -40,7 +40,7 @@ def _bare_engine(*, mooncake: bool) -> GlobalCacheEngine:
 @pytest.mark.parametrize(
     ("mooncake", "strategy", "expect_ignore_remote"),
     [
-        # Compute retrieve under mooncake: force local tiers only.
+        # Compute retrieve under mooncake: force CPU/SSD tiers only.
         (True, CacheStrategy(), True),
         # Prefetch (ignore_gpu): may still pull REMOTE2H.
         (True, CacheStrategy(ignore_gpu=True, ignore_gds=True), False),
@@ -60,23 +60,23 @@ def test_resolve_get_cache_strategy(mooncake, strategy, expect_ignore_remote):
     assert resolved.ignore_ssd is strategy.ignore_ssd
 
 
-def test_mooncake_compute_get_routes_to_local_not_global():
-    """GPU-bound GET with mooncake must not enter _get_impl_global."""
+def test_mooncake_compute_get_routes_to_cpu_ssd():
+    """GPU-bound GET with mooncake must use the CPU/SSD planner."""
     engine = _bare_engine(mooncake=True)
-    local_calls = []
-    global_calls = []
+    cpu_ssd_calls = []
+    with_remote_calls = []
     empty_plan = GetTransferPlan.empty()
 
-    def _local(*args, **kwargs):
-        local_calls.append(kwargs.get("temp_cache_strategy") or args[5])
+    def _cpu_ssd(*args, **kwargs):
+        cpu_ssd_calls.append(kwargs.get("temp_cache_strategy") or args[5])
         return empty_plan
 
-    def _global(*args, **kwargs):
-        global_calls.append(True)
+    def _with_remote(*args, **kwargs):
+        with_remote_calls.append(True)
         return empty_plan
 
-    engine._get_impl_local = _local
-    engine._get_impl_global = _global
+    engine._get_impl_cpu_ssd = _cpu_ssd
+    engine._get_impl_with_remote = _with_remote
     engine.cache_engines = {}
 
     token_ids = np.arange(4, dtype=np.int64)
@@ -92,32 +92,32 @@ def test_mooncake_compute_get_routes_to_local_not_global():
         temp_cache_strategy=CacheStrategy(),
     )
 
-    assert len(local_calls) == 1
-    assert local_calls[0].ignore_remote is True
-    assert global_calls == []
+    assert len(cpu_ssd_calls) == 1
+    assert cpu_ssd_calls[0].ignore_remote is True
+    assert with_remote_calls == []
     assert isinstance(graph, TransferOpGraph)
     assert return_mask.shape == token_mask.shape
 
 
-def test_mooncake_prefetch_get_still_allows_global():
-    """Prefetch (ignore_gpu) under mooncake may still use _get_impl_global."""
+def test_mooncake_prefetch_get_still_allows_remote():
+    """Prefetch (ignore_gpu) under mooncake may still use the REMOTE planner."""
     engine = _bare_engine(mooncake=True)
 
-    local_calls = []
-    global_calls = []
+    cpu_ssd_calls = []
+    with_remote_calls = []
     empty_plan = GetTransferPlan.empty()
 
-    def _local(*args, **kwargs):
-        local_calls.append(True)
+    def _cpu_ssd(*args, **kwargs):
+        cpu_ssd_calls.append(True)
         return empty_plan
 
-    def _global(*args, **kwargs):
+    def _with_remote(*args, **kwargs):
         strategy = kwargs.get("temp_cache_strategy") or args[5]
-        global_calls.append(strategy)
+        with_remote_calls.append(strategy)
         return empty_plan
 
-    engine._get_impl_local = _local
-    engine._get_impl_global = _global
+    engine._get_impl_cpu_ssd = _cpu_ssd
+    engine._get_impl_with_remote = _with_remote
     engine.cache_engines = {}
 
     token_ids = np.arange(4, dtype=np.int64)
@@ -130,9 +130,9 @@ def test_mooncake_prefetch_get_still_allows_global():
         temp_cache_strategy=CacheStrategy(ignore_gpu=True, ignore_gds=True),
     )
 
-    assert local_calls == []
-    assert len(global_calls) == 1
-    assert global_calls[0].ignore_remote is False
+    assert cpu_ssd_calls == []
+    assert len(with_remote_calls) == 1
+    assert with_remote_calls[0].ignore_remote is False
     assert isinstance(graph, TransferOpGraph)
 
 

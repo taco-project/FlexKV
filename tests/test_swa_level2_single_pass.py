@@ -90,33 +90,34 @@ def _put(eng, tok, req=1):
 class _MatchCounter:
     """Wrap the engine's per-tier match entry points and count invocations.
 
-    CPU-only config routes through ``match_local_accel``; we also wrap
-    ``match_all_accel`` so the same counter works if a tier config changes.
+    CPU-only config routes through ``match_cpu_ssd_accel``; we also wrap
+    ``match_cpu_ssd_remote_accel`` so the same counter works if a tier config
+    changes.
     Each call = one round of per-tier radix matching.
     """
 
     def __init__(self, eng):
         self.eng = eng
         self.n = 0
-        self._orig_local = eng.match_local_accel
-        self._orig_all = eng.match_all_accel
+        self._orig_cpu_ssd = eng.match_cpu_ssd_accel
+        self._orig_cpu_ssd_remote = eng.match_cpu_ssd_remote_accel
 
     def __enter__(self):
-        def local(*a, **k):
+        def cpu_ssd(*a, **k):
             self.n += 1
-            return self._orig_local(*a, **k)
+            return self._orig_cpu_ssd(*a, **k)
 
-        def allm(*a, **k):
+        def cpu_ssd_remote(*a, **k):
             self.n += 1
-            return self._orig_all(*a, **k)
+            return self._orig_cpu_ssd_remote(*a, **k)
 
-        self.eng.match_local_accel = local
-        self.eng.match_all_accel = allm
+        self.eng.match_cpu_ssd_accel = cpu_ssd
+        self.eng.match_cpu_ssd_remote_accel = cpu_ssd_remote
         return self
 
     def __exit__(self, *exc):
-        self.eng.match_local_accel = self._orig_local
-        self.eng.match_all_accel = self._orig_all
+        self.eng.match_cpu_ssd_accel = self._orig_cpu_ssd
+        self.eng.match_cpu_ssd_remote_accel = self._orig_cpu_ssd_remote
         return False
 
 

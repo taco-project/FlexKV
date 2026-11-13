@@ -47,7 +47,7 @@ def _prefetch_engine(*, use_mooncake: bool):
     engine.cpu_cache_engine.insert.return_value = cpu_node
     engine.ssd_cache_engine = None
     engine.remote_cache_engine = MagicMock()
-    engine.match_all = MagicMock(
+    engine.match_cpu_ssd_remote = MagicMock(
         return_value=(
             _match(last_node=cpu_root),
             _match(),
@@ -63,7 +63,7 @@ def _plan_remote_prefetch(engine):
         tokens_per_block=16,
     )
     strategy = SimpleNamespace(ignore_gpu=True, ignore_remote=False)
-    return engine._get_impl_global(
+    return engine._get_impl_with_remote(
         request_id=1,
         sequence_meta=sequence,
         block_mask_start=0,

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) <2025> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for CPU allocation in the local GDS GET planner.
+"""Regression tests for CPU allocation in the CPU/SSD GDS GET planner.
 
 These tests exercise graph construction only. They do not initialize a GDS
 worker, require cuFile, or perform a real SSD-to-GPU transfer.
@@ -62,7 +62,7 @@ def _match(block_ids):
     )
 
 
-def _build_local_get(*, enable_gds, cpu_blocks, ssd_blocks, gpu_blocks,
+def _build_cpu_ssd_get(*, enable_gds, cpu_blocks, ssd_blocks, gpu_blocks,
                      cpu_capacity):
     cpu_cache = _FakeCPUCacheEngine(capacity=cpu_capacity)
     engine = GlobalCacheEngine.__new__(GlobalCacheEngine)
@@ -75,12 +75,12 @@ def _build_local_get(*, enable_gds, cpu_blocks, ssd_blocks, gpu_blocks,
     engine.cpu_cache_engine = cpu_cache
     engine.index_accel = False
     engine._metrics_collector = None
-    engine.match_local = lambda sequence_meta, strategy: (
+    engine.match_cpu_ssd = lambda sequence_meta, strategy: (
         _match(cpu_blocks),
         _match(ssd_blocks),
     )
 
-    plan = engine._get_impl_local(
+    plan = engine._get_impl_cpu_ssd(
         request_id=1,
         sequence_meta=object(),
         block_mask_start=0,
@@ -102,7 +102,7 @@ def _only_op(plan, transfer_type):
 
 
 def test_ssd_only_gds_get_does_not_require_cpu_capacity():
-    plan, cpu_cache = _build_local_get(
+    plan, cpu_cache = _build_cpu_ssd_get(
         enable_gds=True,
         cpu_blocks=[],
         ssd_blocks=[40, 41],
@@ -125,7 +125,7 @@ def test_ssd_only_gds_get_does_not_require_cpu_capacity():
 
 
 def test_mixed_gds_get_allocates_no_cpu_blocks_for_ssd_fragment():
-    plan, cpu_cache = _build_local_get(
+    plan, cpu_cache = _build_cpu_ssd_get(
         enable_gds=True,
         cpu_blocks=[10],
         ssd_blocks=[30, 40, 41],
@@ -145,7 +145,7 @@ def test_mixed_gds_get_allocates_no_cpu_blocks_for_ssd_fragment():
 
 
 def test_non_gds_get_still_allocates_cpu_staging_blocks():
-    plan, cpu_cache = _build_local_get(
+    plan, cpu_cache = _build_cpu_ssd_get(
         enable_gds=False,
         cpu_blocks=[],
         ssd_blocks=[40, 41],

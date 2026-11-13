@@ -950,6 +950,13 @@ def resolve_get_cache_strategy(
 
 
 class GlobalCacheEngine:
+    """Plan request transfers across the configured cache tiers.
+
+    The CPU/SSD path may include peer CPU/SSD sources when P2P is enabled.
+    The REMOTE tier is a separate planning choice, not a synonym for peer
+    access within the CPU or SSD tier.
+    """
+
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None,
                  event_collector: Optional[KVEventCollector] = None):
         # pybind releases the GIL around radix match/insert/evict. Protect the
@@ -1188,8 +1195,8 @@ class GlobalCacheEngine:
             self.use_mooncake_store_backend, temp_cache_strategy)
 
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
-            # from this entrance, we will also handle the case of peer_cpu and peer_ssd
-            plan = self._get_impl_local(
+            # CPU/SSD planning can still include peer CPU/SSD sources.
+            plan = self._get_impl_cpu_ssd(
                 request_id,
                 sequence_meta,
                 block_start_idx,
@@ -1201,7 +1208,7 @@ class GlobalCacheEngine:
             )
         else:
             #TODO pcfs will be supported later
-            plan = self._get_impl_global(
+            plan = self._get_impl_with_remote(
                 request_id,
                 sequence_meta,
                 block_start_idx,
@@ -1464,7 +1471,7 @@ class GlobalCacheEngine:
         # of fragment1..3, so reporting on either one alone would be a lie.
         return [op_resident, op_staged]
 
-    def _get_impl_global(self,
+    def _get_impl_with_remote(self,
             request_id: int,
             sequence_meta: SequenceMeta,
             block_mask_start: int,
@@ -1474,8 +1481,9 @@ class GlobalCacheEngine:
             dp_client_id: int,
             swa_aware: bool = False) \
                  -> GetTransferPlan:
-        """
-        transfer pattern:
+        """Plan a GET with the REMOTE tier eligible alongside CPU/SSD.
+
+        Transfer pattern:
 
         GPU: (gpu cached) | fragment1 | fragment2      | fragment3      | (need compute)
                                ↑          ↑               ↑
@@ -1492,9 +1500,10 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
         assert self.remote_cache_engine is not None
         if self.index_accel:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta)
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_cpu_ssd_remote_accel(
+                sequence_meta)
         else:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta)
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_cpu_ssd_remote(sequence_meta)
         transfer_graph = TransferOpGraph()
         swa_reservation: Optional[SWAReadReservation] = None
         swa_read_source: SWAReadSource = SWAReadSource()
@@ -1838,7 +1847,7 @@ class GlobalCacheEngine:
             swa_reservation=swa_reservation,
         )
 
-    def _get_impl_local(self,
+    def _get_impl_cpu_ssd(self,
                         request_id: int,
                         sequence_meta: SequenceMeta,
                         block_mask_start: int,
@@ -1848,8 +1857,9 @@ class GlobalCacheEngine:
                         dp_client_id: int,
                         swa_aware: bool = False) \
                             -> GetTransferPlan:
-        """
-        transfer pattern:
+        """Plan a GET from CPU/SSD, including configured peer sources.
+
+        Transfer pattern:
 
         GPU          : (gpu cached) | fragment1 | fragment2      | (need compute)
                                ↑          ↑
@@ -1867,10 +1877,10 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
 
         if self.index_accel:
-            cpu_matched_result, ssd_matched_result = self.match_local_accel(
+            cpu_matched_result, ssd_matched_result = self.match_cpu_ssd_accel(
                 sequence_meta, temp_cache_strategy, is_put=False, gpu_matched_blocks=block_mask_start)
         else:
-            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
+            cpu_matched_result, ssd_matched_result = self.match_cpu_ssd(sequence_meta, temp_cache_strategy)
 
         transfer_graph = TransferOpGraph()
         swa_reservation: Optional[SWAReadReservation] = None
@@ -1891,7 +1901,7 @@ class GlobalCacheEngine:
             if enable_gpu:
                 swa_reservation = self._reserve_swa_read_source(
                     transfer_graph, swa_read_source, protected_cpu_node, dp_client_id)
-            # Align with _get_impl_global: only refuse Full-only restore when
+            # Align with _get_impl_with_remote: only refuse Full-only restore when
             # compute needs GPU SWA but reservation failed. Prefetch
             # (not enable_gpu) leaves Full intact; SWA is staged separately.
             # (When no SWA source exists, _select_swa_read_source already
@@ -2162,7 +2172,7 @@ class GlobalCacheEngine:
 
         assert not temp_cache_strategy.ignore_gpu
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
-            plan = self._put_impl_local(
+            plan = self._put_impl_cpu_ssd(
                 request_id,
                 sequence_meta,
                 block_start_idx,
@@ -2172,7 +2182,7 @@ class GlobalCacheEngine:
                 dp_client_id,
             )
         else:
-            plan = self._put_impl_global(
+            plan = self._put_impl_with_remote(
                 request_id,
                 sequence_meta,
                 block_start_idx,
@@ -2219,7 +2229,7 @@ class GlobalCacheEngine:
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
-    def _put_impl_global(self,
+    def _put_impl_with_remote(self,
             request_id: int,
             sequence_meta: SequenceMeta,
             block_mask_start: int,
@@ -2228,8 +2238,9 @@ class GlobalCacheEngine:
             temp_cache_strategy: CacheStrategy,
             dp_client_id: int) \
                 -> PutTransferPlan:
-        """
-        transfer pattern:
+        """Plan a PUT with the REMOTE tier eligible alongside CPU/SSD.
+
+        Transfer pattern:
 
         GPU:   (skipped)  | fragment1      | fragment2      | (uncompleted block)
                                ↓                ↓
@@ -2253,12 +2264,11 @@ class GlobalCacheEngine:
         assert self.remote_cache_engine is not None
 
         if self.index_accel:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all_accel(sequence_meta,
-                                                                                               temp_cache_strategy=temp_cache_strategy,
-                                                                                               is_get=False)
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_cpu_ssd_remote_accel(
+                sequence_meta, temp_cache_strategy=temp_cache_strategy, is_get=False)
         else:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_all(sequence_meta,
-                                                                                           temp_cache_strategy=temp_cache_strategy)
+            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_cpu_ssd_remote(
+                sequence_meta, temp_cache_strategy=temp_cache_strategy)
         # PUT sources must be addresses in this process's registered host
         # buffers. A hierarchical match may select a peer node, which is a
         # valid GET source but cannot back local H2DISK/H2REMOTE writes -- and
@@ -2587,7 +2597,7 @@ class GlobalCacheEngine:
             deferred_release=deferred_release,
         )
 
-    def _put_impl_local(self,
+    def _put_impl_cpu_ssd(self,
             request_id: int,
             sequence_meta: SequenceMeta,
             block_mask_start: int,
@@ -2596,8 +2606,9 @@ class GlobalCacheEngine:
             temp_cache_strategy: CacheStrategy,
             dp_client_id: int) \
                 -> PutTransferPlan:
-        """
-        transfer pattern:
+        """Plan a PUT through CPU/SSD without the REMOTE tier.
+
+        Transfer pattern:
 
         GPU:   (skipped)  | fragment1      | fragment2      | (uncompleted block)
                                 ↓                ↓
@@ -2615,11 +2626,11 @@ class GlobalCacheEngine:
         assert self.cpu_cache_engine is not None
 
         if self.index_accel:
-            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta,
+            cpu_matched_result, ssd_matched_result = self.match_cpu_ssd_accel(sequence_meta,
                                                                             temp_cache_strategy=temp_cache_strategy,
                                                                             is_put=True)
         else:
-            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta,
+            cpu_matched_result, ssd_matched_result = self.match_cpu_ssd(sequence_meta,
                                                                       temp_cache_strategy=temp_cache_strategy,
                                                                       is_put=True)
         cpu_matched_blocks = cpu_matched_result.physical_blocks[
@@ -3280,12 +3291,18 @@ class GlobalCacheEngine:
             self._release_swa_read_reservation(swa_reservation)
 
     @nvtx.annotate("Match Prefix Accel", color="yellow")
-    def match_local_accel(self,
+    def match_cpu_ssd_accel(self,
                         sequence_meta: SequenceMeta,
                         temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
                         is_put: bool = False,
                         gpu_matched_blocks: int = 0) \
                             -> Tuple[MatchResultAccel, MatchResultAccel]:
+        """Match the CPU/SSD tier set using accelerated indexes.
+
+        P2P-enabled tiers may choose peer matches for GET. PUT consults their
+        local indexes so insertion anchors refer to this node's buffers.
+        The REMOTE tier is not part of this match.
+        """
         #from flexkv.common.debug import flexkv_logger, summarize_id_tensor
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
@@ -3513,11 +3530,16 @@ class GlobalCacheEngine:
             pass
 
     @nvtx.annotate("Match Prefix", color="yellow")
-    def match_local(self,
+    def match_cpu_ssd(self,
                     sequence_meta: SequenceMeta,
                     temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
                     is_put: bool = False) \
                         -> Tuple[MatchResult, MatchResult]:
+        """Match the configured CPU/SSD tier set.
+
+        Tier engines determine local or distributed index coverage. This tier
+        set does not include the REMOTE tier.
+        """
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
         if self.cpu_cache_engine:
@@ -3528,11 +3550,16 @@ class GlobalCacheEngine:
         return cpu_matched_result, ssd_matched_result
 
     @nvtx.annotate("Match All Prefix accel", color="yellow")
-    def match_all_accel(self,
+    def match_cpu_ssd_remote_accel(self,
                         sequence_meta: SequenceMeta,
                         temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
                         is_get: bool = True) \
                             -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:
+        """Match CPU/SSD and the REMOTE tier using accelerated indexes.
+
+        The cache strategy can skip SSD or REMOTE. For a KV-sharing REMOTE
+        tier, GET may use its distributed snapshot; PUT uses its local index.
+        """
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
         remote_matched_result = MatchResultAccel()
@@ -3552,10 +3579,15 @@ class GlobalCacheEngine:
         return cpu_matched_result, ssd_matched_result, remote_matched_result
 
     @nvtx.annotate("Match All Prefix", color="yellow")
-    def match_all(self,
+    def match_cpu_ssd_remote(self,
                   sequence_meta: SequenceMeta,
                   temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
                       -> Tuple[MatchResult, MatchResult, MatchResult]:
+        """Match the configured CPU/SSD/REMOTE tier set.
+
+        Tier engines determine local or distributed index coverage. SSD and
+        REMOTE participate only when enabled by the cache strategy.
+        """
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
         remote_matched_result = MatchResult()
@@ -3567,6 +3599,12 @@ class GlobalCacheEngine:
             remote_matched_result = self.remote_cache_engine.match(sequence_meta)
 
         return cpu_matched_result, ssd_matched_result, remote_matched_result
+
+    # Compatibility aliases for callers using the previous tier-set names.
+    match_local_accel = match_cpu_ssd_accel
+    match_local = match_cpu_ssd
+    match_all_accel = match_cpu_ssd_remote_accel
+    match_all = match_cpu_ssd_remote
 
     def _prepare_request(self,
                          token_ids: np.ndarray,
