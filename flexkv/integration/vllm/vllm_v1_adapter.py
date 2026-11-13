@@ -321,21 +321,14 @@ class FlexKVSchedulerConnector:
         tier, so KV computed against stale weights can no longer be matched.
 
         Invoked from vLLM's scheduler via reset_prefix_cache(reset_connector=True)
-        after a weight update. Safety relies only on the radix tree being
-        cleared (get_match can no longer hit stale KV); in-flight transfers need
-        not be drained.
-
-        We also clear this connector's own per-request bookkeeping. These dicts
-        map vLLM request_id -> flexkv task_id for requests currently in flight;
-        after a reset those task_ids reference dropped cache, so we clear them to
-        avoid dangling references (they are normally empty at a reset boundary).
+        after a weight update. FlexKV cannot recycle blocks that a transfer still
+        uses, so like vLLM's own prefix cache reset this returns False while any
+        request has a task in flight; the caller retries once the scheduler has
+        reported their completions and freed their GPU blocks.
         """
+        if self.req_id_to_task_dict:
+            return False
         self.flexkv_manager.reset()
-        self.req_id_to_task_dict.clear()
-        self.get_tasks.clear()
-        self.put_tasks.clear()
-        self.tasks_to_launch.clear()
-        self.tasks_to_cancel.clear()
         self.failed_block_ids.clear()
         return True
 
@@ -420,7 +413,10 @@ class FlexKVSchedulerConnector:
                             the task_id and number of new matched tokens.
         """
         match_start_time = time.perf_counter()
-        num_tokens_to_get = (request.num_tokens//self.block_size)*self.block_size
+        # A layer-wise load is synchronous, so its hit must leave vLLM a token
+        # to compute in the same step.
+        num_tokens = request.num_tokens - int(self.enable_layerwise_transfer)
+        num_tokens_to_get = (num_tokens // self.block_size) * self.block_size
         token_ids = request.all_token_ids[:num_tokens_to_get]
 
         assert num_computed_tokens <= num_tokens_to_get, (
@@ -1429,11 +1425,14 @@ class FlexKVConnectorV1Impl:
         """
         self.connector.register_to_server(kv_caches)
 
-    def before_device_sleep(self) -> None:
+    def unregister_kv_caches(self) -> None:
+        """Release the transfer engine's mappings of the KV caches before
+        vLLM sleeps and frees them."""
         if self.role == KVConnectorRole.WORKER:
             self.connector.before_device_sleep()
 
-    def after_device_wake(self) -> None:
+    def restore_kv_caches(self) -> None:
+        """Register the KV caches again after vLLM wakes up."""
         if self.role == KVConnectorRole.WORKER:
             self.connector.after_device_wake()
 

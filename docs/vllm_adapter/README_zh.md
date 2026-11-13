@@ -6,8 +6,8 @@
 
 从 **vLLM v0.17.2rc0**（commit [`8cb24d3`](https://github.com/vllm-project/vllm/commit/8cb24d3aedb9f431fb15a636a3e11a00262f5991)）起，`FlexKVConnectorV1` 已内置于 vLLM，**无需再手动打 patch**。
 
-> **推荐做法**：直接安装 vLLM >= v0.17.2 正式版（或当前 main 分支），不再需要使用 `examples/vllm_adaption/` 下的 patch 文件。  
-> 旧版 patch 仍保留于 `examples/vllm_adaption/` 目录，供需要使用 vLLM < 0.17.2 的用户参考。
+> **推荐做法**：安装 vLLM v0.17.2 ~ v0.28.x，或 v0.33.0 并打上[对应 patch](#给-vllm-打-patch)。从 v0.29.0 起，内置 connector 已无法启动 FlexKV。  
+> 其余 patch 仍保留于 `examples/vllm_adaption/` 目录，供需要使用 vLLM < 0.17.2 的用户参考。
 
 ---
 
@@ -25,8 +25,9 @@
 
 ### 适用版本
 - FlexKV >= `1.0.0`
-- **vLLM >= `0.17.2`（推荐）**：内置 FlexKVConnectorV1，无需打 patch，直接使用
-- vLLM `0.10.1` ~ `0.17.1`：需手动 apply patch，参见[使用旧版 vLLM（需 patch）](#使用旧版-vllm需-patch)
+- vLLM `0.17.2` ~ `0.28.x`：内置 FlexKVConnectorV1，无需打 patch，直接使用
+- vLLM `0.33.0`：需给内置 FlexKVConnectorV1 打 patch，参见[给 vLLM 打 patch](#给-vllm-打-patch)
+- vLLM `0.10.1` ~ `0.17.1`：需手动 apply patch，参见[给 vLLM 打 patch](#给-vllm-打-patch)
 
 ### 配置
 
@@ -48,16 +49,20 @@ enable_gds: false
 EOF
 export FLEXKV_CONFIG_PATH="./flexkv_config.yml"
 ```
+#### 示例三：以 radixshmem 作为 CPU 层
+CPU 层及其前缀索引由 [radixshmem](../radixshmem/config_zh.md) 的 `radix-server` 承担，每节点一个；CPU 缓存大小由它的 `--data-bytes` 决定，而不是 `cpu_cache_gb`。
+```bash
+radix-server --name /flexkv --data-bytes 64G
+export FLEXKV_ENABLE_RADIXSHMEM=1
+```
 
 > 注：`flexkv_config.yml`配置仅为简单示例，选项请参考[`docs/flexkv_config_reference/README_zh.md`](../../docs/flexkv_config_reference/README_zh.md)
 
-### 运行（推荐：vLLM >= 0.17.2，无需 patch）
+### 运行
 
-1. 安装 vLLM（>= 0.17.2 正式版，或从官方 main 分支源码安装）
+1. 安装 vLLM，所用版本需要时再打 patch（参见[给 vLLM 打 patch](#给-vllm-打-patch)）
 ```bash
-pip install 'vllm>=0.17.2'
-# 或从源码安装最新 main 分支：
-# git clone https://github.com/vllm-project/vllm.git && cd vllm && pip install -e .
+pip install 'vllm==0.33.0'
 ```
 
 2. 安装 FlexKV
@@ -102,8 +107,8 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
 
 必须设置 `use_layerwise=true`，使 vLLM 选择 PIECEWISE CUDA Graph 模式；
 逐层 eventfd 等待无法在完整 CUDA Graph 捕获/回放中正确执行。为保证安全，
-仅设置 `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1` 会被 vLLM adapter 忽略。在对应的
-vLLM wrapper 改动合入上游前，请给 vLLM 应用
+仅设置 `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1` 会被 vLLM adapter 忽略。vLLM 0.33.0
+的 patch 已包含对应的 wrapper 改动；其他版本在该改动合入上游前，请给 vLLM 应用
 `examples/vllm_adaption/vllm_main-flexkv-layerwise-wrapper.patch`。
 
 当前仅对 GET/H2D 做逐层流水；PUT 仍是请求级异步。
@@ -114,15 +119,16 @@ vLLM wrapper 改动合入上游前，请给 vLLM 应用
 `FLEXKV_LAYERWISE_WAIT_TIMEOUT_S`（默认 `60` 秒）内未就绪，forward 会失败，
 而不是永久卡住。
 
-### 使用旧版 vLLM（需 patch）
+### 给 vLLM 打 patch
 
-如需在 vLLM < 0.17.2 上使用 FlexKV，请手动 apply 对应版本的 patch：
+请 apply 与 vLLM 版本对应的 patch：
 
 | vLLM 版本 | patch 文件 |
 |---|---|
 | 0.10.1.1 | `examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch` |
 | 0.14.1+ | `examples/vllm_adaption/vllm_up_0_14_1-flexkv-connector.patch` |
 | 0.16.0 | `examples/vllm_adaption/vllm_0_16_0-flexkv-connector.patch` |
+| 0.33.0 | `examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch` |
 
 ```bash
 cd vllm
@@ -130,6 +136,13 @@ cd vllm
 PATCH_FILE=vllm_0_16_0-flexkv-connector.patch
 git apply "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 pip install -e .
+```
+
+0.33.0 的 patch 只修改内置 connector：把 vLLM 的 `KVCacheConfig` 传给 FlexKV，
+并转发缓存清空、sleep/wake 和逐层加载。它也可以直接打到已安装的 wheel 上：
+```bash
+cd "$(python -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"
+git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch"
 ```
 
 ---

@@ -6,7 +6,7 @@
 
 Starting from **vLLM v0.17.2rc0** (commit [`8cb24d3`](https://github.com/vllm-project/vllm/commit/8cb24d3aedb9f431fb15a636a3e11a00262f5991)), `FlexKVConnectorV1` is built into vLLM — **no patch is needed anymore**.
 
-> **Recommended**: Install vLLM >= v0.17.2 (stable release) or build from the latest `main` branch directly. The patch files under `examples/vllm_adaption/` are retained for users who need to use vLLM < 0.17.2.
+> **Recommended**: Install vLLM v0.17.2 ~ v0.28.x, or v0.33.0 with [its patch](#patching-vllm). Since v0.29.0 the built-in connector can no longer start FlexKV. The other patch files under `examples/vllm_adaption/` are retained for users who need to use vLLM < 0.17.2.
 
 ---
 
@@ -25,8 +25,9 @@ This change involves significant API adjustments. Therefore, please note:
 
 ### Supported Versions
 - FlexKV >= `1.0.0`
-- **vLLM >= `0.17.2` (recommended)**: FlexKVConnectorV1 is built in — no patch required
-- vLLM `0.10.1` ~ `0.17.1`: Manual patch required, see [Using Older vLLM (Patch Required)](#using-older-vllm-patch-required)
+- vLLM `0.17.2` ~ `0.28.x`: FlexKVConnectorV1 is built in — no patch required
+- vLLM `0.33.0`: the built-in FlexKVConnectorV1 must be patched, see [Patching vLLM](#patching-vllm)
+- vLLM `0.10.1` ~ `0.17.1`: Manual patch required, see [Patching vLLM](#patching-vllm)
 
 ### Configuration
 
@@ -48,16 +49,20 @@ enable_gds: false
 EOF
 export FLEXKV_CONFIG_PATH="./flexkv_config.yml"
 ```
+#### Example 3: radixshmem as the CPU Tier
+The CPU tier and its prefix index live in a [radixshmem](../radixshmem/config_en.md) `radix-server`, one per node; its `--data-bytes`, not `cpu_cache_gb`, sets the CPU cache size.
+```bash
+radix-server --name /flexkv --data-bytes 64G
+export FLEXKV_ENABLE_RADIXSHMEM=1
+```
 
 > Note: The `flexkv_config.yml` configuration is provided as a simple example only. For full parameter options, please refer to [`docs/flexkv_config_reference/README_en.md`](../../docs/flexkv_config_reference/README_en.md)
 
-### Running (Recommended: vLLM >= 0.17.2, No Patch Needed)
+### Running
 
-1. Install vLLM (>= 0.17.2 stable, or build from official `main` branch)
+1. Install vLLM, then patch it if its version needs it (see [Patching vLLM](#patching-vllm))
 ```bash
-pip install 'vllm>=0.17.2'
-# Or install from source (latest main):
-# git clone https://github.com/vllm-project/vllm.git && cd vllm && pip install -e .
+pip install 'vllm==0.33.0'
 ```
 
 2. Install FlexKV
@@ -104,7 +109,8 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
 `use_layerwise=true` is required so vLLM selects PIECEWISE CUDA graph mode;
 the per-layer eventfd waits cannot execute correctly inside a captured full
 CUDA graph. For safety, setting `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1` alone is
-ignored by the vLLM adapter. Until the matching vLLM wrapper change is merged upstream, apply
+ignored by the vLLM adapter. The vLLM 0.33.0 patch already contains the
+matching wrapper change; for other versions, until it is merged upstream, apply
 `examples/vllm_adaption/vllm_main-flexkv-layerwise-wrapper.patch` to vLLM.
 
 The feature currently pipelines GET/H2D only. PUT remains request-level async.
@@ -116,15 +122,16 @@ If a layer does not become ready within
 `FLEXKV_LAYERWISE_WAIT_TIMEOUT_S` (default `60` seconds), the forward fails
 instead of hanging indefinitely.
 
-### Using Older vLLM (Patch Required)
+### Patching vLLM
 
-If you need to use FlexKV with vLLM < 0.17.2, apply the corresponding patch manually:
+Apply the patch matching your vLLM version:
 
 | vLLM Version | Patch File |
 |---|---|
 | 0.10.1.1 | `examples/vllm_adaption/vllm_0_10_1_1-flexkv-connector.patch` |
 | 0.14.1+ | `examples/vllm_adaption/vllm_up_0_14_1-flexkv-connector.patch` |
 | 0.16.0 | `examples/vllm_adaption/vllm_0_16_0-flexkv-connector.patch` |
+| 0.33.0 | `examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch` |
 
 ```bash
 cd vllm
@@ -132,6 +139,14 @@ cd vllm
 PATCH_FILE=vllm_0_16_0-flexkv-connector.patch
 git apply "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 pip install -e .
+```
+
+The 0.33.0 patch only touches the built-in connector, which then passes vLLM's
+`KVCacheConfig` to FlexKV and forwards cache reset, sleep/wake and layer-wise
+loading. It also applies to an installed wheel:
+```bash
+cd "$(python -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"
+git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch"
 ```
 
 ---

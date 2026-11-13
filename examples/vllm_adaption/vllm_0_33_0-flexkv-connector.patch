@@ -1,0 +1,191 @@
+diff --git a/tests/v1/kv_connector/unit/test_flexkv_connector.py b/tests/v1/kv_connector/unit/test_flexkv_connector.py
+index 061ec3f..206dfe7 100644
+--- a/tests/v1/kv_connector/unit/test_flexkv_connector.py
++++ b/tests/v1/kv_connector/unit/test_flexkv_connector.py
+@@ -125,6 +125,45 @@ class TestFlexKVConnectorImportError:
+         assert "https://github.com/taco-project/FlexKV" in str(exc_info.value)
+ 
+ 
++class TestFlexKVConnectorConfig:
++    def test_kv_cache_config_is_forwarded(self):
++        from vllm.distributed.kv_transfer.kv_connector.v1.flexkv_connector import (
++            FlexKVConnectorV1,
++        )
++
++        vllm_config = _make_vllm_config()
++        kv_cache_config = _make_kv_cache_config()
++        with _install_flexkv_mock(MagicMock()):
++            FlexKVConnectorV1(vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config)
++            impl_cls = sys.modules[
++                "flexkv.integration.vllm.vllm_v1_adapter"
++            ].FlexKVConnectorV1Impl
++        impl_cls.assert_called_once_with(
++            vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
++        )
++
++    def test_requires_token_major_layout(self):
++        from vllm.distributed.kv_transfer.kv_connector.v1.flexkv_connector import (
++            FlexKVConnectorV1,
++        )
++
++        assert FlexKVConnectorV1.get_required_kvcache_layout(MagicMock()) == "LBNHC"
++
++    def test_piecewise_cudagraph_required_only_for_layerwise(self):
++        from vllm.distributed.kv_transfer.kv_connector.v1.flexkv_connector import (
++            FlexKVConnectorV1,
++        )
++
++        assert FlexKVConnectorV1.requires_piecewise_for_cudagraph(
++            {"use_layerwise": True}
++        )
++        assert not FlexKVConnectorV1.requires_piecewise_for_cudagraph({})
++
++    def test_saves_are_best_effort(self):
++        connector = _build_connector(_make_vllm_config(), MagicMock())
++        assert not connector.requires_kv_delivery
++
++
+ class TestFlexKVConnectorDelegation:
+     """All public API methods should be forwarded to the impl."""
+ 
+@@ -229,3 +268,28 @@ class TestFlexKVConnectorDelegation:
+         connector, impl = connector_and_impl
+         connector.wait_for_layer_load("layer_0")
+         impl.wait_for_layer_load.assert_called_once_with("layer_0")
++
++    def test_connector_metadata(self, connector_and_impl):
++        connector, impl = connector_and_impl
++        metadata = MagicMock()
++        connector.bind_connector_metadata(metadata)
++        assert connector._get_connector_metadata() is metadata
++        impl.bind_connector_metadata.assert_called_once_with(metadata)
++
++        connector.clear_connector_metadata()
++        assert not connector.has_connector_metadata()
++        impl.clear_connector_metadata.assert_called_once()
++
++    def test_sleep_and_wake(self, connector_and_impl):
++        connector, impl = connector_and_impl
++        connector.unregister_kv_caches()
++        impl.unregister_kv_caches.assert_called_once()
++        connector.restore_kv_caches()
++        impl.restore_kv_caches.assert_called_once()
++
++    @pytest.mark.parametrize("result", [True, False])
++    def test_reset_cache(self, connector_and_impl, result):
++        connector, impl = connector_and_impl
++        impl.reset_cache.return_value = result
++        assert connector.reset_cache() is result
++        impl.reset_cache.assert_called_once()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
+index bbb64cf..8610e30 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
+@@ -53,6 +53,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+             '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}'
+     """
+ 
++    @property
++    def requires_kv_delivery(self) -> bool:
++        # A best-effort cache: a dropped save is just a future cache miss.
++        return False
++
+     def __init__(
+         self,
+         vllm_config: "VllmConfig",
+@@ -71,27 +76,45 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+                 "for installation instructions."
+             ) from e
+ 
+-        self._flexkv_connector = FlexKVConnectorV1Impl(vllm_config, role)
++        self._flexkv_connector = FlexKVConnectorV1Impl(
++            vllm_config, role, kv_cache_config
++        )
+ 
+     def shutdown(self):
+         self._flexkv_connector.shutdown()
+ 
++    @classmethod
++    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
++        """FlexKV addresses each layer's blocks token-major."""
++        return "LBNHC"
++
++    @classmethod
++    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
++        """Layer-wise loads wait for each layer between CUDA graph pieces."""
++        return bool(extra_config.get("use_layerwise", False))
++
+     # ==============================
+     # Worker-side methods
+     # ==============================
++    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
++        super().bind_connector_metadata(connector_metadata)
++        self._flexkv_connector.bind_connector_metadata(connector_metadata)
++
++    def clear_connector_metadata(self) -> None:
++        self._flexkv_connector.clear_connector_metadata()
++        super().clear_connector_metadata()
++
+     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+-        """No-op for FlexKV (currently).
++        """Bind this step's layer-wise loads, if any.
+ 
+         FlexKV manages all KV transfers on the **scheduler side** via
+         ``build_connector_meta`` (which calls ``launch_tasks``) and
+         ``update_connector_output`` (which polls ``query_finished_task``).
+         KV blocks are transferred directly between the FlexKV server and
+         vLLM's GPU memory without worker-side intervention during the
+-        forward pass — similar to how NIXL operates.
+-
+-        These worker-side hooks are kept (rather than omitted) to satisfy
+-        the ``KVConnectorBase_V1`` interface contract and to serve as
+-        extension points for a future worker-side layer-pipelining path.
++        forward pass — similar to how NIXL operates. With ``use_layerwise``
++        this binds the per-layer completion events of the loads that
++        ``wait_for_layer_load`` waits on.
+ 
+         Args:
+             forward_context (ForwardContext): the forward context.
+@@ -101,13 +124,10 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+         self._flexkv_connector.start_load_kv(forward_context, **kwargs)
+ 
+     def wait_for_layer_load(self, layer_name: str) -> None:
+-        """No-op for FlexKV (currently).
+-
+-        FlexKV manages all KV transfers on the scheduler side.
+-        This hook is retained for ``KVConnectorBase_V1`` API compatibility.
++        """Block until the layer's KV is loaded (layer-wise loading only).
+ 
+         Args:
+-            layer_name: the name of the layer (unused).
++            layer_name: the name of the layer.
+ 
+         """
+         self._flexkv_connector.wait_for_layer_load(layer_name)
+@@ -177,6 +197,14 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+         """
+         self._flexkv_connector.register_kv_caches(kv_caches)
+ 
++    def unregister_kv_caches(self) -> None:
++        """Release FlexKV's mappings of the KV caches before sleep."""
++        self._flexkv_connector.unregister_kv_caches()
++
++    def restore_kv_caches(self) -> None:
++        """Register the KV caches with FlexKV again after wake-up."""
++        self._flexkv_connector.restore_kv_caches()
++
+     # ==============================
+     # Scheduler-side methods
+     # ==============================
+@@ -268,3 +296,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+     def get_block_ids_with_load_errors(self) -> set[int]:
+         """Get the block ids that have failed to load."""
+         return self._flexkv_connector.get_block_ids_with_load_errors()
++
++    def reset_cache(self) -> bool | None:
++        """Drop every tier of the FlexKV cache.
++
++        Returns False while transfers are still in flight; retry once they
++        have drained.
++        """
++        return self._flexkv_connector.reset_cache()
