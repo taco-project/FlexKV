@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 import numpy as np
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.radix_prefetch import PrefetchWaiter
 from flexkv.common.transfer import DeviceType
 
 if TYPE_CHECKING:  # these pull in the C++ extension; keep them off import time
@@ -50,6 +51,8 @@ COMPONENT_SWA = radixshmem.ComponentType.SWA
 
 def _empty_i64() -> np.ndarray:
     return np.empty(0, dtype=np.int64)
+
+
 
 
 @dataclass
@@ -211,12 +214,16 @@ class CacheEngineRadixShmem:
 
     def reset(self) -> None:
         """Clear the tree. Invalidates outstanding slot ids and matches."""
+        stats = getattr(self._client, "transfer_stats", lambda: {})()
+        if stats.get("pending", 0):
+            raise RuntimeError("radixshmem reset requires physical peer pulls to drain")
         self._tree.reset()
 
     def close(self) -> None:
-        client, self._client, self._tree = self._client, None, None
+        client = self._client
         if client is not None:
             client.close()
+            self._client = self._tree = None
 
     @staticmethod
     def _hashes(sequence_meta: SequenceMeta, query_end: Optional[int]) -> np.ndarray:
@@ -288,7 +295,7 @@ class CacheEngineRadixShmem:
             f"radixshmem prefetch on {self.shm_name}: mask={component_mask:#x} "
             f"blocks={len(hashes)} local_hit={job.local_hit} "
             f"planned_hit={job.planned_hit} job={job.job_id}")
-        return job
+        return PrefetchWaiter(job, int(timeout_ms))
 
     def insert(self,
                sequence_meta: SequenceMeta,

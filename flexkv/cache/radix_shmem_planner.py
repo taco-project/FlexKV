@@ -389,7 +389,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
     def _prefetch_inflight(self) -> int:
         """Peer pulls this engine started that have not finished yet."""
         live = [job for job in self._prefetch_jobs
-                if not job.done() and not getattr(job, "cancelled", False)]
+                if not getattr(job, "resources_released", job.done())]
         self._prefetch_jobs = live
         return len(live)
 
@@ -433,8 +433,6 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         plan.prefetch_job = job
         plan.prefetch_local_hit_blocks = int(job.local_hit)
         plan.prefetch_planned_hit_blocks = int(job.planned_hit)
-        if self._metrics_collector is not None and job.planned_hit > job.local_hit:
-            self._metrics_collector.record_cache_hit("peer", job.planned_hit - job.local_hit)
         return plan
 
     def _plan_put(self,
