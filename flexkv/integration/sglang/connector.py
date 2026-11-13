@@ -220,6 +220,7 @@ class FlexKVConnector:
       * ``reset`` / ``shutdown``.
     """
 
+    supports_draft_cache = True
     _chunked_namespace_supported = True
 
     @property
@@ -247,6 +248,7 @@ class FlexKVConnector:
         pp_group: Any = None,
         attn_tp_group: Any = None,
         attn_cp_group: Any = None,
+        draft_kv_pools: Tuple[Any, ...] = (),
     ) -> None:
         self.page_size = int(page_size)
 
@@ -331,6 +333,9 @@ class FlexKVConnector:
         self._is_dsv4 = _is_sglang_dsv4(sgl_model_config)
         self._dsv4_layer_groups: List[Dict[str, Any]] = []
         self._dsv4_state_groups: List[Dict[str, Any]] = []
+        self._draft_cache_plan = None
+        self._draft_kv_pools = tuple(draft_kv_pools)
+        self.cache_format_namespace = None
         self._deduplicate_indexer_group = os.getenv(
             "FLEXKV_DEDUP_INDEXER_GROUP", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -349,6 +354,44 @@ class FlexKVConnector:
             )
 
         kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
+        if self._draft_kv_pools:
+            if self.model_config.pp_size != 1 or self.model_config.kv_dim != 1:
+                raise NotImplementedError("FlexKV draft caches currently require PP1 MLA/DeepSeek pools")
+            from flexkv.integration.sglang.draft_cache import (
+                build_draft_cache_plan, standard_target_groups,
+            )
+            target_layers = self.rank_info.num_layers_per_pp_stage
+            target_groups = (self._dsv4_layer_groups if self._is_dsv4 else
+                             standard_target_groups(kvcache, self.page_size, target_layers, indexer_group))
+            self._draft_cache_plan = build_draft_cache_plan(
+                target_pool=kvcache, draft_pools=self._draft_kv_pools,
+                target_layers=target_layers, page_size=self.page_size,
+                target_groups=target_groups, is_dsv4=self._is_dsv4,
+                identity={key: getattr(server_args, key, None) for key in (
+                    "model_path", "revision", "speculative_algorithm",
+                    "speculative_draft_model_path", "speculative_draft_model_revision",
+                    "kv_cache_dtype", "speculative_draft_kv_cache_dtype",
+                    "tp_size", "pp_size", "dp_size", "attn_dp_size", "attn_cp_size",
+                    "dcp_size", "nnodes", "enable_dp_attention", "speculative_draft_tp_size")},
+            )
+            self.cache_format_namespace = "sglang-draft-cache-v1:" + self._draft_cache_plan.fingerprint
+            self._dsv4_layer_groups = self._draft_cache_plan.full_groups
+            kv_caches = [buffer for group in self._dsv4_layer_groups for buffer in group["buffers"]]
+            indexer_group = None
+            model_config = replace(self.model_config,
+                num_layers=self._draft_cache_plan.transfer_layers, layer_groups=None)
+            model_config.freeze()
+            self.model_config = self.flexkv_config.model_config = model_config
+            self.rank_info = replace(self.rank_info, model_config=model_config,
+                                     pp_end_layer=self._draft_cache_plan.transfer_layers)
+            self.cache_config._num_layers_per_pp_stage = self._draft_cache_plan.transfer_layers
+            if self.cache_config.swa is not None:
+                self.cache_config.swa.num_swa_layers = self._draft_cache_plan.transfer_layers
+                if len(self._draft_cache_plan.swa_groups) > 1:
+                    self.cache_config.swa.multi_group = True
+            logger.info("[FlexKV] draft cache modes=%s target_layers=%d transfer_layers=%d format=%s",
+                        self._draft_cache_plan.modes, target_layers,
+                        self._draft_cache_plan.transfer_layers, self.cache_format_namespace)
         if self._swa_kv_pool is not None and self.cache_config.swa is not None:
             buffers = self._swa_kv_pool.kv_buffer
             snapshot_bytes = sum(
@@ -359,6 +402,11 @@ class FlexKVConnector:
                     int(group["sub_page_size"]) * buffer[0].numel() * buffer.element_size()
                     for buffer in group["buffers"]
                 )
+            if getattr(self, "_draft_cache_plan", None) is not None:
+                snapshot_bytes += sum(buffer[0].numel() * buffer.element_size()
+                    for group in self._draft_cache_plan.swa_groups
+                    for buffer in group["buffers"]
+                    if not any(buffer is target for target in buffers))
             self.cache_config.swa.snapshot_bytes = snapshot_bytes
 
         # Heterogeneous groups change the bytes represented by one logical
@@ -1952,7 +2000,18 @@ class FlexKVConnector:
             or not hasattr(kvcache, "register_layer_transfer_counter")
         ):
             return
-        kvcache.register_layer_transfer_counter(self.layer_done_counter)
+        if getattr(self, "_draft_cache_plan", None) is None:
+            kvcache.register_layer_transfer_counter(self.layer_done_counter)
+            return
+        from flexkv.integration.sglang.draft_cache import (
+            DraftTransferCounter, TargetDraftTransferCounter,
+        )
+        plan = self._draft_cache_plan
+        kvcache.register_layer_transfer_counter(TargetDraftTransferCounter(
+            self.layer_done_counter, plan.target_layers, plan.transfer_layers))
+        for pool in self._draft_kv_pools:
+            pool.register_layer_transfer_counter(DraftTransferCounter(
+                self.layer_done_counter, plan.transfer_layers))
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -2645,7 +2704,7 @@ class FlexKVConnector:
     ) -> None:
         if self.model_config.layer_groups is None:
             layer_groups = None
-            if self._is_dsv4:
+            if self._is_dsv4 or getattr(self, "_draft_cache_plan", None) is not None:
                 layer_groups = self._build_dsv4_layer_group_specs()
             elif indexer_group is not None:
                 layer_groups = self._build_indexer_layer_group_specs(
@@ -2771,7 +2830,7 @@ class FlexKVConnector:
         indexer_group: Optional[_IndexerBufferGroup] = None,
     ) -> None:
         assert len(kv_caches) > 0
-        if self._is_dsv4:
+        if self._is_dsv4 or getattr(self, "_draft_cache_plan", None) is not None:
             self._register_dsv4_to_server(kv_caches)
         else:
             self._register_standard_to_server(kv_caches, indexer_group)
@@ -2845,6 +2904,32 @@ class FlexKVConnector:
         gpu_layouts, handles_per_group), all None when the model has no SWA
         pool. Shared by the GPU registration and by the radixshmem bootstrap,
         which must know the sidecar groups before the TE sees a registration."""
+        if getattr(self, "_draft_cache_plan", None) is not None and self._draft_cache_plan.swa_groups:
+            groups = list(self._draft_cache_plan.swa_groups)
+            for state in self._dsv4_state_groups:
+                groups.append(dict(state, sub_page_size=state["sub_page_size"]))
+            layouts, specs, handles = [], [], []
+            for group in groups:
+                sample = group["buffers"][0]
+                page = int(group["sub_page_size"])
+                # Paged state groups store one ring row per token; their raw
+                # tensors have not yet been viewed as page rows.
+                is_state = "head_size" in group
+                width = int(group["head_size"]) if is_state else sample.shape[1] // page
+                pages = sample.shape[0] // page if is_state else sample.shape[0]
+                layouts.append(KVCacheLayout(type=KVCacheLayoutType.LAYERFIRST,
+                    num_layer=len(group["buffers"]), num_block=pages,
+                    tokens_per_block=page, num_head=1, head_size=width,
+                    kv_dim=1, num_kv_heads=1))
+                specs.append(LayerGroupSpec(num_layers=len(group["layer_ids"]),
+                    num_kv_heads=1, head_size=width, layer_indices=list(group["layer_ids"]),
+                    compress_ratio=int(group["ratio"]), dtype=sample.dtype))
+                handles.append(list(group["buffers"]))
+            first = layouts[0]
+            primary = KVCacheLayout(type=first.type, num_layer=self._draft_cache_plan.transfer_layers,
+                num_block=first.num_block, tokens_per_block=first.tokens_per_block,
+                num_head=first.num_head, head_size=first.head_size, kv_dim=1, num_kv_heads=1)
+            return ([b for group in handles for b in group], primary, specs, layouts, handles)
         swa_caches = None
         swa_layout = None
         swa_layer_groups = None
