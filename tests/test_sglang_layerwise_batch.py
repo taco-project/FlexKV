@@ -13,6 +13,8 @@ import torch
 from flexkv.integration.sglang.comm import FlexKVLayerDoneCounter
 from flexkv.integration.sglang.connector import FlexKVConnector
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def connector():

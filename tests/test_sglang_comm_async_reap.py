@@ -3,6 +3,8 @@ import pytest
 
 from flexkv.integration.sglang.comm import FlexKVComm
 
+pytestmark = pytest.mark.unit
+
 
 class Work:
     def __init__(self, error=None):

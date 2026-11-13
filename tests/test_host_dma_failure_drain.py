@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture(scope="module")
 def failure_probe(tmp_path_factory):
