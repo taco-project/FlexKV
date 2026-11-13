@@ -115,10 +115,13 @@ def build_draft_cache_plan(*, target_pool, draft_pools, target_layers, page_size
                 raise ValueError("Draft/target SWA slot capacities differ")
             source_map = getattr(target_pool, "full_to_swa_index_mapping", None)
             draft_map = getattr(pool, "full_to_swa_index_mapping", None)
-            if (
-                source_map is not None
-                and draft_map is not source_map
-                and (draft_map is None or draft_map.data_ptr() != source_map.data_ptr())
+            if draft_map is not source_map and (
+                source_map is None
+                or draft_map is None
+                or draft_map.data_ptr() != source_map.data_ptr()
+                or draft_map.dtype != source_map.dtype
+                or draft_map.shape != source_map.shape
+                or draft_map.stride() != source_map.stride()
             ):
                 raise ValueError("Draft SWA must share the target full-to-SWA mapping")
             candidate = _group(f"draft{index}_swa", list(draft_swa.kv_buffer), layers, int(draft_swa.page_size))

@@ -130,6 +130,43 @@ def test_deepseek_swa_keeps_three_draft_layers_with_target_mapping(draft_dtype, 
         )
 
 
+@pytest.mark.parametrize("mapping_kind", ["target_missing", "draft_missing", "dtype_alias", "shape_alias"])
+def test_swa_mapping_contract_rejects_missing_or_reinterpreted_aliases(mapping_kind):
+    source = torch.arange(16)
+    target_map, draft_map = source, source
+    if mapping_kind == "target_missing":
+        target_map = None
+    elif mapping_kind == "draft_missing":
+        draft_map = None
+    elif mapping_kind == "dtype_alias":
+        draft_map = source.view(torch.int32)
+    else:
+        draft_map = source.view(4, 4)
+    target = NS(
+        layer_num=2,
+        swa_size=16,
+        full_to_swa_index_mapping=target_map,
+        swa_kv_pool=NS(page_size=4, kv_buffer=[torch.zeros(4, 32, dtype=torch.uint8) for _ in range(2)]),
+    )
+    draft = NS(
+        layer_num=1,
+        compression_ratios=[0],
+        swa_size=16,
+        full_to_swa_index_mapping=draft_map,
+        swa_kv_pool=NS(page_size=4, kv_buffer=[torch.ones(4, 32, dtype=torch.uint8)]),
+    )
+    with pytest.raises(ValueError, match="mapping"):
+        module.build_draft_cache_plan(
+            target_pool=target,
+            draft_pools=(draft,),
+            target_layers=2,
+            page_size=4,
+            target_groups=module.standard_target_groups(mla(2), 4, 2),
+            is_dsv4=True,
+            identity={},
+        )
+
+
 def test_request_ring_does_not_become_a_prefix_sidecar():
     target, draft = mla(2), mla(1)
     draft.swa_req_ring_size = 256
