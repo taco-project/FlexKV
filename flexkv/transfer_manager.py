@@ -1107,6 +1107,13 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         ready_event,
                         start_event,
                         error_conn) -> None:
+        # The bound target ships this handle, the parent's ends of the pipes
+        # included. Holding them, this process would never see the command
+        # pipe close when the parent dies, and would outlive it.
+        self.command_parent_conn.close()
+        self.result_parent_conn.close()
+        self.error_parent_conn.close()
+
         # This process allocates the shared CPU KV pool for all GPUs and spawns
         # the transfer workers; drop the launcher's (GPU0) NUMA binding first.
         reset_inherited_numa_binding("TransferManager")
