@@ -22,6 +22,7 @@ from flexkv.common.transfer import (
     DeviceType,
     TransferOpGraph,
     TransferType,
+    batch_mergeable,
     get_nvtx_default_color,
     invoke_op_callback,
     merge_to_batch_graph,
@@ -1818,7 +1819,12 @@ class KVTaskEngine(KVTaskManager):
 
         all_get = all(self.tasks[tid].task_type == TaskType.GET for tid in task_ids)
         all_put = all(self.tasks[tid].task_type == TaskType.PUT for tid in task_ids)
-        if (len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put):
+        # A graph with ops the merge cannot fuse (a global-dedup PUT's
+        # H2PEERSSD) goes out on its own, in the same submit.
+        mergeable = layerwise_transfer or all(
+            batch_mergeable(self.tasks[tid].graph) for tid in task_ids)
+        if ((len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put)
+                and mergeable):
             if batch_id == -1:
                 batch_id = self._gen_task_id()
             if layerwise_transfer:

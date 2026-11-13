@@ -996,6 +996,18 @@ def _add_batch_sink(graph: TransferOpGraph, terminals: List[int],
     return sink.op_id
 
 
+BATCH_MERGE_TYPES = frozenset({TransferType.DISK2H, TransferType.H2D,
+                               TransferType.D2H, TransferType.H2DISK,
+                               TransferType.H2REMOTE, TransferType.REMOTE2H})
+
+
+def batch_mergeable(graph: Optional[TransferOpGraph]) -> bool:
+    """Whether merge_to_batch_graph can fuse this graph's ops."""
+    return graph is None or all(op.transfer_type in BATCH_MERGE_TYPES
+                                or op.transfer_type == TransferType.VIRTUAL
+                                for op in graph._op_map.values())
+
+
 def merge_to_batch_graph(batch_id: int,
                          transfer_graphs: List[TransferOpGraph],
                          task_end_op_ids: List[int],
@@ -1041,9 +1053,7 @@ def merge_to_batch_graph(batch_id: int,
     callbacks_by_type: Dict[TransferType, List[Tuple[TransferOp, Callable]]] = {}
     swa_ops_by_type: Dict[TransferType, List[TransferOp]] = {}
     swa_callbacks_by_type: Dict[TransferType, List[Tuple[TransferOp, Callable]]] = {}
-    supported_types = {TransferType.DISK2H, TransferType.H2D,
-                       TransferType.D2H, TransferType.H2DISK,
-                       TransferType.H2REMOTE, TransferType.REMOTE2H}
+    supported_types = BATCH_MERGE_TYPES
 
     for tt in supported_types:
         ops_by_type[tt] = []
