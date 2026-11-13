@@ -179,6 +179,10 @@ if libcuda is not None:
     _CUresult = ctypes.c_int
     _CUdeviceptr = ctypes.c_ulonglong  # 64-bit device address
 
+    libcuda.cuMemGetAddressRange_v2.restype = _CUresult
+    libcuda.cuMemGetAddressRange_v2.argtypes = [
+        ctypes.POINTER(_CUdeviceptr), ctypes.POINTER(ctypes.c_size_t), _CUdeviceptr
+    ]
     libcuda.cuPointerGetAttribute.restype = _CUresult
     libcuda.cuPointerGetAttribute.argtypes = [
         ctypes.c_void_p, ctypes.c_int, _CUdeviceptr
@@ -666,7 +670,7 @@ class TensorSharedHandle:
 
         try:
             ## Try direct CUDA IPC export
-            self.ipc_handle = self._export_cuda_ipc_handle(tensor)
+            self.ipc_handle, self.offset = self._export_cuda_ipc_handle(tensor)
             self.use_direct_ipc = True
             self.handle_type = "cuda_ipc"
             self.tensor_shape = tuple(tensor.shape)
@@ -677,7 +681,6 @@ class TensorSharedHandle:
             )
             self.rebuild_func = None
             self.rebuild_args = None
-            self.offset = 0    ## only used when constructing from direct ipc handle
             flexkv_logger.info(
                 f"Tensor exported via direct CUDA IPC: tensor.device={tensor.device}, passed device_id={device_id}, final self.device={self.device}"
             )
@@ -1250,7 +1253,7 @@ class TensorSharedHandle:
 
     ## Export CUDA IPC handle
     @staticmethod
-    def _export_cuda_ipc_handle(tensor: torch.Tensor) -> bytes:
+    def _export_cuda_ipc_handle(tensor: torch.Tensor) -> Tuple[bytes, int]:
         """
         Use CUDA IPC API to export the tensor's IPC handle
         """
@@ -1265,13 +1268,29 @@ class TensorSharedHandle:
         # Ensure we're on the correct device
         torch.cuda.set_device(device)
 
+        if not tensor.is_contiguous():
+            raise ValueError("Direct CUDA IPC requires a contiguous tensor")
+        if libcuda is None:
+            raise RuntimeError("CUDA driver is required to resolve the IPC allocation base")
+        allocation_base = ctypes.c_ulonglong()
+        allocation_bytes = ctypes.c_size_t()
+        result = libcuda.cuMemGetAddressRange_v2(
+            ctypes.byref(allocation_base), ctypes.byref(allocation_bytes),
+            ctypes.c_ulonglong(data_ptr))
+        if result != 0:
+            raise RuntimeError(f"cuMemGetAddressRange_v2 failed: code={result}, ptr={hex(data_ptr)}")
+        offset = data_ptr - allocation_base.value
+        if offset < 0 or offset + tensor.numel() * tensor.element_size() > allocation_bytes.value:
+            raise RuntimeError("CUDA IPC tensor extends outside its allocation")
+        # IPC opens the CUDA allocation base, not the tensor/storage view base.
+        # PyTorch's allocator can suballocate even tensors with storage_offset=0.
         # Create IPC handle buffer
         # ipc_handle = ctypes.create_string_buffer(CUDA_IPC_HANDLE_SIZE)
         ipc_handle = cudaIpcMemHandle_t()
 
         # Call cudaIpcGetMemHandle
         result = cudart.cudaIpcGetMemHandle(
-            ctypes.byref(ipc_handle), ctypes.c_void_p(data_ptr)
+            ctypes.byref(ipc_handle), ctypes.c_void_p(allocation_base.value)
         )
 
         if result != cudaSuccess:
@@ -1285,7 +1304,7 @@ class TensorSharedHandle:
         flexkv_logger.debug(
             f"IPC handle exported successfully, first 16 bytes: {handle_bytes.hex()}"
         )
-        return handle_bytes
+        return handle_bytes, offset
 
     ## Import CUDA IPC handle
     @staticmethod

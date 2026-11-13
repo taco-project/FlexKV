@@ -2453,6 +2453,10 @@ class FlexKVConnector:
                 (any(type(i) is not int for i in explicit_ids) or list(explicit_ids) != active))):
             raise ValueError("Indexer active IDs disagree with skip_topk_layers")
         index_scratch = getattr(pool, "remote_index_k_with_scale_buffer", None)
+        if index_scratch is None:
+            # Newer SGLang keeps the receive scratch on the IndexKeyCache
+            # facade (LayerSplitIndexKeyCache.remote_buffer).
+            index_scratch = getattr(getattr(pool, "index_key_cache", None), "remote_buffer", None)
         if (index_scratch is None or index_scratch.ndim != 2
                 or index_scratch.shape[0] != blocks or index_scratch.shape[1] <= 0
                 or not index_scratch.is_contiguous()
@@ -2613,11 +2617,13 @@ class FlexKVConnector:
     ) -> _IndexerBufferGroup:
         """Drop static ``skip_topk`` aliases from the FlexKV indexer group.
 
-        This first implementation supports ordinary TP/CP, where every cache
-        rank exposes the same physical Index-K buffers.  DSA cache layer split
-        also represents non-owned *active* layers as zero-row tensors; those
-        require an owner-aware registration protocol and must not be inferred
-        from tensor shape here.
+        This path covers ordinary TP/CP, where every cache rank exposes the
+        same physical Index-K buffers.  DSA cache layer split does not come
+        here: ``_resolve_kv_buffers`` routes it to ``_resolve_cp_kv_buffers``,
+        which prunes with the owner map (owned active layers keep their
+        buffer, non-owned active layers alias the receive scratch).  Shape
+        alone cannot tell a non-owned active layer from a skipped one, hence
+        the guard below.
         """
         buffers = list(indexer_buffers)
         if any(type(value) is not bool for value in skip_topk_layers):
@@ -2625,9 +2631,8 @@ class FlexKVConnector:
         skip_mask = list(skip_topk_layers)
         if layer_shard_enabled:
             raise RuntimeError(
-                "FLEXKV_DEDUP_INDEXER_GROUP does not yet support "
-                "CP DSA cache layer split; disable "
-                "--enable-dsa-cache-layer-split or disable indexer dedup"
+                "CP DSA cache layer split must be pruned by the owner-aware "
+                "_resolve_cp_kv_buffers path, not the shape-based compactor"
             )
         if len(skip_mask) != len(buffers):
             raise RuntimeError(
@@ -2688,10 +2693,6 @@ class FlexKVConnector:
         self, kvcache: Any
     ) -> Tuple[List[torch.Tensor], Optional[_IndexerBufferGroup]]:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
-        for attr in kvcache.__dict__:
-            print(f"attr: {attr}")
-            print(f"value: {getattr(kvcache, attr)}")
-            print("-"*100)
         self.sparse_indexer = False
         if getattr(kvcache, "layer_shard_enabled", False):
             resolved, cp_indexer_group = self._resolve_cp_kv_buffers(kvcache)

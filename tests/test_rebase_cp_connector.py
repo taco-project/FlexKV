@@ -320,3 +320,30 @@ def test_cache_validation_sglang_store_api_is_available():
     assert not _is_sparse_indexer_group(None)
     assert not _is_sparse_indexer_group(full)
     assert _is_sparse_indexer_group(subset)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_cp_indexer_scratch_from_index_key_cache_facade(rank):
+    """Newer SGLang exposes the receive scratch as index_key_cache.remote_buffer."""
+    c = connector()
+    pool = physical_pool(rank)
+    scratch = pool.remote_index_k_with_scale_buffer
+    del pool.remote_index_k_with_scale_buffer
+    pool.index_key_cache = SimpleNamespace(remote_buffer=scratch)
+    _, index = c._resolve_cp_kv_buffers(pool)
+    assert index.layer_indices == (0, 2)
+    assert index.buffers[1 - rank] is scratch
+
+
+def test_layer_split_with_indexer_dedup_uses_owner_aware_pruning():
+    """A (CP layer split) and B (Indexer pruning) together: no RuntimeError,
+    only active layers registered, non-owned active layers alias scratch."""
+    c = connector()
+    c._is_dsv4 = False
+    pool = physical_pool(rank=0)
+    main, index = c._resolve_kv_buffers(pool)
+    assert len(main) == 4
+    assert index.layer_indices == (0, 2) and index.logical_layer_count == 4
+    assert index.buffers[0] is pool.index_k_with_scale_buffer[0]
+    assert index.buffers[1] is pool.remote_index_k_with_scale_buffer
+    assert c.sparse_indexer is True

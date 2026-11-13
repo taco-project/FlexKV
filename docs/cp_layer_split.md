@@ -80,7 +80,7 @@ Lookup / store / prefetch 的 token→block 逻辑不变。变的是「一个 bl
 | `flexkv/transfer/workers/gpu_cpu.py` | owner-only H2D/D2H；校验 holders 长度与范围 |
 | `flexkv/integration/sglang/connector.py` | `_configure_h2d_holders`、`_resolve_cp_kv_buffers`、注册前 preflight / geometry vote |
 
-相关测试：`tests/test_rebase_cp_shard.py`、`tests/test_rebase_cp_worker.py`、`tests/test_rebase_cp_connector.py`，以及若干 `*_standalone.py`（默认可不进 CI）。
+相关测试：`tests/test_rebase_cp_shard.py`、`tests/test_rebase_cp_worker.py`、`tests/test_rebase_cp_connector.py`。
 
 ## 验收要点
 

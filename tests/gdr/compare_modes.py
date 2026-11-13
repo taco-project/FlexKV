@@ -283,7 +283,9 @@ def run_case(args, arm, direction, blocks, concurrency, layout):
     case_context = f"arm={arm} direction={direction} blocks={blocks} concurrency={concurrency} layout={layout}"
 
     def consume(target, verify):
-        count = getattr(target,"_gdr_signal_count",1)
+        # main/rebase RegionBatchGroup::submit_layerwise has no signal_count;
+        # each layer posts exactly one notification token per rank.
+        count = 1
         started = time.monotonic()
         verification_s = waiting_s = 0.0
         received = 0
@@ -324,7 +326,7 @@ def run_case(args, arm, direction, blocks, concurrency, layout):
             transfer_begin = time.perf_counter_ns() if trace_rows is not None else 0
             try:
                 if h2d:
-                    group.submit_layerwise(reqs,[],0,getattr(target,"_gdr_signal_count",1))
+                    group.submit_layerwise(reqs,[],0)
                     ok,error=group.wait_layer_completion(args.notification_timeout)
                     if not ok:
                         raise TimeoutError(f"native layer completion failed: {case_context}; "
