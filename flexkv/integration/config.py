@@ -383,6 +383,9 @@ class FlexKVConfig:
         update_default_config_from_user_config(rank_info, self.cache_config, self.user_config)
         self.server_recv_port = GLOBAL_CONFIG_FROM_ENV.server_recv_port
         self.gpu_register_port = self.server_recv_port + "_gpu_register"
+        if GLOBAL_CONFIG_FROM_ENV.dp_direct:
+            # Each DP rank has its own TransferEngine and so its own registration endpoint.
+            self.gpu_register_port += f"_dp{rank_info.dp_client_id}"
 
         logger.info(f"[FlexKV vllm] {self.model_config}, {rank_info}")
 
