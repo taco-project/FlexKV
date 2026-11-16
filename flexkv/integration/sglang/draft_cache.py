@@ -57,6 +57,21 @@ def _paged_rows(buffers, page, name):
     return rows
 
 
+def _indexer_group(name, buffers, layers, page, skip=None):
+    """Retain logical IDs when skip-topk layers have no Index-K storage."""
+    if len(buffers) != len(layers) or (skip is not None and len(skip) != len(layers)):
+        raise ValueError(f"{name}: indexer layer metadata length mismatch")
+    if skip is not None:
+        if any(not flag and buffer.numel() == 0 for flag, buffer in zip(skip, buffers)):
+            raise ValueError(f"{name}: missing active indexer buffer")
+        # Ordinary pools can alias a previous active buffer for skip-topk;
+        # layer-split nonowners are rejected before this generic planner.
+        active = [(buffer, layer) for buffer, layer, flag in zip(buffers, layers, skip) if not flag]
+    else:
+        active = [(buffer, layer) for buffer, layer in zip(buffers, layers) if buffer.numel()]
+    return _group(name, [buffer for buffer, _ in active], [layer for _, layer in active], 1, page)
+
+
 def _append(groups, candidate):
     if candidate is None:
         return "empty"
@@ -86,17 +101,26 @@ def build_draft_cache_plan(*, target_pool, draft_pools, target_layers, page_size
     rejected here until their owning reconstruction/alias contract is passed
     explicitly, instead of serializing request-scoped state as prefix pages.
     """
+    if any(getattr(pool, "layer_shard_enabled", False) for pool in (target_pool, *draft_pools)):
+        raise NotImplementedError("Layer-sharded draft caches require an owner-aware layer-split registration")
+    if not target_groups or any(group is None for group in target_groups):
+        raise ValueError("Draft caches require nonempty target KV groups")
     full = [{**g, "buffers": list(g["buffers"]), "layer_ids": list(g["layer_ids"])} for g in target_groups]
     swa = []
     target_swa = getattr(target_pool, "swa_kv_pool", None)
     if target_swa is not None:
         buffers = list(target_swa.kv_buffer)
         ids = list(range(len(buffers)))
-        swa.append(_group("swa", buffers, ids, int(target_swa.page_size)))
+        target_group = _group("swa", buffers, ids, int(target_swa.page_size))
+        if target_group is None:
+            raise ValueError("Draft caches require nonempty target SWA buffers")
+        swa.append(target_group)
     modes = []
     tail = target_layers
     for index, pool in enumerate(draft_pools):
         count = int(pool.layer_num)
+        if count <= 0:
+            raise ValueError("Draft caches require a positive layer count")
         layers = list(range(tail, tail + count))
         if getattr(pool, "_unified_kv", False) or getattr(pool, "swa_req_ring_size", None) is not None:
             raise NotImplementedError("FlexKV draft request rings/unified arenas require reconstruction support")
@@ -108,6 +132,8 @@ def build_draft_cache_plan(*, target_pool, draft_pools, target_layers, page_size
             draft_swa = getattr(pool, "swa_kv_pool", None)
             if target_swa is None or draft_swa is None:
                 raise NotImplementedError("Paged DeepSeek draft SWA requires the target SWA mapping")
+            if int(draft_swa.page_size) != int(target_swa.page_size):
+                raise ValueError("Draft/target SWA page sizes must share the same physical slot mapping")
             # SGLang binds the draft to the target allocator. Both paged SWA
             # pools must cover the same physical slot space; a full-capacity
             # identity-mapped draft must not follow the target SWA map.
@@ -115,21 +141,25 @@ def build_draft_cache_plan(*, target_pool, draft_pools, target_layers, page_size
                 raise ValueError("Draft/target SWA slot capacities differ")
             source_map = getattr(target_pool, "full_to_swa_index_mapping", None)
             draft_map = getattr(pool, "full_to_swa_index_mapping", None)
-            if draft_map is not source_map and (
-                source_map is None
-                or draft_map is None
-                or draft_map.data_ptr() != source_map.data_ptr()
-                or draft_map.dtype != source_map.dtype
-                or draft_map.shape != source_map.shape
-                or draft_map.stride() != source_map.stride()
+            if source_map is None or draft_map is None or (
+                draft_map is not source_map and (
+                    draft_map.data_ptr() != source_map.data_ptr()
+                    or draft_map.dtype != source_map.dtype
+                    or draft_map.shape != source_map.shape
+                    or draft_map.stride() != source_map.stride()
+                )
             ):
                 raise ValueError("Draft SWA must share the target full-to-SWA mapping")
             candidate = _group(f"draft{index}_swa", list(draft_swa.kv_buffer), layers, int(draft_swa.page_size))
+            if candidate is None or candidate["buffers"][0].shape[0] < swa[0]["buffers"][0].shape[0]:
+                raise ValueError("Draft SWA does not cover the target allocator's physical page space")
             modes.append(_append(swa, candidate))
         else:
             buffers = getattr(pool, "kv_buffer", None)
             if buffers is None:
                 raise NotImplementedError("FlexKV draft support currently requires MLA or DeepSeek split pools")
+            if len(buffers) != count:
+                raise ValueError("Draft KV layer count mismatch")
             rows = _paged_rows(buffers, page_size, "draft KV")
             required_pages = full[0]["buffers"][0].shape[0]
             if rows[0].shape[0] < required_pages:
@@ -137,9 +167,12 @@ def build_draft_cache_plan(*, target_pool, draft_pools, target_layers, page_size
             modes.append(_append(full, _group(f"draft{index}_kv", rows, layers, page_size)))
             indexers = list(getattr(pool, "index_k_with_scale_buffer", None) or [])
             if indexers:
-                if any(buffer.numel() and buffer.shape[0] < required_pages for buffer in indexers):
+                candidate = _indexer_group(
+                    f"draft{index}_indexer", indexers, layers, page_size, getattr(pool, "skip_topk_layers", None)
+                )
+                if candidate is not None and candidate["buffers"][0].shape[0] < required_pages:
                     raise ValueError("Draft indexer does not cover the target allocator's physical page space")
-                modes.append(_append(full, _group(f"draft{index}_indexer", indexers, layers, 1, page_size)))
+                modes.append(_append(full, candidate))
         tail += count
     target_device = full[0]["buffers"][0].device
     if any(b.device != target_device for group in full + swa for b in group["buffers"]):
@@ -180,6 +213,8 @@ def build_draft_cache_plan(*, target_pool, draft_pools, target_layers, page_size
 
 
 def standard_target_groups(pool, page_size, target_layers, indexer_group=None):
+    if getattr(pool, "layer_shard_enabled", False):
+        raise NotImplementedError("Layer-sharded target caches require an owner-aware layer-split registration")
     buffers = getattr(pool, "kv_buffer", None)
     if buffers is None:
         raise NotImplementedError("FlexKV draft target must use MLA or DeepSeek split pools")
@@ -191,7 +226,8 @@ def standard_target_groups(pool, page_size, target_layers, indexer_group=None):
     )
     if indexers:
         layer_ids = indexer_group.layer_indices if indexer_group is not None else range(target_layers)
-        indexer = _group("indexer", indexers, layer_ids, 1, page_size)
+        skip = getattr(pool, "skip_topk_layers", None) if indexer_group is None else None
+        indexer = _indexer_group("indexer", indexers, layer_ids, page_size, skip)
         if indexer is not None:
             groups.append(indexer)
     return groups

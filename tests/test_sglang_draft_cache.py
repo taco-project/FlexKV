@@ -130,7 +130,9 @@ def test_deepseek_swa_keeps_three_draft_layers_with_target_mapping(draft_dtype, 
         )
 
 
-@pytest.mark.parametrize("mapping_kind", ["target_missing", "draft_missing", "dtype_alias", "shape_alias"])
+@pytest.mark.parametrize(
+    "mapping_kind", ["target_missing", "draft_missing", "both_missing", "dtype_alias", "shape_alias"]
+)
 def test_swa_mapping_contract_rejects_missing_or_reinterpreted_aliases(mapping_kind):
     source = torch.arange(16)
     target_map, draft_map = source, source
@@ -138,6 +140,8 @@ def test_swa_mapping_contract_rejects_missing_or_reinterpreted_aliases(mapping_k
         target_map = None
     elif mapping_kind == "draft_missing":
         draft_map = None
+    elif mapping_kind == "both_missing":
+        target_map = draft_map = None
     elif mapping_kind == "dtype_alias":
         draft_map = source.view(torch.int32)
     else:
@@ -172,6 +176,62 @@ def test_request_ring_does_not_become_a_prefix_sidecar():
     draft.swa_req_ring_size = 256
     with pytest.raises(NotImplementedError, match="request rings"):
         plan(target, draft)
+
+
+@pytest.mark.parametrize("aliases", [False, True])
+def test_partial_skip_topk_preserves_target_and_draft_logical_layer_ids(aliases):
+    target, draft = mla(2), mla(3)
+    target.index_k_with_scale_buffer = [torch.zeros(4, 8, dtype=torch.uint8), torch.empty(0, 8, dtype=torch.uint8)]
+    target.skip_topk_layers = [False, True]
+    draft.index_k_with_scale_buffer = [
+        torch.empty(0, 8, dtype=torch.uint8), torch.ones(4, 8, dtype=torch.uint8), torch.empty(0, 8, dtype=torch.uint8)
+    ]
+    draft.skip_topk_layers = [True, False, True]
+    if aliases:
+        target.index_k_with_scale_buffer[1] = target.index_k_with_scale_buffer[0]
+        draft.index_k_with_scale_buffer[0] = draft.index_k_with_scale_buffer[1]
+        draft.index_k_with_scale_buffer[2] = draft.index_k_with_scale_buffer[1]
+    p = plan(target, draft)
+    assert p.modes == ["packed", "packed"]
+    assert p.full_groups[1]["layer_ids"] == [0, 3]
+    assert p.full_groups[1]["buffers"][1] is draft.index_k_with_scale_buffer[1]
+    assert p.transfer_layers == 5
+
+
+@pytest.mark.parametrize("kind", ["missing_active", "mask_count", "count"])
+def test_draft_indexer_metadata_cannot_drop_a_required_member(kind):
+    target, draft = mla(2), mla(2)
+    draft.index_k_with_scale_buffer = [torch.empty(0, 8), torch.ones(4, 8)]
+    draft.skip_topk_layers = [True, False]
+    if kind == "missing_active":
+        draft.skip_topk_layers = [False, False]
+    elif kind == "mask_count":
+        draft.skip_topk_layers = [True]
+    else:
+        draft.index_k_with_scale_buffer.pop()
+    with pytest.raises(ValueError, match="indexer"):
+        plan(target, draft)
+
+
+@pytest.mark.parametrize("sharded", ["target", "draft"])
+def test_generic_draft_planner_requires_explicit_owners_for_sharded_pools(sharded):
+    target, draft = mla(2), mla(1)
+    (target if sharded == "target" else draft).layer_shard_enabled = True
+    with pytest.raises(NotImplementedError, match="owner-aware"):
+        plan(target, draft)
+
+
+@pytest.mark.parametrize("kind", ["smaller_arena", "different_page"])
+def test_draft_swa_cannot_reinterpret_target_physical_slots(kind):
+    mapping = torch.arange(16)
+    target = NS(layer_num=2, swa_size=16, full_to_swa_index_mapping=mapping,
+        swa_kv_pool=NS(page_size=4, kv_buffer=[torch.zeros(4, 32) for _ in range(2)]))
+    draft = NS(layer_num=1, compression_ratios=[0], swa_size=16, full_to_swa_index_mapping=mapping,
+        swa_kv_pool=NS(page_size=4 if kind == "smaller_arena" else 2,
+            kv_buffer=[torch.zeros(2 if kind == "smaller_arena" else 8, 32)]))
+    with pytest.raises(ValueError, match="physical"):
+        module.build_draft_cache_plan(target_pool=target, draft_pools=(draft,), target_layers=2,
+            page_size=4, target_groups=module.standard_target_groups(mla(2), 4, 2), is_dsv4=True, identity={})
 
 
 def test_last_target_layer_fences_every_draft_depth():

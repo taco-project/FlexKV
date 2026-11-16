@@ -250,6 +250,11 @@ class FlexKVConnector:
         attn_cp_group: Any = None,
         draft_kv_pools: Tuple[Any, ...] = (),
     ) -> None:
+        if getattr(kvcache, "layer_shard_enabled", False):
+            raise NotImplementedError(
+                "DSA cache layer split requires an owner-aware native FlexKV registration; "
+                "this public SDK supports replicated TP/CP pools only"
+            )
         self.page_size = int(page_size)
 
         # 1. Resolve FlexKV config from env + sglang server args.
