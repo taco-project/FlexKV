@@ -15,7 +15,7 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
-from flexkv.integration.config import FlexKVConfig
+from flexkv.integration.config import FlexKVConfig, VllmKVGroup
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.server.shm_radix_bootstrap import radix_server_is_distributed
 from flexkv.integration.vllm.layerwise_sync import (
@@ -170,6 +170,28 @@ def _assert_token_major(kv_cache: torch.Tensor, token_dim: int,
         )
 
 
+def _attention_waits_for_layers(forward_context: Optional[dict],
+                                layer_names: Iterable[str]) -> bool:
+    """Whether vLLM's attention calls ``wait_for_layer_load`` before it reads
+    each of these layers: Attention and MLAAttention do through their custom
+    ops (MLAAttention's direct call skips it); DeepSeek-V4.1's own attention
+    does with examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch."""
+    if forward_context is None:
+        return True
+    try:
+        from vllm.model_executor.layers.attention.attention import Attention
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    except ImportError:  # vLLM before 0.33: only its generic attention layers
+        return True
+
+    def waits(layer) -> bool:
+        if isinstance(layer, MLAAttention):
+            return not layer.use_direct_call
+        return isinstance(layer, Attention) or hasattr(layer, "_wait_for_kv_layer_load")
+
+    return all(waits(forward_context.get(name)) for name in layer_names)
+
+
 @dataclass
 class FlexKVResponse:
     task_id: int
@@ -270,6 +292,9 @@ class FlexKVSchedulerConnector:
         self.block_size = flexkv_config.cache_config.tokens_per_block
         self.cache_config = flexkv_config.cache_config
         self.rank_info = rank_info
+        # The vLLM KV cache group whose blocks FlexKV stores.
+        self.group_id = (flexkv_config.vllm_kv_group.group_id
+                         if flexkv_config.vllm_kv_group is not None else 0)
 
         if os.getenv('DYNAMO_USE_FLEXKV', '0') == '1':
             self.collector = KVEventCollector()
@@ -580,7 +605,7 @@ class FlexKVSchedulerConnector:
         # compute slot_mapping
         num_computed_blocks = task.num_computed_tokens // self.block_size
         num_blocks_to_get = num_new_matched_tokens // self.block_size
-        all_block_ids = blocks.get_block_ids()[0]
+        all_block_ids = blocks.get_block_ids()[self.group_id]
         block_ids_to_get = all_block_ids[num_computed_blocks:num_computed_blocks+num_blocks_to_get]
         task.block_ids = block_ids_to_get
         task.slot_mapping = np.array(block_ids_to_get).repeat(self.block_size)*self.block_size
@@ -778,6 +803,36 @@ class FlexKVSchedulerConnector:
         self.flexkv_manager.cancel(task_ids=list(self.tasks_to_cancel.keys()))
         self.tasks_to_cancel.clear()
 
+    def keep_loads_from_zeroing(self, scheduler_output: "SchedulerOutput") -> None:
+        """Take the blocks this step's layer-wise GETs write out of vLLM's zeroing.
+
+        vLLM zeroes a step's new blocks in the worker when the cache mixes
+        precisions (e.g. DeepSeek-V4.1), while the GET's H2D launched here is
+        already writing them. ``KVConnectorBase_V1.build_connector_meta`` lets
+        a synchronous reader keep the blocks it overwrites whole out of
+        ``new_block_ids_to_zero`` if it completes those loads before they are
+        read and fails the step when a load fails. A GET writes every page of
+        its blocks; every layer waits for its load before reading them
+        (``use_layerwise`` refuses an attention that does not); and a layer is
+        signalled only once its H2D has landed, so a GET that fails leaves the
+        layers it did not land unsignalled: the first wait on one raises after
+        ``FLEXKV_LAYERWISE_WAIT_TIMEOUT_S`` and fails the step, instead of
+        letting it compute on blocks that were neither loaded nor zeroed.
+        """
+        zero = getattr(scheduler_output, "new_block_ids_to_zero", None)
+        if not zero or not self.enable_layerwise_transfer:
+            return
+        loaded = {
+            block_id
+            for task in self.tasks_to_launch.values()
+            if isinstance(task, FlexKVGetTask)
+            for block_id in task.block_ids
+        }
+        if loaded:
+            scheduler_output.new_block_ids_to_zero = [
+                block_id for block_id in zero if block_id not in loaded
+            ]
+
     def launch_tasks(self) -> LayerwiseLoadMetadata:
         """
         Launch tasks in self.tasks_to_launch
@@ -956,9 +1011,12 @@ class FlexKVWorkerConnector:
         flexkv_config: FlexKVConfig,
         rank_info: "RankInfo",
         enable_layerwise_transfer: Optional[bool] = None,
+        forward_context: Optional[dict] = None,
     ):
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 
+        # vLLM's layers by name, to check that attention waits per layer
+        self._forward_context = forward_context
 
         # Determine if server_client_mode (same logic as KVManager)
         server_client_mode = (GLOBAL_CONFIG_FROM_ENV.instance_num > 1 or
@@ -1002,6 +1060,21 @@ class FlexKVWorkerConnector:
         self, kv_caches: dict[str, torch.Tensor], *, resume: bool = False
     ):
         logger.info("Start register kv_caches")
+
+        group = self.flexkv_config.vllm_kv_group
+        if group is not None and group.layer_names:
+            self._register_layer_groups(kv_caches, group, resume)
+            logger.info("Finish register kv_caches")
+            self._registered_kv_caches = dict(kv_caches)
+            return
+        if group is not None:
+            # Under vLLM's hybrid KV cache manager the caches of every group
+            # arrive here; FlexKV stores one of them.
+            names = set(group.cache_layer_names)
+            kv_caches = {
+                name: tensor for name, tensor in kv_caches.items()
+                if name in names
+            }
 
         # Separate main KV caches from indexer caches by layer name.
         main_kv_caches: dict[str, torch.Tensor] = {}
@@ -1156,6 +1229,57 @@ class FlexKVWorkerConnector:
         logger.info("Finish register kv_caches")
         self._registered_kv_caches = dict(kv_caches)
 
+    def _register_layer_groups(
+        self, kv_caches: dict[str, torch.Tensor], group: VllmKVGroup,
+        resume: bool,
+    ) -> None:
+        """Register a KV cache group with mixed page sizes (DeepSeek-V4.1) as
+        ``model_config.layer_groups``.
+
+        Each cache is a view led by the block dim; FlexKV moves the page at the
+        start of every block and takes the block stride from the view, which in
+        vLLM's block-outermost layouts spans the pages of all layers.
+        """
+        model_config = self.flexkv_config.model_config
+        if self.enable_layerwise_transfer:
+            self._start_layerwise_eventfd_sender(group.layer_names)
+
+        def layout(num_layer: int, page_bytes: int) -> KVCacheLayout:
+            return KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=num_layer,
+                num_block=group.num_blocks,
+                tokens_per_block=1,
+                num_head=1,
+                head_size=page_bytes,
+                kv_dim=1,
+                num_kv_heads=1,
+            )
+
+        gpu_layouts, handles_per_group = [], []
+        for spec, names in zip(model_config.layer_groups,
+                               group.group_layer_names, strict=True):
+            for name in names:
+                tensor = kv_caches[name]
+                block_stride = tensor.stride(0) * tensor.element_size()
+                if (tensor.shape[0] != group.num_blocks
+                        or block_stride < spec.head_size):
+                    raise ValueError(
+                        f"KV cache {name}: shape={tuple(tensor.shape)} with a "
+                        f"{block_stride} B block stride does not hold "
+                        f"{group.num_blocks} blocks of {spec.head_size} B")
+            gpu_layouts.append(layout(len(names), spec.head_size))
+            handles_per_group.append([kv_caches[name] for name in names])
+
+        self.tp_client.register_to_server(
+            kv_caches=[t for tensors in handles_per_group for t in tensors],
+            kv_layout=layout(model_config.num_layers, model_config.head_size),
+            layer_groups=model_config.layer_groups,
+            gpu_layouts=gpu_layouts,
+            handles_per_group=handles_per_group,
+            resume=resume,
+        )
+
     def before_device_sleep(self) -> int:
         return self.tp_client.suspend_gpu_mappings()
 
@@ -1182,6 +1306,13 @@ class FlexKVWorkerConnector:
                 )
             return
 
+        if not _attention_waits_for_layers(self._forward_context, layer_names):
+            raise NotImplementedError(
+                "use_layerwise needs a model whose attention waits for every "
+                "layer it reads (wait_for_layer_load); this one does not. For "
+                "DeepSeek-V4.1 on vLLM 0.33.0 apply "
+                "examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch, "
+                "otherwise set use_layerwise to false")
         pool = LayerwiseCounterPool(layer_names)
         self.layerwise_counter_pool = pool
         socket_path = build_layerwise_eventfd_socket_path(
@@ -1277,8 +1408,10 @@ class FlexKVWorkerConnector:
         self.layerwise_counter_pool.bind(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        if self.layerwise_counter_pool is not None:
-            self.layerwise_counter_pool.wait(layer_name)
+        pool = self.layerwise_counter_pool
+        # A layer FlexKV loads nothing for (another KV cache group) has no wait.
+        if pool is not None and layer_name in pool.layer_to_index:
+            pool.wait(layer_name)
 
     def shutdown(self) -> None:
         if self.layerwise_counter_pool is not None:
@@ -1389,7 +1522,8 @@ class FlexKVConnectorV1Impl:
                     f"{_e}. device_id will collide across workers and GPU "
                     f"registration will hang at 1/N.")
             self.connector = FlexKVWorkerConnector(
-                flexkv_config, rank_info, self.enable_layerwise_transfer)
+                flexkv_config, rank_info, self.enable_layerwise_transfer,
+                forward_context=vllm_config.compilation_config.static_forward_context)
         else:
             raise ValueError(f"Unrecognized KVConnectorRole: {role}.")
 
@@ -1571,7 +1705,9 @@ class FlexKVConnectorV1Impl:
         """
         Build the connector metadata for this step.
 
-        This function should NOT modify fields in the scheduler_output.
+        This function modifies no field of the scheduler_output but
+        new_block_ids_to_zero, which vLLM lets a synchronous reader trim (see
+        FlexKVSchedulerConnector.keep_loads_from_zeroing).
         Also, calling this function will reset the state of the connector.
 
         Args:
@@ -1601,6 +1737,7 @@ class FlexKVConnectorV1Impl:
             self.connector.handle_preemptions(preempted_req_ids)
 
         self.connector.cancel_tasks()
+        self.connector.keep_loads_from_zeroing(scheduler_output)
         layerwise_metadata = self.connector.launch_tasks()
 
         # Optional: Synchronous wait for get tasks to ensure data consistency.
@@ -1644,6 +1781,15 @@ class FlexKVConnectorV1Impl:
             returned by the engine.
         """
         return self.connector.request_finished(request, block_ids), None
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """``request_finished`` under vLLM's hybrid KV cache manager: one block
+        id list per KV cache group, of which FlexKV stores one."""
+        return self.request_finished(request, block_ids[self.connector.group_id])
 
     def has_pending_push_work(self) -> bool:
         """Keep vLLM stepping while a FlexKV graph completes only when polled."""

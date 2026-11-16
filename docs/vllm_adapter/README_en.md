@@ -120,7 +120,9 @@ GDS is also unsupported in this mode because the fused layer-wise graph uses
 CPU/SSD/remote staging rather than direct `DISK2D` operations.
 If a layer does not become ready within
 `FLEXKV_LAYERWISE_WAIT_TIMEOUT_S` (default `60` seconds), the forward fails
-instead of hanging indefinitely.
+instead of hanging indefinitely. The model's attention must wait for each layer
+it reads; FlexKV refuses to start otherwise. DeepSeek-V4.1's does on vLLM 0.33.0
+with `examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch`.
 
 ### Patching vLLM
 
@@ -141,9 +143,14 @@ git apply "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 pip install -e .
 ```
 
-The 0.33.0 patch only touches the built-in connector, which then passes vLLM's
-`KVCacheConfig` to FlexKV and forwards cache reset, sleep/wake and layer-wise
-loading. It also applies to an installed wheel:
+The 0.33.0 patch makes the built-in connector pass vLLM's `KVCacheConfig` to
+FlexKV and forward cache reset, sleep/wake and layer-wise loading. It also lets
+the connector run under vLLM's hybrid KV cache manager, which DeepSeek-V4.1
+needs: FlexKV stores the model's prefix-cacheable group (the compressed KV and
+indexer K of its KV-source layers), and vLLM's SWA bounded replay rebuilds the
+sliding-window caches after a hit. Other models with several prefix-cacheable
+groups need `--disable-hybrid-kv-cache-manager`. The patch also applies to an
+installed wheel:
 ```bash
 cd "$(python -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"
 git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch"

@@ -148,6 +148,57 @@ def _dsv4_swa_padded_bytes_per_token(swa_page_size: int,
     return padded // swa_page_size
 
 
+@dataclass(frozen=True)
+class VllmKVGroup:
+    """The vLLM KV cache group FlexKV stores.
+
+    ``cache_layer_names`` are all of its vLLM cache layers. A group whose
+    layers keep pages of different sizes (DeepSeek-V4.1: compressed KV and
+    indexer K at two compression ratios) is stored as
+    ``ModelConfig.layer_groups``: ``group_layer_names[g]`` are the caches of
+    layer group ``g``, and FlexKV layer ``i`` holds the caches of one model
+    layer, named ``layer_names[i]`` after its attention cache, the name vLLM's
+    attention waits on with ``wait_for_layer_load``.
+    """
+    group_id: int
+    cache_layer_names: Tuple[str, ...]
+    num_blocks: int = 0
+    layer_names: Tuple[str, ...] = ()
+    group_layer_names: Tuple[Tuple[str, ...], ...] = ()
+
+
+def vllm_transfer_group_id(kv_cache_config: "KVCacheConfig") -> int:
+    """The one vLLM KV cache group FlexKV stores: the only group, or with the
+    hybrid KV cache manager the only prefix-cacheable one. DeepSeek-V4.1's
+    sliding-window and compressor-state groups are rebuilt by vLLM's SWA
+    bounded replay after a prefix hit, so they need no store."""
+    groups = kv_cache_config.kv_cache_groups
+    if len(groups) == 1:
+        return 0
+    cacheable = kv_cache_config.prefix_cacheable_group_ids
+    if len(cacheable) != 1:
+        raise ValueError(
+            "FlexKV stores one prefix-cacheable vLLM KV cache group, but this "
+            f"model has {len(cacheable)} of {len(groups)} groups; run vLLM "
+            "with --disable-hybrid-kv-cache-manager")
+    return cacheable[0]
+
+
+def _vllm_page_bytes(kv_cache_config: "KVCacheConfig") -> dict:
+    """Bytes of one block of every vLLM cache layer, padding included."""
+    layout = getattr(kv_cache_config, "kv_cache_layout", None)
+    if layout is None:
+        return {}
+    from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
+
+    block_outermost = VllmKVCacheLayout[layout].is_block_outermost
+    pages = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        page = tensor.layer_stride if block_outermost else tensor.block_stride
+        pages.update(dict.fromkeys(tensor.layers, page))
+    return pages
+
+
 @dataclass
 class FlexKVConfig:
     enable_flexkv: bool = True
@@ -165,6 +216,9 @@ class FlexKVConfig:
 
     # user configKV/flexkv/transfer/worker.py", line 1303, in _transfer_impl
     user_config: UserConfig = field(default_factory=UserConfig)
+
+    # vLLM only: the KV cache group FlexKV stores (set from KVCacheConfig)
+    vllm_kv_group: Optional[VllmKVGroup] = None
 
     def __post_init__(self):
         if self.server_recv_port == "":
@@ -507,45 +561,53 @@ class FlexKVConfig:
         """Populate the packed storage layout from vLLM resolved KV specs."""
         from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec, iter_layer_specs
 
-        layouts = set()
-        for group in kv_cache_config.kv_cache_groups:
-            for spec in iter_layer_specs(group.kv_cache_spec):
-                if not isinstance(spec, AttentionSpec):
-                    raise ValueError(
-                        "FlexKV only supports attention KV cache specs; got "
-                        f"{type(spec).__name__}"
-                    )
-                if spec.tokens_per_state != 1:
-                    raise ValueError(
-                        "FlexKV does not support compressed vLLM KV states; "
-                        f"tokens_per_state={spec.tokens_per_state}"
-                    )
-                if (
-                    spec.page_size_padded is not None
-                    and spec.page_size_padded != spec.unpadded_page_size_bytes
-                ):
-                    raise ValueError(
-                        "FlexKV does not support padded vLLM KV pages; "
-                        f"page_size_padded={spec.page_size_padded}, "
-                        f"unpadded={spec.unpadded_page_size_bytes}"
-                    )
+        group_id = vllm_transfer_group_id(kv_cache_config)
+        group = kv_cache_config.kv_cache_groups[group_id]
+        self.vllm_kv_group = VllmKVGroup(
+            group_id, tuple(group.layer_names), kv_cache_config.num_blocks)
+        pages = _vllm_page_bytes(kv_cache_config)
+        if len({pages.get(name) for name in group.layer_names}) > 1:
+            self._configure_vllm_layer_groups(kv_cache_config, group_id, pages)
+            return
 
-                element_size = torch.empty((), dtype=spec.dtype).element_size()
-                if spec.state_content_size_bytes % element_size != 0:
-                    raise ValueError(
-                        "vLLM KV state byte width is not divisible by its "
-                        f"dtype size: bytes={spec.state_content_size_bytes}, "
-                        f"dtype={spec.dtype}"
-                    )
-                layouts.add(
-                    (
-                        spec.num_heads,
-                        spec.state_content_size_bytes // element_size,
-                        spec.dtype,
-                        spec.block_size,
-                        isinstance(spec, MLAAttentionSpec),
-                    )
+        layouts = set()
+        for spec in iter_layer_specs(group.kv_cache_spec):
+            if not isinstance(spec, AttentionSpec):
+                raise ValueError(
+                    "FlexKV only supports attention KV cache specs; got "
+                    f"{type(spec).__name__}"
                 )
+            if spec.tokens_per_state != 1:
+                raise ValueError(
+                    "FlexKV does not support compressed vLLM KV states; "
+                    f"tokens_per_state={spec.tokens_per_state}"
+                )
+            if (
+                spec.page_size_padded is not None
+                and spec.page_size_padded != spec.unpadded_page_size_bytes
+            ):
+                raise ValueError(
+                    "FlexKV does not support padded vLLM KV pages; "
+                    f"page_size_padded={spec.page_size_padded}, "
+                    f"unpadded={spec.unpadded_page_size_bytes}"
+                )
+
+            element_size = torch.empty((), dtype=spec.dtype).element_size()
+            if spec.state_content_size_bytes % element_size != 0:
+                raise ValueError(
+                    "vLLM KV state byte width is not divisible by its "
+                    f"dtype size: bytes={spec.state_content_size_bytes}, "
+                    f"dtype={spec.dtype}"
+                )
+            layouts.add(
+                (
+                    spec.num_heads,
+                    spec.state_content_size_bytes // element_size,
+                    spec.dtype,
+                    spec.block_size,
+                    isinstance(spec, MLAAttentionSpec),
+                )
+            )
 
         if len(layouts) != 1:
             raise ValueError(
@@ -576,6 +638,84 @@ class FlexKVConfig:
             f"num_kv_heads_per_rank={physical_num_heads_per_rank}, "
             f"total_storage_heads={self.model_config.num_kv_heads}, "
             f"head_size={physical_head_size}, kv_dim=1, dtype={dtype}"
+        )
+
+    def _configure_vllm_layer_groups(
+        self,
+        kv_cache_config: "KVCacheConfig",
+        group_id: int,
+        pages: dict,
+    ) -> None:
+        """Store a vLLM KV cache group whose layers keep pages of different
+        sizes, e.g. DeepSeek-V4.1's compressed KV and indexer K, as layer
+        groups: one per vLLM KV cache tensor (its layers share one spec), each
+        page one opaque row per block, padding included. FlexKV layer ``i`` is
+        the ``i``-th model layer with caches in the group.
+
+        Only the vLLM KV cache tensors are read, as the scheduler's
+        KVCacheConfig keeps one spec per group, so both sides agree.
+        """
+        from vllm.model_executor.models.utils import extract_layer_index
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec, iter_layer_specs
+
+        group = kv_cache_config.kv_cache_groups[group_id]
+        if not all(isinstance(spec, MLAAttentionSpec)
+                   for spec in iter_layer_specs(group.kv_cache_spec)):
+            raise ValueError(
+                "FlexKV stores a vLLM KV cache group with mixed page sizes only "
+                "when every TP rank holds the same (MLA) caches; got "
+                f"{type(group.kv_cache_spec).__name__}")
+        if self.model_config.pp_size != 1:
+            raise ValueError(
+                "FlexKV stores a vLLM KV cache group with mixed page sizes only "
+                "with pipeline_parallel_size=1")
+
+        # A model layer is named after its shortest cache name, the attention
+        # layer the others (e.g. ``<attn>.indexer.k_cache``) hang off.
+        layer_of = {}
+        model_layers = {}
+        layer_names = []
+        for name in group.layer_names:
+            model_layer = extract_layer_index(name)
+            if model_layer not in model_layers:
+                model_layers[model_layer] = len(layer_names)
+                layer_names.append(name)
+            index = model_layers[model_layer]
+            if len(name) < len(layer_names[index]):
+                layer_names[index] = name
+            layer_of[name] = index
+
+        tokens_per_block = group.kv_cache_spec.block_size
+        layer_groups, group_layer_names = [], []
+        for tensor in kv_cache_config.kv_cache_tensors:
+            names = [name for name in tensor.layers if name in layer_of]
+            if not names:
+                continue
+            layer_groups.append(LayerGroupSpec(
+                num_layers=len(names),
+                num_kv_heads=1,
+                head_size=pages[names[0]],
+                layer_indices=[layer_of[name] for name in names],
+                dtype=torch.uint8,
+                compress_ratio=tokens_per_block,
+            ))
+            group_layer_names.append(tuple(names))
+
+        self.cache_config.tokens_per_block = tokens_per_block
+        self.model_config.num_layers = len(layer_names)
+        self.model_config.num_kv_heads = 1
+        self.model_config.head_size = layer_groups[0].head_size
+        self.model_config.kv_dim = 1
+        self.model_config.dtype = torch.uint8
+        self.model_config.layer_groups = layer_groups
+        self.vllm_kv_group = VllmKVGroup(
+            group_id, tuple(group.layer_names), kv_cache_config.num_blocks,
+            tuple(layer_names), tuple(group_layer_names))
+        logger.info(
+            f"[FlexKV vllm] KV cache group {group_id} as {len(layer_groups)} "
+            f"layer groups over {len(layer_names)} layers, tokens_per_block="
+            f"{tokens_per_block}, page bytes "
+            f"{[g.head_size for g in layer_groups]}, layers {layer_names}"
         )
 
     def post_init_from_sglang_config(

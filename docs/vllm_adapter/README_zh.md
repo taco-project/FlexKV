@@ -117,7 +117,9 @@ VLLM_USE_V1=1 python -m vllm.entrypoints.cli.main serve MODEL \
 支持 GDS，因为融合后的 layer-wise graph 使用 CPU/SSD/remote staging，而
 不是直接 `DISK2D`。如果某一层在
 `FLEXKV_LAYERWISE_WAIT_TIMEOUT_S`（默认 `60` 秒）内未就绪，forward 会失败，
-而不是永久卡住。
+而不是永久卡住。模型的 attention 必须在读每一层之前等待该层加载，否则 FlexKV
+拒绝启动；DeepSeek-V4.1 在 vLLM 0.33.0 上需再打
+`examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch`。
 
 ### 给 vLLM 打 patch
 
@@ -138,8 +140,12 @@ git apply "$FLEXKV_DIR/examples/vllm_adaption/$PATCH_FILE"
 pip install -e .
 ```
 
-0.33.0 的 patch 只修改内置 connector：把 vLLM 的 `KVCacheConfig` 传给 FlexKV，
-并转发缓存清空、sleep/wake 和逐层加载。它也可以直接打到已安装的 wheel 上：
+0.33.0 的 patch 让内置 connector 把 vLLM 的 `KVCacheConfig` 传给 FlexKV，
+并转发缓存清空、sleep/wake 和逐层加载；还让 connector 支持 vLLM 的 hybrid KV cache
+manager（DeepSeek-V4.1 需要）：FlexKV 存取模型唯一的 prefix-cacheable group（各
+KV-source 层的压缩 KV 与 indexer K），命中后 SWA 由 vLLM 的 SWA bounded replay 重算。
+有多个 prefix-cacheable group 的其他模型需加 `--disable-hybrid-kv-cache-manager`。它也
+可以直接打到已安装的 wheel 上：
 ```bash
 cd "$(python -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"
 git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch"

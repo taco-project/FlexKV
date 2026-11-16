@@ -95,6 +95,25 @@ def cache_specs(monkeypatch):
     return make_spec
 
 
+def _kv_cache_config(*group_specs, prefix_cacheable_group_ids=None):
+    """A vLLM KVCacheConfig with one KV cache group per list of layer specs,
+    every group prefix-cacheable unless ``prefix_cacheable_group_ids`` says."""
+    groups = [
+        SimpleNamespace(
+            layer_names=[f"g{group_id}.layers.{i}.attn" for i in range(len(specs))],
+            kv_cache_spec=specs,
+        )
+        for group_id, specs in enumerate(group_specs)
+    ]
+    if prefix_cacheable_group_ids is None:
+        prefix_cacheable_group_ids = tuple(range(len(groups)))
+    return SimpleNamespace(
+        num_blocks=8,
+        kv_cache_groups=groups,
+        prefix_cacheable_group_ids=prefix_cacheable_group_ids,
+    )
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 8])
 @pytest.mark.parametrize(
     "shared,physical_heads,head_size,dtype",
@@ -109,9 +128,7 @@ def test_resolved_spec_storage_layout(config, cache_specs, tp_size, shared, phys
     config.model_config.tp_size = tp_size
     config.model_config.dtype = dtype
     spec = cache_specs(shared, physical_heads, head_size, dtype)
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=[spec, spec])]
-    )
+    kv_cache_config = _kv_cache_config([spec, spec])
 
     config._configure_kv_layout_from_vllm_backend(SimpleNamespace(), "auto", kv_cache_config)
 
@@ -122,12 +139,31 @@ def test_resolved_spec_storage_layout(config, cache_specs, tp_size, shared, phys
 
 def test_resolved_specs_reject_mixed_rank_sharing(config, cache_specs):
     config.model_config.tp_size = 2
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[
-            SimpleNamespace(kv_cache_spec=[cache_specs(shared=True)]),
-            SimpleNamespace(kv_cache_spec=[cache_specs(shared=False)]),
-        ]
-    )
+    kv_cache_config = _kv_cache_config([cache_specs(shared=True), cache_specs(shared=False)])
 
     with pytest.raises(ValueError, match="requires one uniform vLLM attention storage layout"):
+        config._configure_kv_layout_from_vllm_cache_config(kv_cache_config)
+
+
+def test_hybrid_kv_cache_stores_its_prefix_cacheable_group(config, cache_specs):
+    # Only the prefix-cacheable group is stored, so only its specs must share
+    # one storage layout.
+    config.model_config.tp_size = 2
+    kv_cache_config = _kv_cache_config(
+        [cache_specs(shared=True), cache_specs(shared=False)],
+        [cache_specs(shared=True)],
+        prefix_cacheable_group_ids=(1,),
+    )
+
+    config._configure_kv_layout_from_vllm_cache_config(kv_cache_config)
+
+    assert config.vllm_kv_group.group_id == 1
+    assert config.vllm_kv_group.cache_layer_names == ("g1.layers.0.attn",)
+    assert config.model_config.num_kv_heads == 1
+
+
+def test_hybrid_kv_cache_rejects_several_prefix_cacheable_groups(config, cache_specs):
+    kv_cache_config = _kv_cache_config([cache_specs(shared=True)], [cache_specs(shared=True)])
+
+    with pytest.raises(ValueError, match="--disable-hybrid-kv-cache-manager"):
         config._configure_kv_layout_from_vllm_cache_config(kv_cache_config)
