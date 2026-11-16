@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-PREFETCH_BYTE_BUDGET = 128 * 1024**3
+DEFAULT_PREFETCH_MAX_PINNED_BYTES = 128 * 1024**3
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,10 @@ def resolve_prefetch_budget(model, cache, *, cpu_blocks: Optional[int] = None,
         block_size_in_bytes_for_cache,
     )
 
+    configured_limit = cache.prefetch_max_pinned_bytes
+    if isinstance(configured_limit, bool) or not isinstance(configured_limit, int) or configured_limit <= 0:
+        raise ValueError("prefetch_max_pinned_bytes must be a positive integer")
+
     replicas = 1
     if model.num_kv_heads == 1 and GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode == "all_write":
         replicas = model.effective_tp_size_per_node
@@ -39,7 +43,9 @@ def resolve_prefetch_budget(model, cache, *, cpu_blocks: Optional[int] = None,
         )
     if cpu_blocks is None:
         cpu_blocks = cache.num_cpu_blocks
-    # Keep a Full-KV block outside speculative ownership. Sidecars consume the
-    # same credit conservatively; the physical allocator still applies pressure.
-    limit = min(PREFETCH_BYTE_BUDGET, max(0, cpu_blocks - 1) * block_bytes)
+    # Reserve half the Full-KV pool for foreground work, plus one block.
+    # Round the half-pool bound down to whole blocks before subtracting the
+    # spare block. Sidecars consume this same credit conservatively.
+    capacity_blocks = max(0, cpu_blocks // 2 - 1)
+    limit = min(configured_limit, capacity_blocks * block_bytes)
     return PrefetchBudget(cache.tokens_per_block, block_bytes, swa_bytes, limit)

@@ -107,16 +107,17 @@ FlexKV P2P 共享、多节点和 TensorRT-LLM remote 模式。
 ```yaml
 enable_chunked_prefetch: true
 prefetch_options:
-  policy: best_effort
+  policy: timeout
   chunk_max_blocks: 128
   max_inflight_chunks: 2
 prefetch_max_sessions: 128
 prefetch_max_reserved_bytes: 536870912
+prefetch_max_pinned_bytes: 137438953472  # 128 GiB default
 prefetch_result_ttl_s: 60
 ```
 
 这些限额在现有 CPU 池内记账，不是额外内存分配。`chunk_max_blocks`、
-`max_inflight_chunks` 以及全局 session、预留字节和结果 TTL 限额均须为
+`max_inflight_chunks` 以及全局 session、预留字节、pin 字节和结果 TTL 限额均须为
 正数。显式 FlexKV policy 优先；未指定时 connector 读取 SGLang 的
 `hicache_storage_prefetch_policy`。
 
@@ -136,8 +137,8 @@ timeout_per_ki_token_s * candidate_tokens / 1024)`；后三者默认分别为 30
 和 0.1 秒，`timeout_budget_s` 默认未设置。只使用环境变量配置时，可设置
 `FLEXKV_ENABLE_CHUNKED_PREFETCH=1` 和例如
 `FLEXKV_PREFETCH_OPTIONS='{"policy":"timeout","timeout_budget_s":0.02}'`；
-三项限额也分别支持 `FLEXKV_PREFETCH_MAX_SESSIONS`、
-`FLEXKV_PREFETCH_MAX_RESERVED_BYTES` 和
+四项限额也分别支持 `FLEXKV_PREFETCH_MAX_SESSIONS`、
+`FLEXKV_PREFETCH_MAX_RESERVED_BYTES`、`FLEXKV_PREFETCH_MAX_PINNED_BYTES` 和
 `FLEXKV_PREFETCH_RESULT_TTL_S`。已运行的 external server 保留自身配置，客户端
 不会重新配置它。
 
@@ -199,17 +200,26 @@ SGLang 侧的 `storage/flexkv/__init__.py` 通过 `importlib` 从 `flexkv.integr
 `sglang_flexkv_connector.patch` 仅作为 FlexKV 尚未合入 SGLang 主干前的历史参考保留。
 受支持的 SGLang 正式版本不需要它，上述 DeepSeek V4 路径也不能使用它。
 
-### 自动预取字节额度
+### 预取字节额度
 
-预取在飞数据与已完成未消费结果共用后端 pool 账本。额度自动取
-128 GiB 与实际 Full-KV L2 容量减一个 block 的较小值，不额外分配内存。
-初始化时复用 block 大小计算，包含压缩层组、SWA/state snapshot 和
-all_write 副本。后端与配套 SGLang 字节窗口复用同一个
-`resolve_prefetch_budget`。原 `prefetch_max_pinned_bytes` 配置和
-`FLEXKV_PREFETCH_MAX_PINNED_BYTES` 环境变量已移除；旧配置会告警并忽略，
-不会继续用 2 GiB 限制新额度。无需配置新的额度参数。
+保留 `prefetch_max_pinned_bytes` 作为唯一的可调驻留额度入口，默认
+**137438953472 字节（128 GiB）**。对应已有环境变量是
+`FLEXKV_PREFETCH_MAX_PINNED_BYTES`。显式配置优先；旧文件中写了 2 GiB，
+就仍按 2 GiB 生效，需删除旧值或更新到期望额度。不增加固定 K 或第二套额度参数。
 
-128 GiB 是整个后端池的上限，TP/DP 客户端共用实际 pin/reservation 账本。
-在飞 staging 的并发限额与驻留额度不同，现有 reserved-byte 限额仍约束在飞
-窗口；已完成块转入 pin 额度后可继续填充。取消必须 drain，H2D 源数据由原有
-GET 引用保护。物理 Full/SWA allocator 限制和前台背压继续生效。
+有效额度为：
+
+```text
+min(prefetch_max_pinned_bytes,
+    max(0, floor(实际 Full-KV L2 block 数 / 2) - 1) × 物理 block 字节数)
+```
+
+先将 L2 一半容量向下取整到完整 block，再减一个 block，为前台保留余量。
+后端 planner 和配套 SGLang 窗口共用 `resolve_prefetch_budget`；压缩层组、
+已注册 SWA/state snapshot 和 all_write 副本均计入额度，不额外分配内存。
+
+SGLang 默认使用 `timeout`，上面的示例也显式选择该策略；直接调用的
+`PrefetchOptions` 保留 `wait_complete` API 默认值。
+整个后端池共用 pin/reservation 账本，在飞数据及已完成未消费结果持续占额度。
+在飞 staging 并发限额独立生效，完成块转入 pin 额度后，后续窗口可以继续填充。
+取消仍需 drain，H2D 源数据由原有 GET 引用保护，Full/SWA allocator 继续施加物理背压。
