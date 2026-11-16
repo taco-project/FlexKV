@@ -778,14 +778,16 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
             # Per-group GPU strides: compute from the actual tensor to handle
             # different attention backend layouts (flash_attn vs
-            # triton/flashinfer).  A GPU that exposes a single tensor carries no
-            # recoverable per-layer dim, so its stride is left to the layout.
+            # triton/flashinfer).  A GPU that exposes a single tensor for a
+            # multi-layer group carries no recoverable per-layer dim, so its
+            # stride is left to the layout.
             group_gpu_layouts = gpu_layouts_per_group[gi]  # one layout per GPU
             gpu_regions = compile_gpu_regions(
                 [g], [group_gpu_layouts], tpb, self.kv_dim, dtype,
                 tensors_per_group_device=[[
                     (imported_group_blocks[i][0]
-                     if len(imported_group_blocks[i]) > 1 else None)
+                     if len(imported_group_blocks[i]) > 1 or g.num_layers == 1
+                     else None)
                     for i in range(len(group_gpu_layouts))
                 ]],
             )
