@@ -6,6 +6,7 @@ CUDA, never imports a worker class, and is what ``TransferEngine`` holds.
 
 import threading
 import time
+from contextlib import suppress
 from multiprocessing.connection import Connection
 from typing import Any, Union
 
@@ -19,21 +20,42 @@ from flexkv.transfer.worker_op import (
     WorkerLayerwiseTransferOp,
     WorkerTransferOp,
 )
+from flexkv.transfer.worker_sender import OrderedPipeSender, SenderClosed, SenderFull
 
 
 class WorkerHandle:
     """handle for worker process"""
-    def __init__(self, worker_id: int, transfer_conn: Connection, process: mp.Process, ready_event: Any):
+    def __init__(self, worker_id: int, transfer_conn: Connection, process: mp.Process,
+                 ready_event: Any, finished_ops_queue: Any = None,
+                 isolate_remote: bool = False):
         self.worker_id = worker_id
         self.transfer_conn = transfer_conn
         self.process = process
         self.ready_event = ready_event
+        self.finished_ops_queue = finished_ops_queue
+        self._remote_sender = None
+        if isolate_remote:
+            if finished_ops_queue is None:
+                raise ValueError("Remote sender requires the worker completion queue")
+            self._remote_sender = OrderedPipeSender(
+                transfer_conn, self._fail_unsent,
+                name=f"flexkv-remote-pipe-{worker_id}",
+            )
         # One handle is reachable from several TransferType keys (a mooncake
         # or GDS worker serves both directions), and TransferEngine shuts
         # handles down one thread each -- so shutdown() can be entered twice,
         # concurrently, on the same object. See the note on shutdown().
         self._shutdown_lock = threading.Lock()
         self._shutdown_done = False
+
+    def _fail_unsent(self, payload: Any, error: Exception) -> None:
+        op_id = getattr(payload, "transfer_op_id", None)
+        flexkv_logger.error(
+            "Remote pipe send failed worker_id=%s op_id=%s error=%r",
+            self.worker_id, op_id, error,
+        )
+        if op_id is not None:
+            self.finished_ops_queue.put((op_id, False, None))
 
     def submit_transfer(self, op: Union[TransferOp, LayerwiseTransferOp]) -> None:
         if isinstance(op, LayerwiseTransferOp):
@@ -46,18 +68,29 @@ class WorkerHandle:
             trace.set_submit_ns(op.op_id, submitted_ns)
         if trace._TRACE_ON:
             trace.inc_inflight()
-        self.transfer_conn.send(worker_op)
+        if self._remote_sender is None:
+            self.transfer_conn.send(worker_op)
+        else:
+            try:
+                self._remote_sender.submit(worker_op)
+            except (SenderClosed, SenderFull) as exc:
+                self._fail_unsent(worker_op, exc)
 
     def control(
         self, command: str, payload: Any = None, timeout: float = 120.0
     ) -> Any:
         request_id = f"{self.worker_id}:{time.monotonic_ns()}"
-        self.transfer_conn.send({
+        command_payload = {
             "type": "control",
             "command": command,
             "payload": payload,
             "request_id": request_id,
-        })
+        }
+        if self._remote_sender is None:
+            self.transfer_conn.send(command_payload)
+        else:
+            # Data, control and shutdown share one writer and one FIFO.
+            self._remote_sender.submit(command_payload)
         if not self.transfer_conn.poll(timeout):
             raise TimeoutError(
                 f"Worker {self.worker_id} timed out handling {command}"
@@ -88,8 +121,11 @@ class WorkerHandle:
             self._shutdown_done = True
 
             try:
-                self.transfer_conn.send(None)
-            except (BrokenPipeError, OSError, EOFError):
+                if self._remote_sender is None:
+                    self.transfer_conn.send(None)
+                else:
+                    self._remote_sender.close()
+            except (BrokenPipeError, OSError, EOFError, SenderClosed):
                 pass  # Pipe already closed / peer gone
 
             timeout = float(GLOBAL_CONFIG_FROM_ENV.worker_shutdown_timeout_s)
@@ -105,10 +141,11 @@ class WorkerHandle:
                     self.process.kill()
                     self.process.join()
 
-            try:
+            if self._remote_sender is not None:
+                self._remote_sender.join(timeout=5)
+
+            with suppress(Exception):
                 self.transfer_conn.close()
-            except Exception:
-                pass
 
     def __del__(self) -> None:
         try:

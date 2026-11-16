@@ -35,6 +35,8 @@ class CPURemoteTransferWorker(TransferWorkerBase):
     remote tier adds no worker at all.
     """
 
+    _is_remote_worker = True
+
     def __init__(self,
                  worker_id: int,
                  transfer_conn: Connection,

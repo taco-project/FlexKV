@@ -18,6 +18,7 @@ import os
 import signal
 import threading
 import time
+from contextlib import suppress
 from abc import ABC, abstractmethod
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -238,18 +239,14 @@ class TransferWorkerBase(ABC):
         """
         for attr in ("gpu_blocks", "_multi_group_gpu_blocks_keepalive"):
             if getattr(self, attr, None) is not None:
-                try:
+                with suppress(Exception):
                     setattr(self, attr, [])
-                except Exception:  # noqa: BLE001
-                    pass
         # GPUCPUTransferWorker keeps them per pool instead, in a registry keyed
         # by PoolId, so one worker can hold several without a name per pool.
         # getattr-guarded because the other worker classes have no ``_pools``.
         for pool in getattr(self, "_pools", {}).values():
-            try:
+            with suppress(Exception):
                 pool.keepalive = []
-            except Exception:  # noqa: BLE001
-                pass
         gc.collect()
 
     def _drain_cuda_bounded(self, worker_id: Any, timeout_s: float) -> bool:
@@ -327,7 +324,10 @@ class TransferWorkerBase(ABC):
         )
         process.start()
 
-        return WorkerHandle(worker_id, parent_conn, process, ready_event)
+        return WorkerHandle(
+            worker_id, parent_conn, process, ready_event, finished_ops_queue,
+            isolate_remote=bool(getattr(cls, "_is_remote_worker", False)),
+        )
 
     @classmethod
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
@@ -339,7 +339,7 @@ class TransferWorkerBase(ABC):
         # reference if ``__init__`` raises after partial cudaHostRegister; the
         # ``finally`` block can still unpin. ``run()`` only exits the loop —
         # this finally owns shutdown().
-        worker: Optional["TransferWorkerBase"] = None
+        worker: Optional[TransferWorkerBase] = None
 
         def _on_sigterm(signum: int, frame: Any) -> None:
             # Raise SystemExit so the ``finally`` below still runs shutdown().
