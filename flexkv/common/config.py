@@ -796,7 +796,6 @@ class CacheConfig:
     prefetch_options: Optional[Dict[str, Any]] = None
     prefetch_max_sessions: int = 128
     prefetch_max_reserved_bytes: int = 512 * 1024 * 1024
-    prefetch_max_pinned_bytes: int = 2 * 1024 * 1024 * 1024
     prefetch_result_ttl_s: float = 60.0
     # SSD layer granularity: <= 0 means N=1
     layer_granularity: int = -1
@@ -1031,7 +1030,6 @@ class UserConfig:
     prefetch_options: Optional[Dict[str, Any]] = None
     prefetch_max_sessions: int = 128
     prefetch_max_reserved_bytes: int = 512 * 1024 * 1024
-    prefetch_max_pinned_bytes: int = 2 * 1024 * 1024 * 1024
     prefetch_result_ttl_s: float = 60.0
 
     def __post_init__(self):
@@ -1076,6 +1074,13 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
     else:
         raise ValueError(f"Unsupported config file extension: {config_file}")
 
+    if "prefetch_max_pinned_bytes" in config:
+        flexkv_logger.warning(
+            "prefetch_max_pinned_bytes is retired and ignored; prefetch uses "
+            "min(128 GiB, actual L2 capacity minus one block) automatically"
+        )
+        config.pop("prefetch_max_pinned_bytes")
+
     if 'ssd_cache_dir' in config:
         config['ssd_cache_dir'] = parse_path_list(config['ssd_cache_dir'])
 
@@ -1091,13 +1096,17 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
     return user_config
 
 def load_user_config_from_env() -> UserConfig:
+    if os.getenv("FLEXKV_PREFETCH_MAX_PINNED_BYTES") is not None:
+        flexkv_logger.warning(
+            "FLEXKV_PREFETCH_MAX_PINNED_BYTES is retired and ignored; prefetch "
+            "uses min(128 GiB, actual L2 capacity minus one block) automatically"
+        )
     swa_multi_group_env = os.getenv('FLEXKV_SWA_MULTI_GROUP')
     return UserConfig(
         enable_chunked_prefetch=bool(int(os.getenv('FLEXKV_ENABLE_CHUNKED_PREFETCH', 0))),
         prefetch_options=json.loads(os.getenv('FLEXKV_PREFETCH_OPTIONS', '{}')),
         prefetch_max_sessions=int(os.getenv('FLEXKV_PREFETCH_MAX_SESSIONS', 128)),
         prefetch_max_reserved_bytes=int(os.getenv('FLEXKV_PREFETCH_MAX_RESERVED_BYTES', 512 * 1024 * 1024)),
-        prefetch_max_pinned_bytes=int(os.getenv('FLEXKV_PREFETCH_MAX_PINNED_BYTES', 2 * 1024 * 1024 * 1024)),
         prefetch_result_ttl_s=float(os.getenv('FLEXKV_PREFETCH_RESULT_TTL_S', 60)),
         cpu_cache_gb=int(os.getenv('FLEXKV_CPU_CACHE_GB', 16)),
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
@@ -1234,7 +1243,6 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     cache_config.prefetch_options = user_config.prefetch_options
     cache_config.prefetch_max_sessions = user_config.prefetch_max_sessions
     cache_config.prefetch_max_reserved_bytes = user_config.prefetch_max_reserved_bytes
-    cache_config.prefetch_max_pinned_bytes = user_config.prefetch_max_pinned_bytes
     cache_config.prefetch_result_ttl_s = user_config.prefetch_result_ttl_s
     block_size_in_bytes = block_size_in_bytes_for_cache(
         rank_info.model_config, cache_config, rank_info)

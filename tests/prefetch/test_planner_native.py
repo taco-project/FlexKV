@@ -39,7 +39,7 @@ def env(request):
         model_config=ModelConfig(num_layers=1, num_kv_heads=2, head_size=2),
         transfer_handles=[NS(submit_batch=lambda graphs: submitted.extend(graphs))],
     )
-    planner = MooncakeChunkPlanner(engine, 1 << 20)
+    planner = MooncakeChunkPlanner(engine)
     planner._query_client = NS(batch_exists=lambda keys: len(keys))
     coordinator = PrefetchCoordinator(planner, max_reserved_bytes=1 << 20)
     engine._prefetch = coordinator
@@ -416,7 +416,7 @@ def test_compressed_group_reservations_use_exact_block_bytes(env):
             LayerGroupSpec(1, 1, 3, [0], dtype=torch.uint8, compress_ratio=4)
         ],
     )
-    planner = MooncakeChunkPlanner(env.engine, 1024)
+    planner = MooncakeChunkPlanner(env.engine)
     try:
         # 3 bytes per 4-token block. Rounded per-token metrics are zero.
         assert env.engine.model_config.token_size_in_bytes == 0

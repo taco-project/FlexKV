@@ -120,13 +120,12 @@ prefetch_options:
   max_inflight_chunks: 2
 prefetch_max_sessions: 128
 prefetch_max_reserved_bytes: 536870912
-prefetch_max_pinned_bytes: 2147483648
 prefetch_result_ttl_s: 60
 ```
 
 These limits are within the existing CPU pool, not additional allocations.
 `chunk_max_blocks` and `max_inflight_chunks` must be positive; global session,
-reserved-byte, pinned-byte and result-TTL limits must be positive. An explicit
+reserved-byte and result-TTL limits must be positive. An explicit
 FlexKV policy takes precedence over SGLang's prefetch policy. If none is
 specified, the connector reads `hicache_storage_prefetch_policy` from SGLang.
 
@@ -149,8 +148,8 @@ timeout_per_ki_token_s * candidate_tokens / 1024)`. Their defaults are 2.0,
 using environment-backed configuration instead of a config file, use
 `FLEXKV_ENABLE_CHUNKED_PREFETCH=1` and e.g.
 `FLEXKV_PREFETCH_OPTIONS='{"policy":"timeout","timeout_budget_s":0.02}'`;
-the four limits also have corresponding `FLEXKV_PREFETCH_MAX_SESSIONS`,
-`FLEXKV_PREFETCH_MAX_RESERVED_BYTES`, `FLEXKV_PREFETCH_MAX_PINNED_BYTES` and
+the three limits also have corresponding `FLEXKV_PREFETCH_MAX_SESSIONS`,
+`FLEXKV_PREFETCH_MAX_RESERVED_BYTES` and
 `FLEXKV_PREFETCH_RESULT_TTL_S` variables. An already running external server
 retains its own configuration; clients do not reconfigure it.
 
@@ -222,3 +221,21 @@ disabling it reduces sync overhead and improves performance.
 `sglang_flexkv_connector.patch` is retained only as a legacy reference for the
 old pre-upstream integration. It is not required for supported SGLang releases,
 and it must not be used for the DeepSeek V4 path above.
+
+### Automatic prefetch byte budget
+
+In-flight staging and completed, unconsumed results share the backend pool's
+ledger. The budget is automatically min(128 GiB, actual Full-KV L2 capacity
+minus one block), within the existing pool. Block sizing includes compressed
+layer groups, registered SWA/state snapshots and all_write replicas. Backend
+and paired SGLang byte admission reuse `resolve_prefetch_budget`.
+The former `prefetch_max_pinned_bytes` setting and
+`FLEXKV_PREFETCH_MAX_PINNED_BYTES` environment variable are retired; old values
+warn and are ignored instead of retaining the former 2 GiB ceiling. No new
+budget setting is needed.
+
+The cap belongs to the backend pool, shared by TP/DP clients through its real
+pin/reservation ledger. The existing reserved-byte limit separately bounds
+concurrent staging: completed blocks transition to pin credit so later windows
+can continue filling. Cancellation still drains, foreground GET references
+protect H2D sources, and Full/SWA allocators retain physical backpressure.

@@ -184,7 +184,7 @@ def test_capability_gate_runs_before_any_resource_allocation(monkeypatch):
     "field,value",
     [
         ("prefetch_max_sessions", 0),
-        ("prefetch_max_pinned_bytes", -1),
+        ("prefetch_max_reserved_bytes", -1),
         ("prefetch_result_ttl_s", float("nan")),
     ],
 )

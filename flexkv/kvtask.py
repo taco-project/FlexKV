@@ -1211,13 +1211,13 @@ class KVTaskEngine(KVTaskManager):
             from flexkv.prefetch.planner import MooncakeChunkPlanner
             self._prefetch_options = PrefetchOptions(**(cache_config.prefetch_options or {}))
             self._prefetch_options.validate()
-            for name in ("prefetch_max_sessions", "prefetch_max_reserved_bytes", "prefetch_max_pinned_bytes"):
+            for name in ("prefetch_max_sessions", "prefetch_max_reserved_bytes"):
                 value = getattr(cache_config, name)
                 if isinstance(value, bool) or not isinstance(value, int):
                     raise ValueError("prefetch runtime limits must be integers")
             import math
             for limit in (cache_config.prefetch_max_sessions, cache_config.prefetch_max_reserved_bytes,
-                          cache_config.prefetch_max_pinned_bytes, cache_config.prefetch_result_ttl_s):
+                          cache_config.prefetch_result_ttl_s):
                 if not math.isfinite(limit) or limit <= 0:
                     raise ValueError("prefetch runtime limits must be finite and positive")
         super().__init__(model_config, cache_config, gpu_register_port, redis_meta, event_collector)
@@ -1226,7 +1226,7 @@ class KVTaskEngine(KVTaskManager):
 
         self._runtime = None
         if cache_config.enable_chunked_prefetch:
-            self._prefetch_backend = MooncakeChunkPlanner(self, cache_config.prefetch_max_pinned_bytes)
+            self._prefetch_backend = MooncakeChunkPlanner(self)
             metrics = get_global_collector()
             self._prefetch = PrefetchCoordinator(
                 self._prefetch_backend,

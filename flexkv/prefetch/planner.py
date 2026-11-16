@@ -56,41 +56,19 @@ class PrefetchChunk:
 
 
 class MooncakeChunkPlanner:
-    def __init__(self, engine, max_pinned_bytes):
+    def __init__(self, engine):
         self.engine = engine
         self.cache = engine.cache_engine
-        self.block_size = engine.cache_config.tokens_per_block
-        from flexkv.common.config import (
-            block_size_in_bytes_for_cache,
-            RankInfo,
-            GLOBAL_CONFIG_FROM_ENV,
-        )
+        from flexkv.prefetch.budget import resolve_prefetch_budget
 
-        self.block_bytes = block_size_in_bytes_for_cache(
-            engine.model_config, engine.cache_config, RankInfo(engine.model_config)
+        budget = resolve_prefetch_budget(
+            engine.model_config, engine.cache_config,
+            cpu_blocks=self.cache.cpu_cache_engine.num_total_blocks,
         )
-        # Full KV and its SWA/state sidecar use the same rank replication mode.
-        replicas = 1
-        if (
-            engine.model_config.num_kv_heads == 1
-            and GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode == "all_write"
-        ):
-            replicas = engine.model_config.effective_tp_size_per_node
-        self.block_bytes *= replicas
-        swa = engine.cache_config.swa
-        self.swa_slot_bytes = 0
-        if swa is not None and swa.enabled:
-            if swa.multi_group and swa.snapshot_bytes is None:
-                raise ValueError(
-                    "multi-group SWA prefetch requires registered snapshot geometry"
-                )
-            self.swa_slot_bytes = replicas * (
-                swa.snapshot_bytes
-                or (
-                    swa.num_swa_layers * self.block_size * swa.bytes_per_token_per_layer
-                )
-            )
-        self.max_pinned_bytes = max_pinned_bytes
+        self.block_size = budget.tokens_per_block
+        self.block_bytes = budget.block_bytes
+        self.swa_slot_bytes = budget.swa_slot_bytes
+        self.max_pinned_bytes = budget.byte_limit
         self.pinned_bytes = 0
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="flexkv-prefetch-query"
@@ -98,6 +76,9 @@ class MooncakeChunkPlanner:
         self._query_client = None
 
     def begin(self, tokens, namespace, client_id, options):
+        minimum = self.block_bytes + (self.swa_slot_bytes if options.swa_aware else 0)
+        if self.max_pinned_bytes < minimum:
+            raise PrefetchCapacityExhausted("L2 pool cannot fit a speculative block")
         if options.swa_aware and not self.cache.swa_op_constructor.enabled:
             raise ValueError("SWA prefetch requires enabled SWA storage and transfer")
         tokens = np.asarray(tokens)

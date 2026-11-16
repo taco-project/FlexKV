@@ -112,12 +112,11 @@ prefetch_options:
   max_inflight_chunks: 2
 prefetch_max_sessions: 128
 prefetch_max_reserved_bytes: 536870912
-prefetch_max_pinned_bytes: 2147483648
 prefetch_result_ttl_s: 60
 ```
 
 这些限额在现有 CPU 池内记账，不是额外内存分配。`chunk_max_blocks`、
-`max_inflight_chunks` 以及全局 session、预留字节、pin 字节和结果 TTL 限额均须为
+`max_inflight_chunks` 以及全局 session、预留字节和结果 TTL 限额均须为
 正数。显式 FlexKV policy 优先；未指定时 connector 读取 SGLang 的
 `hicache_storage_prefetch_policy`。
 
@@ -137,8 +136,8 @@ timeout_per_ki_token_s * candidate_tokens / 1024)`；后三者默认分别为 30
 和 0.1 秒，`timeout_budget_s` 默认未设置。只使用环境变量配置时，可设置
 `FLEXKV_ENABLE_CHUNKED_PREFETCH=1` 和例如
 `FLEXKV_PREFETCH_OPTIONS='{"policy":"timeout","timeout_budget_s":0.02}'`；
-四项限额也分别支持 `FLEXKV_PREFETCH_MAX_SESSIONS`、
-`FLEXKV_PREFETCH_MAX_RESERVED_BYTES`、`FLEXKV_PREFETCH_MAX_PINNED_BYTES` 和
+三项限额也分别支持 `FLEXKV_PREFETCH_MAX_SESSIONS`、
+`FLEXKV_PREFETCH_MAX_RESERVED_BYTES` 和
 `FLEXKV_PREFETCH_RESULT_TTL_S`。已运行的 external server 保留自身配置，客户端
 不会重新配置它。
 
@@ -199,3 +198,18 @@ SGLang 侧的 `storage/flexkv/__init__.py` 通过 `importlib` 从 `flexkv.integr
 
 `sglang_flexkv_connector.patch` 仅作为 FlexKV 尚未合入 SGLang 主干前的历史参考保留。
 受支持的 SGLang 正式版本不需要它，上述 DeepSeek V4 路径也不能使用它。
+
+### 自动预取字节额度
+
+预取在飞数据与已完成未消费结果共用后端 pool 账本。额度自动取
+128 GiB 与实际 Full-KV L2 容量减一个 block 的较小值，不额外分配内存。
+初始化时复用 block 大小计算，包含压缩层组、SWA/state snapshot 和
+all_write 副本。后端与配套 SGLang 字节窗口复用同一个
+`resolve_prefetch_budget`。原 `prefetch_max_pinned_bytes` 配置和
+`FLEXKV_PREFETCH_MAX_PINNED_BYTES` 环境变量已移除；旧配置会告警并忽略，
+不会继续用 2 GiB 限制新额度。无需配置新的额度参数。
+
+128 GiB 是整个后端池的上限，TP/DP 客户端共用实际 pin/reservation 账本。
+在飞 staging 的并发限额与驻留额度不同，现有 reserved-byte 限额仍约束在飞
+窗口；已完成块转入 pin 额度后可继续填充。取消必须 drain，H2D 源数据由原有
+GET 引用保护。物理 Full/SWA allocator 限制和前台背压继续生效。
