@@ -120,6 +120,22 @@ if TYPE_CHECKING:
 
 logger = flexkv_logger
 
+# FLEXKV_HASH_SCHEME for blocks named by vLLM's own block hashes: a router
+# recomputes those from the tokens for sha256_cbor without lookahead tokens.
+VLLM_SHA256_CBOR_I64 = "vllm-sha256-cbor-i64-v1"
+
+
+def _check_hash_scheme(vllm_config: "VllmConfig") -> None:
+    scheme = GLOBAL_CONFIG_FROM_ENV.hash_scheme
+    algo = vllm_config.cache_config.prefix_caching_hash_algo
+    lookahead = vllm_config.num_hash_lookahead_tokens
+    if scheme != VLLM_SHA256_CBOR_I64 or algo != "sha256_cbor" or lookahead:
+        raise ValueError(
+            f"FLEXKV_HASH_SCHEME={scheme!r}: the vLLM connector names blocks by vLLM's "
+            f"block hashes as {VLLM_SHA256_CBOR_I64!r}, which needs "
+            f"--prefix-caching-hash-algo sha256_cbor and no lookahead block hashes "
+            f"(got {algo!r}, {lookahead} lookahead tokens)")
+
 
 def _assert_token_major(kv_cache: torch.Tensor, token_dim: int,
                         head_dim: int) -> None:
@@ -285,6 +301,7 @@ class FlexKVSchedulerConnector:
         ] = {}
 
         self.flexkv_stats = FlexKVStats(int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', '200')))
+        self.hash_scheme = GLOBAL_CONFIG_FROM_ENV.hash_scheme
         self.failed_block_ids: set[int] = set()
 
         self.maybe_skip_put = os.getenv('FLEXKV_MAYBE_SKIP_PUT', '0') == '1'
@@ -395,7 +412,8 @@ class FlexKVSchedulerConnector:
                 try:
                     task_id = self.flexkv_manager.prefetch_async(
                         token_ids=np.asarray(request.all_token_ids[:num_tokens], dtype=np.int64),
-                        namespace=self._extract_namespace(request))
+                        namespace=self._extract_namespace(request),
+                        **self._block_hashes(request, num_tokens))
                 except Exception as e:  # noqa: BLE001 - serve from the local tiers
                     logger.warning(f"FlexKV prefetch of {req_id} failed: {e}")
             if task_id is None or task_id < 0:
@@ -419,6 +437,16 @@ class FlexKVSchedulerConnector:
         """Whether vLLM must keep stepping with no request left: a returned
         task's graph (a PUT's SSD write) completes only when polled."""
         return self.flexkv_manager.has_running_graphs()
+
+    def _block_hashes(self, request: "Request", num_tokens: int) -> dict:
+        """``block_hashes`` under FLEXKV_HASH_SCHEME: vLLM's own hashes of the
+        request's first ``num_tokens`` tokens (they carry its LoRA, cache salt
+        and multimodal keys), first 8 bytes as a big-endian int64."""
+        if not self.hash_scheme:
+            return {}
+        hashes = request.block_hashes[:num_tokens // self.block_size]
+        return {"block_hashes": np.frombuffer(
+            b"".join(h[:8] for h in hashes), dtype=">i8").astype(np.int64)}
 
     def _extract_namespace(self, request: "Request") -> Optional[List[str]]:
         """
@@ -490,6 +518,7 @@ class FlexKVSchedulerConnector:
             token_ids=np_token_ids,
             token_mask=np_token_mask,
             namespace=namespace,
+            **self._block_hashes(request, num_tokens_to_get),
         )
         num_new_matched_tokens = int(np.count_nonzero(matched_mask))
 
@@ -688,6 +717,7 @@ class FlexKVSchedulerConnector:
         task_id, unmatched_mask = self.flexkv_manager.put_match(
             token_ids=np_token_ids,
             namespace=namespace,
+            **self._block_hashes(request, num_tokens_to_put),
         )
 
         num_unmatched_tokens = int(np.count_nonzero(unmatched_mask))
@@ -1339,6 +1369,8 @@ class FlexKVConnectorV1Impl:
         self._bound_metadata: Optional[FlexKVConnectorMetadata] = None
 
         if role == KVConnectorRole.SCHEDULER:
+            if GLOBAL_CONFIG_FROM_ENV.hash_scheme:
+                _check_hash_scheme(vllm_config)
             self.connector = FlexKVSchedulerConnector(
                 flexkv_config, rank_info, self.enable_layerwise_transfer)
             # Track scheduled requests to detect preemptions in build_connector_meta
