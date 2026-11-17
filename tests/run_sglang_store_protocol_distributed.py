@@ -19,15 +19,19 @@ from flexkv.integration.sglang.connector import FlexKVConnector
 
 
 class _FakeKVManager:
-    def put_match(self, *, token_ids, token_mask):
+    def put_match(self, *, token_ids, token_mask, namespace=None):
         del token_mask
         return 17, np.ones(len(token_ids), dtype=np.bool_)
 
     def launch(self, **kwargs):
         del kwargs
 
-    def try_wait(self, *, task_ids):
+    def wait(self, task_ids, *, timeout, completely):
         assert task_ids == [17]
+        assert timeout == 0.0
+        if completely:
+            status = "not_found" if getattr(self, "tail_done", False) else "timeout"
+            return {17: SimpleNamespace(status=SimpleNamespace(value=status))}
         return {17: SimpleNamespace(status=SimpleNamespace(value="success"))}
 
 
@@ -73,6 +77,15 @@ def main() -> None:
     completed = connector.check_completed_stores()
     assert completed == ["request"]
     assert connector._inflight_stores == {}
+
+    # GPU ownership is released on both ranks while the leader still drives
+    # a delayed storage tail. Tail completion must not emit the rid twice.
+    assert connector.check_completed_stores() == []
+    assert bool(getattr(connector, "_store_tail_tasks", {})) is (rank == 0)
+    if rank == 0:
+        connector.kv_manager.tail_done = True
+    assert connector.check_completed_stores() == []
+    assert not getattr(connector, "_store_tail_tasks", {})
     print(
         json.dumps(
             {
