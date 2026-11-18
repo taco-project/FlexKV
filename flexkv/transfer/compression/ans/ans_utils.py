@@ -1,6 +1,6 @@
 import os
 import uuid
-from typing import Tuple, List, Dict, Optional, Any
+from typing import Tuple, List, Dict, NamedTuple, Optional, Any, Sequence, Union
 
 import torch
 
@@ -28,6 +28,39 @@ MIN_CHUNK_BYTES = 4096
 RATIO_PLATEAU_BYTES = 16 * 1024
 SSD_PACKED_IO_ALIGN = 512
 
+# Which layer groups of a heterogeneous-KV model ANS compresses.
+#   "auto" (default) -- every group the kernels can address AND that ANS has
+#                       headroom to shrink; see ``select_nvcomp_groups``
+#   "all"            -- every addressable group, headroom or not
+#   "0" / "0,1"      -- exactly those ordinals; a named group that is
+#                       ineligible is an error, not a silent drop
+#   "none"           -- nothing, which disables nvcomp
+# The list is resolved once, in the engine process, and handed to the worker
+# strategy; it is never re-read inside a worker. See ``select_nvcomp_groups``.
+NVCOMP_GROUPS_ENV = "FLEXKV_NVCOMP_GROUPS"
+
+# Element types ANS can address but has no headroom on: already-quantized KV
+# is close to maximum entropy, so the compressed chunk routinely comes out
+# LARGER than the slot the CPU tier reserved for it -- which is not a silent
+# corruption but a hard failure ("compressed payload exceeded the CPU chunk
+# slot") that fails the whole transfer graph and the request with it.
+#
+# Measured on GLM-5.3: group 0 (bf16 MLA latent) compresses 1.42x, while
+# group 1 (the uint8 DSA indexer, fp8 scales packed in) overflowed on every
+# single store. So "auto" skips these, and ``FLEXKV_NVCOMP_GROUPS=all`` or an
+# explicit ordinal is how you ask for one anyway.
+LOW_HEADROOM_DTYPES = (
+    torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8,
+)
+
+# Sentinel for "read the env"; ``None`` already means "auto" on the wire.
+_FROM_ENV = object()
+
+# Sentinel for "all": every addressable group, skipping the headroom
+# heuristic. Distinct from an explicit ordinal list, which treats an
+# unaddressable group as a configuration error rather than dropping it.
+_ALL_GROUPS = object()
+
 
 def check_dtype(dtype) -> None:
     if dtype not in SUPPORTED_DTYPES:
@@ -53,6 +86,8 @@ def check_engine_nvcomp_enable(
     *,
     layerwise_enabled: bool,
     cpu_handle: Optional[Any],
+    model_config: Optional[Any] = None,
+    ssd_handle: Optional[Any] = None,
 ) -> bool:
     """Engine-level enable/fallback policy for nvcomp ANS."""
     if os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") != "1":
@@ -78,6 +113,28 @@ def check_engine_nvcomp_enable(
             "[nvcomp-fallback] FLEXKV_ENABLE_NVCOMP=1 but the KV cache uses "
             "the packed 4D layout, which the ANS kernels cannot address yet; "
             "disabling nvcomp.")
+        return False
+
+    # Heterogeneous (multi-group) KV: a DSA model (DeepSeek-V4, GLM-5.3) splits
+    # its layers into groups with different geometry -- group 0 is the MLA
+    # latent, group 1 the indexer. Which of them get compressed is decided by
+    # ``select_nvcomp_groups``; an empty selection means nvcomp has nothing to
+    # do and the whole feature is declined.
+    #
+    # This has to be decided here rather than in the strategy, which is where
+    # the refusal used to live: by the time a strategy attaches it is already
+    # inside a spawned worker process, so raising there kills the worker and
+    # the engine waits on a `ready` that can never arrive. Declining at the
+    # engine level degrades to uncompressed transfers instead, matching every
+    # other guard in this function. `layer_groups` is the same condition the
+    # worker keys on -- it is what makes `tp_group_transfer_groups` non-None.
+    layer_groups = getattr(model_config, "layer_groups", None)
+    if layer_groups and not check_multi_group_nvcomp(
+            layer_groups,
+            tokens_per_block=getattr(cpu_handle.kv_layout, "tokens_per_block",
+                                     None) if cpu_handle is not None else None,
+            default_dtype=getattr(model_config, "dtype", None),
+            has_ssd=ssd_handle is not None):
         return False
 
     # TODO(nvcomp-guard): layerwise transfer is not supported yet
@@ -116,6 +173,289 @@ def check_engine_nvcomp_enable(
             "paths use uncompressed transfers consistently.")
         return False
     return True
+
+
+class GroupPlan(NamedTuple):
+    """One compressed layer group, as the engine hands it to a worker.
+
+    ``table_layer_offset`` is the group's first row in the size table's layer
+    dimension. Every group -- compressed or not -- owns a private stretch of
+    ``num_layers`` rows at the running prefix sum, so two compressed groups can
+    never alias each other's lengths. Offsets are computed over *all* groups,
+    not just the selected ones, so a table allocated under one selection is
+    still addressed correctly under another.
+    """
+    group_index: int
+    table_layer_offset: int
+    num_layers: int
+
+
+def group_table_layer_offsets(layer_groups: Sequence[Any]) -> List[int]:
+    """Per-group first row in the size table's layer dimension (prefix sum)."""
+    offsets: List[int] = []
+    running = 0
+    for group in layer_groups:
+        offsets.append(running)
+        running += int(group.num_layers)
+    return offsets
+
+
+def group_low_headroom_reason(
+    group: Any, *, default_dtype: Optional[torch.dtype],
+) -> Optional[str]:
+    """Why ``auto`` should not pick this group even though ANS can address it.
+
+    Separate from ``group_nvcomp_ineligible_reason`` because the two answer
+    different questions: that one is "would this even run", this one is "is it
+    worth running". Only ``auto`` consults this; an explicitly named group is
+    compressed regardless, which is how you override the heuristic.
+    """
+    dtype = getattr(group, "dtype", None) or default_dtype
+    if dtype in LOW_HEADROOM_DTYPES:
+        return (f"dtype {dtype} is already quantized, so ANS is likely to "
+                "overflow the CPU chunk slot rather than shrink it")
+    return None
+
+
+def group_nvcomp_ineligible_reason(
+    group: Any,
+    *,
+    tokens_per_block: Optional[int],
+    default_dtype: Optional[torch.dtype],
+) -> Optional[str]:
+    """Why ANS cannot compress this layer group, or ``None`` if it can.
+
+    Every check here is about whether the *kernels* can address the group, not
+    about whether compressing it is a good idea. Whether it is worthwhile is
+    ``group_low_headroom_reason``, which only ``auto`` consults -- so an
+    operator naming a group explicitly still gets it.
+    """
+    dtype = getattr(group, "dtype", None) or default_dtype
+    if dtype not in SUPPORTED_DTYPES:
+        return f"dtype {dtype} is not one ANS supports"
+
+    if tokens_per_block is not None:
+        chunk = group_chunk_bytes(
+            group, tokens_per_block=tokens_per_block, default_dtype=default_dtype)
+        if chunk % (getattr(group, "num_kv_heads", 1) or 1):
+            # Unreachable arithmetically; kept so a future geometry change
+            # trips here rather than in the kernel.
+            return f"chunk={chunk}B does not divide by the head count"
+        if chunk < MIN_CHUNK_BYTES:
+            return f"chunk={chunk}B is below the {MIN_CHUNK_BYTES}B ANS minimum"
+    return None
+
+
+def group_chunk_bytes(
+    group: Any, *, tokens_per_block: int,
+    default_dtype: Optional[torch.dtype],
+) -> int:
+    """Bytes of one (layer, kv) slot of one block of this group.
+
+    Same formula as ``flexkv.transfer.template.group_chunk_bytes``; duplicated
+    rather than imported because that module pulls in the storage layer and
+    this one is imported from the engine before any layout exists.
+    ``compress_ratio`` shrinks the token dimension on both sides of the
+    transfer, so it is a smaller chunk rather than a ratio between the two.
+    """
+    dtype = getattr(group, "dtype", None) or default_dtype
+    tokens = tokens_per_block // getattr(group, "compress_ratio", 1)
+    return (tokens * group.num_kv_heads * group.head_size * dtype.itemsize)
+
+
+def _parse_groups_env(
+    raw: str, num_groups: int,
+) -> Union[None, List[int], object]:
+    """``FLEXKV_NVCOMP_GROUPS`` -> requested ordinals.
+
+    Returns ``None`` for "auto" and the ``_ALL_GROUPS`` sentinel for "all".
+    "all" is not just ``range(num_groups)``: naming an ordinal the kernels
+    cannot address is a configuration error and declines nvcomp, whereas "all"
+    means "every group you can address" and drops the ones you cannot -- it
+    overrides the headroom heuristic, not the addressability check.
+    """
+    value = raw.strip().lower()
+    if value in ("", "auto"):
+        return None
+    if value == "all":
+        return _ALL_GROUPS
+    if value == "none":
+        return []
+    requested: List[int] = []
+    for piece in value.replace(" ", "").split(","):
+        if not piece:
+            continue
+        try:
+            idx = int(piece)
+        except ValueError:
+            raise ValueError(
+                f"{NVCOMP_GROUPS_ENV}={raw!r}: {piece!r} is not an integer, "
+                "'auto', 'all', or 'none'.")
+        if not 0 <= idx < num_groups:
+            raise ValueError(
+                f"{NVCOMP_GROUPS_ENV}={raw!r}: group {idx} is out of range for "
+                f"a model with {num_groups} layer group(s).")
+        if idx not in requested:
+            requested.append(idx)
+    return requested
+
+
+def select_nvcomp_groups(
+    layer_groups: Sequence[Any],
+    *,
+    tokens_per_block: Optional[int],
+    default_dtype: Optional[torch.dtype],
+    has_ssd: bool = False,
+    env: Union[str, None, Any] = _FROM_ENV,
+) -> List[GroupPlan]:
+    """Which layer groups ANS compresses, and where each one's table rows are.
+
+    Resolved once in the engine process and handed to the worker strategy, so
+    the engine's accept decision and the worker's binding can never disagree --
+    they are the same list, not two copies of a constant.
+
+    ``FLEXKV_NVCOMP_GROUPS`` selects:
+
+    * ``auto`` (default) -- every group the kernels can address *and* that ANS
+      has headroom to shrink. A group whose data is already quantized is
+      skipped: it does not merely compress badly, it overflows the CPU chunk
+      slot and fails the whole transfer graph (see ``LOW_HEADROOM_DTYPES``).
+      That failure is loud rather than corrupting, but a default that makes
+      every store fail is still the wrong default.
+    * ``all`` -- every addressable group, headroom or not. This is the escape
+      hatch for measuring the heuristic rather than trusting it.
+    * ``0`` / ``0,1`` -- exactly those ordinals, headroom or not. Naming a
+      group the kernels cannot address is a configuration error, so it
+      declines nvcomp outright rather than quietly compressing a subset of
+      what was asked for.
+    * ``none`` -- nothing, which disables nvcomp.
+
+    Returns an empty list when nvcomp should not run.
+    """
+    # The SSD tier cannot carry a compressed CPU block on this layout.
+    # CPUSSDDiskTransferWorker moves a multi-group block as one opaque blob
+    # (``_init_multi_group_ssd``: CPU and SSD share a byte-identical BLOCKFIRST
+    # block, so there is no per-chunk addressing to hang a table off), which
+    # means the compressed *lengths* never travel with the bytes. The uniform
+    # path avoids this by packing through NvcompCpuSsdStrategy, which keeps
+    # ssd_size_table[s] alongside and restores cpu_size_table[c'] on DISK2H.
+    # Blob-copying instead would restore a CPU block into a slot whose table
+    # row still holds some earlier block's lengths -- decompressed at the wrong
+    # length, with no error. Decline rather than half-support it.
+    if has_ssd:
+        flexkv_logger.warning(
+            "[nvcomp-fallback] multi-group KV with an SSD tier: CPU<->SSD "
+            "moves these blocks as opaque blobs and cannot carry the "
+            "compressed-size table, so a DISK2H restore would decompress at a "
+            "stale length. Disabling nvcomp.")
+        return []
+
+    raw = os.environ.get(NVCOMP_GROUPS_ENV, "auto") if env is _FROM_ENV else (
+        "auto" if env is None else str(env))
+    try:
+        requested = _parse_groups_env(raw, len(layer_groups))
+    except ValueError as exc:
+        flexkv_logger.warning(f"[nvcomp-fallback] {exc} Disabling nvcomp.")
+        return []
+
+    if requested == []:
+        flexkv_logger.info(
+            f"[nvcomp-multi-group] {NVCOMP_GROUPS_ENV}={raw!r} selects no "
+            "layer groups; disabling nvcomp.")
+        return []
+
+    offsets = group_table_layer_offsets(layer_groups)
+    reasons = [
+        group_nvcomp_ineligible_reason(
+            group, tokens_per_block=tokens_per_block,
+            default_dtype=default_dtype)
+        for group in layer_groups
+    ]
+
+    if requested is None:
+        # "auto" answers two questions per group, and they are deliberately
+        # separate: can the kernels address it, and is compressing it worth
+        # doing. Only auto asks the second one -- "all" and an explicit
+        # ordinal take the group regardless, so the heuristic is overridable.
+        skips = [
+            reason or group_low_headroom_reason(
+                group, default_dtype=default_dtype)
+            for reason, group in zip(reasons, layer_groups)
+        ]
+        chosen = [gi for gi, reason in enumerate(skips) if reason is None]
+        for gi, reason in enumerate(skips):
+            if reason is not None:
+                flexkv_logger.info(
+                    f"[nvcomp-multi-group] layer group {gi} transfers "
+                    f"uncompressed: {reason}.")
+    elif requested is _ALL_GROUPS:
+        # "all" overrides the headroom heuristic but not addressability: a
+        # group the kernels cannot reach is dropped, same as under auto.
+        chosen = [gi for gi, reason in enumerate(reasons) if reason is None]
+        for gi, reason in enumerate(reasons):
+            if reason is not None:
+                flexkv_logger.info(
+                    f"[nvcomp-multi-group] layer group {gi} transfers "
+                    f"uncompressed: {reason}.")
+    else:
+        # An explicitly named group that cannot be compressed is a config
+        # error. Silently dropping it would leave the operator believing a
+        # measurement covered a group it never touched.
+        rejected = [(gi, reasons[gi]) for gi in requested
+                    if reasons[gi] is not None]
+        if rejected:
+            detail = "; ".join(f"group {gi}: {r}" for gi, r in rejected)
+            flexkv_logger.warning(
+                f"[nvcomp-fallback] {NVCOMP_GROUPS_ENV}={raw!r} names "
+                f"group(s) ANS cannot compress ({detail}). Disabling nvcomp "
+                "rather than compressing a subset of what was requested.")
+            return []
+        chosen = list(requested)
+
+    if not chosen:
+        flexkv_logger.warning(
+            "[nvcomp-fallback] multi-group KV: no layer group can be "
+            "compressed; disabling nvcomp.")
+        return []
+
+    plans = [
+        GroupPlan(group_index=gi,
+                  table_layer_offset=offsets[gi],
+                  num_layers=int(layer_groups[gi].num_layers))
+        for gi in sorted(chosen)
+    ]
+    described = ", ".join(
+        f"{p.group_index}({p.num_layers}L, "
+        f"dtype={getattr(layer_groups[p.group_index], 'dtype', None) or default_dtype}, "
+        f"rows {p.table_layer_offset}..{p.table_layer_offset + p.num_layers - 1})"
+        for p in plans)
+    skipped = len(layer_groups) - len(plans)
+    flexkv_logger.info(
+        f"[nvcomp-multi-group] {NVCOMP_GROUPS_ENV}={raw!r} -> compressing "
+        f"layer group(s) {described}; "
+        f"{skipped} other group(s) transfer uncompressed.")
+    return plans
+
+
+def check_multi_group_nvcomp(
+    layer_groups: List[Any],
+    *,
+    tokens_per_block: Optional[int],
+    default_dtype: Optional[torch.dtype],
+    has_ssd: bool = False,
+) -> bool:
+    """Whether nvcomp can run on a heterogeneous-KV model at all.
+
+    Thin wrapper so the engine's accept/decline is literally
+    ``select_nvcomp_groups`` finding something to do, rather than a second
+    predicate that could drift from it.
+    """
+    return bool(select_nvcomp_groups(
+        layer_groups,
+        tokens_per_block=tokens_per_block,
+        default_dtype=default_dtype,
+        has_ssd=has_ssd,
+    ))
 
 
 def check_worker_nvcomp_enable(
@@ -201,7 +541,19 @@ def allocate_engine_size_tables(
     Optional[torch.Tensor],
 ]:
     layout = cpu_handle.kv_layout
-    num_layers = layout.num_layer
+    # On a heterogeneous-KV model every group gets a private stretch of the
+    # table's layer dimension, at the prefix sum of the groups' layer counts
+    # (``group_table_layer_offsets``). Sizing from ``layout.num_layer`` instead
+    # would give one group's worth of rows for all of them: two groups whose
+    # local layer ids both start at 0 would write each other's lengths, and the
+    # restore would decompress at the wrong length with no error. Offsets cover
+    # every group, not just the compressed ones, so the table stays valid when
+    # FLEXKV_NVCOMP_GROUPS changes without reallocating.
+    layer_groups = getattr(model_config, "layer_groups", None)
+    if layer_groups:
+        num_layers = sum(int(g.num_layers) for g in layer_groups)
+    else:
+        num_layers = layout.num_layer
     # Read the region count off the layout rather than recomputing it from
     # the legacy flag, so the table always matches what the kernels stride over.
     kv_dim = layout.kv_dim
