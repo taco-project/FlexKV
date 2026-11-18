@@ -1859,6 +1859,12 @@ class FlexKVConnectorV1Impl:
         id list per KV cache group, of which FlexKV stores one."""
         return self.request_finished(request, block_ids[self.connector.group_id])
 
+    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
+        """The KV cache group a FlexKV load restores: the one FlexKV stores.
+        vLLM keeps an async load's blocks of it out of zeroing, and replays
+        the sliding window of any group a hit does not restore."""
+        return (self.connector.group_id,)
+
     def has_pending_push_work(self) -> bool:
         """Keep vLLM stepping while a FlexKV graph completes only when polled."""
         if self.role != KVConnectorRole.SCHEDULER:

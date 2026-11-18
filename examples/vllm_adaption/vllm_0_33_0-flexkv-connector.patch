@@ -1,5 +1,5 @@
 diff --git a/tests/v1/kv_connector/unit/test_flexkv_connector.py b/tests/v1/kv_connector/unit/test_flexkv_connector.py
-index 061ec3f..8e3590d 100644
+index 061ec3f..0a54a45 100644
 --- a/tests/v1/kv_connector/unit/test_flexkv_connector.py
 +++ b/tests/v1/kv_connector/unit/test_flexkv_connector.py
 @@ -125,6 +125,53 @@ class TestFlexKVConnectorImportError:
@@ -70,7 +70,7 @@ index 061ec3f..8e3590d 100644
      def test_register_kv_caches(self, connector_and_impl):
          connector, impl = connector_and_impl
          kv_caches = {"layer_0": torch.zeros(1)}
-@@ -206,6 +260,14 @@ class TestFlexKVConnectorDelegation:
+@@ -206,6 +260,21 @@ class TestFlexKVConnectorDelegation:
          impl.request_finished.assert_called_once_with(req, [1, 2, 3])
          assert result == (True, {"key": "val"})
  
@@ -82,10 +82,17 @@ index 061ec3f..8e3590d 100644
 +        impl.request_finished_all_groups.assert_called_once_with(req, ([1], [2, 3]))
 +        assert result == (False, None)
 +
++    def test_get_loaded_kv_cache_group_ids(self, connector_and_impl):
++        connector, impl = connector_and_impl
++        req = MagicMock()
++        impl.get_loaded_kv_cache_group_ids.return_value = (1,)
++        assert connector.get_loaded_kv_cache_group_ids(req) == (1,)
++        impl.get_loaded_kv_cache_group_ids.assert_called_once_with(req)
++
      def test_take_events(self, connector_and_impl):
          connector, impl = connector_and_impl
          impl.take_events.return_value = iter([])
-@@ -219,6 +281,19 @@ class TestFlexKVConnectorDelegation:
+@@ -219,6 +288,19 @@ class TestFlexKVConnectorDelegation:
          impl.get_kv_connector_stats.assert_called_once()
          assert result is None
  
@@ -105,7 +112,7 @@ index 061ec3f..8e3590d 100644
      def test_get_block_ids_with_load_errors(self, connector_and_impl):
          connector, impl = connector_and_impl
          impl.get_block_ids_with_load_errors.return_value = {7, 8}
-@@ -229,3 +304,35 @@ class TestFlexKVConnectorDelegation:
+@@ -229,3 +311,35 @@ class TestFlexKVConnectorDelegation:
          connector, impl = connector_and_impl
          connector.wait_for_layer_load("layer_0")
          impl.wait_for_layer_load.assert_called_once_with("layer_0")
@@ -142,7 +149,7 @@ index 061ec3f..8e3590d 100644
 +        assert connector.has_pending_push_work() is result
 +        impl.has_pending_push_work.assert_called_once()
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
-index bbb64cf..3ad67e9 100644
+index bbb64cf..85db1e7 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 @@ -10,6 +10,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -295,7 +302,7 @@ index bbb64cf..3ad67e9 100644
  
          """
          return self._flexkv_connector.get_num_new_matched_tokens(
-@@ -252,6 +293,20 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -252,6 +293,24 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          """
          return self._flexkv_connector.request_finished(request, block_ids)
  
@@ -308,6 +315,10 @@ index bbb64cf..3ad67e9 100644
 +        list per KV cache group. FlexKV stores the prefix-cacheable group."""
 +        return self._flexkv_connector.request_finished_all_groups(request, block_ids)
 +
++    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
++        """The KV cache group a FlexKV load restores: the one FlexKV stores."""
++        return self._flexkv_connector.get_loaded_kv_cache_group_ids(request)
++
 +    def has_pending_push_work(self) -> bool:
 +        """Whether FlexKV transfers still complete only while the engine
 +        keeps stepping (e.g. an SSD write after the request finished)."""
@@ -316,7 +327,7 @@ index bbb64cf..3ad67e9 100644
      def take_events(self) -> Iterable["KVCacheEvent"]:
          """Collect buffered KV cache events.
  
-@@ -265,6 +320,23 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -265,6 +324,23 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          """Get the KV connector stats collected during the last interval."""
          return self._flexkv_connector.get_kv_connector_stats()
  
