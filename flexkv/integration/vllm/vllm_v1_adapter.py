@@ -344,6 +344,9 @@ class FlexKVSchedulerConnector:
         self.failed_load_req_ids: set[str] = set()
 
         self.maybe_skip_put = os.getenv('FLEXKV_MAYBE_SKIP_PUT', '0') == '1'
+        # How long vLLM may wait for a PUT to free its blocks rather than
+        # preempt a request (has_pending_block_frees); 0 never waits.
+        self.pending_free_wait_s = float(os.getenv('FLEXKV_PENDING_FREE_WAIT_S', '5'))
         self.enable_layerwise_transfer = (
             bool(int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', '0')))
             if enable_layerwise_transfer is None
@@ -496,6 +499,20 @@ class FlexKVSchedulerConnector:
         """Whether vLLM must keep stepping with no request left: a returned
         task's graph (a PUT's SSD write) completes only when polled."""
         return self.flexkv_manager.has_running_graphs()
+
+    def has_pending_block_frees(self) -> bool:
+        """Whether a PUT will soon free a finished request's blocks, so that
+        vLLM, short of blocks, can wait for them instead of preempting a
+        request. Not once the oldest PUT has run for pending_free_wait_s: one
+        that hangs must not keep vLLM from preempting for good."""
+        if self.pending_free_wait_s <= 0:
+            return False
+        launched = [task.task_launch_time
+                    for tasks in self.put_tasks.values() for task in tasks]
+        if launched:
+            return time.perf_counter() - min(launched) < self.pending_free_wait_s
+        return any(isinstance(task, FlexKVPutTask)
+                   for task in self.tasks_to_launch.values())
 
     def _block_hashes(self, request: "Request", num_tokens: int) -> dict:
         """``block_hashes`` under FLEXKV_HASH_SCHEME: vLLM's own hashes of the
@@ -1893,6 +1910,12 @@ class FlexKVConnectorV1Impl:
         if self.role != KVConnectorRole.SCHEDULER:
             return False
         return self.connector.has_pending_work()
+
+    def has_pending_block_frees(self) -> bool:
+        """Let vLLM wait for a FlexKV PUT to free blocks instead of preempting."""
+        if self.role != KVConnectorRole.SCHEDULER:
+            return False
+        return self.connector.has_pending_block_frees()
 
     def take_events(self) -> Iterable['KVCacheEvent']:
         '''

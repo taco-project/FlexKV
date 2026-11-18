@@ -157,6 +157,10 @@ git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/vllm_0_33_0-fle
 `'{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both","kv_load_failure_policy":"recompute"}'`。
 layer-wise 加载失败则会让该次 forward 失败（见上文）。
 
+FlexKV 还在把已结束请求的 KV 从 GPU block 拷出时，vLLM 缺 block 会等这些 block 释放，
+而不是抢占运行中的请求；最早的一次拷贝超过 `FLEXKV_PENDING_FREE_WAIT_S` 秒（默认 `5`，
+设为 `0` 则不等）后就不再等待。
+
 ---
 
 ## Legacy版本（<= 0.1.0），目前的版本尽量不要使用

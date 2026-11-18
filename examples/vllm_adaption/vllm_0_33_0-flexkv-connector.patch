@@ -1,5 +1,5 @@
 diff --git a/tests/v1/kv_connector/unit/test_flexkv_connector.py b/tests/v1/kv_connector/unit/test_flexkv_connector.py
-index 061ec3f..53fb429 100644
+index 061ec3f..7fab465 100644
 --- a/tests/v1/kv_connector/unit/test_flexkv_connector.py
 +++ b/tests/v1/kv_connector/unit/test_flexkv_connector.py
 @@ -125,6 +125,53 @@ class TestFlexKVConnectorImportError:
@@ -125,7 +125,7 @@ index 061ec3f..53fb429 100644
      def test_get_block_ids_with_load_errors(self, connector_and_impl):
          connector, impl = connector_and_impl
          impl.get_block_ids_with_load_errors.return_value = {7, 8}
-@@ -229,3 +317,35 @@ class TestFlexKVConnectorDelegation:
+@@ -229,3 +317,42 @@ class TestFlexKVConnectorDelegation:
          connector, impl = connector_and_impl
          connector.wait_for_layer_load("layer_0")
          impl.wait_for_layer_load.assert_called_once_with("layer_0")
@@ -161,8 +161,15 @@ index 061ec3f..53fb429 100644
 +        impl.has_pending_push_work.return_value = result
 +        assert connector.has_pending_push_work() is result
 +        impl.has_pending_push_work.assert_called_once()
++
++    @pytest.mark.parametrize("result", [True, False])
++    def test_has_pending_block_frees(self, connector_and_impl, result):
++        connector, impl = connector_and_impl
++        impl.has_pending_block_frees.return_value = result
++        assert connector.has_pending_block_frees() is result
++        impl.has_pending_block_frees.assert_called_once()
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
-index bbb64cf..b2f955f 100644
+index bbb64cf..4e812c7 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 @@ -10,6 +10,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -326,7 +333,7 @@ index bbb64cf..b2f955f 100644
      def build_connector_meta(
          self, scheduler_output: SchedulerOutput
      ) -> KVConnectorMetadata:
-@@ -252,6 +297,24 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -252,6 +297,29 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          """
          return self._flexkv_connector.request_finished(request, block_ids)
  
@@ -348,10 +355,15 @@ index bbb64cf..b2f955f 100644
 +        keeps stepping (e.g. an SSD write after the request finished)."""
 +        return self._flexkv_connector.has_pending_push_work()
 +
++    def has_pending_block_frees(self) -> bool:
++        """Whether a FlexKV PUT will soon free a finished request's blocks,
++        which vLLM can wait for instead of preempting a request."""
++        return self._flexkv_connector.has_pending_block_frees()
++
      def take_events(self) -> Iterable["KVCacheEvent"]:
          """Collect buffered KV cache events.
  
-@@ -265,6 +328,23 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -265,6 +333,23 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          """Get the KV connector stats collected during the last interval."""
          return self._flexkv_connector.get_kv_connector_stats()
  

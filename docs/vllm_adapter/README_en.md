@@ -163,6 +163,11 @@ in `--kv-transfer-config`, e.g.
 `'{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both","kv_load_failure_policy":"recompute"}'`.
 A layer-wise load that fails fails the forward instead (see above).
 
+While FlexKV still copies a finished request's KV out of its GPU blocks, a vLLM
+short of blocks waits for them rather than preempting a running request. It
+stops waiting once the oldest such copy has run for `FLEXKV_PENDING_FREE_WAIT_S`
+seconds (default `5`; `0` turns the wait off).
+
 ---
 
 ## Legacy Version (<= 0.1.0) – Not Recommended for Current Use
