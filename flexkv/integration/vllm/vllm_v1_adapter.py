@@ -439,33 +439,51 @@ class FlexKVSchedulerConnector:
 
         return num_new_matched_tokens, True
 
+    def on_new_request(self, request: "Request") -> None:
+        """Start the prefetch of an arriving request's prompt, so that it runs
+        while the request waits in vLLM's queue rather than from its first
+        scheduling attempt. Its local GPU hit is not known yet."""
+        if self.enable_prefetch:
+            self._start_prefetch(request, num_computed_tokens=0)
+
     def _prefetch_done(self, request: "Request", num_computed_tokens: int) -> bool:
-        """Start the prefetch of a waiting request's prompt (peer CPU, local and
-        peer SSD into the local CPU tier) on first sight, then tell whether it
-        has finished; the GET that follows reads what it brought."""
+        """Tell whether the prefetch of a waiting request's prompt has finished,
+        starting it if on_new_request did not; the GET that follows reads what
+        it brought."""
         req_id = request.request_id
         if req_id in self.prefetched_req_ids:
             return True
         task_id = self.prefetch_tasks.get(req_id)
         if task_id is None:
-            num_tokens = request.num_tokens // self.block_size * self.block_size
-            if num_tokens > num_computed_tokens:
-                try:
-                    task_id = self.flexkv_manager.prefetch_async(
-                        token_ids=np.asarray(request.all_token_ids[:num_tokens], dtype=np.int64),
-                        namespace=self._extract_namespace(request),
-                        **self._block_hashes(request, num_tokens))
-                except Exception as e:  # noqa: BLE001 - serve from the local tiers
-                    logger.warning(f"FlexKV prefetch of {req_id} failed: {e}")
-            if task_id is None or task_id < 0:
-                self.prefetched_req_ids.add(req_id)
+            task_id = self._start_prefetch(request, num_computed_tokens)
+            if task_id is None:
                 return True
-            self.prefetch_tasks[req_id] = task_id
         if task_id not in self.flexkv_manager.try_wait([task_id]):
             return False
         del self.prefetch_tasks[req_id]
         self.prefetched_req_ids.add(req_id)
         return True
+
+    def _start_prefetch(self, request: "Request", num_computed_tokens: int) -> Optional[int]:
+        """Prefetch the prompt's full blocks (peer CPU, local and peer SSD into
+        the local CPU tier) unless the local hit covers them; return the task
+        id, or None when there is nothing to wait for."""
+        req_id = request.request_id
+        task_id = None
+        num_tokens = request.num_tokens // self.block_size * self.block_size
+        if num_tokens > num_computed_tokens:
+            try:
+                task_id = self.flexkv_manager.prefetch_async(
+                    token_ids=np.asarray(request.all_token_ids[:num_tokens], dtype=np.int64),
+                    namespace=self._extract_namespace(request),
+                    **self._block_hashes(request, num_tokens))
+            except Exception as e:  # noqa: BLE001 - serve from the local tiers
+                logger.warning(f"FlexKV prefetch of {req_id} failed: {e}")
+        if task_id is None or task_id < 0:
+            self.prefetched_req_ids.add(req_id)
+            return None
+        self.prefetch_tasks[req_id] = task_id
+        return task_id
 
     def _forget_prefetch(self, req_id: str) -> None:
         self.prefetched_req_ids.discard(req_id)
@@ -1761,6 +1779,11 @@ class FlexKVConnectorV1Impl:
         Update KVConnector state after block allocation.
         """
         self.connector.update_state_after_alloc(request, blocks, num_external_tokens)
+
+    def on_new_request(self, request: "Request") -> None:
+        """Start FlexKV's prefetch of a request as it arrives."""
+        if self.role == KVConnectorRole.SCHEDULER:
+            self.connector.on_new_request(request)
 
     def build_connector_meta(
             self, scheduler_output: "SchedulerOutput") -> "KVConnectorMetadata":
