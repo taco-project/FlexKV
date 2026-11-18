@@ -32,6 +32,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.v1.engine import FinishReason
 
+# KVConnectorTransferResults: lets a worker report a failed load per request,
+# the one report vLLM 0.33 takes once a model has several KV cache groups
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorTransferResults)
+except ImportError:
+    KVConnectorTransferResults = None  # type: ignore[misc,assignment]
+
 # KVConnectorStats: available since v0.11.0
 try:
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -206,6 +214,9 @@ class FlexKVConnectorMetadata(KVConnectorMetadata):
 
     layerwise: LayerwiseLoadMetadata = field(
         default_factory=LayerwiseLoadMetadata)
+    # Requests whose async GET failed, for the workers to report: vLLM takes a
+    # failed load only from them (FlexKVConnectorV1Impl.get_transfer_results).
+    failed_recving: frozenset[str] = frozenset()
 
 
 @dataclass(slots=True)
@@ -327,7 +338,18 @@ class FlexKVSchedulerConnector:
 
         self.flexkv_stats = FlexKVStats(int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', '200')))
         self.hash_scheme = GLOBAL_CONFIG_FROM_ENV.hash_scheme
-        self.failed_block_ids: set[int] = set()
+        # Requests whose async GET failed. vLLM takes a failed load only from a
+        # worker (FlexKVConnectorV1Impl.get_transfer_results), and FlexKV sees
+        # a GET end only after vLLM has read the step's worker reports, so a
+        # failed request goes to the workers in the next step's metadata
+        # (take_failed_loads), its finished_recving held back until they
+        # report it (failed_loads_reported). vLLM then recomputes the request,
+        # which is not loaded again. A vLLM without KVConnectorTransferResults
+        # cannot take the report: there a failed GET is reported as finished.
+        self.report_failed_loads = KVConnectorTransferResults is not None
+        self.failed_loads_to_send: set[str] = set()
+        self.failed_loads_unreported: set[str] = set()
+        self.failed_load_req_ids: set[str] = set()
 
         self.maybe_skip_put = os.getenv('FLEXKV_MAYBE_SKIP_PUT', '0') == '1'
         self.enable_layerwise_transfer = (
@@ -384,7 +406,6 @@ class FlexKVSchedulerConnector:
         if self.req_id_to_task_dict or self.prefetch_tasks:
             return False
         self.flexkv_manager.reset()
-        self.failed_block_ids.clear()
         return True
 
     ####################
@@ -408,6 +429,9 @@ class FlexKVSchedulerConnector:
                             and whether it is necessary to get the new matched
                             blocks from flexkv.
         """
+        if request.request_id in self.failed_load_req_ids:
+            # vLLM recomputes a request whose load failed.
+            return 0, False
         if self.enable_prefetch and not self._prefetch_done(request, num_computed_tokens):
             return None, False
         task_id, num_new_matched_tokens = self._get_match(request=request,
@@ -639,6 +663,11 @@ class FlexKVSchedulerConnector:
             vLLM must defer freeing them; False if the blocks can be freed.
         """
         self._forget_prefetch(request.request_id)
+        self.failed_load_req_ids.discard(request.request_id)
+        if request.request_id in self.failed_loads_unreported:
+            # Its blocks hold no KV; vLLM frees them once the failed load's
+            # report arrives.
+            return False
         # A GET task still owns the blocks until its graph completion callback
         # runs. In layer-wise mode this is normally only a short tail after the
         # final eventfd; query_finished_task() will return this finished request
@@ -925,8 +954,13 @@ class FlexKVSchedulerConnector:
             if task_id in self.get_tasks:
                 tasks = self.get_tasks.pop(task_id)
                 if not self.enable_layerwise_transfer:
-                    finished_recving.update(
-                        task.request.request_id for task in tasks)
+                    req_ids = {task.request.request_id for task in tasks}
+                    if success or not self.report_failed_loads:
+                        finished_recving |= req_ids
+                    else:
+                        self.failed_loads_to_send |= req_ids
+                        self.failed_loads_unreported |= req_ids
+                        self.failed_load_req_ids |= req_ids
             else:
                 tasks = self.put_tasks.pop(task_id)
                 finished_sending.update(task.request.request_id for task in tasks)
@@ -936,8 +970,6 @@ class FlexKVSchedulerConnector:
                 if not success:
                     logger.error(f"{task} failed, status: {response.status}.")
                     num_failed_tasks += 1
-                    if isinstance(task, FlexKVGetTask):
-                        self.failed_block_ids.update(task.block_ids)
                 # responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
                 #                                             request=task.request, success=success))
                 deferred = self.deferred_layerwise_puts.pop(
@@ -952,10 +984,16 @@ class FlexKVSchedulerConnector:
         self.flexkv_stats.record_faild(num_failed_requests=num_failed_tasks)
         return finished_sending, finished_recving
 
-    def get_and_clear_failed_block_ids(self) -> set[int]:
-        failed = self.failed_block_ids
-        self.failed_block_ids = set()
+    def take_failed_loads(self) -> frozenset[str]:
+        """The failed loads for this step's connector metadata, each sent once:
+        vLLM fails on a request reported received twice."""
+        failed = frozenset(self.failed_loads_to_send)
+        self.failed_loads_to_send.clear()
         return failed
+
+    def failed_loads_reported(self, req_ids: set[str]) -> None:
+        """The workers reported these failed loads to vLLM."""
+        self.failed_loads_unreported -= req_ids
 
     def handle_preemptions(self, preempted_req_ids: set[str]):
         """
@@ -1569,13 +1607,7 @@ class FlexKVConnectorV1Impl:
             return
         metadata = kwargs.get("connector_metadata")
         if metadata is None:
-            metadata = self._bound_metadata
-        if metadata is None:
-            # vLLM binds metadata on the outer FlexKVConnectorV1 wrapper before
-            # delegating this hook to the installed FlexKV implementation.
-            from vllm.distributed.kv_transfer import get_kv_transfer_group
-            outer_connector = get_kv_transfer_group()
-            metadata = outer_connector._get_connector_metadata()
+            metadata = self._step_metadata()
         if not isinstance(metadata, FlexKVConnectorMetadata):
             raise TypeError(
                 "expected FlexKVConnectorMetadata, got "
@@ -1636,8 +1668,46 @@ class FlexKVConnectorV1Impl:
             tuple of (sending/saving ids, recving/loading ids).
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
+
+        The scheduler side reports every other finished transfer. The failed
+        loads this step's metadata carries are reported here as received, so
+        that a vLLM wrapper not forwarding get_transfer_results still releases
+        them, if only as received.
         """
-        return None, None
+        return None, (self._failed_loads() or None)
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> "KVConnectorTransferResults":
+        """Report the failed loads this step's metadata carries as received
+        and failed.
+
+        vLLM takes a failed load only from a worker, and per request once a
+        model has several KV cache groups. FlexKV sees a GET end on the
+        scheduler side, after vLLM has read the step's worker reports, so the
+        scheduler side passes the failure here a step later.
+        """
+        failed = self._failed_loads()
+        return KVConnectorTransferResults(
+            finished_recving=failed, failed_recving=failed)
+
+    def _failed_loads(self) -> set[str]:
+        """The failed loads this step's metadata carries, on a worker."""
+        if self.role != KVConnectorRole.WORKER:
+            return set()
+        metadata = self._step_metadata()
+        return set(metadata.failed_recving) if metadata is not None else set()
+
+    def _step_metadata(self) -> Optional[FlexKVConnectorMetadata]:
+        """This step's connector metadata. A vLLM wrapper that does not forward
+        bind_connector_metadata binds it on itself before delegating."""
+        if self._bound_metadata is not None:
+            return self._bound_metadata
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+        outer_connector = get_kv_transfer_group()
+        if not outer_connector.has_connector_metadata():
+            return None
+        return outer_connector._get_connector_metadata()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
@@ -1746,7 +1816,9 @@ class FlexKVConnectorV1Impl:
         if os.getenv('FLEXKV_SYNC_GET', '0') == '1':
             self.connector.wait_for_all_get_tasks()
 
-        return FlexKVConnectorMetadata(layerwise=layerwise_metadata)
+        return FlexKVConnectorMetadata(
+            layerwise=layerwise_metadata,
+            failed_recving=self.connector.take_failed_loads())
 
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
         """
@@ -1761,8 +1833,12 @@ class FlexKVConnectorV1Impl:
             return
 
         finished_sending, finished_recving = self.connector.query_finished_task()
+        # What the workers report as received are the failed loads of an
+        # earlier step's metadata (get_transfer_results).
+        reported = set(connector_output.finished_recving or ())
+        self.connector.failed_loads_reported(reported)
         connector_output.finished_sending = finished_sending
-        connector_output.finished_recving = finished_recving
+        connector_output.finished_recving = finished_recving | reported
 
 
     def request_finished(
@@ -1840,6 +1916,7 @@ class FlexKVConnectorV1Impl:
         return _FlexKVConnectorStats(data=data)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        if self.role == KVConnectorRole.SCHEDULER:
-            return self.connector.get_and_clear_failed_block_ids()
+        """None: FlexKV reports a failed load per request
+        (get_transfer_results), as vLLM refuses block ids once a model has
+        several KV cache groups."""
         return set()

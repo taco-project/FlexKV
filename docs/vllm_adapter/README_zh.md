@@ -151,6 +151,12 @@ cd "$(python -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__f
 git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch"
 ```
 
+打了 0.33.0 的 patch 后，FlexKV 加载失败会作为 failed receive 报给 vLLM，由 vLLM 按
+`kv_load_failure_policy` 处理：默认（`"fail"`）该请求以错误结束；设为 `"recompute"`
+则 vLLM 不经 FlexKV 重算该请求。在 `--kv-transfer-config` 里设置，例如
+`'{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both","kv_load_failure_policy":"recompute"}'`。
+layer-wise 加载失败则会让该次 forward 失败（见上文）。
+
 ---
 
 ## Legacy版本（<= 0.1.0），目前的版本尽量不要使用

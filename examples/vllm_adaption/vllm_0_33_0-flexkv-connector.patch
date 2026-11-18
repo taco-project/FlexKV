@@ -1,5 +1,5 @@
 diff --git a/tests/v1/kv_connector/unit/test_flexkv_connector.py b/tests/v1/kv_connector/unit/test_flexkv_connector.py
-index 061ec3f..5e51d4f 100644
+index 061ec3f..1f90627 100644
 --- a/tests/v1/kv_connector/unit/test_flexkv_connector.py
 +++ b/tests/v1/kv_connector/unit/test_flexkv_connector.py
 @@ -125,6 +125,53 @@ class TestFlexKVConnectorImportError:
@@ -56,7 +56,21 @@ index 061ec3f..5e51d4f 100644
  class TestFlexKVConnectorDelegation:
      """All public API methods should be forwarded to the impl."""
  
-@@ -206,6 +253,14 @@ class TestFlexKVConnectorDelegation:
+@@ -165,6 +212,13 @@ class TestFlexKVConnectorDelegation:
+         impl.get_finished.assert_called_once_with({"req1"})
+         assert result == ({"req1"}, None)
+ 
++    def test_get_transfer_results(self, connector_and_impl):
++        connector, impl = connector_and_impl
++        results = MagicMock()
++        impl.get_transfer_results.return_value = results
++        assert connector.get_transfer_results({"req1"}) is results
++        impl.get_transfer_results.assert_called_once_with({"req1"})
++
+     def test_register_kv_caches(self, connector_and_impl):
+         connector, impl = connector_and_impl
+         kv_caches = {"layer_0": torch.zeros(1)}
+@@ -206,6 +260,14 @@ class TestFlexKVConnectorDelegation:
          impl.request_finished.assert_called_once_with(req, [1, 2, 3])
          assert result == (True, {"key": "val"})
  
@@ -71,7 +85,7 @@ index 061ec3f..5e51d4f 100644
      def test_take_events(self, connector_and_impl):
          connector, impl = connector_and_impl
          impl.take_events.return_value = iter([])
-@@ -229,3 +284,35 @@ class TestFlexKVConnectorDelegation:
+@@ -229,3 +291,35 @@ class TestFlexKVConnectorDelegation:
          connector, impl = connector_and_impl
          connector.wait_for_layer_load("layer_0")
          impl.wait_for_layer_load.assert_called_once_with("layer_0")
@@ -108,18 +122,19 @@ index 061ec3f..5e51d4f 100644
 +        assert connector.has_pending_push_work() is result
 +        impl.has_pending_push_work.assert_called_once()
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
-index bbb64cf..97ebe35 100644
+index bbb64cf..bb6c92c 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
-@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+@@ -10,6 +10,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
      KVConnectorBase_V1,
      KVConnectorMetadata,
      KVConnectorRole,
++    KVConnectorTransferResults,
 +    SupportsHMA,
  )
  from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
  from vllm.logger import init_logger
-@@ -32,7 +33,7 @@ logger = init_logger(__name__)
+@@ -32,7 +34,7 @@ logger = init_logger(__name__)
  # GitHub: https://github.com/taco-project/FlexKV
  # Install: git clone git@github.com:taco-project/FlexKV.git \
  #          && cd FlexKV && bash build.sh
@@ -128,7 +143,7 @@ index bbb64cf..97ebe35 100644
      """KV Connector that offloads KV cache to FlexKV.
  
      FlexKV is a distributed KV Store and multi-level cache management system
-@@ -53,6 +54,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -53,6 +55,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
              '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}'
      """
  
@@ -140,7 +155,7 @@ index bbb64cf..97ebe35 100644
      def __init__(
          self,
          vllm_config: "VllmConfig",
-@@ -71,27 +77,45 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -71,27 +78,45 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
                  "for installation instructions."
              ) from e
  
@@ -193,7 +208,7 @@ index bbb64cf..97ebe35 100644
  
          Args:
              forward_context (ForwardContext): the forward context.
-@@ -101,13 +125,10 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -101,13 +126,10 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          self._flexkv_connector.start_load_kv(forward_context, **kwargs)
  
      def wait_for_layer_load(self, layer_name: str) -> None:
@@ -209,7 +224,24 @@ index bbb64cf..97ebe35 100644
  
          """
          self._flexkv_connector.wait_for_layer_load(layer_name)
-@@ -177,6 +198,14 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -167,6 +189,16 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+         """
+         return self._flexkv_connector.get_finished(finished_req_ids)
+ 
++    def get_transfer_results(
++        self, finished_req_ids: set[str]
++    ) -> KVConnectorTransferResults:
++        """Report the loads FlexKV found failed, as received and failed.
++
++        FlexKV sees a load fail on the scheduler side and passes it to the
++        workers in the connector metadata, as only a worker reports one.
++        """
++        return self._flexkv_connector.get_transfer_results(finished_req_ids)
++
+     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+         """Initialize with the KV caches. Useful for pre-registering the
+         KV caches in the KVConnector (e.g. for NIXL).
+@@ -177,6 +209,14 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          """
          self._flexkv_connector.register_kv_caches(kv_caches)
  
@@ -224,7 +256,7 @@ index bbb64cf..97ebe35 100644
      # ==============================
      # Scheduler-side methods
      # ==============================
-@@ -184,7 +213,7 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -184,7 +224,7 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          self,
          request: "Request",
          num_computed_tokens: int,
@@ -233,7 +265,7 @@ index bbb64cf..97ebe35 100644
          """Get the number of new tokens that can be loaded from the
          external KV cache beyond ``num_computed_tokens``.
  
-@@ -196,7 +225,8 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -196,7 +236,8 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          Returns:
              Tuple of (num_external_tokens, is_ready) where
              num_external_tokens is the number of additional tokens that
@@ -243,7 +275,7 @@ index bbb64cf..97ebe35 100644
  
          """
          return self._flexkv_connector.get_num_new_matched_tokens(
-@@ -252,6 +282,20 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -252,6 +293,20 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
          """
          return self._flexkv_connector.request_finished(request, block_ids)
  
@@ -264,7 +296,7 @@ index bbb64cf..97ebe35 100644
      def take_events(self) -> Iterable["KVCacheEvent"]:
          """Collect buffered KV cache events.
  
-@@ -268,3 +312,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -268,3 +323,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
      def get_block_ids_with_load_errors(self) -> set[int]:
          """Get the block ids that have failed to load."""
          return self._flexkv_connector.get_block_ids_with_load_errors()

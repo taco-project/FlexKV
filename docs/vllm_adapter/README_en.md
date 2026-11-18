@@ -156,6 +156,13 @@ cd "$(python -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__f
 git apply --include='vllm/*' "$FLEXKV_DIR/examples/vllm_adaption/vllm_0_33_0-flexkv-connector.patch"
 ```
 
+With the 0.33.0 patch a FlexKV load that fails reaches vLLM as a failed receive,
+and vLLM applies its `kv_load_failure_policy`: by default (`"fail"`) the request
+ends with an error, with `"recompute"` vLLM recomputes it without FlexKV. Set it
+in `--kv-transfer-config`, e.g.
+`'{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both","kv_load_failure_policy":"recompute"}'`.
+A layer-wise load that fails fails the forward instead (see above).
+
 ---
 
 ## Legacy Version (<= 0.1.0) – Not Recommended for Current Use
