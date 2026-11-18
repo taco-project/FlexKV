@@ -1,5 +1,5 @@
 diff --git a/tests/v1/kv_connector/unit/test_flexkv_connector.py b/tests/v1/kv_connector/unit/test_flexkv_connector.py
-index 061ec3f..1f90627 100644
+index 061ec3f..8e3590d 100644
 --- a/tests/v1/kv_connector/unit/test_flexkv_connector.py
 +++ b/tests/v1/kv_connector/unit/test_flexkv_connector.py
 @@ -125,6 +125,53 @@ class TestFlexKVConnectorImportError:
@@ -85,7 +85,27 @@ index 061ec3f..1f90627 100644
      def test_take_events(self, connector_and_impl):
          connector, impl = connector_and_impl
          impl.take_events.return_value = iter([])
-@@ -229,3 +291,35 @@ class TestFlexKVConnectorDelegation:
+@@ -219,6 +281,19 @@ class TestFlexKVConnectorDelegation:
+         impl.get_kv_connector_stats.assert_called_once()
+         assert result is None
+ 
++    def test_build_kv_connector_stats(self):
++        from vllm.distributed.kv_transfer.kv_connector.v1.flexkv_connector import (
++            FlexKVConnectorV1,
++        )
++
++        with _install_flexkv_mock(MagicMock()):
++            impl_cls = sys.modules[
++                "flexkv.integration.vllm.vllm_v1_adapter"
++            ].FlexKVConnectorV1Impl
++            stats = FlexKVConnectorV1.build_kv_connector_stats({"num_get_requests": 1})
++        impl_cls.build_kv_connector_stats.assert_called_once_with({"num_get_requests": 1})
++        assert stats is impl_cls.build_kv_connector_stats.return_value
++
+     def test_get_block_ids_with_load_errors(self, connector_and_impl):
+         connector, impl = connector_and_impl
+         impl.get_block_ids_with_load_errors.return_value = {7, 8}
+@@ -229,3 +304,35 @@ class TestFlexKVConnectorDelegation:
          connector, impl = connector_and_impl
          connector.wait_for_layer_load("layer_0")
          impl.wait_for_layer_load.assert_called_once_with("layer_0")
@@ -122,7 +142,7 @@ index 061ec3f..1f90627 100644
 +        assert connector.has_pending_push_work() is result
 +        impl.has_pending_push_work.assert_called_once()
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
-index bbb64cf..bb6c92c 100644
+index bbb64cf..3ad67e9 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py
 @@ -10,6 +10,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -296,7 +316,19 @@ index bbb64cf..bb6c92c 100644
      def take_events(self) -> Iterable["KVCacheEvent"]:
          """Collect buffered KV cache events.
  
-@@ -268,3 +323,11 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+@@ -265,6 +320,23 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
+         """Get the KV connector stats collected during the last interval."""
+         return self._flexkv_connector.get_kv_connector_stats()
+ 
++    @classmethod
++    def build_kv_connector_stats(
++        cls, data: dict[str, Any] | None = None
++    ) -> KVConnectorStats | None:
++        """FlexKV's stats, rebuilt in the process that logs them."""
++        from flexkv.integration.vllm.vllm_v1_adapter import FlexKVConnectorV1Impl
++
++        return FlexKVConnectorV1Impl.build_kv_connector_stats(data)
++
      def get_block_ids_with_load_errors(self) -> set[int]:
          """Get the block ids that have failed to load."""
          return self._flexkv_connector.get_block_ids_with_load_errors()

@@ -45,39 +45,31 @@ try:
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 
     class _FlexKVConnectorStats(KVConnectorStats):
-        """Serializable vLLM stats snapshot for the FlexKV scheduler side."""
-
-        _RATIO_KEYS = {"get_gpu_match_ratio", "get_flexkv_match_ratio"}
+        """FlexKV's counts (FlexKVStats) over an interval. vLLM sums the
+        scheduler side's per-step reports and logs them with their ratios."""
 
         def reset(self):
-            for key in self.data:
-                self.data[key] = 0
+            self.data = {}
 
         def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
-            if other.is_empty():
-                return self
             for key, value in other.data.items():
-                if key not in self._RATIO_KEYS:
-                    self.data[key] = self.data.get(key, 0) + value
-            query_tokens = self.data.get("num_get_query_tokens", 0)
-            self.data["get_gpu_match_ratio"] = (
-                self.data.get("num_gpu_matched_tokens", 0) / query_tokens
-                if query_tokens else 0.0
-            )
-            self.data["get_flexkv_match_ratio"] = (
-                self.data.get("num_flexkv_matched_tokens", 0) / query_tokens
-                if query_tokens else 0.0
-            )
+                self.data[key] = self.data.get(key, 0) + value
             return self
 
         def reduce(self) -> dict[str, int | float]:
-            return dict(self.data)
+            query_tokens = self.data.get("num_get_query_tokens", 0)
+
+            def ratio(key: str) -> float:
+                return self.data.get(key, 0) / query_tokens if query_tokens else 0.0
+
+            return {
+                **self.data,
+                "get_gpu_match_ratio": ratio("num_gpu_matched_tokens"),
+                "get_flexkv_match_ratio": ratio("num_flexkv_matched_tokens"),
+            }
 
         def is_empty(self) -> bool:
-            return not any(
-                value for key, value in self.data.items()
-                if key not in self._RATIO_KEYS
-            )
+            return not any(self.data.values())
 
     class _FlexKVWorkerSentinelStats(KVConnectorStats):
         """Sentinel stats returned from the worker side so that
@@ -1900,20 +1892,19 @@ class FlexKVConnectorV1Impl:
             # scheduler's stats, avoiding NotImplementedError.
             return _FlexKVWorkerSentinelStats(data={})
 
-        stats = self.connector.flexkv_stats
-        data = {
-            "num_get_requests": stats.num_get_requests,
-            "num_get_query_tokens": stats.num_get_query_tokens,
-            "num_gpu_matched_tokens": stats.num_gpu_matched_tokens,
-            "num_flexkv_matched_tokens": stats.num_flexkv_matched_tokens,
-            "num_put_requests": stats.num_put_requests,
-            "num_put_query_tokens": stats.num_put_query_tokens,
-            "num_put_unmatched_tokens": stats.num_put_unmatched_tokens,
-            "num_failed_requests": stats.num_failed_requests,
-            "get_gpu_match_ratio": stats.get_gpu_match_ratio,
-            "get_flexkv_match_ratio": stats.get_flexkv_match_ratio,
-        }
-        return _FlexKVConnectorStats(data=data)
+        # The counts since the previous step's report: vLLM sums them.
+        return _FlexKVConnectorStats(
+            data=self.connector.flexkv_stats.take_counts())
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: Optional[dict[str, Any]] = None
+    ) -> Optional["KVConnectorStats"]:
+        """FlexKV's stats from the payload vLLM passes the process that logs
+        them (see get_kv_connector_stats)."""
+        if _FlexKVConnectorStats is None:
+            return None
+        return _FlexKVConnectorStats(data=dict(data or {}))
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """None: FlexKV reports a failed load per request
