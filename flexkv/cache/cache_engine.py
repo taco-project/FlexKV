@@ -2670,9 +2670,10 @@ class GlobalCacheEngine:
 
         if len(fragment12_cpu_blocks) < fragment12_num_blocks or \
             len(fragment2_ssd_blocks) < fragment2_num_blocks:
-            print(f"[WARNING] PUT request {request_id} FAILED: "
-                  f"CPU={len(fragment12_cpu_blocks)}/{fragment12_num_blocks}, "
-                  f"SSD={len(fragment2_ssd_blocks)}/{fragment2_num_blocks}")
+            flexkv_logger.warning(
+                f"PUT request {request_id} FAILED: "
+                f"CPU={len(fragment12_cpu_blocks)}/{fragment12_num_blocks}, "
+                f"SSD={len(fragment2_ssd_blocks)}/{fragment2_num_blocks}")
             self.cpu_cache_engine.recycle(fragment12_cpu_blocks)
             if enable_ssd:
                 self.ssd_cache_engine.recycle(fragment2_ssd_blocks)
