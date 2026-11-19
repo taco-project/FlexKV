@@ -13,7 +13,8 @@ from flexkv.common.config import (
     recompute_cache_block_counts,
     update_default_config_from_user_config,
 )
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.common.storage import (
+    KVCacheLayout, KVCacheLayoutType, align_host_block_bytes)
 
 pytestmark = pytest.mark.unit
 
@@ -121,8 +122,8 @@ def test_compact_indexer_reclaims_capacity_at_fixed_bytes() -> None:
 
     assert recompute_cache_block_counts(model_config, cache_config) is True
     # Rank-shared KV (num_kv_heads=1): one copy per block whatever tp_size is.
-    compact_bytes = 8 * 64 * 576 * 2 + 3 * 8448
-    aliased_bytes = 8 * 64 * 576 * 2 + 8 * 8448
+    compact_bytes = align_host_block_bytes(8 * 64 * 576 * 2 + 3 * 8448)
+    aliased_bytes = align_host_block_bytes(8 * 64 * 576 * 2 + 8 * 8448)
     assert cache_config.num_cpu_blocks == (1 << 30) // compact_bytes
     assert cache_config.num_cpu_blocks > (1 << 30) // aliased_bytes
 
@@ -171,3 +172,14 @@ def test_multi_group_block_holds_one_copy_of_rank_shared_kv(
     )
     assert layout.get_block_stride() == copies * one_copy
     assert model_config.token_size_in_bytes * 64 == copies * one_copy
+
+
+def test_multi_group_block_is_padded_for_direct_io(monkeypatch) -> None:
+    """With FLEXKV_HOST_BLOCK_ALIGN=4096 a DSv4.1 FULL block (417,920 B) is
+    padded so O_DIRECT can engage."""
+    import flexkv.common.storage as storage
+    assert align_host_block_bytes(417920) == 417920
+    monkeypatch.setattr(storage, "HOST_BLOCK_ALIGN", 4096)
+    assert align_host_block_bytes(417920) % 4096 == 0
+    assert 0 <= align_host_block_bytes(417920) - 417920 < 4096
+    assert align_host_block_bytes(8192) == 8192

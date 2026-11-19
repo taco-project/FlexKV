@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
@@ -18,6 +19,16 @@ class AccessHandleType(Enum):
     FILE = auto()  # single file or file list
     TENSOR_HANDLE = auto()  # single tensor handle or tensor handle list
     GDS_MANAGER = auto()
+
+# Multi-group host blocks are padded to this many bytes. SSD I/O only uses
+# O_DIRECT when the block stride is a multiple of the device's direct-I/O
+# alignment, so set 4096 with an SSD tier. 1 (default) leaves blocks unpadded.
+HOST_BLOCK_ALIGN = max(1, int(os.environ.get("FLEXKV_HOST_BLOCK_ALIGN", "1")))
+
+
+def align_host_block_bytes(nbytes: int) -> int:
+    return (nbytes + HOST_BLOCK_ALIGN - 1) // HOST_BLOCK_ALIGN * HOST_BLOCK_ALIGN
+
 
 # NOTE: GPU layout depends on the vLLM version's non-MLA KV cache shape:
 #   vLLM <= 0.21: (kv, num_blocks, ...)  -> LAYERFIRST
@@ -120,12 +131,12 @@ class KVCacheLayout:
                             f"{self.tokens_per_block}. Choose a page_size that is a "
                             f"multiple of every group's compress_ratio."
                         )
-                bytes_per_block = self.tp_size * sum(
+                bytes_per_block = align_host_block_bytes(self.tp_size * sum(
                     g.num_layers * self.kv_dim *
                     (self.tokens_per_block // g.compress_ratio) *
                     g.num_kv_heads * g.head_size * g.dtype.itemsize
                     for g in self.layer_groups
-                )
+                ))
                 self._kv_shape = torch.Size([self.num_block, bytes_per_block])
             elif self.type == KVCacheLayoutType.LAYERFIRST:  # for Layerwise transfer
                 self._kv_shape = torch.Size([self.num_layer,

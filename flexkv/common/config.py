@@ -10,7 +10,8 @@ import copy
 
 import torch
 
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.common.storage import (
+    KVCacheLayout, KVCacheLayoutType, align_host_block_bytes)
 from flexkv.common.debug import flexkv_logger
 
 
@@ -1161,7 +1162,7 @@ def block_size_in_bytes_for_cache(
                     f"does not divide tokens_per_block="
                     f"{cache_config.tokens_per_block}"
                 )
-        return model_config.host_rank_copies * sum(
+        return align_host_block_bytes(model_config.host_rank_copies * sum(
             group.num_layers
             * model_config.kv_dim
             * (cache_config.tokens_per_block // group.compress_ratio)
@@ -1169,7 +1170,7 @@ def block_size_in_bytes_for_cache(
             * group.head_size
             * (group.dtype or model_config.dtype).itemsize
             for group in model_config.layer_groups
-        )
+        ))
     if rank_info is None:
         raise ValueError(
             "rank_info is required when model_config.layer_groups is None")

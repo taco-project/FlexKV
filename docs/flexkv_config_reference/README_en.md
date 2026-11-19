@@ -167,6 +167,7 @@ Notes:
 |---------------------|------|---------|-------------|
 | `FLEXKV_MAX_FILE_SIZE_GB` | float | -1 | Maximum size of a single SSD file, -1 means unlimited |
 | `FLEXKV_IOURING_ENTRIES` | int | 512 | io_uring queue depth. Recommended to set to `512` to improve concurrent I/O performance |
+| `FLEXKV_HOST_BLOCK_ALIGN` | int | 1 | Pad each multi-layer-group CPU/SSD block to a multiple of this many bytes. Set `4096` with an SSD tier so SSD I/O can use O_DIRECT (DeepSeek V4.1 blocks are not 4 KiB multiples) |
 | `FLEXKV_IOURING_FLAGS` | int | 0 | io_uring flags, default is 0 |
 | `FLEXKV_SSD_IO_OPT` | bool | 1 | Master switch for SSD↔CPU transfer I/O optimization (on by default). When enabled, the system automatically coalesces many small scattered I/Os into fewer large ones, cutting syscall overhead and improving transfer efficiency; set to `0` to fall back to the most basic one-I/O-per-chunk transfers (correct but slower) |
 
