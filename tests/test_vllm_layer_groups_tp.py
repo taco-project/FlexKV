@@ -16,11 +16,11 @@ pytest.importorskip("vllm.v1.kv_cache_layout")
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV  # noqa: E402
 from flexkv.common.transfer import TransferType  # noqa: E402
 from flexkv.integration.config import FlexKVConfig  # noqa: E402
-from flexkv.integration.vllm.vllm_v1_adapter import FlexKVWorkerConnector  # noqa: E402
 from flexkv.server.shm_radix_bootstrap import cpu_kv_layout  # noqa: E402
 from flexkv.transfer.workers.gpu_cpu import GPUCPUTransferWorker  # noqa: E402
 
-from test_vllm_layer_groups import NUM_BLOCKS, _gqa_config  # noqa: E402
+from test_vllm_layer_groups import (  # noqa: E402
+    NUM_BLOCKS, _gqa_config, _register, _vllm_cache_views)
 
 LOCAL_RANKS = 2
 NUM_CPU_BLOCKS = 4
@@ -41,33 +41,13 @@ class _Handle:
         return self.tensor
 
 
-class _Registration:
-    """Stands in for KVTPClient: keeps what the connector registers."""
-
-    def register_to_server(self, **kwargs):
-        self.kwargs = kwargs
-
-
 def _vllm_caches(config, device, seed):
     """One rank's raw KV allocation, random bytes, and its caches as vLLM's
-    worker hands them over: per layer a logical ``[B, H, N, C]`` view whose
-    block ``b`` sits at ``offset + l * layer_stride + b * block_stride``."""
-    specs = config.kv_cache_groups[0].kv_cache_spec.kv_cache_specs
-    size = config.kv_cache_tensors[0].size
+    worker hands them over."""
     generator = torch.Generator().manual_seed(seed)
-    raw = torch.randint(0, 256, (size,), dtype=torch.uint8, generator=generator).to(device)
-    data = raw.view(torch.bfloat16)
-    caches = {}
-    for tensor in config.kv_cache_tensors:
-        for index, name in enumerate(tensor.layers):
-            spec = specs[name]
-            content = spec.head_size + spec.head_size_v
-            caches[name] = torch.as_strided(
-                data,
-                (config.num_blocks, spec.num_kv_heads, spec.block_size, content),
-                (tensor.block_stride // 2, spec.block_size * content, content, 1),
-                (tensor.offset + index * tensor.layer_stride) // 2)
-    return raw, caches
+    raw = torch.randint(0, 256, (config.kv_cache_tensors[0].size,), dtype=torch.uint8,
+                        generator=generator).to(device)
+    return raw, _vllm_cache_views(config, config.kv_cache_groups[0].layer_names, raw=raw)
 
 
 def _page(raw, config, name, block):
@@ -99,14 +79,8 @@ def test_split_heads_round_trip_through_per_rank_slots(
     raws, registrations = [], []
     for rank in range(LOCAL_RANKS):
         raw, caches = _vllm_caches(config, torch.device("cuda", rank), seed=rank)
-        connector = object.__new__(FlexKVWorkerConnector)
-        connector.flexkv_config = flexkv_config
-        connector.enable_layerwise_transfer = False
-        connector.layerwise_counter_pool = None
-        connector.tp_client = _Registration()
-        connector._register_layer_groups(caches, group, resume=False)
         raws.append(raw)
-        registrations.append(connector.tp_client.kwargs)
+        registrations.append(_register(flexkv_config, caches))
 
     host_layout = cpu_kv_layout(model_config, flexkv_config.cache_config, NUM_CPU_BLOCKS)
     host = torch.zeros(tuple(host_layout.kv_shape), dtype=torch.uint8)

@@ -73,15 +73,17 @@ def _dsv41_config(scheduler: bool) -> KVCacheConfig:
     return config
 
 
-def _vllm_cache_views(config, layer_names, kernel_block_size=None):
+def _vllm_cache_views(config, layer_names, kernel_block_size=None, raw=None):
     """The caches of ``layer_names`` as vLLM's worker hands them over: a
-    logical ``[B, H, N, C]`` view per layer into one allocation."""
+    logical ``[B, H, N, C]`` view per layer into one byte allocation, ``raw``
+    or a zeroed one."""
     specs = {}
     for group in config.kv_cache_groups:
         specs.update(group.kv_cache_spec.kv_cache_specs
                      if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
                      else dict.fromkeys(group.layer_names, group.kv_cache_spec))
-    raw = torch.zeros(config.kv_cache_tensors[0].size, dtype=torch.int8)
+    if raw is None:
+        raw = torch.zeros(config.kv_cache_tensors[0].size, dtype=torch.int8)
     layout = VllmKVCacheLayout[config.kv_cache_layout]
     views = {}
     for tensor in config.kv_cache_tensors:
@@ -214,22 +216,33 @@ def test_gqa_layouts_give_each_rank_heads(layout):
     assert (main.num_layer, main.num_head, main.num_kv_heads) == (4, 2, 2 * 4)
 
 
-@pytest.mark.parametrize("scheduler", [True, False])
-def test_group_mixing_mla_and_split_caches_keeps_a_copy_per_rank(scheduler):
-    config = _gqa_config(scheduler)
-    if not scheduler:
-        group = config.kv_cache_groups[0]
-        specs = dict(group.kv_cache_spec.kv_cache_specs)
-        specs[f"{G}.1.self_attn.attn"] = MLAAttentionSpec(
-            block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16)
-        config.kv_cache_groups[0] = KVCacheGroupSpec(
-            group.layer_names, UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs))
+def _gqa_config_with_mla_at(layer):
+    """The GQA group as a worker sees it, with layer ``layer``'s cache MLA."""
+    config = _gqa_config(scheduler=False)
+    group = config.kv_cache_groups[0]
+    specs = dict(group.kv_cache_spec.kv_cache_specs)
+    specs[f"{G}.{layer}.self_attn.attn"] = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16)
+    config.kv_cache_groups[0] = KVCacheGroupSpec(
+        group.layer_names, UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs))
+    return config
+
+
+def test_group_mixing_mla_and_split_caches_keeps_a_copy_per_rank():
     flexkv_config = FlexKVConfig()
     flexkv_config.model_config.tp_size = 4
-    flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
+    flexkv_config._configure_kv_layout_from_vllm_cache_config(_gqa_config_with_mla_at(1))
 
     assert not flexkv_config.vllm_kv_group.kv_shared_across_ranks
     assert flexkv_config.model_config.host_rank_copies == 4
+
+
+def test_group_led_by_mla_with_split_caches_is_refused():
+    flexkv_config = FlexKVConfig()
+    flexkv_config.model_config.tp_size = 4
+
+    with pytest.raises(ValueError, match="first layer is MLA"):
+        flexkv_config._configure_kv_layout_from_vllm_cache_config(_gqa_config_with_mla_at(0))
 
 
 def test_kernel_block_split_view_moves_whole_blocks():
@@ -261,21 +274,6 @@ def test_block_stride_from_interleaved_view():
     (region,) = compile_gpu_regions([group], [[layout]], 64, 1, torch.uint8,
                                     tensors_per_group_device=[[view]])
     assert (region.chunk_bytes, region.block_stride) == (4608, BLOCK)
-
-
-def test_group_led_by_mla_with_split_caches_is_refused():
-    config = _gqa_config(scheduler=False)
-    group = config.kv_cache_groups[0]
-    specs = dict(group.kv_cache_spec.kv_cache_specs)
-    specs[f"{G}.0.self_attn.attn"] = MLAAttentionSpec(
-        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
-    config.kv_cache_groups[0] = KVCacheGroupSpec(
-        group.layer_names, UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs))
-    flexkv_config = FlexKVConfig()
-    flexkv_config.model_config.tp_size = 4
-
-    with pytest.raises(ValueError, match="first layer is MLA"):
-        flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
 
 
 def test_caches_vllm_replicates_keep_one_copy():
