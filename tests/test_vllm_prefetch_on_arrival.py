@@ -70,6 +70,14 @@ def test_request_without_a_full_block_has_nothing_to_wait_for(scheduler, manager
     assert scheduler.connector.get_num_new_matched_tokens(request, 0) == (0, False)
 
 
+def test_scheduling_does_not_start_a_missing_prefetch(scheduler, manager):
+    # A vLLM that does not call on_new_request gets no prefetch.
+    assert scheduler.connector.get_num_new_matched_tokens(_request(), 0) == (0, False)
+
+    manager.prefetch_async.assert_not_called()
+    manager.get_match.assert_called_once()
+
+
 def test_request_ended_before_scheduling_cancels_its_prefetch(scheduler, manager):
     request = _request()
     request.is_finished = lambda: True

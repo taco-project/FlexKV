@@ -371,9 +371,9 @@ class FlexKVSchedulerConnector:
             self.cache_config.enable_ssd or radix_server_is_distributed(
                 rank_info.model_config, self.cache_config,
                 label="FlexKVSchedulerConnector")))
-        # request_id -> prefetch task id, while the request waits for it
+        # request_id -> prefetch task id, from the request's arrival
+        # (on_new_request) until a scheduling attempt sees it finished
         self.prefetch_tasks: dict[str, int] = {}
-        self.prefetched_req_ids: set[str] = set()
 
         logger.info(f"Finish init FlexKVSchedulerConnector, prefetch={self.enable_prefetch}")
 
@@ -427,7 +427,7 @@ class FlexKVSchedulerConnector:
         if request.request_id in self.failed_load_req_ids:
             # vLLM recomputes a request whose load failed.
             return 0, False
-        if self.enable_prefetch and not self._prefetch_done(request, num_computed_tokens):
+        if not self._prefetch_done(request):
             return None, False
         task_id, num_new_matched_tokens = self._get_match(request=request,
                                                           num_computed_tokens=num_computed_tokens)
@@ -443,53 +443,40 @@ class FlexKVSchedulerConnector:
         return num_new_matched_tokens, True
 
     def on_new_request(self, request: "Request") -> None:
-        """Start the prefetch of an arriving request's prompt, so that it runs
-        while the request waits in vLLM's queue rather than from its first
-        scheduling attempt. Its local GPU hit is not known yet."""
-        if self.enable_prefetch:
-            self._start_prefetch(request, num_computed_tokens=0)
+        """Start the prefetch of an arriving request's prompt (peer CPU, local
+        and peer SSD into the local CPU tier) while it waits in vLLM's queue;
+        get_num_new_matched_tokens waits for it. Its local GPU hit is not known
+        yet, so the prefetch covers all of the prompt's full blocks."""
+        if not self.enable_prefetch:
+            return
+        num_tokens = request.num_tokens // self.block_size * self.block_size
+        if num_tokens == 0:
+            return
+        try:
+            task_id = self.flexkv_manager.prefetch_async(
+                token_ids=np.asarray(request.all_token_ids[:num_tokens], dtype=np.int64),
+                namespace=self._extract_namespace(request),
+                **self._block_hashes(request, num_tokens))
+        except Exception as e:  # noqa: BLE001 - serve from the local tiers
+            logger.warning(f"FlexKV prefetch of {request.request_id} failed: {e}")
+            return
+        if task_id is not None and task_id >= 0:
+            self.prefetch_tasks[request.request_id] = task_id
 
-    def _prefetch_done(self, request: "Request", num_computed_tokens: int) -> bool:
-        """Tell whether the prefetch of a waiting request's prompt has finished,
-        starting it if on_new_request did not; the GET that follows reads what
-        it brought."""
-        req_id = request.request_id
-        if req_id in self.prefetched_req_ids:
-            return True
-        task_id = self.prefetch_tasks.get(req_id)
+    def _prefetch_done(self, request: "Request") -> bool:
+        """Whether the prefetch on_new_request started for a waiting request has
+        finished, so that the GET reads what it brought. A request without one
+        (no full block, or a vLLM that does not call on_new_request) has none
+        to wait for."""
+        task_id = self.prefetch_tasks.get(request.request_id)
         if task_id is None:
-            task_id = self._start_prefetch(request, num_computed_tokens)
-            if task_id is None:
-                return True
+            return True
         if task_id not in self.flexkv_manager.try_wait([task_id]):
             return False
-        del self.prefetch_tasks[req_id]
-        self.prefetched_req_ids.add(req_id)
+        del self.prefetch_tasks[request.request_id]
         return True
 
-    def _start_prefetch(self, request: "Request", num_computed_tokens: int) -> Optional[int]:
-        """Prefetch the prompt's full blocks (peer CPU, local and peer SSD into
-        the local CPU tier) unless the local hit covers them; return the task
-        id, or None when there is nothing to wait for."""
-        req_id = request.request_id
-        task_id = None
-        num_tokens = request.num_tokens // self.block_size * self.block_size
-        if num_tokens > num_computed_tokens:
-            try:
-                task_id = self.flexkv_manager.prefetch_async(
-                    token_ids=np.asarray(request.all_token_ids[:num_tokens], dtype=np.int64),
-                    namespace=self._extract_namespace(request),
-                    **self._block_hashes(request, num_tokens))
-            except Exception as e:  # noqa: BLE001 - serve from the local tiers
-                logger.warning(f"FlexKV prefetch of {req_id} failed: {e}")
-        if task_id is None or task_id < 0:
-            self.prefetched_req_ids.add(req_id)
-            return None
-        self.prefetch_tasks[req_id] = task_id
-        return task_id
-
     def _forget_prefetch(self, req_id: str) -> None:
-        self.prefetched_req_ids.discard(req_id)
         task_id = self.prefetch_tasks.pop(req_id, None)
         if task_id is not None:
             # A running prefetch keeps its blocks until its graph drains.
