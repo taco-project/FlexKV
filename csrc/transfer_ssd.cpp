@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <future>
 #include <mutex>
@@ -16,6 +17,13 @@
 #include <thread>
 
 #include "transfer_ssd.h"
+
+namespace {
+// Largest single read/write handed to io_uring. The kernel stops one I/O at
+// MAX_RW_COUNT (~2 GiB) and an SQE length is 32-bit, so bigger runs go out as
+// several SQEs.
+constexpr int64_t kMaxIoBytes = int64_t{1} << 30;
+}  // namespace
 
 namespace flexkv {
 
@@ -143,6 +151,7 @@ static void transfer_blocks_impl(
       int infile = raw / num_files_per_device;
       if (can_merge && !segments.empty() &&
           segments.back().count < kMaxIov &&
+          (segments.back().count + 1) * chunk_size_in_bytes <= kMaxIoBytes &&
           segments.back().fd_idx == fd_idx &&
           segments.back().infile_start + segments.back().count == infile) {
         segments.back().count++;
@@ -351,6 +360,18 @@ void transfer_kv_blocks_ssd(
                   is_4k_aligned(ssd_kv_stride_in_bytes)));
   }
 
+  if (!is_direct) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      FLEXKV_LOG_WARNING(
+          "operation=ssd_transfer act=open status=degraded mode=buffered "
+          "reason=not_4k_aligned block_stride=%ld chunk=%ld base_aligned=%d "
+          "hint=\"O_DIRECT needs 4096-byte aligned block stride; SSD I/O goes "
+          "through the page cache\"",
+          static_cast<long>(block_stride_in_bytes),
+          static_cast<long>(chunk_size_in_bytes), base_aligned ? 1 : 0);
+    }
+  }
   std::vector<std::vector<int>> &fds = ioctx.get_fds(is_read, is_direct);
 
   std::vector<std::vector<int>> cpu_blocks_partition(num_devices,
@@ -401,18 +422,14 @@ void transfer_kv_blocks_ssd(
         if (iouring.enabled()) {
           IOCallable do_io = [&](int fd, void *cpu_ptr, int64_t ssd_offset,
                                  int64_t size, bool is_read) {
-            int rc;
-            if (is_read) {
-              rc = iouring.prep_read(fd, cpu_ptr, size, ssd_offset);
+            for (int64_t done = 0; done < size; done += kMaxIoBytes) {
+              void *ptr = static_cast<char *>(cpu_ptr) + done;
+              const int64_t off = ssd_offset + done;
+              const int64_t len = std::min(kMaxIoBytes, size - done);
+              const int rc = is_read ? iouring.prep_read(fd, ptr, len, off)
+                                     : iouring.prep_write(fd, ptr, len, off);
               if (rc < 0 &&
-                  !transfer_full(fd, cpu_ptr, (size_t)size, (off_t)ssd_offset,
-                                 true))
-                throw std::runtime_error("Failed to transfer block");
-            } else {
-              rc = iouring.prep_write(fd, cpu_ptr, size, ssd_offset);
-              if (rc < 0 &&
-                  !transfer_full(fd, cpu_ptr, (size_t)size, (off_t)ssd_offset,
-                                 false))
+                  !transfer_full(fd, ptr, (size_t)len, (off_t)off, is_read))
                 throw std::runtime_error("Failed to transfer block");
             }
           };
@@ -424,13 +441,13 @@ void transfer_kv_blocks_ssd(
             const struct iovec *stable = iov_arena.back().data();
             int rc;
             if (is_read) {
-              rc = iouring.prep_readv(fd, stable, iovcnt, ssd_offset);
+              rc = iouring.prep_readv(fd, stable, iovcnt, ssd_offset, total_size);
               if (rc < 0 &&
                   !transfer_iov_full(fd, stable, iovcnt, (off_t)ssd_offset,
                                      (size_t)total_size, true))
                 throw std::runtime_error("Failed to transfer block (vectored)");
             } else {
-              rc = iouring.prep_writev(fd, stable, iovcnt, ssd_offset);
+              rc = iouring.prep_writev(fd, stable, iovcnt, ssd_offset, total_size);
               if (rc < 0 &&
                   !transfer_iov_full(fd, stable, iovcnt, (off_t)ssd_offset,
                                      (size_t)total_size, false))
