@@ -407,6 +407,17 @@ class ModelConfig:
         return self.tp_size_per_node * self.cp_size_per_node
 
     @property
+    def host_rank_copies(self) -> int:
+        """Per-rank slices one multi-group CPU/SSD block holds.
+
+        Head-sharded KV (``num_kv_heads > 1``) keeps every TP rank's heads side
+        by side in the block. Rank-shared KV (``num_kv_heads == 1``, MLA / DSv4)
+        is the same on every rank and the transfer addresses a single copy
+        (sharded / rank0_only write one, H2D reads one), so the block holds one.
+        """
+        return 1 if self.num_kv_heads == 1 else self.tp_size
+
+    @property
     def num_kv_heads_per_node(self) -> int:
         """Number of KV heads visible to a single node."""
         if self.num_kv_heads == 1:
@@ -447,8 +458,8 @@ class ModelConfig:
         """Whole-model per-token KV footprint (bytes) across all layers/groups."""
         kv_dim = self.kv_dim
         if self.layer_groups:
-            # layer_groups store per-GPU num_kv_heads; multiply by tp_size
-            # to get full-model per-token size (matching CPU/SSD block sizing).
+            # layer_groups store per-GPU num_kv_heads; multiply by the
+            # per-rank copies a host block holds (matching CPU/SSD block sizing).
             # Each group may carry its own dtype (None = inherit ModelConfig.dtype),
             # so indexer-as-group (fp8/uint8) and main KV (bf16) sum correctly.
             # ``compress_ratio`` shrinks the per-token contribution. This
@@ -460,7 +471,7 @@ class ModelConfig:
                 * (g.dtype or self.dtype).itemsize
                 // g.compress_ratio
                 for g in self.layer_groups
-            ) * self.tp_size
+            ) * self.host_rank_copies
         return self.num_layers * self.num_kv_heads * self.head_size * kv_dim * self.dtype.itemsize
 
     def __str__(self) -> str:
@@ -1150,7 +1161,7 @@ def block_size_in_bytes_for_cache(
                     f"does not divide tokens_per_block="
                     f"{cache_config.tokens_per_block}"
                 )
-        return model_config.tp_size * sum(
+        return model_config.host_rank_copies * sum(
             group.num_layers
             * model_config.kv_dim
             * (cache_config.tokens_per_block // group.compress_ratio)

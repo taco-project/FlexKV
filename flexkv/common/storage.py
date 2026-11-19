@@ -100,7 +100,9 @@ class KVCacheLayout:
                 # bytes.  kv_dim and tokens_per_block are taken from the layout
                 # top level (uniform across groups in supported configs).
                 # layer_groups store per-GPU num_kv_heads (after TP split);
-                # tp_size multiplies so each block holds data for ALL TP ranks.
+                # tp_size is the number of per-rank slices a block holds
+                # (ModelConfig.host_rank_copies: TP size for head-sharded KV,
+                # 1 for rank-shared KV).
                 if any(g.dtype is None for g in self.layer_groups):
                     raise ValueError(
                         "Multi-group KVCacheLayout requires LayerGroupSpec.dtype "
