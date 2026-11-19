@@ -81,6 +81,14 @@ class KVManager:
                 "and enable_p2p_ssd=False (cross-node reuse follows the "
                 "radix-server's cluster flags)"
             )
+        if (self.enable_radixshmem and model_config.nnodes > 1
+                and model_config.local_dp_size is None):
+            raise ValueError(
+                "radix_shmem needs every replica on one node (or node-local DP, "
+                "local_dp_size): for a replica spanning nodes only the master "
+                "node's radix-server indexes a block, and a peer pull fills "
+                "that node's slots alone"
+            )
         flexkv_logger.info(
             f"[KVManager] IPC ports: server_recv_port={self.server_recv_port}, "
             f"gpu_register_port={self.gpu_register_port}"

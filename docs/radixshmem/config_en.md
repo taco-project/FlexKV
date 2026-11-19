@@ -25,7 +25,10 @@ radixshmem repository's README, API documentation and `radix-server --help`.
 | `FLEXKV_INSTANCE_NUM` / `FLEXKV_INSTANCE_ID` | `1` / `0` | Identify engines sharing a server on one node. |
 
 This mode supplies only the CPU tier. Disable `enable_ssd`, `enable_remote`,
-`enable_p2p_cpu` and `enable_p2p_ssd`; `KVManager` checks these combinations.
+`enable_p2p_cpu` and `enable_p2p_ssd`, and keep each replica (a set of TP/PP
+ranks) on one node or use node-local DP: for a replica spanning nodes only the
+master node's radix-server indexes a block, and a peer pull lands there alone.
+`KVManager` checks these combinations.
 Cross-node reuse is handled by a clustered radix-server (etcd and RDMA).
 For one DP and one instance, KVTaskEngine runs in the engine process and TE is
 its child. Multiple DP clients or instances use a per-node KVServer whose
@@ -142,8 +145,9 @@ supported; deployment must avoid this combination.
 ## Errors
 
 The server name must start with `/` and contain no whitespace. KVManager rejects
-SSD, remote and FlexKV P2P combinations. Geometry construction rejects a
-non-BLOCKFIRST CPU layout and an enabled SWA window smaller than one block.
+SSD, remote and FlexKV P2P combinations and a replica spanning nodes. Geometry
+construction rejects a non-BLOCKFIRST CPU layout and an enabled SWA window
+smaller than one block.
 Attach reports unreachable or not-ready servers after the 600-second budget;
 server configuration failures and incompatible geometry are reported as errors.
 In cluster mode index attachment retries unreachable RHT shards until the ready

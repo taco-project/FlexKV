@@ -1,6 +1,7 @@
 """A vLLM KV cache group with mixed page sizes whose heads TP splits (GQA/MHA),
-through the GPU<->CPU worker at TP2: each rank's pages go to its own slot of
-the host block and come back to that rank.
+through the GPU<->CPU worker of a node with two TP ranks (TP2, or TP4 over two
+nodes): each rank's pages go to its own slot of the node's host block and come
+back to that rank.
 
 Built from the production pieces: FlexKVConfig turns vLLM's KVCacheConfig into
 layer groups, FlexKVWorkerConnector._register_layer_groups describes each
@@ -21,11 +22,12 @@ from flexkv.transfer.workers.gpu_cpu import GPUCPUTransferWorker  # noqa: E402
 
 from test_vllm_layer_groups import NUM_BLOCKS, _gqa_config  # noqa: E402
 
-TP = 2
+LOCAL_RANKS = 2
 NUM_CPU_BLOCKS = 4
 NUM_GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
-pytestmark = pytest.mark.skipif(NUM_GPUS < TP, reason=f"Need {TP} GPUs, found {NUM_GPUS}")
+pytestmark = pytest.mark.skipif(
+    NUM_GPUS < LOCAL_RANKS, reason=f"Need {LOCAL_RANKS} GPUs, found {NUM_GPUS}")
 
 
 class _Handle:
@@ -81,18 +83,21 @@ def _page(raw, config, name, block):
 
 @pytest.mark.parametrize("region_batch", [True, False], ids=["region-batch", "thread-groups"])
 @pytest.mark.parametrize("layout", ["BLHNC", "LBHNC"])
-def test_split_heads_round_trip_through_per_rank_slots(monkeypatch, layout, region_batch):
+@pytest.mark.parametrize("tp_size,nnodes", [(2, 1), (4, 2)], ids=["tp2", "tp4-over-2-nodes"])
+def test_split_heads_round_trip_through_per_rank_slots(
+        monkeypatch, tp_size, nnodes, layout, region_batch):
     monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "region_batch", region_batch)
     config = _gqa_config(scheduler=False, layout=layout)
     flexkv_config = FlexKVConfig()
-    flexkv_config.model_config.tp_size = TP
+    flexkv_config.model_config.tp_size = tp_size
+    flexkv_config.model_config.nnodes = nnodes
     flexkv_config._configure_kv_layout_from_vllm_cache_config(config)
     model_config = flexkv_config.model_config
     group = flexkv_config.vllm_kv_group
     num_groups = len(model_config.layer_groups)
 
     raws, registrations = [], []
-    for rank in range(TP):
+    for rank in range(LOCAL_RANKS):
         raw, caches = _vllm_caches(config, torch.device("cuda", rank), seed=rank)
         connector = object.__new__(FlexKVWorkerConnector)
         connector.flexkv_config = flexkv_config
@@ -115,7 +120,7 @@ def test_split_heads_round_trip_through_per_rank_slots(monkeypatch, layout, regi
         gpu_kv_layouts=[reg["kv_layout"] for reg in registrations],
         cpu_kv_layout=host_layout,
         dtype=registrations[0]["kv_caches"][0].dtype,
-        tp_group_size=TP,
+        tp_group_size=model_config.effective_tp_size_per_node,
         layer_groups=model_config.layer_groups,
         gpu_blocks_per_group=[
             [[_Handle(t) for t in reg["handles_per_group"][gi]] for reg in registrations]
@@ -131,9 +136,9 @@ def test_split_heads_round_trip_through_per_rank_slots(monkeypatch, layout, regi
 
         worker._transfer_impl(gpu_src, cpu_ids, TransferType.D2H)
 
-        slot = host.shape[1] // TP
+        slot = host.shape[1] // LOCAL_RANKS
         for gpu_block, cpu_block in zip(gpu_src.tolist(), cpu_ids.tolist()):
-            for rank in range(TP):
+            for rank in range(LOCAL_RANKS):
                 pages = torch.cat([_page(raws[rank], config, name, gpu_block) for name in names])
                 assert torch.equal(host[cpu_block, rank * slot:(rank + 1) * slot], pages.cpu())
 
@@ -142,7 +147,7 @@ def test_split_heads_round_trip_through_per_rank_slots(monkeypatch, layout, regi
             raw.zero_()
         worker._transfer_impl(cpu_ids, gpu_dst, TransferType.H2D)
 
-        for rank in range(TP):
+        for rank in range(LOCAL_RANKS):
             expected = torch.zeros_like(originals[rank])
             for src, dst in zip(gpu_src.tolist(), gpu_dst.tolist()):
                 for name in names:

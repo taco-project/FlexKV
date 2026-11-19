@@ -411,12 +411,13 @@ class ModelConfig:
     def host_rank_copies(self) -> int:
         """Per-rank slices one multi-group CPU/SSD block holds.
 
-        Head-sharded KV (``num_kv_heads > 1``) keeps every TP rank's heads side
-        by side in the block. Rank-shared KV (``num_kv_heads == 1``, MLA / DSv4)
+        Head-sharded KV (``num_kv_heads > 1``) keeps the heads of every TP rank
+        on the node side by side in the block (a node's pool holds only its own
+        ranks' KV). Rank-shared KV (``num_kv_heads == 1``, MLA / DSv4)
         is the same on every rank and the transfer addresses a single copy
         (sharded / rank0_only write one, H2D reads one), so the block holds one.
         """
-        return 1 if self.num_kv_heads == 1 else self.tp_size
+        return 1 if self.num_kv_heads == 1 else self.tp_size_per_node
 
     @property
     def num_kv_heads_per_node(self) -> int:

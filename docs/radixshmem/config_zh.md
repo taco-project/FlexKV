@@ -27,7 +27,7 @@ radixshmem 侧接口见 radixshmem 仓库的 `README.md` 与 `docs/api.md`，`ra
 | `FLEXKV_CPU_LAYOUT` | `BLOCKFIRST` | 必须是 `BLOCKFIRST`（默认即是）：一个 SlotStore slot 就是一个连续的 CPU block。 |
 | `FLEXKV_INSTANCE_NUM` / `FLEXKV_INSTANCE_ID` | `1` / `0` | 同一节点上多个推理引擎共享一个 radix-server 时区分实例（第 4.5 节）。 |
 
-`enable_remote`、`enable_p2p_cpu`、`enable_p2p_ssd` 必须关闭，KVManager 构造时校验。SSD 层（`ssd_cache_gb > 0`）需要每节点再起一个只做索引的 radix-server 并设置 `FLEXKV_RADIXSHMEM_SSD_SERVER_NAME`，跨节点共享 SSD、PD 部署见 [cpu_ssd_pool_pd_zh.md](cpu_ssd_pool_pd_zh.md)。
+`enable_remote`、`enable_p2p_cpu`、`enable_p2p_ssd` 必须关闭；每个副本（一组 TP/PP rank）须在一个节点内（或用 node-local DP），跨节点的副本只有主节点的 radix-server 登记它的 block，对端拉取也只落到主节点。两者都由 KVManager 构造时校验。SSD 层（`ssd_cache_gb > 0`）需要每节点再起一个只做索引的 radix-server 并设置 `FLEXKV_RADIXSHMEM_SSD_SERVER_NAME`，跨节点共享 SSD、PD 部署见 [cpu_ssd_pool_pd_zh.md](cpu_ssd_pool_pd_zh.md)。
 跨节点复用由 radix-server 完成（etcd + RDMA），server 以集群参数启动时自动开启。
 
 进程模型与 FlexKV 其它模式一致：`dp_size=1` 且单实例时 KVTaskEngine 在引擎进程内，TE 是它的子进程；
@@ -153,7 +153,7 @@ FLEXKV_INSTANCE_NUM=2 FLEXKV_INSTANCE_ID=0    FLEXKV_INSTANCE_NUM=2 FLEXKV_INSTA
 ## 6. 报错含义
 
 - `FLEXKV_RADIXSHMEM_SERVER_NAME` 须以 `/` 开头且无空白。
-- KVManager 构造时：打开了 `enable_ssd`、`enable_remote`、`enable_p2p_cpu` 或 `enable_p2p_ssd`。
+- KVManager 构造时：打开了 `enable_ssd`、`enable_remote`、`enable_p2p_cpu` 或 `enable_p2p_ssd`；一个副本跨节点。
 - 计算几何时（attach 前）：`FLEXKV_CPU_LAYOUT != BLOCKFIRST`；SWA 开启但 `window_blocks < 1`。
 - attach：
   - 600 s 内连不上 server 报 `no radix-server named ... reachable ...`（附启动命令）；
