@@ -1285,47 +1285,61 @@ class FlexKVWorkerConnector:
         self, kv_caches: dict[str, torch.Tensor], group: VllmKVGroup,
         resume: bool,
     ) -> None:
-        """Register a KV cache group with mixed page sizes (DeepSeek-V4.1) as
-        ``model_config.layer_groups``.
+        """Register the GPU caches of a vLLM KV cache group with mixed page sizes
+        (e.g. DeepSeek-V4.1) by ``model_config.layer_groups``: layer group
+        ``g`` gets ``group.group_layer_names[g]``, one tensor per layer.
 
-        Each cache is a view led by the block dim; FlexKV moves the page at the
-        start of every block and takes the block stride from the view, which in
-        vLLM's block-outermost layouts spans the pages of all layers.
+        FlexKV moves each page as opaque bytes, padding included: block ``b``
+        of a cache is the page at ``data_ptr() + b * stride(0)``, where vLLM's
+        ``[B, H, N, C]`` view makes ``stride(0)`` the whole packed block in
+        BLHNC and one page in LBHNC. A view vLLM split into kernel blocks has
+        several rows per block, back to back, so a block is still one page.
         """
         model_config = self.flexkv_config.model_config
         if self.enable_layerwise_transfer:
             self._start_layerwise_eventfd_sender(group.layer_names)
 
-        def layout(num_layer: int, page_bytes: int) -> KVCacheLayout:
-            return KVCacheLayout(
-                type=KVCacheLayoutType.LAYERFIRST,
-                num_layer=num_layer,
-                num_block=group.num_blocks,
-                tokens_per_block=1,
-                num_head=1,
-                head_size=page_bytes,
-                kv_dim=1,
-                num_kv_heads=1,
-            )
-
         gpu_layouts, handles_per_group = [], []
         for spec, names in zip(model_config.layer_groups,
                                group.group_layer_names, strict=True):
-            for name in names:
-                tensor = kv_caches[name]
-                block_stride = tensor.stride(0) * tensor.element_size()
-                if (tensor.shape[0] != group.num_blocks
-                        or block_stride < spec.head_size):
+            tensors = [kv_caches[name] for name in names]
+            for name, tensor in zip(names, tensors):
+                rows, rest = divmod(tensor.shape[0], group.num_blocks)
+                block_stride = tensor.stride(0) * tensor.element_size() * rows
+                if (rest or not rows or block_stride < spec.head_size
+                        or (rows > 1 and block_stride != spec.head_size)):
                     raise ValueError(
                         f"KV cache {name}: shape={tuple(tensor.shape)} with a "
                         f"{block_stride} B block stride does not hold "
                         f"{group.num_blocks} blocks of {spec.head_size} B")
-            gpu_layouts.append(layout(len(names), spec.head_size))
-            handles_per_group.append([kv_caches[name] for name in names])
+            heads = tensors[0].shape[1]
+            # One head when padding keeps the page from splitting into H heads.
+            num_head = heads if spec.head_size % heads == 0 else 1
+            gpu_layouts.append(KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(names),
+                num_block=group.num_blocks,
+                tokens_per_block=1,
+                num_head=num_head,
+                head_size=spec.head_size // num_head,
+                kv_dim=model_config.kv_dim,
+                num_kv_heads=(1 if group.kv_shared_across_ranks
+                              else num_head * model_config.tp_size),
+            ))
+            handles_per_group.append(tensors)
 
         self.tp_client.register_to_server(
             kv_caches=[t for tensors in handles_per_group for t in tensors],
-            kv_layout=layout(model_config.num_layers, model_config.head_size),
+            kv_layout=KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=model_config.num_layers,
+                num_block=group.num_blocks,
+                tokens_per_block=1,
+                num_head=gpu_layouts[0].num_head,
+                head_size=model_config.head_size // gpu_layouts[0].num_head,
+                kv_dim=model_config.kv_dim,
+                num_kv_heads=gpu_layouts[0].num_kv_heads,
+            ),
             layer_groups=model_config.layer_groups,
             gpu_layouts=gpu_layouts,
             handles_per_group=handles_per_group,

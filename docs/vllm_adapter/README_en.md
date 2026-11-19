@@ -149,7 +149,11 @@ the connector run under vLLM's hybrid KV cache manager, which DeepSeek-V4.1
 needs: FlexKV stores the model's prefix-cacheable group (the compressed KV and
 indexer K of its KV-source layers), and vLLM's SWA bounded replay rebuilds the
 sliding-window caches after a hit. Other models with several prefix-cacheable
-groups need `--disable-hybrid-kv-cache-manager`. The patch also applies to an
+groups need `--disable-hybrid-kv-cache-manager`. The stored group's layers may
+keep pages of different sizes: a CPU/SSD block then holds one copy of the
+pages when every TP rank holds the same ones (MLA, or vLLM's `kv_tp_replicas`
+says so), and one copy per TP rank otherwise (e.g. GQA/MHA, whose heads TP
+splits). The patch also applies to an
 installed wheel:
 ```bash
 cd "$(python -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"

@@ -158,13 +158,15 @@ class VllmKVGroup:
     ``ModelConfig.layer_groups``: ``group_layer_names[g]`` are the caches of
     layer group ``g``, and FlexKV layer ``i`` holds the caches of one model
     layer, named ``layer_names[i]`` after its attention cache, the name vLLM's
-    attention waits on with ``wait_for_layer_load``.
+    attention waits on with ``wait_for_layer_load``. ``kv_shared_across_ranks``
+    says every TP rank holds the same pages of the group.
     """
     group_id: int
     cache_layer_names: Tuple[str, ...]
     num_blocks: int = 0
     layer_names: Tuple[str, ...] = ()
     group_layer_names: Tuple[Tuple[str, ...], ...] = ()
+    kv_shared_across_ranks: bool = False
 
 
 def vllm_transfer_group_id(kv_cache_config: "KVCacheConfig") -> int:
@@ -652,19 +654,28 @@ class FlexKVConfig:
         page one opaque row per block, padding included. FlexKV layer ``i`` is
         the ``i``-th model layer with caches in the group.
 
-        Only the vLLM KV cache tensors are read, as the scheduler's
-        KVCacheConfig keeps one spec per group, so both sides agree.
+        A CPU/SSD block keeps one copy of a block's pages when every TP rank
+        holds the same ones (vLLM's ``kv_tp_replicas``, or an MLA first layer),
+        and one per rank otherwise. Of the group's specs only the first layer's
+        is read, as the scheduler's KVCacheConfig keeps no other, so both sides
+        agree; the workers, which see every spec, refuse a group whose first
+        layer is MLA while other caches differ across ranks.
         """
         from vllm.model_executor.models.utils import extract_layer_index
         from vllm.v1.kv_cache_interface import MLAAttentionSpec, iter_layer_specs
 
         group = kv_cache_config.kv_cache_groups[group_id]
-        if not all(isinstance(spec, MLAAttentionSpec)
-                   for spec in iter_layer_specs(group.kv_cache_spec)):
+        specs = iter_layer_specs(group.kv_cache_spec)
+        first_spec = next(iter(specs))
+        replicated = (
+            getattr(kv_cache_config, "kv_tp_replicas", 1) >= self.model_config.tp_size)
+        kv_shared_across_ranks = replicated or isinstance(first_spec, MLAAttentionSpec)
+        if kv_shared_across_ranks and not replicated and not all(
+                isinstance(spec, MLAAttentionSpec) for spec in specs):
             raise ValueError(
-                "FlexKV stores a vLLM KV cache group with mixed page sizes only "
-                "when every TP rank holds the same (MLA) caches; got "
-                f"{type(group.kv_cache_spec).__name__}")
+                "FlexKV keeps one copy for every TP rank of a vLLM KV cache group "
+                "whose first layer is MLA, the only layer the scheduler sees, but "
+                "this group also has caches that differ across TP ranks")
         if self.model_config.pp_size != 1:
             raise ValueError(
                 "FlexKV stores a vLLM KV cache group with mixed page sizes only "
@@ -703,19 +714,23 @@ class FlexKVConfig:
 
         self.cache_config.tokens_per_block = tokens_per_block
         self.model_config.num_layers = len(layer_names)
-        self.model_config.num_kv_heads = 1
+        self.model_config.num_kv_heads = 1 if kv_shared_across_ranks else (
+            getattr(first_spec, "num_heads", 1) * self.model_config.tp_size)
         self.model_config.head_size = layer_groups[0].head_size
         self.model_config.kv_dim = 1
         self.model_config.dtype = torch.uint8
         self.model_config.layer_groups = layer_groups
         self.vllm_kv_group = VllmKVGroup(
             group_id, tuple(group.layer_names), kv_cache_config.num_blocks,
-            tuple(layer_names), tuple(group_layer_names))
+            tuple(layer_names), tuple(group_layer_names), kv_shared_across_ranks)
         logger.info(
             f"[FlexKV vllm] KV cache group {group_id} as {len(layer_groups)} "
             f"layer groups over {len(layer_names)} layers, tokens_per_block="
             f"{tokens_per_block}, page bytes "
-            f"{[g.head_size for g in layer_groups]}, layers {layer_names}"
+            f"{[g.head_size for g in layer_groups]}, "
+            f"{self.model_config.host_rank_copies} host copies per block "
+            f"(kv_shared_across_ranks={kv_shared_across_ranks}), "
+            f"layers {layer_names}"
         )
 
     def post_init_from_sglang_config(

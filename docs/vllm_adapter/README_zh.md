@@ -144,7 +144,10 @@ pip install -e .
 并转发缓存清空、sleep/wake 和逐层加载；还让 connector 支持 vLLM 的 hybrid KV cache
 manager（DeepSeek-V4.1 需要）：FlexKV 存取模型唯一的 prefix-cacheable group（各
 KV-source 层的压缩 KV 与 indexer K），命中后 SWA 由 vLLM 的 SWA bounded replay 重算。
-有多个 prefix-cacheable group 的其他模型需加 `--disable-hybrid-kv-cache-manager`。它也
+有多个 prefix-cacheable group 的其他模型需加 `--disable-hybrid-kv-cache-manager`。所存
+group 内各层的 page 大小可以不同：所有 TP rank 的 page 相同时（MLA，或 vLLM 的
+`kv_tp_replicas` 如此判定），CPU/SSD block 只存一份；否则（如 head 被 TP 切分的
+GQA/MHA）每个 TP rank 各存一份。它也
 可以直接打到已安装的 wheel 上：
 ```bash
 cd "$(python -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"
