@@ -51,7 +51,8 @@ from flexkv.cache.radix_shmem_engine import (
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig
 from flexkv.common.debug import flexkv_logger
-from flexkv.server.shm_radix_bootstrap import (PREFETCH_MAX_INFLIGHT, PREFETCH_TIMEOUT_MS,
+from flexkv.server.shm_radix_bootstrap import (PREFETCH_MAX_INFLIGHT,
+                                               chunk_transfer_timeout_ms,
                                                expected_geometry, radix_server_name)
 from flexkv.common.transfer import (
     DeviceType,
@@ -409,6 +410,10 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
         what is here.
         """
         assert self.cpu_cache_engine is not None
+        # Chunked sessions own peer pulls via PrefetchCoordinator; do not start
+        # a second whole-prefix pull_async from the legacy PREFETCH plan path.
+        if getattr(self.cache_config, "enable_chunked_prefetch", False):
+            return RadixGetPlan.empty()
         engine = self.cpu_cache_engine
         if not engine.peer_enabled:
             return RadixGetPlan.empty()
@@ -424,7 +429,7 @@ class RadixShmemCacheEngine(GlobalCacheEngine):
             sequence_meta,
             component_mask=mask,
             query_end=block_mask_end,
-            timeout_ms=PREFETCH_TIMEOUT_MS,
+            timeout_ms=chunk_transfer_timeout_ms(self.cache_config.prefetch_options),
         )
         plan = RadixGetPlan.empty()
         if job is None:
