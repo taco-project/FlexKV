@@ -14,6 +14,16 @@ from flexkv.integration.sglang.connector import FlexKVConnector
 pytestmark = pytest.mark.unit
 
 
+def test_public_layer_split_fails_before_config_or_collectives(monkeypatch):
+    config = MagicMock(side_effect=AssertionError("must reject before configuring ranks"))
+    monkeypatch.setattr(FlexKVConfig, "from_env", config)
+    with pytest.raises(NotImplementedError, match="owner-aware native"):
+        FlexKVConnector(sgl_model_config=None, server_args=None, page_size=4,
+            kvcache=SimpleNamespace(layer_shard_enabled=True), tp_rank=0, dp_rank=0,
+            pp_rank=0, attn_cp_rank=0)
+    config.assert_not_called()
+
+
 @pytest.mark.parametrize('architecture,legacy', [
     ('DeepseekV4ForCausalLM', False),
     ('DeepseekV4ForCausalLMNextN', False),
