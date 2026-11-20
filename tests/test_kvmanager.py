@@ -1140,6 +1140,9 @@ def _run_indexer_test(model_config, cache_config, test_config, gpu_layout_type,
         # Indexer is also MLA-style storage (single tensor per layer,
         # num_kv_heads=1, head_size=64, uint8).
         {"tp_size": 1, "dp_size": 1, "kv_dim": 1},
+        # Rank-shared KV under TP: one copy per host block.
+        {"tp_size": 2, "dp_size": 1, "kv_dim": 1, "num_kv_heads": 1},
+        {"tp_size": 4, "dp_size": 1, "kv_dim": 1, "num_kv_heads": 1},
     ],    indirect=True,
 )
 @pytest.mark.parametrize("cache_config", [

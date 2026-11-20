@@ -141,7 +141,7 @@ def cpu_kv_layout(model_config: ModelConfig, cache_config: CacheConfig,
         kv_dim=model_config.kv_dim,
         num_kv_heads=model_config.num_kv_heads,
         layer_groups=_resolve_groups(model_config.layer_groups, model_config.dtype),
-        tp_size=model_config.tp_size,
+        tp_size=model_config.host_rank_copies,
     )
 
 
@@ -173,7 +173,7 @@ def swa_cpu_kv_layout(model_config: ModelConfig, cache_config: CacheConfig,
         kv_dim=1,
         num_kv_heads=1,
         layer_groups=_resolve_groups(swa.layer_groups, torch.uint8),
-        tp_size=model_config.tp_size,
+        tp_size=model_config.host_rank_copies,
     )
 
 

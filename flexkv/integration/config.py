@@ -844,6 +844,24 @@ class FlexKVConfig:
             swa_config.num_slots = capacities.get("num_cpu_slots", swa_config.num_slots)
             swa_config.num_ssd_slots = capacities.get("num_ssd_slots", swa_config.num_ssd_slots)
             swa_config.num_remote_slots = capacities.get("num_remote_slots", swa_config.num_remote_slots)
+            # With an SSD tier every PUT that reaches SSD also needs an SSD SWA
+            # slot; with none, each such PUT fails before radix insert and
+            # nothing is stored on CPU either. Default to the CPU slot count
+            # rather than silently storing nothing.
+            if (self.user_config.ssd_cache_gb > 0
+                    and swa_config.num_ssd_slots == 0):
+                if "num_ssd_slots" in capacities:
+                    logger.warning(
+                        "[FlexKV sglang] swa.num_ssd_slots=0 with the SSD tier "
+                        "enabled: every PUT that reaches SSD will fail and "
+                        "store nothing")
+                else:
+                    swa_config.num_ssd_slots = swa_config.num_slots
+                    logger.warning(
+                        "[FlexKV sglang] swa.num_ssd_slots unset with the SSD "
+                        f"tier enabled; defaulting to num_cpu_slots="
+                        f"{swa_config.num_slots}. Set swa.num_ssd_slots to "
+                        "size the SSD SWA tier")
             # Gate the SWA data plane (byte movement) behind an env switch so it
             # can be turned off for A/B or if a byte-layout issue surfaces in
             # production, degrading cleanly to full-KV-only (all build_*_chain

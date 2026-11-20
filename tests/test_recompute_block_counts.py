@@ -13,7 +13,8 @@ from flexkv.common.config import (
     recompute_cache_block_counts,
     update_default_config_from_user_config,
 )
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.common.storage import (
+    KVCacheLayout, KVCacheLayoutType, align_host_block_bytes)
 
 pytestmark = pytest.mark.unit
 
@@ -120,7 +121,65 @@ def test_compact_indexer_reclaims_capacity_at_fixed_bytes() -> None:
     ]
 
     assert recompute_cache_block_counts(model_config, cache_config) is True
-    compact_bytes = 4 * (8 * 64 * 576 * 2 + 3 * 8448)
-    aliased_bytes = 4 * (8 * 64 * 576 * 2 + 8 * 8448)
+    # Rank-shared KV (num_kv_heads=1): one copy per block whatever tp_size is.
+    compact_bytes = align_host_block_bytes(8 * 64 * 576 * 2 + 3 * 8448)
+    aliased_bytes = align_host_block_bytes(8 * 64 * 576 * 2 + 8 * 8448)
     assert cache_config.num_cpu_blocks == (1 << 30) // compact_bytes
     assert cache_config.num_cpu_blocks > (1 << 30) // aliased_bytes
+
+
+@pytest.mark.parametrize("num_kv_heads, copies", [(1, 1), (8, 4)])
+def test_multi_group_block_holds_one_copy_of_rank_shared_kv(
+        num_kv_heads: int, copies: int) -> None:
+    """MLA-style KV is identical on every TP rank and is written once.
+
+    Sizing the block for tp_size copies left (tp_size - 1)/tp_size of every
+    CPU/SSD block unused and moved that much extra on every CPU<->SSD op.
+    Head-sharded KV still needs one slice per rank.
+    """
+    group = LayerGroupSpec(
+        num_layers=4,
+        num_kv_heads=1 if num_kv_heads == 1 else num_kv_heads // 4,
+        head_size=512,
+        layer_indices=list(range(4)),
+        compress_ratio=1,
+        dtype=torch.bfloat16,
+    )
+    model_config = ModelConfig(
+        num_layers=4,
+        num_kv_heads=num_kv_heads,
+        head_size=512,
+        kv_dim=1,
+        tp_size=4,
+        dtype=torch.bfloat16,
+        layer_groups=[group],
+    )
+    cache_config = CacheConfig(tokens_per_block=64)
+    one_copy = 4 * 64 * group.num_kv_heads * 512 * 2
+
+    assert model_config.host_rank_copies == copies
+    layout = KVCacheLayout(
+        type=KVCacheLayoutType.BLOCKFIRST,
+        num_layer=4,
+        num_block=1,
+        tokens_per_block=64,
+        num_head=group.num_kv_heads,
+        head_size=512,
+        kv_dim=1,
+        num_kv_heads=num_kv_heads,
+        layer_groups=[group],
+        tp_size=model_config.host_rank_copies,
+    )
+    assert layout.get_block_stride() == copies * one_copy
+    assert model_config.token_size_in_bytes * 64 == copies * one_copy
+
+
+def test_multi_group_block_is_padded_for_direct_io(monkeypatch) -> None:
+    """With FLEXKV_HOST_BLOCK_ALIGN=4096 a DSv4.1 FULL block (417,920 B) is
+    padded so O_DIRECT can engage."""
+    import flexkv.common.storage as storage
+    assert align_host_block_bytes(417920) == 417920
+    monkeypatch.setattr(storage, "HOST_BLOCK_ALIGN", 4096)
+    assert align_host_block_bytes(417920) % 4096 == 0
+    assert 0 <= align_host_block_bytes(417920) - 417920 < 4096
+    assert align_host_block_bytes(8192) == 8192
