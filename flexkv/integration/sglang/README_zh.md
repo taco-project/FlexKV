@@ -107,12 +107,12 @@ FlexKV P2P 共享、多节点和 TensorRT-LLM remote 模式。
 ```yaml
 enable_chunked_prefetch: true
 prefetch_options:
-  policy: best_effort
+  policy: timeout
   chunk_max_blocks: 128
   max_inflight_chunks: 2
 prefetch_max_sessions: 128
 prefetch_max_reserved_bytes: 536870912
-prefetch_max_pinned_bytes: 2147483648
+prefetch_max_pinned_bytes: 137438953472  # 128 GiB default
 prefetch_result_ttl_s: 60
 ```
 
@@ -199,3 +199,27 @@ SGLang 侧的 `storage/flexkv/__init__.py` 通过 `importlib` 从 `flexkv.integr
 
 `sglang_flexkv_connector.patch` 仅作为 FlexKV 尚未合入 SGLang 主干前的历史参考保留。
 受支持的 SGLang 正式版本不需要它，上述 DeepSeek V4 路径也不能使用它。
+
+### 预取字节额度
+
+保留 `prefetch_max_pinned_bytes` 作为唯一的可调驻留额度入口，默认
+**137438953472 字节（128 GiB）**。对应已有环境变量是
+`FLEXKV_PREFETCH_MAX_PINNED_BYTES`。显式配置优先；旧文件中写了 2 GiB，
+就仍按 2 GiB 生效，需删除旧值或更新到期望额度。不增加固定 K 或第二套额度参数。
+
+有效额度为：
+
+```text
+min(prefetch_max_pinned_bytes,
+    max(0, floor(实际 Full-KV L2 block 数 / 2) - 1) × 物理 block 字节数)
+```
+
+先将 L2 一半容量向下取整到完整 block，再减一个 block，为前台保留余量。
+后端 planner 和配套 SGLang 窗口共用 `resolve_prefetch_budget`；压缩层组、
+已注册 SWA/state snapshot 和 all_write 副本均计入额度，不额外分配内存。
+
+SGLang 默认使用 `timeout`，上面的示例也显式选择该策略；直接调用的
+`PrefetchOptions` 保留 `wait_complete` API 默认值。
+整个后端池共用 pin/reservation 账本，在飞数据及已完成未消费结果持续占额度。
+在飞 staging 并发限额独立生效，完成块转入 pin 额度后，后续窗口可以继续填充。
+取消仍需 drain，H2D 源数据由原有 GET 引用保护，Full/SWA allocator 继续施加物理背压。

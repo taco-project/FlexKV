@@ -12,6 +12,7 @@ import torch
 
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
+from flexkv.prefetch.budget import DEFAULT_PREFETCH_MAX_PINNED_BYTES
 
 
 def assert_mooncake_prefetch_ready(cache_config, prefetch_enabled: bool) -> None:
@@ -796,7 +797,7 @@ class CacheConfig:
     prefetch_options: Optional[Dict[str, Any]] = None
     prefetch_max_sessions: int = 128
     prefetch_max_reserved_bytes: int = 512 * 1024 * 1024
-    prefetch_max_pinned_bytes: int = 2 * 1024 * 1024 * 1024
+    prefetch_max_pinned_bytes: int = DEFAULT_PREFETCH_MAX_PINNED_BYTES
     prefetch_result_ttl_s: float = 60.0
     # SSD layer granularity: <= 0 means N=1
     layer_granularity: int = -1
@@ -1031,7 +1032,7 @@ class UserConfig:
     prefetch_options: Optional[Dict[str, Any]] = None
     prefetch_max_sessions: int = 128
     prefetch_max_reserved_bytes: int = 512 * 1024 * 1024
-    prefetch_max_pinned_bytes: int = 2 * 1024 * 1024 * 1024
+    prefetch_max_pinned_bytes: int = DEFAULT_PREFETCH_MAX_PINNED_BYTES
     prefetch_result_ttl_s: float = 60.0
 
     def __post_init__(self):
@@ -1097,7 +1098,8 @@ def load_user_config_from_env() -> UserConfig:
         prefetch_options=json.loads(os.getenv('FLEXKV_PREFETCH_OPTIONS', '{}')),
         prefetch_max_sessions=int(os.getenv('FLEXKV_PREFETCH_MAX_SESSIONS', 128)),
         prefetch_max_reserved_bytes=int(os.getenv('FLEXKV_PREFETCH_MAX_RESERVED_BYTES', 512 * 1024 * 1024)),
-        prefetch_max_pinned_bytes=int(os.getenv('FLEXKV_PREFETCH_MAX_PINNED_BYTES', 2 * 1024 * 1024 * 1024)),
+        prefetch_max_pinned_bytes=int(os.getenv(
+            'FLEXKV_PREFETCH_MAX_PINNED_BYTES', DEFAULT_PREFETCH_MAX_PINNED_BYTES)),
         prefetch_result_ttl_s=float(os.getenv('FLEXKV_PREFETCH_RESULT_TTL_S', 60)),
         cpu_cache_gb=int(os.getenv('FLEXKV_CPU_CACHE_GB', 16)),
         ssd_cache_gb=int(os.getenv('FLEXKV_SSD_CACHE_GB', 0)),
