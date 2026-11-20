@@ -5,7 +5,7 @@ import os
 import weakref
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from typing import Tuple, List, Union, Dict, Any, BinaryIO
+from typing import Tuple, List, Union, Dict, Any
 try:
     from flexkv.c_ext import Pcfs
 except ImportError:
@@ -250,6 +250,8 @@ _libc.munmap.restype = ctypes.c_int
 _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 _libc.close.restype = ctypes.c_int
 _libc.close.argtypes = [ctypes.c_int]
+_libc.fallocate.restype = ctypes.c_int
+_libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_long, ctypes.c_long]
 
 
 @dataclass
@@ -842,10 +844,11 @@ class SSDAllocator(BaseStorageAllocator):
             # when we don't set max_file_size_gb, we will create a file, size is exactly the required capacity
             cfg_max_blocks_per_file = total_blocks_per_device
 
-        fsys_max_blocks_per_file = cls.get_file_size_limit(cache_dir[0]) // block_size
+        # Files from a previous run are reused, so the space they hold counts as free.
+        free_bytes = cls.get_file_size_limit(cache_dir[0]) + cls._reusable_bytes(cache_dir[0], f"{file_prefix}_0_")
+        fsys_max_blocks_per_file = free_bytes // block_size
         num_blocks_per_file = min(fsys_max_blocks_per_file, cfg_max_blocks_per_file, total_blocks_per_device)
         if num_blocks_per_file < 1:
-            free_bytes = cls.get_file_size_limit(cache_dir[0])
             raise RuntimeError(
                 f"SSD directory {cache_dir[0]} has {free_bytes} bytes free, "
                 f"which cannot hold one {block_size}-byte block "
@@ -866,8 +869,7 @@ class SSDAllocator(BaseStorageAllocator):
             ssd_files[i] = []
             for j in range(num_files_per_device):
                 file_path = os.path.join(cache_dir[i], f"{file_prefix}_{i}_{j}.bin")
-                with open(file_path, "wb+", buffering=0) as file:
-                    cls._create_file(file, real_file_size)
+                cls._create_file(file_path, real_file_size)
                 ssd_files[i].append(file_path)
                 file_count += 1
                 if file_count % max(1, total_num_files // 10) == 0 or file_count == total_num_files:
@@ -888,13 +890,34 @@ class SSDAllocator(BaseStorageAllocator):
         )
 
     @classmethod
-    def _create_file(cls, file: BinaryIO, total_size_per_file: int) -> None:
+    def _create_file(cls, file_path: str, total_size_per_file: int) -> None:
+        # Keep a file left by a previous run instead of truncating it: blocks already
+        # written there are overwritten in place, while the first write into a hole (or
+        # an unwritten extent) allocates under the inode lock and is serialized on ext4.
+        # Its old contents are never read: the SSD index starts empty.
+        fd = os.open(file_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            os.truncate(file.fileno(), total_size_per_file)
+            if os.fstat(fd).st_size != total_size_per_file:
+                os.ftruncate(fd, total_size_per_file)
+            # Reserve the blocks up front (a no-op for ranges a reused file already
+            # holds). Without fallocate support or enough space, stay sparse.
+            if _libc.fallocate(fd, 0, 0, total_size_per_file) != 0:
+                err = ctypes.get_errno()
+                flexkv_logger.warning(f"fallocate({file_path}) failed: {os.strerror(err)}, "
+                                      f"the file stays sparse")
+            os.fsync(fd)
         except OSError as e:
             raise RuntimeError(f"Failed to initialize file: {e}") from e
-        file.flush()
-        os.fsync(file.fileno())
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _reusable_bytes(cache_dir: str, name_prefix: str) -> int:
+        total = 0
+        for entry in os.scandir(cache_dir):
+            if entry.name.startswith(name_prefix) and entry.name.endswith(".bin") and entry.is_file():
+                total += entry.stat().st_blocks * 512
+        return total
 
     @classmethod
     def from_raw_data(cls,
