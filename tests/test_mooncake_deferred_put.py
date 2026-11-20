@@ -387,3 +387,38 @@ def test_p2p_publication_happens_once_for_the_inserted_ready_node():
 
     engine.local_index.insert_and_publish.assert_called_once_with(inserted)
     assert engine.match(sequence).num_matched_blocks == 2
+
+
+def test_full_cpu_hit_swa_source_fence_excludes_full_storage_tail():
+    from flexkv.common.transfer import TransferOp
+
+    manager = _manager()
+    sequence = _sequence([1, 2, 3])
+    initial = _plan(manager, 1, sequence)
+    manager._commit_deferred_insert(_pending_for(initial))
+    manager.cpu_cache_engine._alloc_swa_slot = Mock(return_value=7)
+
+    def swa_chain(graph, **kwargs):
+        del kwargs
+        d2h = TransferOp(
+            graph_id=graph.graph_id, transfer_type=TransferType.D2H,
+            src_block_ids=np.array([0], dtype=np.int64),
+            dst_block_ids=np.array([7], dtype=np.int64), is_swa=True,
+        )
+        remote = TransferOp(
+            graph_id=graph.graph_id, transfer_type=TransferType.H2REMOTE,
+            src_block_ids=np.array([7], dtype=np.int64),
+            dst_block_ids=np.array([0], dtype=np.int64), is_swa=True,
+        )
+        graph.add_transfer_op(d2h)
+        graph.add_transfer_op(remote)
+        graph.add_dependency(remote.op_id, d2h.op_id)
+        return SimpleNamespace(d2h_id=d2h.op_id, h2disk_id=None, h2remote_id=remote.op_id)
+
+    manager.swa_op_constructor = SimpleNamespace(enabled=True, build_put_chain=swa_chain)
+    retry = _plan(manager, 2, sequence)
+    readers = [op for op in retry.transfer_graph._op_map.values()
+               if op.transfer_type == TransferType.D2H]
+    assert len(readers) == 1 and readers[0].is_swa
+    assert retry.finished_ops_ids == [readers[0].op_id]
+    assert _find_op(retry, TransferType.H2REMOTE).op_id not in retry.finished_ops_ids

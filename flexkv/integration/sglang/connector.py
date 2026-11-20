@@ -473,6 +473,9 @@ class FlexKVConnector:
         # Stores
         self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
         self._inflight_store_contexts: Dict[str, _CacheOpContext] = {}
+        # GPU ownership ends at the PUT task-end (all D2H lanes). Storage
+        # tails retain their engine-owned host buffers until the graph drains.
+        self._store_tail_tasks: Dict[int, _CacheOpContext] = {}
         # Prefetches
         self._ongoing_prefetches: Dict[str, int] = {}  # rid -> fkv_task_id
         self._prefetch_contexts: Dict[str, _CacheOpContext] = {}
@@ -1570,8 +1573,52 @@ class FlexKVConnector:
         self._inflight_store_contexts[rid] = context
         return fkv_task_id
 
+    def _track_store_tail(self, task_id: int, context: _CacheOpContext) -> None:
+        config = getattr(self, "cache_config", None)
+        if config is not None and not (config.enable_ssd or config.enable_remote):
+            return
+        if not hasattr(self, "_store_tail_tasks"):
+            self._store_tail_tasks = {}
+        self._store_tail_tasks[task_id] = context
+
+    def _retire_store_tails(self, responses: Dict[int, Any]) -> None:
+        tails = getattr(self, "_store_tail_tasks", {})
+        for task_id, response in responses.items():
+            if task_id not in tails or not _is_terminal_status(_status_value(response)):
+                continue
+            context = tails.pop(task_id)
+            # An early wait consumes the response, but the engine retains the
+            # graph and host-buffer ownership until it drains. It may then
+            # retire the task before this sweep observes it (NOTFOUND).
+            status = _status_value(response)
+            if status in {"failed", "cancelled"}:
+                self._log_cache_op(
+                    context, "complete", status, direction="H2STORAGE",
+                    source="store_tail",
+                )
+
+    def _drain_store_tails(self) -> None:
+        if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
+            return
+        tails = getattr(self, "_store_tail_tasks", {})
+        if not tails:
+            return
+        try:
+            responses = self.kv_manager.wait(
+                list(tails), timeout=0.0, completely=True
+            ) or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FlexKV] store tail poll failed; tasks retained: %s", exc)
+            return
+        self._retire_store_tails(responses)
+
     def check_completed_stores(self) -> List[str]:
-        """Return rids whose stores have completed since the last call."""
+        """Return rids whose GPU source slots are safe to release.
+
+        PUT task-end covers every Full/SWA D2H lane on all transfer handles;
+        H2DISK/H2REMOTE remain owned and drained separately.
+        """
+        self._drain_store_tails()
         completed_rids: List[str] = []
         completed_by_rid: Dict[str, Any] = {}
 
@@ -1581,7 +1628,7 @@ class FlexKVConnector:
             try:
                 completed_dict = (
                     self.kv_manager.wait(
-                        list(fk_to_rid), timeout=0.0, completely=True
+                        list(fk_to_rid), timeout=0.0, completely=False
                     )
                     or {}
                 )
@@ -1622,6 +1669,8 @@ class FlexKVConnector:
                     "_inflight_store_contexts", rid, "store", fk_tid
                 )
                 response = completed_by_rid.get(rid)
+                if _status_value(response) == "success":
+                    self._track_store_tail(fk_tid, context)
                 self._log_cache_op(
                     context,
                     "complete",
@@ -1634,55 +1683,31 @@ class FlexKVConnector:
         return completed_rids
 
     def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
-        """Block until a single store task identified by ``rid`` finishes."""
+        """Wait for GPU source safety; the collective sweep releases ownership.
+
+        A local wait never retires another rank's source-node lock. Storage
+        tails are tracked by task id, so public request ids may be reused.
+        """
         fkv_task_id = self._inflight_stores.get(rid, -1)
         if fkv_task_id < 0:
             return True
         context = getattr(self, "_inflight_store_contexts", {}).get(rid)
-        context = context or self._new_op_context(
-            "store", rid, task_id=fkv_task_id
-        )
+        context = context or self._new_op_context("store", rid, task_id=fkv_task_id)
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
-            self._inflight_stores.pop(rid, None)
-            getattr(self, "_inflight_store_contexts", {}).pop(rid, None)
-            return True
+            return False
         try:
-            resp = self.kv_manager.wait(
-                [fkv_task_id], timeout=timeout, completely=True
+            responses = self.kv_manager.wait(
+                [fkv_task_id], timeout=timeout, completely=False
             ) or {}
         except Exception as exc:  # noqa: BLE001
             self._log_cache_op(
-                context,
-                "poll",
-                "failed",
-                direction="D2H",
-                transfer_mode="no-layerwise",
-                error=str(exc),
+                context, "poll", "failed", direction="D2H", error=str(exc)
             )
             return False
-        status = _status_value(resp.get(fkv_task_id))
-        if not _is_terminal_status(status):
-            self._log_cache_op(
-                context,
-                "poll",
-                status,
-                direction="D2H",
-                transfer_mode="no-layerwise",
-            )
-            return False
-        self._inflight_stores.pop(rid, None)
-        self._pop_context(
-            "_inflight_store_contexts", rid, "store", fkv_task_id
-        )
-        success = status == KVResponseStatus.SUCCESS.value
-        self._log_cache_op(
-            context,
-            "complete",
-            status,
-            direction="D2H",
-            transfer_mode="no-layerwise",
-        )
-        return success
+        status = _status_value(responses.get(fkv_task_id))
+        if status == "success":
+            self._track_store_tail(fkv_task_id, context)
+        return status == "success"
 
     # ------------------------------------------------------------------
     # Public API — prefetch
@@ -2054,13 +2079,16 @@ class FlexKVConnector:
         self._completed_layerwise.clear()
         self._launched_load_tids.clear()
         getattr(self, "_launched_load_contexts", {}).clear()
-        # Store completion protects source GPU slots. Followers must not
-        # return from reset and let SGLang free those slots before the leader
-        # has observed a terminal (completely drained) response.
+        # Reset fences both GPU sources and released-source storage tails.
+        # Host buffers may still be read after SGLang has reclaimed GPU slots.
+        # Every rank waits for the leader's full drain before resetting pools.
         store_reset_status = {"ok": True, "error": ""}
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             inflight = list(self._inflight_stores.items())
-            task_ids = [fk_tid for _, fk_tid in inflight if fk_tid >= 0]
+            tails = getattr(self, "_store_tail_tasks", {})
+            task_ids = list(dict.fromkeys(
+                [fk_tid for _, fk_tid in inflight if fk_tid >= 0] + list(tails)
+            ))
             store_responses: Dict[int, Any] = {}
             wait_error = ""
             if task_ids:
@@ -2070,7 +2098,8 @@ class FlexKVConnector:
                     ) or {}
                 except Exception as exc:  # noqa: BLE001
                     wait_error = str(exc)
-            unsafe = []
+            self._retire_store_tails(store_responses)
+            unsafe = list(tails)
             for rid, fk_tid in inflight:
                 if fk_tid < 0:
                     continue
