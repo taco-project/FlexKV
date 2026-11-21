@@ -636,6 +636,85 @@ class FlexKVConnector:
     # Public API — lookup / load
     # ------------------------------------------------------------------
 
+    def pending_probe_plan(self, observed_times, interval: float = 0.5):
+        """Agree on a rate-limited observation plan before any TP collective.
+
+        Wall-clock decisions must come from the sync leader; independent rank
+        timers could make only some ranks enter a lookup scatter and deadlock.
+        """
+        # scatter validates local placeholders on followers before receiving
+        # the leader's object. LOOKUP requires dict on every rank.
+        payload = {"observed_at": 0.0, "indices": []}
+        if self._sync_ctx.is_sync_leader or not self._sync_ctx.needs_sync:
+            now = time.time()
+            payload = {"observed_at": now, "indices": [i for i, t in enumerate(observed_times) if now - t >= interval]}
+        if self._sync_ctx.needs_sync:
+            payload = self._sync_ctx.scatter(payload, channel=FlexKVScatterChannel.LOOKUP)
+        return payload
+
+    def sync_prefix_length(self, local_length: int) -> int:
+        """Use the shortest local device prefix before a shared CPU probe."""
+        if self._sync_ctx.needs_sync:
+            return int(self._sync_ctx.all_reduce_min(int(local_length)))
+        return int(local_length)
+
+    def peek_cpu_prefix_tokens(self, token_ids, token_mask, namespace=None):
+        """CPU-only metadata probe with no retained restore/prefetch ownership.
+
+        Uses the existing local get_match protocol and releases its temporary
+        task/pins. No L3 read, GPU allocation, H2D, or request-rid lookup entry
+        is created. It deliberately bypasses per-request operation logging.
+        None means unavailable, not an idle request with zero compute cost.
+        """
+        payload = {"hit": None, "error": "No local sync-leader metadata"}
+        if self._sync_ctx.is_sync_leader:
+            count, error = None, None
+            task = -1
+            try:
+                if self.kv_manager is None:
+                    raise RuntimeError("FlexKV manager unavailable for pending probe")
+                pending = getattr(self, "_metadata_probe_task", -1)
+                if pending >= 0:
+                    # Keep at most one failed cancellation owned; do not keep
+                    # creating pinned probes while cancellation is unavailable.
+                    self.kv_manager.cancel([pending])
+                    self._metadata_probe_task = -1
+                task, mask = self.kv_manager.get_match(
+                    token_ids=np.asarray(token_ids, dtype=np.int64),
+                    token_mask=self._as_numpy_mask(token_mask),
+                    cpu_only=True,
+                    namespace=namespace,
+                    swa_aware=self._swa_kv_pool is not None,
+                )
+                self._metadata_probe_task = task
+                count = int(mask.sum()) if mask is not None else 0
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                # A successful nonempty match pins its CPU prefix even though
+                # no transfer was launched. Release that temporary ownership
+                # on both the normal and result-decoding error paths. Empty
+                # graphs already completed in get_match need no cancellation.
+                if task >= 0 and (count is None or count > 0):
+                    try:
+                        self.kv_manager.cancel([task])
+                    except Exception as exc:
+                        error = str(exc)
+                    else:
+                        self._metadata_probe_task = -1
+                elif task >= 0:
+                    self._metadata_probe_task = -1
+            if error is not None:
+                logger.warning("FlexKV pending metadata probe unavailable: %s", error)
+            elif count is not None:
+                count = count // self.page_size * self.page_size
+            payload = {"hit": count, "error": error}
+        if self._sync_ctx.needs_sync:
+            payload = self._sync_ctx.scatter(payload, channel=FlexKVScatterChannel.LOOKUP)
+        # A non-leader with collective sync explicitly disabled has no local
+        # manager. Report unavailable rather than inventing a zero load.
+        return payload["hit"] if payload is not None and payload["error"] is None else None
+
     def lookup_kv(
         self,
         token_ids: Sequence[int],
@@ -643,6 +722,7 @@ class FlexKVConnector:
         rid: Optional[str] = None,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
+        *, cpu_only: bool = False,
     ) -> Tuple[int, int]:
         """Page-aligned prefix lookup against FlexKV.
 
@@ -678,7 +758,7 @@ class FlexKVConnector:
                 res = self.kv_manager.get_match(
                     token_ids=tids_np,
                     token_mask=mask_np,
-                    cpu_only=getattr(self, "_chunked_prefetch", False),
+                    cpu_only=cpu_only or getattr(self, "_chunked_prefetch", False),
                     swa_aware=self._swa_kv_pool is not None,
                     namespace=namespace,
                 )
@@ -1979,6 +2059,15 @@ class FlexKVConnector:
         # that the worker has stopped writing layer completion eventfds.
         load_reset_status = {"ok": True, "error": ""}
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            probe = getattr(self, "_metadata_probe_task", -1)
+            if probe >= 0:
+                try:
+                    self.kv_manager.cancel([probe])
+                    self._metadata_probe_task = -1
+                except Exception as exc:
+                    load_reset_status = {
+                        "ok": False, "error": f"metadata probe cancellation failed: {exc}",
+                    }
             launched = list(dict.fromkeys(self._launched_load_tids))
             if launched:
                 try:
