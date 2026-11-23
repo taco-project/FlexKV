@@ -222,3 +222,28 @@ disabling it reduces sync overhead and improves performance.
 `sglang_flexkv_connector.patch` is retained only as a legacy reference for the
 old pre-upstream integration. It is not required for supported SGLang releases,
 and it must not be used for the DeepSeek V4 path above.
+
+## Draft-cache adapter contract
+
+Pair a draft-aware SGLang adapter with a connector exposing
+`supports_draft_cache = True`. The adapter forwards the ordered union of
+packed and sidecar device pools, deduplicating by object identity; a distinct
+sidecar must not be lost when packed pools are also present. Separate Mamba
+draft state, fused/request-ring envelopes and unsupported sharded draft pools
+are rejected rather than treated as target-only hits.
+
+The SDK chooses physical packing and retains every active Index-K layer's
+original logical ID. Skip-topk layers may be empty or alias an earlier active
+buffer. Paged draft SWA must share the target mapping, page size and sufficient
+physical capacity; two missing mappings are not a shared-slot contract. All
+supported members use the existing cache entry, budget and completion path.
+
+This public SDK supports ordinary replicated MLA/DSA and paged DSpark SWA.
+DSA CP layer split requires per-layer owner metadata in the native registration
+API, which this SDK does not provide; it is rejected before configuration or
+collectives. Replicated TP/CP layouts remain supported.
+
+The public SGLang adapter keeps its existing public namespace schema with the
+optional draft-format prefix. Native ABI,
+GPU transfer, full-model quality and production throughput remain separate
+validation boundaries; a connector capability flag alone proves none of them.
