@@ -451,6 +451,14 @@ def _unpack_vmm_fd(handle_bytes: bytes) -> Tuple[int, int]:
     return pid, key
 
 
+def _expandable_segments_enabled() -> bool:
+    for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        conf = os.environ.get(var, "").replace(" ", "").lower()
+        if "expandable_segments:true" in conf:
+            return True
+    return False
+
+
 def _check_cu(where: str, result: int) -> None:
     """Raise on non-CUDA_SUCCESS return codes from the driver API."""
     if result != CUDA_SUCCESS:
@@ -1016,6 +1024,15 @@ class TensorSharedHandle:
                 mem_handle,
                 ctypes.c_ulonglong(0),
             )
+            if res != CUDA_SUCCESS and _expandable_segments_enabled():
+                # The export carries one physical handle per tensor; under
+                # expandable segments a KV tensor is backed by many.
+                raise RuntimeError(
+                    f"cuMemMap failed with CUresult={res}: the KV tensor was "
+                    "allocated with PyTorch expandable_segments, which backs it "
+                    "with several physical allocations; FlexKV can only share "
+                    "single-allocation tensors. Unset expandable_segments in "
+                    "PYTORCH_CUDA_ALLOC_CONF / PYTORCH_ALLOC_CONF")
             _check_cu("cuMemMap", res)
 
             # Grant this device read/write access to the mapped range.

@@ -149,7 +149,7 @@ class StorageEngine:
                 kv_dim=self._model_config.kv_dim,
                 num_kv_heads=self._model_config.num_kv_heads,
                 layer_groups=host_layer_groups,
-                tp_size=self._model_config.tp_size,
+                tp_size=self._model_config.host_rank_copies,
             )
             if self._radix_client is not None:
                 self._attach_radix_pool(self._cpu_layout, buffer_dtype, is_swa=False)
@@ -173,7 +173,7 @@ class StorageEngine:
                 kv_dim=self._model_config.kv_dim,
                 num_kv_heads=self._model_config.num_kv_heads,
                 layer_groups=host_layer_groups,
-                tp_size=self._model_config.tp_size,
+                tp_size=self._model_config.host_rank_copies,
             )
             self.allocate(
                 device_type=DeviceType.SSD,
@@ -202,7 +202,7 @@ class StorageEngine:
                     kv_dim=self._model_config.kv_dim,
                     num_kv_heads=self._model_config.num_kv_heads,
                     layer_groups=host_layer_groups,
-                    tp_size=self._model_config.tp_size,
+                    tp_size=self._model_config.host_rank_copies,
                 )
                 self.allocate(
                     device_type=DeviceType.REMOTE,
@@ -231,7 +231,7 @@ class StorageEngine:
                     kv_dim=1,
                     num_kv_heads=1,
                     layer_groups=self._swa_layer_groups,
-                    tp_size=self._model_config.tp_size,
+                    tp_size=self._model_config.host_rank_copies,
                 )
                 if self._radix_client is not None:
                     self._attach_radix_pool(self._swa_cpu_layout, torch.uint8, is_swa=True)
@@ -265,7 +265,7 @@ class StorageEngine:
                     kv_dim=1,
                     num_kv_heads=1,
                     layer_groups=self._swa_layer_groups,
-                    tp_size=self._model_config.tp_size,
+                    tp_size=self._model_config.host_rank_copies,
                 )
                 self.allocate(
                     device_type=DeviceType.SSD,
@@ -302,7 +302,7 @@ class StorageEngine:
                     kv_dim=1,
                     num_kv_heads=1,
                     layer_groups=self._swa_layer_groups,
-                    tp_size=self._model_config.tp_size,
+                    tp_size=self._model_config.host_rank_copies,
                 )
                     swa_remote_path = self._cache_config.remote_cache_path
                     if isinstance(swa_remote_path, str):

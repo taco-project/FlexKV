@@ -34,13 +34,17 @@ public:
     total_completed = 0;
 
     if (_entries > 0) {
-      if (!io_uring_queue_init(_entries, &ring, flags)) {
+      // io_uring_queue_init reports failure as -errno in its return value.
+      const int rc = io_uring_queue_init(_entries, &ring, flags);
+      if (rc == 0) {
         entries = _entries;
       } else {
         FLEXKV_LOG_ERROR(
             "operation=io_uring_init act=complete status=failed "
-            "entries=%d flags=%d errno=%d",
-            _entries, flags, errno);
+            "entries=%d flags=%d errno=%d fallback=threaded_pread "
+            "hint=\"container seccomp may block io_uring_setup; run with "
+            "--security-opt seccomp=unconfined\"",
+            _entries, flags, -rc);
       }
     }
 
@@ -99,7 +103,7 @@ public:
       }
 
       for (unsigned i = 0; i < count; i++) {
-        if (cqes[i]->res < 0) {
+        if (failed(cqes[i])) {
           cqe_err++;
         }
       }
@@ -130,6 +134,7 @@ public:
     // Single-segment I/O: io_uring_prep_read takes (buf, len) directly, so we
     // avoid a per-I/O heap iovec (and the matching delete on completion).
     io_uring_prep_read(sqe, fd, ptr, size, offset);
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(size));
 
     sqe->ioprio = read_ioprio;
 
@@ -151,6 +156,7 @@ public:
     // Single-segment I/O: io_uring_prep_write takes (buf, len) directly, so we
     // avoid a per-I/O heap iovec (and the matching delete on completion).
     io_uring_prep_write(sqe, fd, ptr, size, offset);
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(size));
 
     sqe->ioprio = write_ioprio;
 
@@ -159,7 +165,8 @@ public:
   }
 
   // Vectored I/O: readv/writev from a single offset into multiple buffers
-  int prep_readv(int fd, const struct iovec *iovs, int iovcnt, uint64_t offset) {
+  int prep_readv(int fd, const struct iovec *iovs, int iovcnt, uint64_t offset,
+                 uint64_t size) {
     if (prepare()) {
       total_over_limit++;
       return -1;
@@ -167,12 +174,14 @@ public:
     sqe = io_uring_get_sqe(&ring);
     if (!sqe) return -1;
     io_uring_prep_readv(sqe, fd, iovs, iovcnt, offset);
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(size));
     sqe->ioprio = read_ioprio;
     prepared++;
     return 0;
   }
 
-  int prep_writev(int fd, const struct iovec *iovs, int iovcnt, uint64_t offset) {
+  int prep_writev(int fd, const struct iovec *iovs, int iovcnt, uint64_t offset,
+                  uint64_t size) {
     if (prepare()) {
       total_over_limit++;
       return -1;
@@ -180,6 +189,7 @@ public:
     sqe = io_uring_get_sqe(&ring);
     if (!sqe) return -1;
     io_uring_prep_writev(sqe, fd, iovs, iovcnt, offset);
+    io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(size));
     sqe->ioprio = write_ioprio;
     prepared++;
     return 0;
@@ -208,6 +218,15 @@ public:
   }
 
 private:
+  // Every SQE carries its expected byte count: a short read/write is as much a
+  // failure as a negative result (the kernel caps one I/O at ~2 GiB, and a
+  // network filesystem may return early).
+  static bool failed(const io_uring_cqe *c) {
+    return c->res < 0 ||
+           static_cast<uint64_t>(c->res) !=
+               reinterpret_cast<uint64_t>(io_uring_cqe_get_data(c));
+  }
+
   int prepare() {
     if (prepared >= entries / 2) {
       submit();
@@ -218,7 +237,7 @@ private:
         return -1;
       }
 
-      if (cqe->res < 0) {
+      if (failed(cqe)) {
         cqe_err++;
       }
 
