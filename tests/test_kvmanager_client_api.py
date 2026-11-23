@@ -27,7 +27,6 @@ def _manager(server_client_mode: bool) -> KVManager:
     manager = KVManager.__new__(KVManager)
     manager.server_client_mode = server_client_mode
     manager.server_launch_mode = "embedded"
-    manager.owns_mps = False
     manager.server_handle = None
     # spec_set: attribute access outside the real class raises, so a call to a
     # method that was renamed away fails here instead of silently passing.

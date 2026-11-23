@@ -906,8 +906,6 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     eviction_policy=os.getenv('FLEXKV_EVICTION_POLICY', 'lru'),
     slru_protected_threshold=int(os.getenv('FLEXKV_SLRU_PROTECTED_THRESHOLD', 2)),
 
-    enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
-
     enable_collective_sync=bool(int(os.getenv('FLEXKV_ENABLE_COLLECTIVE_SYNC', 1))),
 
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),

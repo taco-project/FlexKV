@@ -124,9 +124,15 @@ swa_multi_group: false
 
 ### CUDA MPS（Multi-Process Service）
 
-| 环境变量 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `FLEXKV_ENABLE_MPS` | bool | 1 | 是否自动管理 CUDA MPS 的启停。设为 0 可禁用 |
+FlexKV 不会自动启动或停止 CUDA MPS（`FLEXKV_ENABLE_MPS` 已移除），请在**启动推理引擎之前**手动启动 MPS daemon。在 daemon 启动前就已初始化 CUDA 的进程不会接入 MPS。
+
+FlexKV 的传输 worker 是独立进程，默认的 H2D/D2H 拷贝是 SM 上的 kernel。不开 MPS 时，GPU 会让它们与推理引擎的 kernel 分时执行，传输（包括 layerwise H2D）无法与计算重叠。
+
+```bash
+nvidia-cuda-mps-control -d            # 启动 MPS daemon
+# 启动推理引擎
+echo quit | nvidia-cuda-mps-control   # 推理引擎退出后停止 daemon
+```
 
 ---
 

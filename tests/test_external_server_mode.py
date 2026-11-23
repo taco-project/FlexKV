@@ -48,7 +48,6 @@ def test_external_mode_never_starts_or_stops_shared_server(
         manager.shutdown()
 
     assert manager.server_handle is None
-    assert not manager.owns_mps
     create_server.assert_not_called()
     dp_client.start_server_and_register.assert_called_once()
     dp_client.unregister.assert_called_once()
