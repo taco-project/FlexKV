@@ -1070,6 +1070,11 @@ class KVTaskManager:
                 task_id, job.job_id, result.source_rank, planned,
                 result.remote_blocks, result.remote_bytes, result.common_hit)
             metrics_collector = get_global_collector()
+            if metrics_collector is not None:
+                verified = max(0, min(int(result.common_hit), task.prefetch_planned_hit_blocks)
+                               - task.prefetch_local_hit_blocks)
+                if verified:
+                    metrics_collector.record_cache_hit("peer", verified)
             if metrics_collector is not None and result.remote_blocks > 0:
                 metrics_collector.record_transfer_completed(
                     TransferType.PEERH2H.value, int(result.remote_blocks),
