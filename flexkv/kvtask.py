@@ -1401,7 +1401,9 @@ class KVTaskEngine(KVTaskManager):
             nvtx_range = nvtx.start_range(message=f"KVTask.wait[{task_id}]", color="red")
             while True:
                 if task_id not in self.tasks:
-                    flexkv_logger.error(f"task_id {task_id} not submitted into flexKV")
+                    # Early PUT responses may precede graph retirement. A later
+                    # tail sweep can legitimately find the drained task gone.
+                    flexkv_logger.debug(f"task_id {task_id} is no longer active")
                     return_responses[task_id] = KVResponse(
                         status=KVResponseStatus.NOTFOUND,
                         task_id=task_id,

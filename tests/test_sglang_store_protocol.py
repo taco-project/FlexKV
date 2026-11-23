@@ -258,7 +258,7 @@ def test_store_ready_uses_leader_payload_and_dedicated_channel():
     connector._sync_ctx.scatter.assert_called_once_with([], channel=FlexKVScatterChannel.STORE_READY)
 
 
-def test_store_completion_waits_for_fully_drained_graph():
+def test_store_completion_waits_for_source_fence():
     connector = FlexKVConnector.__new__(FlexKVConnector)
     connector.kv_manager = MagicMock()
     connector._sync_ctx = SimpleNamespace(
@@ -284,12 +284,12 @@ def test_store_completion_waits_for_fully_drained_graph():
     assert connector.check_completed_stores() == ["request"]
     assert connector._inflight_stores == {}
     assert connector.kv_manager.wait.call_args_list == [
-        (([17],), {"timeout": 0.0, "completely": True}),
-        (([17],), {"timeout": 0.0, "completely": True}),
+        (([17],), {"timeout": 0.0, "completely": False}),
+        (([17],), {"timeout": 0.0, "completely": False}),
     ]
 
 
-def test_wait_store_keeps_tracking_until_fully_drained():
+def test_wait_store_keeps_tracking_until_collective_source_release():
     connector = FlexKVConnector.__new__(FlexKVConnector)
     connector.kv_manager = MagicMock()
     connector._sync_ctx = SimpleNamespace(is_sync_leader=True)
@@ -310,10 +310,10 @@ def test_wait_store_keeps_tracking_until_fully_drained():
     assert connector._inflight_stores == {"request": 17}
 
     assert connector.wait_store("request", timeout=5.0)
-    assert connector._inflight_stores == {}
+    assert connector._inflight_stores == {"request": 17}
     assert connector.kv_manager.wait.call_args_list == [
-        (([17],), {"timeout": 5.0, "completely": True}),
-        (([17],), {"timeout": 5.0, "completely": True}),
+        (([17],), {"timeout": 5.0, "completely": False}),
+        (([17],), {"timeout": 5.0, "completely": False}),
     ]
 
 

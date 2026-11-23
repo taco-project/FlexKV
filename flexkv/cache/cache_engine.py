@@ -2455,13 +2455,6 @@ class GlobalCacheEngine:
             if op_d2h is not None:
                 transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)
 
-        if op_d2h is None:
-            assert self.use_mooncake_store_backend
-            if op_h2disk is not None:
-                finished_ops_ids.append(op_h2disk.op_id)
-            if op_h2remote is not None:
-                finished_ops_ids.append(op_h2remote.op_id)
-
         swa_ops = SWAPutChainOpIds()
         if cpu_swa_slot >= 0:
             empty = np.array([], dtype=np.int64)
@@ -2491,6 +2484,14 @@ class GlobalCacheEngine:
             if put_to_remote and (remote_swa_slot >= 0 or put_remote_via_mooncake):
                 assert swa_ops.h2remote_id is not None
             finished_ops_ids.append(swa_ops.d2h_id)
+
+        if not finished_ops_ids:
+            # No GPU reader exists in this graph. Keep a storage completion
+            # point for remote-only retries; never add it to a SWA D2H fence.
+            if op_h2disk is not None:
+                finished_ops_ids.append(op_h2disk.op_id)
+            if op_h2remote is not None:
+                finished_ops_ids.append(op_h2remote.op_id)
 
         # Insert-after: nothing is mounted on any radix tree at plan time. Each
         # tier's staging (and its SWA slot) stays detached until the ops that
