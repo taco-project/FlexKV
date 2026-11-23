@@ -115,12 +115,12 @@ capacity and Mooncake Store settings and setting SSD capacity to zero:
 ```yaml
 enable_chunked_prefetch: true
 prefetch_options:
-  policy: best_effort
+  policy: timeout
   chunk_max_blocks: 128
   max_inflight_chunks: 2
 prefetch_max_sessions: 128
 prefetch_max_reserved_bytes: 536870912
-prefetch_max_pinned_bytes: 2147483648
+prefetch_max_pinned_bytes: 137438953472  # 128 GiB default
 prefetch_result_ttl_s: 60
 ```
 
@@ -222,3 +222,31 @@ disabling it reduces sync overhead and improves performance.
 `sglang_flexkv_connector.patch` is retained only as a legacy reference for the
 old pre-upstream integration. It is not required for supported SGLang releases,
 and it must not be used for the DeepSeek V4 path above.
+
+### Prefetch byte budget
+
+`prefetch_max_pinned_bytes` is the single configurable residency ceiling,
+with a default of **137438953472 bytes (128 GiB)**. The existing environment
+spelling is `FLEXKV_PREFETCH_MAX_PINNED_BYTES`. An explicit value is honored;
+for example, an existing 2 GiB setting remains 2 GiB until removed or updated.
+No request-count window or second byte-limit setting is introduced.
+
+The effective budget is:
+
+```text
+min(prefetch_max_pinned_bytes,
+    max(0, floor(actual Full-KV L2 block count / 2) - 1) * physical block bytes)
+```
+
+The half-pool bound is rounded down to whole blocks; one additional block is
+left for foreground work. Backend and paired SGLang admission share
+`resolve_prefetch_budget`. Sizing includes compressed groups, registered
+SWA/state snapshots and all_write replicas, within the existing pool.
+
+SGLang defaults to `timeout`; the example above selects it explicitly.
+Standalone `PrefetchOptions` retains its `wait_complete` API default.
+The backend pool's shared pin/reservation ledger counts in-flight and completed,
+unconsumed data. The existing staging-byte limit separately bounds concurrent
+transfers; completed blocks move to pin credit and later windows can refill.
+Cancellation still drains, foreground GET references protect H2D sources, and
+physical Full/SWA allocators retain backpressure.

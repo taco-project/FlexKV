@@ -1226,7 +1226,7 @@ class KVTaskEngine(KVTaskManager):
 
         self._runtime = None
         if cache_config.enable_chunked_prefetch:
-            self._prefetch_backend = MooncakeChunkPlanner(self, cache_config.prefetch_max_pinned_bytes)
+            self._prefetch_backend = MooncakeChunkPlanner(self)
             metrics = get_global_collector()
             self._prefetch = PrefetchCoordinator(
                 self._prefetch_backend,
