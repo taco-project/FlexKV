@@ -432,3 +432,22 @@ def test_connector_forwards_namespace_to_chunked_session(namespace):
     assert call.args[0].tolist() == [1, 2, 3, 4]
     assert call.args[1].candidate_start_token == 2
     assert call.kwargs["namespace"] == namespace
+
+
+@pytest.mark.parametrize(
+    "wants_swa,partial_swa,should_fail",
+    [
+        (True, False, True),    # SWA model / swa_aware + radix chunked
+        (True, True, False),    # Mooncake can serve SWA checkpoints
+        (False, False, False),  # Full-only + radix ok
+    ],
+)
+def test_connector_fail_fast_swa_without_checkpoint_support(
+    wants_swa, partial_swa, should_fail
+):
+    caps = PrefetchCapabilities(partial_swa_checkpoints=partial_swa)
+    if should_fail:
+        with pytest.raises(RuntimeError, match="does not support SWA"):
+            FlexKVConnector._require_chunked_swa_support(caps, wants_swa=wants_swa)
+    else:
+        FlexKVConnector._require_chunked_swa_support(caps, wants_swa=wants_swa)

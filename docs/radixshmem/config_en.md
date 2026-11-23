@@ -15,6 +15,9 @@ reported as a warning; otherwise the notice is informational. FlexKV does not
 start or size the server. See `flexkv/server/shm_radix_bootstrap.py` and the
 radixshmem repository's README, API documentation and `radix-server --help`.
 
+For `wait_complete`, `timeout`, and `best_effort` behavior, chunk sizing, and
+stop/drain ownership, see the [RadixShmem prefetch design](../design/radixshmem_chunked_prefetch.md).
+
 ## Environment variables
 
 | Variable | Default | Meaning |
@@ -38,8 +41,8 @@ The following are constants in `flexkv/server/shm_radix_bootstrap.py`:
 | Constant | Value | Meaning |
 | --- | --- | --- |
 | `READY_TIMEOUT_S` | 600 | Total wait for server reachability and readiness, including late startup, prefault and cluster rendezvous. Keep the server's bootstrap timeout below this. |
-| `PREFETCH_TIMEOUT_MS` | 5000 | Server-side timeout for one peer pull; the job completes with the local hits available at expiry. |
-| `PREFETCH_MAX_INFLIGHT` | 128 | Maximum peer pulls in flight per KVTaskEngine; new prefetches skip peer lookup at the limit. |
+| `PREFETCH_TIMEOUT_MS` | 5000 | Default server deadline for one peer pull; expired transfers drain before slots can be reclaimed. Override via `chunk_timeout_ms` or `FLEXKV_RADIXSHMEM_CHUNK_TIMEOUT_MS`. |
+| `PREFETCH_MAX_INFLIGHT` | 128 | Legacy peer-pull limit per KVTaskEngine. The chunked planner additionally serializes claims globally per planner. |
 | `MAX_OUTSTANDING` | 256 | Maximum outstanding peer-pull jobs per `RadixClient`. FlexKV submits nonblocking; at the limit the new job completes with local hits. |
 
 ## Geometry and slot counts

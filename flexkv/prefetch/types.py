@@ -9,6 +9,10 @@ class PrefetchCapacityExhausted(RuntimeError):
     """Expected admission stop when existing prefixes exhaust the pin budget."""
 
 
+class PrefetchBusy(RuntimeError):
+    """Temporary backend contention; retry without sealing the session."""
+
+
 @dataclass(frozen=True)
 class PrefetchHandle:
     epoch: str
@@ -26,6 +30,15 @@ class PrefetchOptions:
     timeout_budget_s: Optional[float] = None
     candidate_start_token: int = 0
     swa_aware: bool = False
+
+    @classmethod
+    def from_mapping(cls, raw: Optional[dict] = None) -> "PrefetchOptions":
+        """Build options, ignoring backend-only keys (e.g. ``chunk_timeout_ms``)."""
+        import dataclasses
+
+        raw = raw or {}
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in raw.items() if k in known})
 
     def validate(self) -> None:
         from .policy import get_policy

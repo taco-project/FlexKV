@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from flexkv.prefetch.planner import MooncakeChunkPlanner, PrefetchContext
+from flexkv.prefetch.mooncake_planner import MooncakeChunkPlanner, MooncakePrefetchContext
 from flexkv.prefetch.types import PrefetchCapacityExhausted
 
 pytestmark = pytest.mark.unit
@@ -31,7 +31,7 @@ def planner_with_prefix(prefix_blocks=224):
     sequence = NS(token_ids=tokens, block_hashes=tokens)
     future = Future()
     future.set_result((sequence, len(tokens)))
-    context = PrefetchContext(tokens=tokens, namespace=None, client_id=0, future=future)
+    context = MooncakePrefetchContext(tokens=tokens, namespace=None, client_id=0, future=future)
     return planner, context, cpu
 
 

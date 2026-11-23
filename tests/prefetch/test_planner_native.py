@@ -18,7 +18,7 @@ from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, LayerGroupSpec
 from flexkv.common.transfer import CompletedOp, DeviceType
 from flexkv.prefetch.coordinator import PrefetchCoordinator
-from flexkv.prefetch.planner import MooncakeChunkPlanner
+from flexkv.prefetch.mooncake_planner import MooncakeChunkPlanner
 from flexkv.prefetch.types import PrefetchOptions
 
 
@@ -399,6 +399,7 @@ def test_actual_graph_ipc_runtime_drain_and_cpu_bytes_without_polling(env):
     finally:
         allow.set()
         engine.shutdown()
+    # shutdown joins and closes the multiprocessing Process handle.
     assert ipc.process is None
     assert ipc.command_parent_conn.closed and ipc.result_parent_conn.closed
     assert not engine.transfer_handles[0].thread.is_alive()

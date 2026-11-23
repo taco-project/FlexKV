@@ -1,9 +1,11 @@
 """Single-owner session scheduler. The backend owns cache plans, not policy.
 
-Backend methods: begin, resolve, reserve, submit_batch, complete, commit,
-discard, release. resolve is nonblocking (None means metadata still pending).
-An admitted chunk retains credit through commit/discard, including out-of-order
-completion. Transport-accepted work is never cancelled or forgotten.
+Backend contract: ``ChunkPlannerBase`` in ``flexkv.prefetch.base_planner`` —
+begin, resolve, reserve, submit_batch, complete, commit, discard, release,
+cancel_query, result_end (optional poll_completions). resolve is nonblocking
+(None means metadata still pending). An admitted chunk retains credit through
+commit/discard, including out-of-order completion. Transport-accepted work is
+never cancelled or forgotten.
 """
 
 from collections import OrderedDict
@@ -16,6 +18,7 @@ from typing import Any, Dict, Optional
 from .policy import freeze_policies, get_policy
 from .types import (
     PrefetchCapacityExhausted,
+    PrefetchBusy,
     PrefetchHandle,
     PrefetchOptions,
     PrefetchSnapshot,
@@ -148,6 +151,19 @@ class PrefetchCoordinator:
                 self.seal(session, reason)
 
     def tick(self):
+        # Job-based backends (radixshmem pull_async) have no transfer-engine
+        # completion pipe; poll them before commit so drain can progress.
+        poll = getattr(self.backend, "poll_completions", None)
+        if callable(poll):
+            for completion in poll():
+                self.on_completion(completion)
+        # Return completed claims before trying *any* waiting session. Otherwise
+        # the previous owner can commit and reclaim midway through this loop,
+        # repeatedly jumping ahead of a waiter visited just before it.
+        for session in list(self.sessions.values()):
+            if session.terminal_at is None:
+                self._commit_ready(session)
+                self._finalize(session)
         batch = []
         # Rotate active requests for fair bounded admission.
         for handle in list(self.sessions):
@@ -169,6 +185,9 @@ class PrefetchCoordinator:
                 chunk = self._plan_and_claim(session)
                 if chunk is not None:
                     batch.append(chunk)
+                    self.sessions.move_to_end(handle)
+            except PrefetchBusy:
+                pass
             except PrefetchCapacityExhausted:
                 self.seal(session, "capacity")
                 self._finalize(session)
@@ -176,12 +195,22 @@ class PrefetchCoordinator:
                 session.error = f"{type(exc).__name__}: {exc}"
                 self.seal(session, "backend_error")
                 self._finalize(session)
-            self.sessions.move_to_end(handle)
         if batch:
             # The backend must either accept all descriptors into its bounded
             # outbox or report a known-not-submitted failure. Ambiguous transport
             # failures keep resources retained and make the runtime unhealthy.
             self.backend.submit_batch(batch)
+            # Radixshmem may finish a chunk synchronously (local-only / saturated);
+            # pick those up in the same tick so drain does not wait an extra poll.
+            if callable(poll):
+                for completion in poll():
+                    self.on_completion(completion)
+                for handle in list(self.sessions):
+                    session = self.sessions[handle]
+                    if session.terminal_at is not None:
+                        continue
+                    self._commit_ready(session)
+                    self._finalize(session)
         self.reap()
         return len(batch)
 
@@ -261,6 +290,8 @@ class PrefetchCoordinator:
             return False
         chunk = session.chunks[completion.graph_id]
         self.backend.complete(chunk, completion)
+        if getattr(completion, "error", None):
+            session.error = completion.error
         session.version += 1
         return True
 
