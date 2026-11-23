@@ -126,9 +126,15 @@ Some configurations can only be set through environment variables.
 
 ### CUDA MPS (Multi-Process Service)
 
-| Environment Variable | Type | Default | Description |
-|---------------------|------|---------|-------------|
-| `FLEXKV_ENABLE_MPS` | bool | 1 | Whether to automatically manage CUDA MPS startup and shutdown. Set to 0 to disable |
+FlexKV does not start or stop CUDA MPS (`FLEXKV_ENABLE_MPS` has been removed); start the MPS daemon manually **before launching the inference engine**. A process that initializes CUDA before the daemon is running does not join MPS.
+
+FlexKV's transfer workers are separate processes, and the default H2D/D2H copies are SM kernels. Without MPS the GPU time-slices them against the inference engine's kernels, so transfers, layerwise H2D included, do not overlap with computation.
+
+```bash
+nvidia-cuda-mps-control -d            # start the MPS daemon
+# launch the inference engine
+echo quit | nvidia-cuda-mps-control   # stop the daemon after the engine exits
+```
 
 ---
 

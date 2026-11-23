@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import os
-import subprocess
 from typing import Optional, Tuple, List, Dict, Union, Iterable, Sequence
 import time
 
@@ -121,8 +120,6 @@ class KVManager:
         )
 
         self.redis_meta_client = None
-        self.enable_mps = GLOBAL_CONFIG_FROM_ENV.enable_mps
-        self.owns_mps = self.enable_mps and self.server_launch_mode != "external"
         self.kv_task_engine = None
         self.server_handle = None
 
@@ -171,11 +168,6 @@ class KVManager:
             )
 
     def start(self) -> None:
-        if self.owns_mps:
-            # try to start MPS
-            subprocess.run(['nvidia-cuda-mps-control', '-d'], check=False)
-            flexkv_logger.debug("MPS started")
-
         if not self.server_client_mode:
             self.kv_task_engine.start()
         else:
@@ -204,11 +196,6 @@ class KVManager:
             if self.kv_task_engine is not None:
                 self.kv_task_engine.shutdown()
 
-        if self.owns_mps:
-            flexkv_logger.info(
-                "MPS is enabled. To stop MPS daemon manually, run: "
-                "'echo quit | nvidia-cuda-mps-control'"
-            )
         flexkv_logger.info("[FLEXKV] KVManager.shutdown done.")
 
     def get_async(self,
