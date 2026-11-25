@@ -156,11 +156,13 @@ When enabled (off by default; set `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`), Flex
 |---------------------|------|---------|-------------|
 | `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD` | int | 0 | Only `0` / `1` are accepted; other values fail at startup. `1`: enable the NUMA spreading above (reset inherited binding, split the CPU pool per node, register Mooncake MRs per region). `0`: legacy behaviour, memory follows the launcher's binding |
 | `FLEXKV_NUMA_NODES` | str | unset | Node list to spread over, e.g. `0,1` or `0-3`, intersected with the process's `Mems_allowed`. When unset, all nodes in `Mems_allowed` that have CPUs are used (memory-only CXL/HBM nodes are skipped). Spreading needs at least two eligible nodes |
-| `FLEXKV_CPUS` | str | unset | Linux CPU list for KVServer, TransferManager and the asynchronous prefetch task-state worker, such as `16-31,80-95`. Set before launching the inference engine. It works on a single NUMA node and with memory spreading disabled. The effective list is limited by the container's CPU set |
+| `FLEXKV_CPUS` | str | unset | Explicit Linux CPU list for standalone KVServer and TransferManager processes, e.g. `16-31,80-95`. Spawned transfer workers inherit the mask. Takes precedence over `FLEXKV_CPUS_PER_NODE`; the kernel limits the effective mask to the container cpuset |
+| `FLEXKV_CPUS_PER_NODE` | int | 0 | Reserve the last K physical core groups, including SMT siblings, on each usable NUMA node. `0` disables this option. Like `FLEXKV_CPUS`, it supports a single NUMA node and works with memory spreading disabled |
 
 Notes:
 
-- A warning is logged and the pool stays in one region if the container forbids `mbind` / `set_mempolicy` or `lcm(block size, page/mapping alignment)` is too coarse for an even split. Successful changes to CPU affinity and task memory policy still apply. Set `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=0` and leave `FLEXKV_CPUS` unset to retain the launcher binding.
+- Set these variables before launch. In-process `TaskRuntime` and `StoreLookup` threads stay with their host rank to preserve L3 locality and avoid cross-CCD GIL contention.
+- A warning is logged and the pool stays in one region if the container forbids `mbind` / `set_mempolicy` or `lcm(block size, page/mapping alignment)` is too coarse for an even split. Successful changes to CPU affinity and task memory policy still apply. To retain the launcher binding, set `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=0` and leave both CPU affinity options unset.
 - Log markers: `[NUMA][TransferManager] ... reset inherited binding`, `[NUMA] CPU pool ... spread over nodes`, and `[MooncakeStoreBackend] registering external MRs: ... regions=[(ptr, size, 'cpu:0'), (ptr, size, 'cpu:1')]`. At runtime, `numastat -p <TransferManager pid>` or `numastat -m` shows per-node Shmem/HugePages usage.
 - The CPU pool is shared by every GPU, so any GPU may read or write any block, and about half of the H2D/D2H traffic still crosses NUMA nodes. This feature balances memory capacity and RDMA NIC load across nodes.
 

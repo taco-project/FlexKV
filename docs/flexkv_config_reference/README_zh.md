@@ -154,11 +154,13 @@ FlexKV 的 KVServer 由 `dp_client_id == 0` 的调用方拉起（例如 SGLang �
 |--------|------|--------|------|
 | `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD` | int | 0 | 只接受 `0` / `1`，其他值启动时报错。`1`：开启上述 NUMA 分布（重置继承的绑定、CPU 池按节点分段、Mooncake MR 按段注册）。`0`：保持旧行为，内存跟随启动进程的绑定 |
 | `FLEXKV_NUMA_NODES` | str | 未设置 | 参与分布的节点列表，例如 `0,1` 或 `0-3`，会与进程的 `Mems_allowed` 取交集。未设置时使用 `Mems_allowed` 中所有带 CPU 的节点（不含仅有内存的 CXL/HBM 节点）。内存分布需要至少两个可用节点 |
-| `FLEXKV_CPUS` | str | 未设置 | KVServer、TransferManager 和异步预取任务管理线程的 Linux CPU 列表，例如 `16-31,80-95`。在推理引擎启动前设置。在单 NUMA 节点及关闭内存分布时均可生效，实际可用 CPU 受容器 cpuset 限制 |
+| `FLEXKV_CPUS` | str | 未设置 | 独立 KVServer 和 TransferManager 进程的 Linux CPU 列表，例如 `16-31,80-95`；派生的传输子进程继承该掩码。优先于 `FLEXKV_CPUS_PER_NODE`，实际范围受容器 cpuset 限制 |
+| `FLEXKV_CPUS_PER_NODE` | int | 0 | 预留每个可用 NUMA 节点末尾的 K 组物理核（含 SMT 兄弟线程），`0` 表示关闭。和 `FLEXKV_CPUS` 一样，单节点或关闭内存分布时也可用 |
 
 说明：
 
-- 容器禁止 `mbind` / `set_mempolicy`，或 `lcm(block 大小, 页/映射对齐)` 太大而无法均匀切分时，日志会告警并使用单段内存池。已生效的 CPU 亲和性和进程内存策略继续生效。需要沿用启动进程的绑定时，设 `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=0`，并取消设置 `FLEXKV_CPUS`。
+- 在启动引擎前设置。进程内的 `TaskRuntime` 和 `StoreLookup` 线程仍与宿主 rank 共用 CPU 范围，保留 L3 局部性，避免跨 CCD 争用 GIL。
+- 容器禁止 `mbind` / `set_mempolicy`，或 `lcm(block 大小, 页/映射对齐)` 太大而无法均匀切分时，日志会告警并使用单段内存池。已生效的 CPU 亲和性和进程内存策略继续生效。要沿用启动进程的绑定，设 `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=0` 并取消设置两个 CPU 亲和性选项。
 - 日志关键字：`[NUMA][TransferManager] ... reset inherited binding`、`[NUMA] CPU pool ... spread over nodes`，以及 `[MooncakeStoreBackend] registering external MRs: ... regions=[(ptr, size, 'cpu:0'), (ptr, size, 'cpu:1')]`。运行时可用 `numastat -p <TransferManager pid>` 或 `numastat -m` 确认各节点的 Shmem/HugePages 占用。
 - 由于 CPU 池被所有 GPU 共享，同一个 block 可能被任意 GPU 读写，H2D/D2H 仍会有约一半流量跨 NUMA；本功能保证的是内存容量和 RDMA 网卡负载在节点间均衡。
 

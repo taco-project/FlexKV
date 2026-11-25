@@ -27,9 +27,9 @@ What ``FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`` (opt-in) does
 ``FLEXKV_NUMA_NODES`` (e.g. ``0,1`` or ``0-3``) restricts the nodes used;
 default is every node in the cpuset that has CPUs.
 
-``FLEXKV_CPUS`` sets an explicit CPU list independently of the memory policy.
-It covers KVServer, TransferManager and the task-state worker thread when the
-asynchronous prefetch runtime is active. Set it before launching the engine.
+``FLEXKV_CPUS`` and ``FLEXKV_CPUS_PER_NODE`` set CPU placement independently
+of the memory policy, only for KVServer and TransferManager child processes
+and the workers that inherit their masks. In-process workers are not rebound.
 """
 
 import ctypes
