@@ -5,6 +5,8 @@ from functools import wraps
 import queue
 import threading
 
+from flexkv.common.cpu_affinity import apply_configured_cpu_affinity
+
 
 def on_runtime(method):
     @wraps(method)
@@ -64,6 +66,7 @@ class TaskRuntime:
 
     def _run(self):
         try:
+            apply_configured_cpu_affinity("TaskRuntime", all_threads=False)
             while not self.stopping:
                 self.wake.clear()
                 for _ in range(64):

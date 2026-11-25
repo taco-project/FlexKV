@@ -23,9 +23,13 @@ What ``FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`` (opt-in) does
    for the whole pool). Mooncake labels every MR with the NUMA node of its
    first page (``cpu:N``), so transfers of each region pick that node's NICs.
 
-``FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=0`` (default) keeps the legacy behaviour.
+``FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=0`` (default) keeps the inherited memory policy.
 ``FLEXKV_NUMA_NODES`` (e.g. ``0,1`` or ``0-3``) restricts the nodes used;
 default is every node in the cpuset that has CPUs.
+
+``FLEXKV_CPUS`` sets an explicit CPU list independently of the memory policy.
+It covers KVServer, TransferManager and the task-state worker thread when the
+asynchronous prefetch runtime is active. Set it before launching the engine.
 """
 
 import ctypes
@@ -37,6 +41,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+from flexkv.common.cpu_affinity import apply_configured_cpu_affinity
 from flexkv.common.debug import flexkv_logger
 
 ENV_ENABLE_NUMA_SPREAD = "FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD"
@@ -212,19 +217,19 @@ def reset_inherited_numa_binding(role: str) -> None:
     Must run before the CPU pool is allocated and before worker processes /
     threads are created: mempolicy and affinity are inherited at creation.
     """
+    configured_cpus = apply_configured_cpu_affinity(role)
     nodes = get_spread_nodes()
     if not nodes:
         return
     before_cpus = len(os.sched_getaffinity(0))
-    target_cpus: Set[int] = set()
-    for n in nodes:
-        target_cpus |= node_cpus(n)
-    if target_cpus:
-        try:
-            # The kernel intersects the mask with the cpuset.
-            os.sched_setaffinity(0, target_cpus)
-        except OSError as e:
-            flexkv_logger.warning(f"[NUMA][{role}] sched_setaffinity failed: {e}")
+    if not configured_cpus:
+        target_cpus = set().union(*(node_cpus(node) for node in nodes))
+        if target_cpus:
+            try:
+                # The kernel intersects the mask with the cpuset.
+                os.sched_setaffinity(0, target_cpus)
+            except OSError as e:
+                flexkv_logger.warning(f"[NUMA][{role}] sched_setaffinity failed: {e}")
     try:
         set_task_mempolicy(_MPOL_INTERLEAVE, nodes)
     except OSError as e:
