@@ -1081,7 +1081,7 @@ class KVTaskManager:
                     int(result.remote_bytes), "get")
         self._mark_completed(task_id)
 
-    def _get_completed_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
+    def _get_completed_ops(self, timeout: Optional[Union[int, float]] = None) -> List[CompletedOp]:
         results = []
         # Keep lightweight test/fallback managers created with ``__new__``
         # compatible with the pre-bitmap state shape.

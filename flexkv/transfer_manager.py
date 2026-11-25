@@ -7,7 +7,7 @@ import time
 import queue
 import selectors
 from queue import Queue
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Optional, List, Tuple, Any, Union
 from abc import ABC, abstractmethod
 from multiprocessing import Process, Pipe, Event
 from sympy.assumptions.assume import true
@@ -579,7 +579,7 @@ class TransferManager:
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         self.transfer_engine.submit_transfer_graph(transfer_graphs)
 
-    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
+    def wait(self, timeout: Optional[Union[int, float]] = None) -> List[CompletedOp]:
         return self.transfer_engine.get_completed_graphs_and_ops(timeout)
 
     def start(self) -> None:
@@ -993,7 +993,7 @@ class TransferManagerHandleBase(ABC):
         pass
 
     @abstractmethod
-    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
+    def wait(self, timeout: Optional[Union[int, float]] = None) -> List[CompletedOp]:
         pass
 
     @abstractmethod
@@ -1026,7 +1026,7 @@ class TransferManagerIntraProcessHandle(TransferManagerHandleBase):
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         self.transfer_manager.submit_batch(transfer_graphs)
 
-    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
+    def wait(self, timeout: Optional[Union[int, float]] = None) -> List[CompletedOp]:
         return self.transfer_manager.wait(timeout)
 
     def shutdown(self) -> None:
@@ -1368,7 +1368,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         })
         nvtx.end_range(nvtx_range)
 
-    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
+    def wait(self, timeout: Optional[Union[int, float]] = None) -> List[CompletedOp]:
         finished_ops: List[CompletedOp] = []
         deadline = None if timeout is None else time.monotonic() + max(0, timeout)
         while True:
@@ -1591,7 +1591,7 @@ class TransferManagerMultiNodeHandle(TransferManagerHandleBase):
         except Exception as e:
             flexkv_logger.error(f"Failed to submit batch graphs to remote: {e}")
 
-    def wait(self, timeout: float | None = None) -> List[CompletedOp]:
+    def wait(self, timeout: Optional[Union[int, float]] = None) -> List[CompletedOp]:
         start_time = time.time()
         results = []
 
@@ -1674,7 +1674,7 @@ class TransferManagerHandle:
     def submit_batch(self, transfer_graphs: List[TransferOpGraph]) -> None:
         self._handle.submit_batch(transfer_graphs)
 
-    def wait(self, timeout: Optional[float] = None) -> List[CompletedOp]:
+    def wait(self, timeout: Optional[Union[int, float]] = None) -> List[CompletedOp]:
         return self._handle.wait(timeout)
 
     def shutdown(self) -> None:

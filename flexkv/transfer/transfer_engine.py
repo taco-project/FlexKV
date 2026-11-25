@@ -1518,7 +1518,7 @@ class TransferEngine:
         self.task_queue.put(transfer_graph)
         nvtx.end_range(nvtx_range)
 
-    def get_completed_graphs_and_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
+    def get_completed_graphs_and_ops(self, timeout: Optional[Union[int, float]] = None) -> List[CompletedOp]:
         """Drain completed ops, blocking up to ``timeout`` for the first one.
 
         The old early-return-on-empty ignored ``timeout`` and busy-spun the
