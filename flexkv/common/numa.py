@@ -26,6 +26,9 @@ What ``FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`` (opt-in) does
 ``FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=0`` (default) keeps the inherited memory policy.
 ``FLEXKV_NUMA_NODES`` (e.g. ``0,1`` or ``0-3``) restricts the nodes used;
 default is every node in the cpuset that has CPUs.
+``FLEXKV_CLIENT_NUMA_MAP`` optionally maps DP client IDs to nodes, e.g.
+``0:0,1:1``. Unmapped clients use GPU topology when all their TP GPUs
+share one node. Other clients allocate across the CPU pool's regions.
 
 ``FLEXKV_CPUS`` and ``FLEXKV_CPUS_PER_NODE`` set CPU placement independently
 of the memory policy, only for KVServer and TransferManager child processes
@@ -39,6 +42,7 @@ import os
 import platform
 import threading
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from flexkv.common.cpu_affinity import apply_configured_cpu_affinity
@@ -46,6 +50,13 @@ from flexkv.common.debug import flexkv_logger
 
 ENV_ENABLE_NUMA_SPREAD = "FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD"
 ENV_NUMA_NODES = "FLEXKV_NUMA_NODES"
+ENV_CLIENT_NUMA_MAP = "FLEXKV_CLIENT_NUMA_MAP"
+# The Internal KVServer may clear CUDA visibility for its own GPU runtime.
+_ENV_CLIENT_CUDA_VISIBLE_DEVICES = "FLEXKV_CLIENT_CUDA_VISIBLE_DEVICES"
+
+_DRM_CLASS = Path("/sys/class/drm")
+_NVIDIA_GPUS = Path("/proc/driver/nvidia/gpus")
+_PCI_DEVICES = Path("/sys/bus/pci/devices")
 
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
@@ -112,7 +123,7 @@ def node_cpus(node: int) -> Set[int]:
         return set()
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def get_spread_nodes() -> Tuple[int, ...]:
     """NUMA nodes the CPU pool is spread over; empty when spreading is off
     or there is nothing to spread over (fewer than two usable nodes)."""
@@ -139,6 +150,110 @@ def get_spread_nodes() -> Tuple[int, ...]:
             f"[NUMA] unsupported arch {platform.machine()}; spreading disabled")
         return ()
     return tuple(nodes) if len(nodes) >= 2 else ()
+
+
+def _read_numa_node(device: Path) -> Optional[int]:
+    try:
+        node = int((device / "numa_node").read_text())
+    except (OSError, ValueError):
+        return None
+    return node if node >= 0 else None
+
+
+@functools.lru_cache(maxsize=1)
+def _gpu_numa_nodes() -> Tuple[Optional[int], ...]:
+    # DRM render minors give the host render-device order without counting
+    # display-only devices such as BMC adapters. Deduplicate PCI functions.
+    devices = {}
+    vendors = set()
+    render_nodes = (path for path in _DRM_CLASS.glob("renderD*")
+                    if path.name.removeprefix("renderD").isdigit())
+    for render in sorted(render_nodes, key=lambda path: int(path.name.removeprefix("renderD"))):
+        try:
+            device = (render / "device").resolve(strict=True)
+            vendor = (device / "vendor").read_text().strip()
+        except (OSError, RuntimeError):
+            continue
+        if vendor in ("0x1002", "0x10de"):
+            vendors.add(vendor)
+            devices[device] = _read_numa_node(device)
+
+    nvidia = []
+    for info in _NVIDIA_GPUS.glob("*/information"):
+        try:
+            fields = dict(line.split(":", 1) for line in info.read_text().splitlines() if ":" in line)
+            minor = int(fields["Device Minor"])
+        except (OSError, ValueError, KeyError):
+            continue
+        nvidia.append((minor, info.parent.name, fields.get("Model", "").strip()))
+    if nvidia:
+        vendors.add("0x10de")
+    if len(vendors) > 1:
+        # A single ordinal space cannot describe multiple GPU runtimes.
+        return ()
+
+    pci_order = os.getenv("CUDA_DEVICE_ORDER") == "PCI_BUS_ID"
+    if nvidia:
+        if pci_order:
+            nvidia.sort(key=lambda gpu: gpu[1])
+        else:
+            # CUDA's default speed heuristic can reorder different models.
+            if len({model for _, _, model in nvidia}) > 1:
+                return ()
+            nvidia.sort()
+        return tuple(_read_numa_node(_PCI_DEVICES / bus) for _, bus, _ in nvidia)
+    if pci_order and vendors == {"0x10de"}:
+        devices = dict(sorted(devices.items()))
+    return tuple(devices.values())
+
+
+def query_gpu_numa_node(physical_gpu_id: int) -> Optional[int]:
+    """Return the NUMA node of a host GPU ordinal using Linux driver topology."""
+    nodes = _gpu_numa_nodes()
+    return nodes[physical_gpu_id] if 0 <= physical_gpu_id < len(nodes) else None
+
+
+def resolve_client_numa_node(dp_client_id: int, tp_size: int) -> Optional[int]:
+    """Prefer a node only if every GPU used by this client is local to it."""
+    if dp_client_id < 0 or tp_size <= 0:
+        return None
+    spec = os.getenv(ENV_CLIENT_NUMA_MAP, "").strip()
+    if spec:
+        overrides = {}
+        try:
+            for entry in spec.split(","):
+                client, node = map(int, entry.split(":"))
+                if client < 0 or node < 0 or client in overrides:
+                    raise ValueError(entry)
+                overrides[client] = node
+        except ValueError:
+            flexkv_logger.warning(f"[NUMA] invalid {ENV_CLIENT_NUMA_MAP}={spec!r}")
+            return None
+        if dp_client_id in overrides:
+            return overrides[dp_client_id]
+
+    first = dp_client_id * tp_size
+    gpu_ids = list(range(first, first + tp_size))
+    # HIP's mask uses the ordinals already exposed by ROCr. HIP and CUDA
+    # visibility are aliases on ROCm, so apply only one at that level.
+    cuda = os.getenv("CUDA_VISIBLE_DEVICES", os.getenv(_ENV_CLIENT_CUDA_VISIBLE_DEVICES))
+    hip = os.getenv("HIP_VISIBLE_DEVICES", cuda)
+    for mask in (hip, os.getenv("ROCR_VISIBLE_DEVICES")):
+        if mask is None:
+            continue
+        try:
+            visible = [int(value) for value in mask.split(",")]
+            if any(gpu < 0 for gpu in visible):
+                return None
+            gpu_ids = [visible[logical] for logical in gpu_ids]
+        except (IndexError, ValueError):
+            return None
+
+    nodes = {query_gpu_numa_node(gpu) for gpu in gpu_ids}
+    if len(nodes) == 1:
+        node = nodes.pop()
+        return node if node is not None and node >= 0 else None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +399,23 @@ def plan_cpu_pool_numa_regions(
     bounds.append(logical_bytes)
     return [(bounds[i], bounds[i + 1] - bounds[i], int(nodes[i]))
             for i in range(n)]
+
+
+def plan_cpu_pool_numa_block_ranges(
+    num_blocks: int,
+    block_bytes: int,
+    page_align_bytes: int,
+    is_blockfirst: bool = True,
+    nodes: Optional[Sequence[int]] = None,
+) -> List[Tuple[int, int, int]]:
+    """Translate a BLOCKFIRST pool's byte ranges into half-open block ranges."""
+    if not is_blockfirst or block_bytes <= 0 or num_blocks <= 0:
+        return []
+    return [
+        (offset // block_bytes, (offset + length) // block_bytes, node)
+        for offset, length, node in plan_cpu_pool_numa_regions(
+            num_blocks * block_bytes, block_bytes, page_align_bytes, nodes=nodes)
+    ]
 
 
 def bind_cpu_pool(base_ptr: int,

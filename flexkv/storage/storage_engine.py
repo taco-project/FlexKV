@@ -76,6 +76,26 @@ def _pool_from_kwargs(kwargs: Dict[str, Any]) -> PoolId:
     return _resolve_pool(pool_id, is_swa)
 
 
+def cpu_kv_layout(model_config: ModelConfig,
+                  cache_config: CacheConfig,
+                  num_layers_per_pp_stage: int) -> KVCacheLayout:
+    layer_groups = _resolve_layer_groups(model_config.layer_groups, model_config.dtype)
+    if not is_multi_group(layer_groups, num_layers_per_pp_stage):
+        layer_groups = None
+    return KVCacheLayout(
+        type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
+        num_layer=num_layers_per_pp_stage,
+        num_block=cache_config.num_cpu_blocks,
+        tokens_per_block=cache_config.tokens_per_block,
+        num_head=model_config.num_kv_heads_per_node,
+        head_size=model_config.head_size,
+        kv_dim=model_config.kv_dim,
+        num_kv_heads=model_config.num_kv_heads,
+        layer_groups=layer_groups,
+        tp_size=model_config.host_rank_copies,
+    )
+
+
 class StorageEngine:
     def _cpu_allocator(self) -> type[CPUAllocator] | type[HugePageAllocator]:
         if self._cache_config.use_hugepage_cpu_buffer:
@@ -139,18 +159,8 @@ class StorageEngine:
         buffer_dtype = torch.uint8 if opaque_host else self._model_config.dtype
 
         if self._cache_config.enable_cpu:
-            self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
-                type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
-                num_layer=num_layers_per_pp_stage,
-                num_block=self._cache_config.num_cpu_blocks,
-                tokens_per_block=self._cache_config.tokens_per_block,
-                num_head=self._model_config.num_kv_heads_per_node,
-                head_size=self._model_config.head_size,
-                kv_dim=self._model_config.kv_dim,
-                num_kv_heads=self._model_config.num_kv_heads,
-                layer_groups=host_layer_groups,
-                tp_size=self._model_config.host_rank_copies,
-            )
+            self._cpu_layout: Optional[KVCacheLayout] = cpu_kv_layout(
+                self._model_config, self._cache_config, num_layers_per_pp_stage)
             if self._radix_client is not None:
                 self._attach_radix_pool(self._cpu_layout, buffer_dtype, is_swa=False)
             else:

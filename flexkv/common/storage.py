@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Union, List, Optional, Any, Dict, TYPE_CHECKING
+from typing import Tuple, Union, List, Optional, Any, Dict, TYPE_CHECKING
 
 import torch
 
@@ -322,6 +322,8 @@ class StorageHandle:
     gpu_device_id: Optional[int] = None
     remote_config_custom: Optional[Dict[str, Any]] = None
     worker_data: Optional[Any] = None
+    # Byte ranges whose preferred-node policy was installed by the allocator.
+    numa_regions: Tuple[Tuple[int, int, int], ...] = ()
 
     def get_tensor_list(self) -> List[torch.Tensor]:
         assert isinstance(self.data, list) and \

@@ -262,7 +262,12 @@ class KVTaskManager:
             transfer_handle.start()
 
     def is_ready(self) -> bool:
-        return all(transfer_handle.is_ready() for transfer_handle in self.transfer_handles)
+        if not all(transfer_handle.is_ready() for transfer_handle in self.transfer_handles):
+            return False
+        block_ranges = getattr(self.transfer_handles[0], "cpu_numa_block_ranges", None)
+        if block_ranges is not None:
+            self.cache_engine.confirm_cpu_numa_block_ranges(block_ranges)
+        return True
 
     def __del__(self) -> None:
         self.shutdown()

@@ -28,11 +28,11 @@ from flexkv.common.config import (
     recompute_cache_block_counts, GLOBAL_CONFIG_FROM_ENV,
 )
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.numa import reset_inherited_numa_binding
+from flexkv.common.numa import numa_spread_enabled, reset_inherited_numa_binding
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.pool import PoolId
 from flexkv.common.transfer import DeviceType
-from flexkv.common.storage import KVCacheLayout
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
 from flexkv.server.utils import get_zmq_socket
@@ -1054,6 +1054,13 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         self.start_event = self.mp_ctx.Event()
         self.ready_event = self.mp_ctx.Event()
 
+        self._numa_ranges_reader = self._numa_ranges_writer = None
+        self._numa_ranges_lock = None
+        self.cpu_numa_block_ranges: Optional[Tuple[Tuple[int, int, int], ...]] = None
+        if numa_spread_enabled() and cache_config.enable_cpu and not GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
+            self._numa_ranges_reader, self._numa_ranges_writer = self.mp_ctx.Pipe(duplex=False)
+            self._numa_ranges_lock = self.mp_ctx.Lock()
+
         self._completed_results: List[CompletedOp] = []
 
     def _start_process(self) -> None:
@@ -1073,10 +1080,13 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                   self.gpu_register_port,
                   self.ready_event,
                   self.start_event,
-                  self.error_child_conn),
+                  self.error_child_conn,
+                  self._numa_ranges_writer),
             daemon=False
         )
         self.process.start()
+        if self._numa_ranges_writer is not None:
+            self._numa_ranges_writer.close()
         self.error_child_conn.close()
         flexkv_logger.debug(f"TransferManager subprocess spawned, pid={self.process.pid}")
 
@@ -1088,7 +1098,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         gpu_register_port: str,
                         ready_event,
                         start_event,
-                        error_conn) -> None:
+                        error_conn,
+                        numa_ranges_conn=None) -> None:
         # This process allocates the shared CPU KV pool for all GPUs and spawns
         # the transfer workers; drop the launcher's (GPU0) NUMA binding first.
         reset_inherited_numa_binding("TransferManager")
@@ -1129,6 +1140,20 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             transfer_manager.initialize_transfer_engine()
             transfer_manager.start()
             flexkv_logger.debug("TransferEngine started successfully, setting ready_event")
+            if numa_ranges_conn is not None:
+                # Use the registered geometry and actual allocator, including
+                # regular shmem fallback when HugePage allocation fails.
+                cpu = transfer_manager.storage_engine.get_storage_handle(DeviceType.CPU)
+                ranges = ()
+                if cpu.numa_regions and cpu.kv_layout.type == KVCacheLayoutType.BLOCKFIRST:
+                    block_bytes = (cpu.data.numel() * cpu.data.element_size()
+                                   // cpu.kv_layout.num_block)
+                    ranges = tuple(
+                        (offset // block_bytes, (offset + length) // block_bytes, node)
+                        for offset, length, node in cpu.numa_regions
+                    )
+                numa_ranges_conn.send(ranges)
+                numa_ranges_conn.close()
             ready_event.set()
 
             # Setup selector for event-driven processing (complete zero polling!)
@@ -1312,7 +1337,14 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
 
     def is_ready(self) -> bool:
         self._check_worker_health()
-        return self.ready_event.is_set()
+        if self._numa_ranges_lock is not None:
+            with self._numa_ranges_lock:
+                reader = self._numa_ranges_reader
+                if reader is not None and reader.poll():
+                    self.cpu_numa_block_ranges = reader.recv()
+                    reader.close()
+                    self._numa_ranges_reader = None
+        return self.ready_event.is_set() and self._numa_ranges_reader is None
 
     def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
         self._check_worker_health()
@@ -1356,6 +1388,10 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                 return finished_ops
 
     def shutdown(self) -> None:
+        for conn in (getattr(self, "_numa_ranges_reader", None),
+                     getattr(self, "_numa_ranges_writer", None)):
+            if conn is not None:
+                conn.close()
         if self.process is not None and self.process.pid is not None and self.process.is_alive():
             try:
                 flexkv_logger.info(
@@ -1627,6 +1663,10 @@ class TransferManagerHandle:
 
     def is_ready(self) -> bool:
         return self._handle.is_ready()
+
+    @property
+    def cpu_numa_block_ranges(self) -> Optional[Tuple[Tuple[int, int, int], ...]]:
+        return getattr(self._handle, "cpu_numa_block_ranges", None)
 
     def submit(self, transfer_graph: TransferOpGraph, task_end_op_id: int = -1) -> None:
         self._handle.submit(transfer_graph, task_end_op_id)

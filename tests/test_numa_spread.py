@@ -29,6 +29,9 @@ MiB = 1 << 20
 def _clean_env(monkeypatch):
     monkeypatch.delenv(numa.ENV_ENABLE_NUMA_SPREAD, raising=False)
     monkeypatch.delenv(numa.ENV_NUMA_NODES, raising=False)
+    monkeypatch.delenv("FLEXKV_CPUS", raising=False)
+    monkeypatch.delenv("FLEXKV_CPUS_PER_NODE", raising=False)
+    monkeypatch.delenv("FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES", raising=False)
     numa.get_spread_nodes.cache_clear()
     yield
     numa.get_spread_nodes.cache_clear()
@@ -153,7 +156,7 @@ def test_nodemask_encoding():
 def check_plan(regions, logical, unit, nodes):
     assert [r[2] for r in regions] == list(nodes)
     assert regions[0][0] == 0
-    for (off, length, _), nxt in zip(regions, regions[1:] + [(logical, 0, None)]):
+    for (off, length, _), nxt in zip(regions, regions[1:] + [(logical, 0, None)], strict=True):
         assert off + length == nxt[0]  # contiguous, no gap / overlap
         assert off % unit == 0         # block- and page-aligned start
         assert length > 0
@@ -192,7 +195,7 @@ def test_plan_regions_deterministic():
 
 def test_bind_cpu_pool_covers_mapping_padding(monkeypatch):
     calls = []
-    monkeypatch.setattr(numa, "bind_range", lambda a, l, n: calls.append((a, l, n)))
+    monkeypatch.setattr(numa, "bind_range", lambda addr, length, node: calls.append((addr, length, node)))
     regions = [(0, 100, 0), (100, 100, 1)]
     assert numa.bind_cpu_pool(1000, regions, 256, "t") is True
     assert calls == [(1000, 100, 0), (1100, 156, 1)]
@@ -235,10 +238,26 @@ def test_touch_pages_keeps_content():
 # ---------------------------------------------------------------------------
 # Default (flag off) is the legacy path
 # ---------------------------------------------------------------------------
-def test_default_reset_binding_is_noop(no_syscalls):
-    before = os.sched_getaffinity(0)
+def test_default_reset_binding_is_noop(no_syscalls, monkeypatch):
+    monkeypatch.setattr(os, "sched_getaffinity", lambda *_: pytest.fail("read affinity"),
+                        raising=False)
     numa.reset_inherited_numa_binding("test")
-    assert os.sched_getaffinity(0) == before
+
+
+@pytest.mark.parametrize("spread", [False, True])
+def test_configured_cpu_affinity_is_preserved_with_memory_spreading(spread, monkeypatch):
+    monkeypatch.setenv(numa.ENV_ENABLE_NUMA_SPREAD, str(int(spread)))
+    fake_host(monkeypatch, [0, 1], {0: {0}, 1: {1}})
+    calls = []
+    monkeypatch.setattr(numa, "apply_configured_cpu_affinity",
+                        lambda role: calls.append(role) or True)
+    monkeypatch.setattr(numa, "set_task_mempolicy",
+                        lambda mode, nodes: calls.append((mode, nodes)))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda *_: {0}, raising=False)
+    monkeypatch.setattr(os, "sched_setaffinity", lambda *_: pytest.fail("overrode affinity"),
+                        raising=False)
+    numa.reset_inherited_numa_binding("KVServer")
+    assert calls == ["KVServer"] + ([(numa._MPOL_INTERLEAVE, (0, 1))] if spread else [])
 
 
 def test_default_cpu_allocator_is_legacy(no_syscalls, monkeypatch):
@@ -278,6 +297,38 @@ def test_default_mooncake_registration_is_legacy(no_syscalls, monkeypatch):
                         mapped_size=10 * MiB, block_size=MiB, max_mr_size=1 << 40,
                         size_alignment=2 * MiB, pointer_alignment=2 * MiB,
                         mr_split_policy="strict")
+
+
+@pytest.mark.parametrize("hugepage", [False, True])
+def test_mooncake_touches_and_queries_each_registered_region(hugepage, monkeypatch):
+    from flexkv.transfer import backends
+
+    monkeypatch.setenv(numa.ENV_ENABLE_NUMA_SPREAD, "1")
+    fake_host(monkeypatch, [0, 1], {0: {0}, 1: {1}})
+    base = 1 << 30
+    backend = backends.MooncakeStoreBackend.__new__(backends.MooncakeStoreBackend)
+    backend._cpu_buffer = SimpleNamespace(
+        data_ptr=lambda: base, numel=lambda: 65 * MiB, element_size=lambda: 1,
+    )
+    backend.block_size_bytes = MiB
+    backend.cache_config = SimpleNamespace(
+        hugepage_size_bytes=2 * MiB, mooncake_max_mr_size_bytes=20 * MiB,
+        mooncake_mr_split_policy="strict",
+    )
+    if hugepage:
+        monkeypatch.setenv("FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES", str(4 * MiB))
+        expected = [(base + off * MiB, size * MiB)
+                    for off, size in [(0, 20), (20, 12), (32, 20), (52, 16)]]
+    else:
+        expected = [(base, 33 * MiB), (base + 33 * MiB, 32 * MiB)]
+    calls = []
+    monkeypatch.setattr(backends, "touch_pages", lambda ptrs: calls.append(("touch", ptrs)))
+    monkeypatch.setattr(backends, "query_page_nodes",
+                        lambda ptrs: calls.append(("query", ptrs)) or [0] * len(ptrs))
+    cpu = SimpleNamespace(mapped_size=68 * MiB if hugepage else None)
+    assert backend._registration_regions(cpu) == expected
+    starts = [ptr for ptr, _ in expected]
+    assert calls == [("touch", starts), ("query", starts)]
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, TYPE_CHECKING, List, Dict
+from typing import Optional, Sequence, Tuple, TYPE_CHECKING, List, Dict
 
 import time
 import numpy as np
@@ -41,7 +41,8 @@ class HierarchyLRCacheEngine:
                  eviction_policy: str = "lru",
                  meta: Optional[RedisMeta] = None,
                  reset_barrier_timeout_ms: int = 60000,
-                 reset_barrier_poll_ms: int = 50) -> None:
+                 reset_barrier_poll_ms: int = 50,
+                 numa_block_ranges: Optional[Sequence[Tuple[int, int, int]]] = None) -> None:
         if num_total_blocks <= 0:
             raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
@@ -88,7 +89,7 @@ class HierarchyLRCacheEngine:
         # defer channel start to start(meta)
 
         # Local memory pool for physical blocks on this device
-        self.mempool = Mempool(num_total_blocks=int(local_max_num_blocks or num_total_blocks))
+        self.mempool = Mempool(int(local_max_num_blocks or num_total_blocks), numa_block_ranges=numa_block_ranges)
 
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
@@ -455,7 +456,8 @@ class HierarchyLRCacheEngine:
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
-             strict: bool = True) -> torch.Tensor:
+             strict: bool = True,
+             preferred_node: Optional[int] = None) -> torch.Tensor:
         # Calculate current utilization
         utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
 
@@ -520,7 +522,7 @@ class HierarchyLRCacheEngine:
         #print(f"[TAKE STATISTICS] device type: {self.device_type.name}, utilization: {utilization}, ",
         #      f"should_evict: {should_evict}, num_required_blocks: {num_required_blocks}, ",
         #      f"num_allocated_blocks: {num_allocated_blocks}, num_free_blocks: {self.mempool.num_free_blocks}")
-        return self.mempool.allocate_blocks(num_allocated_blocks)
+        return self.mempool.allocate_blocks(num_allocated_blocks, preferred_node=preferred_node)
 
     def recycle(self, physical_blocks: np.ndarray) -> None:
         self.mempool.recycle_blocks(physical_blocks)
@@ -613,7 +615,10 @@ class HierarchyLRCacheEngine:
 
     #TODO is this enough for peercpu and peerssd?
     @classmethod
-    def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, device_type: DeviceType, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
+    def from_cache_config(cls, cache_config: "CacheConfig", node_id: int,
+                          device_type: DeviceType, meta: Optional[RedisMeta] = None,
+                          numa_block_ranges: Optional[Sequence[Tuple[int, int, int]]] = None
+                          ) -> "HierarchyLRCacheEngine":
 
         if device_type == DeviceType.REMOTE:
             return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta)
@@ -652,5 +657,6 @@ class HierarchyLRCacheEngine:
                 reset_barrier_timeout_ms=int(GLOBAL_CONFIG_FROM_ENV.reset_barrier_timeout_ms),
                 reset_barrier_poll_ms=int(GLOBAL_CONFIG_FROM_ENV.reset_barrier_poll_ms),
                 meta=meta,
+                numa_block_ranges=numa_block_ranges,
             )
             raise ValueError("Invalid device type: {cache_config.device_type}")

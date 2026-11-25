@@ -14,11 +14,13 @@
 # limitations under the License.
 
 import logging
+import math
+import os
 import threading
 import time
 from functools import partial, wraps
 from queue import Queue
-from typing import List, Tuple, Optional, Dict, Callable
+from typing import List, Tuple, Optional, Dict, Callable, Sequence
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -33,6 +35,10 @@ from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.swa_cache_engine import SWAOpConstructor, SWAPutChainOpIds
 from flexkv.common.block import SequenceMeta, format_block_hash
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig, is_multi_group
+from flexkv.common import numa
+from flexkv.common.storage import KVCacheLayoutType
+from flexkv.storage.allocator import _numa_block_bytes
+from flexkv.storage.storage_engine import cpu_kv_layout
 from flexkv.common.transfer import (
     CompletedOp,
     CompletionAwareCallback,
@@ -371,7 +377,8 @@ class CacheEngineAccel:
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector = None,
                  protected_threshold = 2,
-                 swa_config: Optional["SWAPoolConfig"] = None):
+                 swa_config: Optional["SWAPoolConfig"] = None,
+                 numa_block_ranges: Optional[Sequence[Tuple[int, int, int]]] = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -391,7 +398,7 @@ class CacheEngineAccel:
         self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy,
                                      protected_threshold)
 
-        self.mempool = Mempool(num_total_blocks=num_total_blocks)
+        self.mempool = Mempool(num_total_blocks, numa_block_ranges=numa_block_ranges)
 
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
@@ -562,7 +569,8 @@ class CacheEngineAccel:
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
-             strict: bool = True) -> np.ndarray:
+             strict: bool = True,
+             preferred_node: Optional[int] = None) -> np.ndarray:
         # Calculate current utilization
         utilization = ((self.mempool.num_total_blocks - self.mempool.num_free_blocks)
                        / self.mempool.num_total_blocks) if self.mempool.num_total_blocks > 0 else 0
@@ -655,7 +663,7 @@ class CacheEngineAccel:
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
+        allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks, preferred_node=preferred_node)
 
         # Record allocation metrics
         if self._metrics_collector is not None and num_allocated_blocks > 0:
@@ -679,7 +687,8 @@ class CacheEngine:
                  event_collector: Optional[KVEventCollector] = None,
                  metrics_collector = None,
                  protected_threshold = 2,
-                 swa_config: Optional["SWAPoolConfig"] = None):
+                 swa_config: Optional["SWAPoolConfig"] = None,
+                 numa_block_ranges: Optional[Sequence[Tuple[int, int, int]]] = None):
         if not isinstance(device_type, DeviceType):
             raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
@@ -701,7 +710,7 @@ class CacheEngine:
                                     eviction_policy=eviction_policy,
                                     protected_threshold=protected_threshold)
 
-        self.mempool = Mempool(num_total_blocks=num_total_blocks)
+        self.mempool = Mempool(num_total_blocks, numa_block_ranges=numa_block_ranges)
 
         self.tokens_per_block = tokens_per_block
         self.num_total_blocks = num_total_blocks
@@ -827,7 +836,8 @@ class CacheEngine:
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[RadixNode] = None,
-             strict: bool = True) -> np.ndarray:
+             strict: bool = True,
+             preferred_node: Optional[int] = None) -> np.ndarray:
         # Calculate current utilization
         utilization = ((self.mempool.num_total_blocks - self.mempool.num_free_blocks)
                        / self.mempool.num_total_blocks) if self.mempool.num_total_blocks > 0 else 0
@@ -904,7 +914,7 @@ class CacheEngine:
                                f"required: {num_required_blocks}, "
                                f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
-        allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks)
+        allocated_blocks = self.mempool.allocate_blocks(num_allocated_blocks, preferred_node=preferred_node)
 
         # Record allocation metrics
         if self._metrics_collector is not None and num_allocated_blocks > 0:
@@ -966,6 +976,8 @@ class GlobalCacheEngine:
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
 
+        self._cpu_numa_block_ranges: Tuple[Tuple[int, int, int], ...] = ()
+        self._client_numa_nodes: Dict[int, Optional[int]] = {}
         self.cpu_cache_engine = None
         self.ssd_cache_engine = None
         self.remote_cache_engine = None
@@ -1012,6 +1024,7 @@ class GlobalCacheEngine:
             )
 
         if cache_config.enable_cpu:
+            self._cpu_numa_block_ranges = self._plan_cpu_numa_block_ranges()
             self.cpu_cache_engine = self._build_cpu_cache_engine(cache_config, event_collector)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
@@ -1112,7 +1125,8 @@ class GlobalCacheEngine:
         """
         if cache_config.enable_p2p_cpu:
             return HierarchyLRCacheEngine.from_cache_config(
-                cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta)
+                cache_config, self.node_id, DeviceType.CPU, meta=self.redis_meta,
+                numa_block_ranges=self._cpu_numa_block_ranges)
         if self.index_accel:
             return CacheEngineAccel(
                 device_type=DeviceType.CPU,
@@ -1126,6 +1140,7 @@ class GlobalCacheEngine:
                 metrics_collector=self._metrics_collector,
                 protected_threshold=self.protected_threshold,
                 swa_config=cache_config.swa,
+                numa_block_ranges=self._cpu_numa_block_ranges,
             )
         return CacheEngine(
             device_type=DeviceType.CPU,
@@ -1139,7 +1154,54 @@ class GlobalCacheEngine:
             metrics_collector=self._metrics_collector,
             protected_threshold=self.protected_threshold,
             swa_config=cache_config.swa,
+            numa_block_ranges=self._cpu_numa_block_ranges,
         )
+
+    def _plan_cpu_numa_block_ranges(self) -> Tuple[Tuple[int, int, int], ...]:
+        if not numa.numa_spread_enabled() or GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
+            return ()
+        is_blockfirst = GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST
+        if not is_blockfirst:
+            return ()
+        cfg = self.cache_config
+        model = self.model_config
+        layout = cpu_kv_layout(model, cfg, model.num_layers)
+        page_align = numa.PAGE_SIZE
+        if cfg.use_hugepage_cpu_buffer:
+            hugepage_size = int(cfg.hugepage_size_bytes)
+            mapping_alignment = os.getenv(
+                "FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES", str(hugepage_size))
+            try:
+                page_align = math.lcm(hugepage_size, int(mapping_alignment))
+            except ValueError:
+                # HugePageAllocator falls back to a regular CPU buffer.
+                pass
+        return tuple(numa.plan_cpu_pool_numa_block_ranges(
+            cfg.num_cpu_blocks, _numa_block_bytes(layout, model.dtype),
+            page_align, is_blockfirst=is_blockfirst))
+
+    @_synchronized_cache_tree
+    def confirm_cpu_numa_block_ranges(self, block_ranges: Tuple[Tuple[int, int, int], ...]) -> None:
+        """Use the pool actually created by TransferManager before serving requests."""
+        if block_ranges == self._cpu_numa_block_ranges:
+            return
+        pool = self.cpu_cache_engine.mempool
+        if pool.num_used_blocks:
+            raise RuntimeError("Cannot change NUMA placement after allocating CPU blocks")
+        self.cpu_cache_engine.mempool = Mempool(pool.num_total_blocks, numa_block_ranges=block_ranges)
+        self._cpu_numa_block_ranges = block_ranges
+
+    def _client_preferred_numa_node(self, dp_client_id: int) -> Optional[int]:
+        if dp_client_id not in self._client_numa_nodes:
+            self._client_numa_nodes[dp_client_id] = numa.resolve_client_numa_node(
+                dp_client_id, self.model_config.tp_size)
+        return self._client_numa_nodes[dp_client_id]
+
+    def _take_cpu_blocks(self, dp_client_id: int, **kwargs) -> np.ndarray:
+        if getattr(self, "_cpu_numa_block_ranges", ()):
+            return self.cpu_cache_engine.take(
+                preferred_node=self._client_preferred_numa_node(dp_client_id), **kwargs)
+        return self.cpu_cache_engine.take(**kwargs)
 
     def start(self) -> None:
         if self.cpu_cache_engine and self.cache_config.enable_p2p_cpu:
@@ -1590,7 +1652,8 @@ class GlobalCacheEngine:
         if fragment23_num_blocks > 0:
             num_extra_required_blocks = fragment23_num_blocks
             try:
-                fragment23_cpu_blocks = self.cpu_cache_engine.take(
+                fragment23_cpu_blocks = self._take_cpu_blocks(
+                    dp_client_id,
                     num_required_blocks=num_extra_required_blocks,
                     protected_node=cpu_matched_result.last_node,
                     strict=True
@@ -1973,7 +2036,8 @@ class GlobalCacheEngine:
             allocated_cpu_block_num += fragment1_num_blocks
         if allocated_cpu_block_num > 0:
             nvtx.push_range(f"take {allocated_cpu_block_num} cpu blocks", color="green")
-            allocated_cpu_blocks = self.cpu_cache_engine.take(
+            allocated_cpu_blocks = self._take_cpu_blocks(
+                dp_client_id,
                 num_required_blocks=allocated_cpu_block_num,
                 protected_node=cpu_matched_result.last_node,
                 strict=False
@@ -2312,7 +2376,8 @@ class GlobalCacheEngine:
 
         fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
 
-        fragment12_cpu_blocks = self.cpu_cache_engine.take(
+        fragment12_cpu_blocks = self._take_cpu_blocks(
+            dp_client_id,
             num_required_blocks=fragment12_num_blocks,
             protected_node=cpu_matched_result.last_node,
             strict=False
@@ -2653,7 +2718,8 @@ class GlobalCacheEngine:
 
         fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
 
-        fragment12_cpu_blocks = self.cpu_cache_engine.take(
+        fragment12_cpu_blocks = self._take_cpu_blocks(
+            dp_client_id,
             num_required_blocks=fragment12_num_blocks,
             protected_node = cpu_matched_result.last_node,
             strict=False
