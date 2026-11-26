@@ -30,7 +30,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 
 from flexkv.cache.cache_engine import (
     DEFAULT_CACHE_STRATEGY,

@@ -47,6 +47,10 @@ class _FakeOp:
 def test_trace_off_returns_none(monkeypatch):
     trace = _reload_with_env(monkeypatch, None)
     assert trace._TRACE_ON is False
+    # Metrics collection is gated by _TIMING_ON (shared with Prometheus), which
+    # configure(False) leaves alone; clear it explicitly for this assertion.
+    # Cython modules may also retain timing state across reload.
+    trace._TIMING_ON = False
     op = _FakeOp()
     assert trace.build_worker_metrics(op, 1_000_000, 2_000_000,
                                        3_000_000, 4_000_000, 0, 0, False,

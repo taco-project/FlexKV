@@ -10,6 +10,7 @@ import torch.multiprocessing.reductions as reductions
 import zmq
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.platform import non_kernel_stack_mode
 
 
 class cudaIpcMemHandle_t(ctypes.Structure):
@@ -38,13 +39,16 @@ except:
 # Load CUDA driver library. CuMemAllocator's cuMemCreate + cuMemMap live in
 # libcuda, not libcudart, so we need both. Setting to None on ImportError
 # keeps the legacy code path working on systems without the driver stub.
-try:
-    libcuda = ctypes.CDLL("libcuda.so")
-except OSError:
+if non_kernel_stack_mode() and os.environ.get("FLEXKV_DISABLE_VMM_PROBE", "0") == "1":
+    libcuda = None
+else:
     try:
-        libcuda = ctypes.CDLL("libcuda.so.1")
+        libcuda = ctypes.CDLL("libcuda.so")
     except OSError:
-        libcuda = None
+        try:
+            libcuda = ctypes.CDLL("libcuda.so.1")
+        except OSError:
+            libcuda = None
 
 
 # CUDA IPC handle size (64 bytes on Linux)
@@ -173,6 +177,10 @@ if libcuda is not None:
     _CUresult = ctypes.c_int
     _CUdeviceptr = ctypes.c_ulonglong  # 64-bit device address
 
+    libcuda.cuMemGetAddressRange_v2.restype = _CUresult
+    libcuda.cuMemGetAddressRange_v2.argtypes = [
+        ctypes.POINTER(_CUdeviceptr), ctypes.POINTER(ctypes.c_size_t), _CUdeviceptr
+    ]
     libcuda.cuPointerGetAttribute.restype = _CUresult
     libcuda.cuPointerGetAttribute.argtypes = [
         ctypes.c_void_p, ctypes.c_int, _CUdeviceptr
@@ -507,7 +515,7 @@ def _is_vmm_pointer(data_ptr: int) -> bool:
     the caller falls back to the existing cudaIpc path (which then errors
     out cleanly on a truly non-shareable allocation).
     """
-    if libcuda is None:
+    if libcuda is None or os.environ.get("FLEXKV_DISABLE_VMM_PROBE", "0") == "1":
         return False
     legacy_ok = ctypes.c_uint(0)
     result = libcuda.cuPointerGetAttribute(
@@ -609,6 +617,14 @@ class TensorSharedHandle:
         if not tensor.is_cuda:
             raise ValueError("Only support CUDA tensor sharing")
 
+        if non_kernel_stack_mode():
+            if device_id != -1 and torch.device(f"cuda:{device_id}") != tensor.device:
+                raise ValueError("Non-kernel-stack IPC must retain the owner's logical device")
+            # UUID-wrapped rebuild args cannot take the device rewrite below.
+            device_id = -1
+            if os.environ.get("FLEXKV_FORCE_DIRECT_IPC", "0") != "1":
+                force_direct_ipc = False
+
         # VMM allocations (vLLM CuMemAllocator etc.) cannot be exported via
         # cudaIpcGetMemHandle at all — the legacy IPC API rejects them. We
         # must detect this up front and route to the driver-API export path,
@@ -637,12 +653,23 @@ class TensorSharedHandle:
                 self.handle_type = "torch_reduce"
                 return
             except RuntimeError as e:
+                # The fallback changes the failure mode (cuda_ipc opens one
+                # mapping per tensor and can exhaust the per-process limit),
+                # so allow surfacing the original export error instead.
+                if os.environ.get("FLEXKV_STRICT_IPC_MODE", "0").strip().lower() in (
+                        "1", "true", "yes"):
+                    raise RuntimeError(
+                        "torch_reduce export failed and FLEXKV_STRICT_IPC_MODE=1 "
+                        f"forbids the fallback to cuda_ipc: {e}") from e
                 flexkv_logger.warning(f"PyTorch CUDA IPC export failed: {e}")
-                flexkv_logger.info("Attempting direct CUDA IPC export...")
+                flexkv_logger.warning(
+                    "[FlexKV-IPC-MODE] falling back to direct CUDA IPC "
+                    "(handle_type=cuda_ipc); set FLEXKV_STRICT_IPC_MODE=1 to "
+                    "surface the torch_reduce error instead")
 
         try:
             ## Try direct CUDA IPC export
-            self.ipc_handle = self._export_cuda_ipc_handle(tensor)
+            self.ipc_handle, self.offset = self._export_cuda_ipc_handle(tensor)
             self.use_direct_ipc = True
             self.handle_type = "cuda_ipc"
             self.tensor_shape = tuple(tensor.shape)
@@ -653,7 +680,6 @@ class TensorSharedHandle:
             )
             self.rebuild_func = None
             self.rebuild_args = None
-            self.offset = 0    ## only used when constructing from direct ipc handle
             flexkv_logger.info(
                 f"Tensor exported via direct CUDA IPC: tensor.device={tensor.device}, passed device_id={device_id}, final self.device={self.device}"
             )
@@ -864,6 +890,12 @@ class TensorSharedHandle:
         raise ValueError(f"Unsupported tensor dtype: {dtype}")
 
     def get_tensor(self) -> torch.Tensor:
+        tensor = self._get_tensor_impl()
+        if hasattr(self, "gdr_target"):
+            tensor._flexkv_gdr = self.gdr_target
+        return tensor
+
+    def _get_tensor_impl(self) -> torch.Tensor:
         if self.handle_type == "vmm_fabric":
             return self._import_vmm_handle(
                 self.ipc_handle,
@@ -1095,6 +1127,9 @@ class TensorSharedHandle:
     ) -> Tuple[Callable, Tuple[Any], torch.device]:
         device = tensor.device
         rebuild_func, rebuild_args = reductions.reduce_tensor(tensor)
+        if non_kernel_stack_mode():
+            from flexkv.common.ipc_uuid import wrap_rebuild
+            rebuild_func, rebuild_args = wrap_rebuild(rebuild_func, rebuild_args, device)
         return rebuild_func, rebuild_args, device
 
     ## Import tensor handle
@@ -1103,10 +1138,17 @@ class TensorSharedHandle:
         rebuild_func: Callable, rebuild_args: Tuple[Any], device: torch.device
     ) -> torch.Tensor:
         try:
+            from flexkv.common.ipc_uuid import rebuild_by_uuid, device_from_uuid
+            if rebuild_func is rebuild_by_uuid:
+                device = device_from_uuid(rebuild_args[3])
             tensor = rebuild_func(*rebuild_args)
             assert isinstance(tensor, torch.Tensor)
 
             if tensor.device != device:
+                if non_kernel_stack_mode():
+                    raise RuntimeError(
+                        f"Non-kernel-stack IPC returned {tensor.device}, expected owner device {device}; "
+                        "copying would break the shared allocation alias")
                 flexkv_logger.warning(
                     f"Tensor device {tensor.device} is not the same as the target device {device}"
                 )
@@ -1212,9 +1254,10 @@ class TensorSharedHandle:
 
     ## Export CUDA IPC handle
     @staticmethod
-    def _export_cuda_ipc_handle(tensor: torch.Tensor) -> bytes:
+    def _export_cuda_ipc_handle(tensor: torch.Tensor) -> Tuple[bytes, int]:
         """
-        Use CUDA IPC API to export the tensor's IPC handle
+        Use CUDA IPC API to export the tensor's IPC handle and its byte offset
+        inside the CUDA allocation that the handle opens.
         """
         # Get device pointer
         data_ptr = tensor.data_ptr()
@@ -1227,13 +1270,26 @@ class TensorSharedHandle:
         # Ensure we're on the correct device
         torch.cuda.set_device(device)
 
-        # Create IPC handle buffer
-        # ipc_handle = ctypes.create_string_buffer(CUDA_IPC_HANDLE_SIZE)
+        if not tensor.is_contiguous():
+            raise ValueError("Direct CUDA IPC requires a contiguous tensor")
+        if libcuda is None:
+            raise RuntimeError("CUDA driver is required to resolve the IPC allocation base")
+        allocation_base = ctypes.c_ulonglong()
+        allocation_bytes = ctypes.c_size_t()
+        result = libcuda.cuMemGetAddressRange_v2(
+            ctypes.byref(allocation_base), ctypes.byref(allocation_bytes),
+            ctypes.c_ulonglong(data_ptr))
+        if result != 0:
+            raise RuntimeError(f"cuMemGetAddressRange_v2 failed: code={result}, ptr={hex(data_ptr)}")
+        offset = data_ptr - allocation_base.value
+        if offset < 0 or offset + tensor.numel() * tensor.element_size() > allocation_bytes.value:
+            raise RuntimeError("CUDA IPC tensor extends outside its allocation")
+        # IPC opens the CUDA allocation base, not the tensor/storage view base.
+        # PyTorch's allocator can suballocate even tensors with storage_offset=0.
         ipc_handle = cudaIpcMemHandle_t()
 
-        # Call cudaIpcGetMemHandle
         result = cudart.cudaIpcGetMemHandle(
-            ctypes.byref(ipc_handle), ctypes.c_void_p(data_ptr)
+            ctypes.byref(ipc_handle), ctypes.c_void_p(allocation_base.value)
         )
 
         if result != cudaSuccess:
@@ -1247,7 +1303,7 @@ class TensorSharedHandle:
         flexkv_logger.debug(
             f"IPC handle exported successfully, first 16 bytes: {handle_bytes.hex()}"
         )
-        return handle_bytes
+        return handle_bytes, offset
 
     ## Import CUDA IPC handle
     @staticmethod

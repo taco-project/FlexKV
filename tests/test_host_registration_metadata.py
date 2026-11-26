@@ -3,6 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from flexkv.common import platform
 from flexkv.transfer import host_buffer
 
 pytestmark = pytest.mark.unit
@@ -79,3 +80,73 @@ def test_whole_registration_publishes_one_range(registered, monkeypatch):
     api[0].assert_called_once_with(0x100000, 128 * 1024, 0)
     host_buffer.cudaHostUnregister(tensor)
     api[1].assert_called_once_with(0x100000)
+
+
+@pytest.mark.parametrize("kernel_transfer,flags", [(True, 3), (False, 0)])
+def test_platform_register_flags(registered, monkeypatch, kernel_transfer, flags):
+    driver, _, tensor = registered
+    monkeypatch.setattr(platform, "kernel_transfer_built", lambda: kernel_transfer)
+    monkeypatch.delenv("FLEXKV_CUDAHOST_REGISTER_FLAGS", raising=False)
+    host_buffer.cudaHostRegister(tensor)
+    assert all(call.args[2].value == flags
+               for call in driver.cudaHostRegister.call_args_list)
+    host_buffer.cudaHostUnregister(tensor)
+
+
+@pytest.mark.parametrize("flags", ["1", "2", "3", "4", "-1"])
+def test_non_kernel_stack_rejects_nondefault_flags(registered, monkeypatch, flags):
+    driver, _, tensor = registered
+    monkeypatch.setattr(platform, "kernel_transfer_built", lambda: False)
+    monkeypatch.setenv("FLEXKV_CUDAHOST_REGISTER_FLAGS", flags)
+    with pytest.raises(ValueError, match="FLAGS=0"):
+        host_buffer.cudaHostRegister(tensor)
+    driver.cudaHostRegister.assert_not_called()
+
+
+def test_non_kernel_stack_rejects_mapped_allocation(registered, monkeypatch):
+    import torch
+
+    monkeypatch.setattr(platform, "kernel_transfer_built", lambda: False)
+    with pytest.raises(RuntimeError, match="forbidden"):
+        host_buffer.alloc_mapped_host_tensor(16, torch.uint8)
+
+
+def test_registered_allocation_lives_until_last_storage_view(registered, monkeypatch):
+    import gc
+    import torch
+
+    driver, api, _ = registered
+    monkeypatch.setattr(platform, "kernel_transfer_built", lambda: False)
+    monkeypatch.setenv("FLEXKV_CUDAHOST_REGISTER_FLAGS", "0")
+    tensor = host_buffer.alloc_registered_host_tensor(128 * 1024, torch.uint8)
+    ptr = tensor.data_ptr()
+    view = tensor.detach()
+    del tensor
+    gc.collect()
+    driver.cudaHostUnregister.assert_not_called()
+    assert ptr in host_buffer._registered_ranges
+    monkeypatch.setenv("FLEXKV_CUDAHOST_CHUNK_SIZE_GB", "0")
+    del view
+    gc.collect()
+    assert driver.cudaHostUnregister.call_count == 3
+    api[1].assert_called_once_with(ptr)
+    assert ptr not in host_buffer._registered_ranges
+
+
+def test_registered_mapping_is_retained_if_unpin_fails(registered, monkeypatch):
+    import gc
+    import torch
+
+    driver, api, _ = registered
+    monkeypatch.setattr(platform, "kernel_transfer_built", lambda: False)
+    monkeypatch.setenv("FLEXKV_CUDAHOST_REGISTER_FLAGS", "0")
+    monkeypatch.setenv("FLEXKV_CUDAHOST_CHUNK_SIZE_GB", "0")
+    monkeypatch.setattr(host_buffer, "_failed_registered_mappings", {})
+    tensor = host_buffer.alloc_registered_host_tensor(4096, torch.uint8)
+    ptr = tensor.data_ptr()
+    driver.cudaHostUnregister.return_value = 1
+    del tensor
+    gc.collect()
+    assert ptr in host_buffer._failed_registered_mappings
+    assert ptr in host_buffer._registered_ranges
+    api[1].assert_not_called()

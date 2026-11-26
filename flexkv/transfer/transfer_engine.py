@@ -22,7 +22,7 @@ import os
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import contextlib
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import numpy as np
 import torch
 
@@ -32,7 +32,7 @@ from flexkv.common.storage import StorageHandle
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp, WorkerKey
 from flexkv.common.transfer import get_nvtx_range_color
 from flexkv.transfer.scheduler import TransferScheduler
-from flexkv.transfer import trace
+from flexkv.transfer import put_trace, trace
 from flexkv.transfer.workers import (
     WorkerHandle,
     CPUSSDDiskTransferWorker,
@@ -148,6 +148,8 @@ class TransferEngine:
         """
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
+        if getattr(cache_config, "put_trace", None) is not None:
+            put_trace.configure(cache_config.put_trace, run_id=cache_config.put_trace_run_id)
 
         first_handles = next(iter(gpu_handles.values()))
         self._num_layers_for_local_pp_stage = first_handles[0].kv_layout.num_layer
@@ -451,6 +453,12 @@ class TransferEngine:
         }
         for _pool in _gpu_cpu_pools:
             self._register_worker(_pool, TransferType.D2H, self.d2h_workers)
+        if _enable_layerwise:
+            # Synchronous (non-batch) GETs still emit plain H2D ops; serve them
+            # on the WHOLE-completion D2H worker instead of spawning another.
+            self.h2d_workers = self.d2h_workers
+            for _pool in _gpu_cpu_pools:
+                self._register_worker(_pool, TransferType.H2D, self.h2d_workers)
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
             # GPU register may copy a Recsys identity group onto model_config.
@@ -801,8 +809,8 @@ class TransferEngine:
 
         # Startup assertions: verify layerwise mode worker map consistency
         if _enable_layerwise:
-            assert TransferType.H2D not in self._worker_map, \
-                "H2D worker should not exist in layerwise mode (fused into layerwise worker)"
+            assert self.h2d_workers is self.d2h_workers, \
+                "Synchronous H2D must reuse the existing WHOLE-completion GPU/CPU worker"
             # DISK2H deliberately *is* registered under layerwise: the SSD read
             # is hoisted out of the LAYERWISE op (see merge_to_batch_graph)
             # because the PER_LAYER worker has no SSD binding to fuse it into,
@@ -1188,6 +1196,9 @@ class TransferEngine:
     def _finalize_or_discard(self, op: TransferOp, finished_ops: List[TransferOp]) -> None:
         """Route a fully-drained op: discard if any replica of it failed,
         finalize (completion message + successor scheduling) otherwise."""
+        if put_trace.ENABLED and getattr(op, "_put_trace", None):
+            put_trace.emit("op_done", **op._put_trace, op=op.op_id,
+                           status="failed" if op.op_id in self._failed_parent_op_ids else "ok")
         if op.op_id in self._failed_parent_op_ids:
             self._discard_failed_op(op)
         else:
@@ -1485,6 +1496,7 @@ class TransferEngine:
                     layer_granularity=op.layer_granularity,
                 )
                 replica.op_id = next(self._replica_op_id_counter)
+                put_trace.replica(op, replica)
                 register_op_to_buffer(replica, self.pin_buffer)
                 self._child_id_to_child[replica.op_id] = replica
                 self._child_to_parent_op_id[replica.op_id] = op.op_id

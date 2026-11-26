@@ -22,7 +22,7 @@ def create_worker(monkeypatch):
     monkeypatch.setattr(GPUCPUTransferWorker, "_ensure_cuda_device", lambda *a: None)
     monkeypatch.setattr(GPUCPUTransferWorker, "_import_tensor_handles", lambda self, handles: handles)
     monkeypatch.setattr(GPUCPUTransferWorker, "_register_host_tensor",
-                        lambda self, tensor, label: registrations.append((tensor, label)))
+                        lambda self, tensor, label, align_bytes=0: registrations.append((tensor, label)))
     monkeypatch.setattr(GPUCPUTransferWorker, "_init_uniform", lambda self, *a, pool_id, **kw:
                         _Pool(pool_id=pool_id, name=pool_id.name, layer_members=[[], []]))
     monkeypatch.setattr(GPUCPUTransferWorker, "_build_region_batch",
@@ -32,7 +32,8 @@ def create_worker(monkeypatch):
     monkeypatch.setattr(GLOBAL_CONFIG_FROM_ENV, "layerwise_completion_contract", CompletionContract.PER_LAYER)
     cpu, swa, shared = torch.empty(16), torch.empty(8), torch.zeros((2, 4), dtype=torch.int64)
     gpu = SimpleNamespace(device=torch.device("cuda:0"))
-    layout = SimpleNamespace(kv_dim=1, num_kv_heads=1, num_layer=2, type=None)
+    layout = SimpleNamespace(kv_dim=1, num_kv_heads=1, num_layer=2, type=None,
+                             get_block_stride=lambda: 8)
 
     def create(completion=None, socket=None, with_swa=False):
         kwargs = dict(worker_id=1, transfer_conn=Mock(), finished_ops_queue=Mock(),

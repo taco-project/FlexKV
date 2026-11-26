@@ -23,7 +23,7 @@ from abc import ABC, abstractmethod
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import torch
 from torch.multiprocessing import Queue as MPQueue
 
@@ -33,7 +33,7 @@ from flexkv.common.memory_handle import (
     close_all_cuda_ipc_handles,
 )
 from flexkv.common.transfer import TransferType, get_nvtx_range_color
-from flexkv.transfer import trace
+from flexkv.transfer import put_trace, trace
 from flexkv.transfer.backends import StorageBackend
 from flexkv.transfer.cuda_sync import synchronize_cuda_devices
 from flexkv.transfer.geometry import EdgeGeometry
@@ -148,14 +148,14 @@ class TransferWorkerBase(ABC):
         # Record each owning device before IPC import, including partial init.
         return import_tensor_handles(handles, cuda_device_ids=self._cuda_device_ids)
 
-    def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
+    def _register_host_tensor(self, tensor: torch.Tensor, label: str = "", align_bytes: int = 0) -> None:
         """cudaHostRegister and track for paired unregister in shutdown()."""
         size_gb = tensor.numel() * tensor.element_size() / (1024 ** 3)
         flexkv_logger.info(
             f"[worker {self.worker_id}] cudaHostRegister {label or 'host'}: "
             f"ptr=0x{tensor.data_ptr():x} size={size_gb:.3f} GiB"
         )
-        cudaHostRegister(tensor)
+        cudaHostRegister(tensor, align_bytes=align_bytes)
         self._host_registered.append((tensor, label or "host"))
 
     def _pin_op_buffer(self) -> None:
@@ -165,7 +165,12 @@ class TransferWorkerBase(ABC):
         or every worker creates a default CUDA context on GPU0.
         """
         if not self._op_buffer_pinned:
-            self._register_host_tensor(self.op_buffer_tensor, "op_buffer")
+            row_bytes = (
+                self.op_buffer_tensor.stride(0) * self.op_buffer_tensor.element_size()
+                if self.op_buffer_tensor.dim() >= 2 else 0
+            )
+            self._register_host_tensor(
+                self.op_buffer_tensor, "op_buffer", align_bytes=row_bytes)
             self._op_buffer_pinned = True
 
     def shutdown(self) -> None:
@@ -474,6 +479,7 @@ class TransferWorkerBase(ABC):
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(
             transfer_op, pinned=backend.needs_pinned_block_ids)
         start_time = time.time()
+        put_trace.mark("backend_begin")
         if backend.reports_block_results:
             block_results, transfer_size = backend.transfer_blocks(
                 self, transfer_op, src_block_ids, dst_block_ids)
@@ -482,6 +488,7 @@ class TransferWorkerBase(ABC):
             transfer_size = backend.transfer(
                 self, transfer_op, src_block_ids, dst_block_ids)
         end_time = time.time()
+        put_trace.mark("backend_end")
         if block_results is None:
             # Bool path: a throw here propagates, exactly as it did when every
             # launch_transfer logged for itself. The run loop turns it into a
@@ -548,6 +555,12 @@ class TransferWorkerBase(ABC):
                                   end_time: float,
                                   uncompressed_size: Optional[int] = None) -> None:
         """Emit one terminal record per transfer op."""
+        if put_trace.ENABLED:
+            trace_blocks = (len(transfer_op.src_block_ids_h2d)
+                            if transfer_op.transfer_type == TransferType.LAYERWISE
+                            else int(transfer_op.valid_block_num))
+            put_trace.volume(bytes=int(transfer_size), blocks=trace_blocks,
+                             uncompressed_bytes=int(uncompressed_size) if uncompressed_size is not None else None)
         if not flexkv_logger.is_enabled_for(logging.INFO):
             return
         duration_s = max(end_time - start_time, 1e-9)
@@ -684,6 +697,21 @@ class TransferWorkerBase(ABC):
                     if not isinstance(op, dict):
                         op._received_ns = time.perf_counter_ns()
                     batch_ops.append(op)
+                trace_prepare_start = put_trace.now()
+                if getattr(self, "_gdr_config", {}).get("enabled"):
+                    # Re-arm here: one owner producer fence then covers every
+                    # op of this drained batch (see gdr_runtime.maybe_fence_d2h).
+                    self._gdr_need_producer_fence = True
+                    from flexkv.transfer.gdr_batch import prepare_batch
+                    try:
+                        prepare_batch(self, batch_ops)
+                    except Exception:
+                        flexkv_logger.warning("GDR coalescing unavailable before DMA", exc_info=True)
+                if put_trace.ENABLED:
+                    try:
+                        put_trace.batch_prepared(batch_ops, trace_prepare_start)
+                    except Exception:
+                        flexkv_logger.warning("PUT trace batch diagnostics failed", exc_info=True)
                 for op in batch_ops:
                     if isinstance(op, dict) and op.get("type") == "control":
                         self._reply_control(op)
@@ -696,6 +724,11 @@ class TransferWorkerBase(ABC):
                                             f"graph_id: {op.transfer_graph_id}",
                                             color=get_nvtx_range_color(op.transfer_graph_id))
                         nvtx_pushed = True
+                        if put_trace.ENABLED:
+                            try:
+                                put_trace.worker_begin(op, transfer_start_ns)
+                            except Exception:
+                                flexkv_logger.warning("PUT trace start diagnostics failed", exc_info=True)
                         transfer_status = self.launch_transfer(op)
                     except Exception as e:
                         is_layerwise = op.transfer_type == TransferType.LAYERWISE
@@ -749,6 +782,18 @@ class TransferWorkerBase(ABC):
                             f"failed for op {op.transfer_op_id}: {e}",
                             exc_info=True,
                         )
+                    if put_trace.ENABLED:
+                        try:
+                            if isinstance(transfer_status, WorkerTransferResult):
+                                completed = int(sum(value >= 0 for value in transfer_status.block_results))
+                                count = len(transfer_status.block_results)
+                                put_trace.volume(completed_blocks=completed, requested_blocks=count)
+                                trace_status = "ok" if completed == count else "partial" if completed else "failed"
+                            else:
+                                trace_status = "ok" if transfer_status is True else "failed"
+                            put_trace.worker_end(op, launched_ns, trace_status)
+                        except Exception:
+                            flexkv_logger.warning("PUT trace worker diagnostics failed", exc_info=True)
                     # Report the outcome, success or failure: a dropped op
                     # leaves its graph incomplete forever and leaks every
                     # resource its plan holds. A bare int still means success,

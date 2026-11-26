@@ -335,6 +335,7 @@ class KVTPClient:
         device_id: int,
         pp_rank: int = 0,
         intra_client_id: int = 0,
+        gdr_local_rank: Optional[int] = None,
     ):
         """A TP-level GPU registration client."""
         # Init inter-process communication
@@ -354,12 +355,17 @@ class KVTPClient:
         self.pp_rank = pp_rank
         self.intra_client_id = intra_client_id
         self.device_id = device_id
+        self.gdr_local_rank = gdr_local_rank
 
         flexkv_logger.info(
             f"KVTPClient {device_id} Initialized! "
             f"(gpu_register_port={gpu_register_port}, "
             f"dp_client_id={dp_client_id}, pp_rank={pp_rank}, "
             f"intra_client_id={intra_client_id})")
+
+    def retire_gdr_owners(self) -> None:
+        for owner in getattr(self, "_gdr_owners", ()):
+            owner.retire()
 
     def set_slot_mapping(self, task_id: int, slot_mapping: np.ndarray) -> None:
         """Send set_slot_mapping message to TransferManagerOnRemote via existing ZMQ channel.
@@ -389,6 +395,9 @@ class KVTPClient:
             )
 
     def suspend_gpu_mappings(self) -> int:
+        from flexkv.common.gdr_config import worker_gdr_config
+        if worker_gdr_config()["enabled"] or getattr(self, "_gdr_owners", ()):
+            raise RuntimeError("GPU hot-remap is unavailable while GDR is enabled")
         request = {
             "type": "suspend_gpu",
             "registration_key": (self.dp_client_id, self.intra_client_id),
@@ -409,6 +418,9 @@ class KVTPClient:
                     "to reach the suspend barrier"
                 )
             time.sleep(0.01)
+        for owner in getattr(self, "_gdr_owners", []):
+            owner.close()
+        self._gdr_owners = []
         for handle in self._exported_handles:
             handle.release_exported_vmm_handle()
         self._exported_handles = []
@@ -429,6 +441,10 @@ class KVTPClient:
         swa_handles_per_group: Optional[List[List[torch.Tensor]]] = None,
         resume: bool = False,
     ) -> None:
+        if resume:
+            from flexkv.common.gdr_config import worker_gdr_config
+            if worker_gdr_config()["enabled"] or getattr(self, "_gdr_owners", ()):
+                raise RuntimeError("GPU hot-remap is unavailable while GDR is enabled")
         group_fields = (layer_groups, gpu_layouts, handles_per_group)
         if any(value is not None for value in group_fields) and not all(
             value is not None for value in group_fields
@@ -513,6 +529,15 @@ class KVTPClient:
                 swa_handles_per_group_shared.append(
                     [TensorSharedHandle(t, device_id) for t in group_tensors]
                 )
+
+        from flexkv.transfer.gdr_owner import export_targets
+        pairs = list(zip(kv_caches, handles))
+        for tensors, shared in zip(handles_per_group or [], handles_per_group_shared or []):
+            pairs.extend(zip(tensors, shared))
+        pairs.extend(zip(swa_caches or [], swa_handles_shared or []))
+        for tensors, shared in zip(swa_handles_per_group or [], swa_handles_per_group_shared or []):
+            pairs.extend(zip(tensors, shared))
+        export_targets(self, pairs)
 
         register_req = RegisterTPClientRequest(
             dp_client_id=self.dp_client_id,

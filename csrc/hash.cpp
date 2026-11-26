@@ -33,7 +33,7 @@ void Hasher::reset() { XXH64_reset(xxhasher, 0); }
 HashType Hasher::digest() { return XXH64_digest(xxhasher); }
 
 Hasher &Hasher::update(const torch::Tensor &input) {
-  assert(input.ndim() == 1);
+  assert(input.dim() == 1);
   XXH64_update(xxhasher, input.data_ptr(),
                input.numel() * input.element_size());
   return *this;
@@ -46,8 +46,8 @@ Hasher &Hasher::update(const void *input, size_t size) {
 
 void gen_hashes(Hasher &hasher, const torch::Tensor &token_ids,
                 int tokens_per_block, torch::Tensor &block_hashes) {
-  assert(token_ids.ndim() == 1);
-  assert(block_hashes.ndim() == 1);
+  assert(token_ids.dim() == 1);
+  assert(block_hashes.dim() == 1);
   assert(token_ids.numel() / tokens_per_block == block_hashes.numel());
 
   assert(token_ids.element_size() == sizeof(int64_t));

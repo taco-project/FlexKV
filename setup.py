@@ -305,6 +305,38 @@ enable_nvcomp = os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") == "1"
 # FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
 enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
 
+
+def _build_bool(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"Invalid boolean {name}={raw!r}")
+
+
+enable_kernel_transfer = _build_bool("FLEXKV_ENABLE_KERNEL_TRANSFER", True)
+enable_nvtx = _build_bool("FLEXKV_ENABLE_NVTX", enable_kernel_transfer)
+enable_gdr = _build_bool("FLEXKV_ENABLE_GDR", False)
+gdr_backend = os.environ.get("FLEXKV_GDR_BACKEND", "auto").strip().lower()
+if gdr_backend == "auto":
+    # Resolve from the explicit build capability, never from an installed
+    # runtime: host-only builds use mapped GDR, kernel builds use native GDR.
+    gdr_backend = "native" if enable_kernel_transfer else "mapped"
+if gdr_backend not in ("native", "mapped"):
+    raise ValueError("FLEXKV_GDR_BACKEND must be auto, native or mapped")
+if enable_gdr and not enable_kernel_transfer and gdr_backend != "mapped":
+    raise RuntimeError("Host-only GDR builds require FLEXKV_GDR_BACKEND=mapped")
+if enable_gdr and gdr_backend == "mapped" and enable_kernel_transfer:
+    raise RuntimeError("Mapped GDR requires FLEXKV_ENABLE_KERNEL_TRANSFER=0")
+if not enable_kernel_transfer and (enable_gds or enable_nvcomp):
+    raise RuntimeError("GDS/nvcomp require FLEXKV_ENABLE_KERNEL_TRANSFER=1")
+print(f"FLEXKV build: kernel_transfer={enable_kernel_transfer}, nvtx={enable_nvtx}, "
+      f"gdr={enable_gdr}, gdr_backend={gdr_backend}")
+
 # Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
     "csrc/bindings.cpp",
@@ -317,6 +349,8 @@ cpp_sources = [
     "csrc/device_thread_pool.cpp",
     "csrc/transfer_backend.cpp",
     "csrc/region_batch.cpp",
+    "csrc/gdr/runtime.cpp",
+    "csrc/gdr/transport.cpp",
     "csrc/layer_notify.cpp",
     "csrc/transfer_ssd.cpp",
     "csrc/radix_tree.cpp",
@@ -325,6 +359,12 @@ cpp_sources = [
 ]
 
 hpp_sources = [
+    "csrc/gdr/config.h", "csrc/gdr/runtime.h",
+    "csrc/gdr/transport.h", "csrc/gdr/topology.h",
+    "csrc/flexkv_nvtx.h",
+    "csrc/gtensor_handler.cuh",
+    "csrc/transfer.cuh",
+    "csrc/non_kernel_stack.h",
     "csrc/host_registration.h",
     "csrc/host_dma.h",
     "csrc/cuda_stream_lifetime.h",
@@ -350,9 +390,9 @@ extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
 if enable_p2p:
     extra_link_args.append("-lhiredis")
 
-if enable_cputest:
+if enable_cputest or not enable_kernel_transfer:
     extra_link_args.remove("-lcuda")
-    # Set TORCH_CUDA_ARCH_LIST to avoid IndexError when no GPU is available
+if enable_cputest and enable_kernel_transfer:
     os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
 
 
@@ -362,9 +402,10 @@ if enable_metrics:
 else:
     print("FLEXKV_ENABLE_METRICS=0: building without Prometheus monitoring")
 # Auto-detect GPU architecture if TORCH_CUDA_ARCH_LIST is not explicitly set
-if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
-    os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
-print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
+if enable_kernel_transfer:
+    if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
+    print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
 
 extra_compile_args = [
     "-O3",
@@ -430,6 +471,44 @@ if not enable_gds:
 if not enable_p2p:
     print("ENABLE_P2P = false: Skipping distributed (P2P/Redis) code; no libhiredis or Redis deps required")
 
+capability_flags = [
+    f"-DFLEXKV_ENABLE_KERNEL_TRANSFER={int(enable_kernel_transfer)}",
+    f"-DFLEXKV_ENABLE_NVTX={int(enable_nvtx)}",
+]
+if enable_gdr:
+    capability_flags.append("-DFLEXKV_ENABLE_GDR")
+    if _build_bool("FLEXKV_GDR_WR_API", True):
+        capability_flags.append("-DFLEXKV_GDR_WR_API")
+    extra_link_args.append("-libverbs")
+    if gdr_backend == "mapped":
+        capability_flags.append("-DFLEXKV_GDR_MAPPED")
+    elif "-lcuda" not in extra_link_args:
+        extra_link_args.append("-lcuda")
+hpp_sources.append("csrc/gdr/bindings.h")
+extra_compile_args.extend(capability_flags)
+nvcc_compile_args.extend(capability_flags)
+
+
+def _host_compile_cuda_sources(sources):
+    mirrored_sources = []
+    for source in sources:
+        if not source.endswith(".cu"):
+            mirrored_sources.append(source)
+            continue
+        path = Path(source)
+        mirror = Path(build_dir) / "host_src" / path.with_suffix(".cu.cpp")
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        text = path.read_text()
+        if not mirror.exists() or mirror.read_text() != text:
+            mirror.write_text(text)
+        hpp_sources.append(source)
+        mirrored_sources.append(str(mirror))
+    return mirrored_sources
+
+
+if not enable_kernel_transfer:
+    cpp_sources = _host_compile_cuda_sources(cpp_sources)
+
 cpp_extensions = [
     cpp_extension.CUDAExtension(
         name="flexkv.c_ext",
@@ -455,8 +534,13 @@ if not debug:
                       "flexkv/**/benchmark_*.py",
                       "flexkv/benchmark/**/*.py",
                       "flexkv/benchmark/test_kvmanager.py",
+                      # Read by path before the package is importable.
+                      "flexkv/_build_info.py",
                       # Keep the CPU-only diagnostic CLI runnable via python -m.
-                      "flexkv/transfer/ce_replay.py"]
+                      "flexkv/transfer/ce_replay.py",
+                      "flexkv/transfer/put_trace.py",
+                      # Dynamic store/engine facades + __getattr__ crash under Cython.
+                      "flexkv/external/mooncake_parallel_io.py"]
     # Import cython when debug is turned off.
     from Cython.Build import cythonize
     cythonized_modules = cythonize(
@@ -502,6 +586,10 @@ class CustomBuildExt(cpp_extension.BuildExtension):
                 if os.path.isfile(source_file):
                     shutil.copy2(source_file, dest_file)
                     print(f"Copied {source_file} to {dest_file}")
+
+# flexkv.common.platform derives the non-kernel stack from this; it has no runtime switch.
+Path("flexkv/_build_info.py").write_text(
+    f"KERNEL_TRANSFER = {enable_kernel_transfer}\n")
 
 with open("requirements.txt") as f:
     install_requires = f.read().splitlines()

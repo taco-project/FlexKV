@@ -50,6 +50,7 @@ def test_connector_routes_policy_before_runtime_creation(
     config = NS(
         cache_config=cfg,
         model_config=ModelConfig(),
+        user_config=NS(gdr={}),
         post_init_from_sglang_config=Mock(return_value=NS()),
     )
     monkeypatch.setattr(module.FlexKVConfig, "from_env", lambda: config)
@@ -87,6 +88,7 @@ def test_connector_keeps_snapshot_budget_when_resolving_indexer_group(monkeypatc
     config = NS(
         cache_config=cfg,
         model_config=ModelConfig(),
+        user_config=NS(gdr={}),
         post_init_from_sglang_config=Mock(return_value=NS()),
     )
     monkeypatch.setattr(module.FlexKVConfig, "from_env", lambda: config)
