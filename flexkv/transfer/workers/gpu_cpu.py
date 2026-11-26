@@ -43,6 +43,7 @@ from flexkv.transfer.region_batch import (
 from flexkv.transfer.template import compile_gpu_regions, compile_host_regions
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp, WorkerTransferOp
 from flexkv.transfer.workers.runtime import TransferWorkerBase
+from flexkv.transfer.host_buffer import host_register_align_bytes
 
 # Stand-in for the block ids of a cached layerwise request, which are rebound
 # on every submit. Never read: a plan is only handed to cpp after every
@@ -264,7 +265,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         self.cpu_tensor = cpu_blocks
 
         flexkv_logger.info(f"Pinning CPU Memory: {cpu_blocks.numel() * cpu_blocks.element_size() / (1024 ** 3):.2f} GB")
-        self._register_host_tensor(cpu_blocks, "tp_cpu_kv_pool")
+        self._register_host_tensor(
+            cpu_blocks, "tp_cpu_kv_pool",
+            align_bytes=host_register_align_bytes(cpu_kv_layout, dtype))
 
         self.num_layers = gpu_kv_layouts[0].num_layer
         # The *original model* layer count for this PP stage -- the index space
@@ -357,9 +360,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 raise ValueError(
                     "uniform SWA pool needs swa_gpu_blocks and swa_gpu_kv_layouts")
             swa_cpu_tensor = materialize_worker_tensor(swa_cpu_blocks)
-            self._register_host_tensor(swa_cpu_tensor, "tp_swa_cpu_kv_pool")
-            self.swa_cpu_tensor = swa_cpu_tensor
             swa_dt = swa_dtype or self.dtype
+            self._register_host_tensor(
+                swa_cpu_tensor, "tp_swa_cpu_kv_pool",
+                align_bytes=host_register_align_bytes(swa_cpu_kv_layout, swa_dt))
+            self.swa_cpu_tensor = swa_cpu_tensor
             if swa_multi_group:
                 swa_pool = self._init_tp_multi_group(
                     swa_gpu_blocks_per_group, swa_gpu_layouts_per_group,

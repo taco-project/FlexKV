@@ -336,7 +336,8 @@ class NixlFileBackend(StorageBackend):
             f"[worker {worker.worker_id}] {self.name}: pinning CPU pool "
             f"{gib:.2f} GiB"
         )
-        worker._register_host_tensor(self.cpu_blocks, "nixl_cpu_pool")
+        worker._register_host_tensor(
+            self.cpu_blocks, "nixl_cpu_pool", align_bytes=cpu.block_stride)
         if not self._session.prepare_dram_cpu(self.cpu_blocks):
             raise RuntimeError("NIXL: prepare_dram_cpu failed")
 

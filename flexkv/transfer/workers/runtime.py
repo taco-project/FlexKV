@@ -148,14 +148,14 @@ class TransferWorkerBase(ABC):
         # Record each owning device before IPC import, including partial init.
         return import_tensor_handles(handles, cuda_device_ids=self._cuda_device_ids)
 
-    def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
+    def _register_host_tensor(self, tensor: torch.Tensor, label: str = "", align_bytes: int = 0) -> None:
         """cudaHostRegister and track for paired unregister in shutdown()."""
         size_gb = tensor.numel() * tensor.element_size() / (1024 ** 3)
         flexkv_logger.info(
             f"[worker {self.worker_id}] cudaHostRegister {label or 'host'}: "
             f"ptr=0x{tensor.data_ptr():x} size={size_gb:.3f} GiB"
         )
-        cudaHostRegister(tensor)
+        cudaHostRegister(tensor, align_bytes=align_bytes)
         self._host_registered.append((tensor, label or "host"))
 
     def _pin_op_buffer(self) -> None:
@@ -165,7 +165,12 @@ class TransferWorkerBase(ABC):
         or every worker creates a default CUDA context on GPU0.
         """
         if not self._op_buffer_pinned:
-            self._register_host_tensor(self.op_buffer_tensor, "op_buffer")
+            row_bytes = (
+                self.op_buffer_tensor.stride(0) * self.op_buffer_tensor.element_size()
+                if self.op_buffer_tensor.dim() >= 2 else 0
+            )
+            self._register_host_tensor(
+                self.op_buffer_tensor, "op_buffer", align_bytes=row_bytes)
             self._op_buffer_pinned = True
 
     def shutdown(self) -> None:

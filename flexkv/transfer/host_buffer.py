@@ -96,16 +96,41 @@ def _get_cudahost_register_flags() -> int:
 _FLEXKV_CUDAHOST_CHUNK_SAFETY_MARGIN_BYTES = 4 * 1024  # 4 KiB cushion for CUDA internal alignment
 
 
-def _get_cudahost_chunk_bytes() -> int:
+def host_register_align_bytes(cpu_kv_layout, dtype: torch.dtype) -> int:
+    """CPU block stride in bytes; heterogeneous layouts already report bytes."""
+    stride = int(cpu_kv_layout.get_block_stride())
+    if getattr(cpu_kv_layout, "layer_groups", None) is not None:
+        return stride
+    return stride * dtype.itemsize
+
+
+def _align_cudahost_chunk_bytes(chunk_bytes: int, align_bytes: int) -> int:
+    if chunk_bytes <= 0 or align_bytes <= 0:
+        return chunk_bytes
+    import math
+    quantum = math.lcm(align_bytes, 4096)
+    aligned = chunk_bytes // quantum * quantum
+    if aligned <= 0:
+        raise ValueError(
+            f"FLEXKV_CUDAHOST_CHUNK_SIZE_GB yields chunk_bytes={chunk_bytes} smaller "
+            f"than register align quantum={quantum} (align_bytes={align_bytes}); "
+            "increase the chunk size or set FLEXKV_CUDAHOST_CHUNK_SIZE_GB=0")
+    return aligned
+
+
+def _get_cudahost_chunk_bytes(align_bytes: int = 0) -> int:
     chunk_gb = float(os.getenv("FLEXKV_CUDAHOST_CHUNK_SIZE_GB", "0"))
     if chunk_gb <= 0:
         return 0  # no chunking
     chunk = int(chunk_gb * (1024 ** 3)) - _FLEXKV_CUDAHOST_CHUNK_SAFETY_MARGIN_BYTES
     # Round down to 4 KiB page boundary
-    return chunk & ~0xFFF
+    chunk &= ~0xFFF
+    if chunk <= 0:
+        raise ValueError("FLEXKV_CUDAHOST_CHUNK_SIZE_GB must exceed the 4 KiB safety margin")
+    return _align_cudahost_chunk_bytes(chunk, align_bytes)
 
 
-def cudaHostRegister(tensor: torch.Tensor) -> None:
+def cudaHostRegister(tensor: torch.Tensor, align_bytes: int = 0) -> None:
     """Register a CPU tensor with CUDA, optionally in chunks of FLEXKV_CUDAHOST_CHUNK_SIZE_GB.
 
     Chunked registration keeps each cudaHostRegister call under the configured size,
@@ -116,7 +141,7 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
     ptr_base = tensor.data_ptr()
     total_size = tensor.numel() * tensor.element_size()
     flags = _get_cudahost_register_flags()
-    chunk_size = _get_cudahost_chunk_bytes()
+    chunk_size = _get_cudahost_chunk_bytes(align_bytes)
     api = _host_region_api()
     if chunk_size and api is None and any(
         os.getenv(name, "0") == "1"
@@ -145,6 +170,10 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
         record_registration()
         return
 
+    flexkv_logger.info(
+        f"[host_buffer] cudaHostRegister chunked: total={total_size} "
+        f"chunk={chunk_size} align_bytes={align_bytes} "
+        f"n_chunks={(total_size + chunk_size - 1) // chunk_size}")
     for offset in range(0, total_size, chunk_size):
         size = min(chunk_size, total_size - offset)
         ret = cudart.cudaHostRegister(
