@@ -11,11 +11,12 @@ from flexkv.common.hash_utils import HashType, Hasher, gen_hashes, get_hash_size
 def _get_namespace_hash_key(namespace: Optional[List[str]]) -> Optional[np.ndarray]:
     if not namespace or len(namespace) == 0:
         return None
-    
-    # Use null character as delimiter to prevent ambiguity
-    # e.g. ["a:b", "c"] → "a:b\x00c" != ["a", "b:c"] → "a\x00b:c"
-    namespace_key = "\x00".join(namespace)
-    namespace_bytes = namespace_key.encode('utf-8')
+
+    # Length-prefix every component so that no component's content can stand
+    # in for a boundary: ["a\x00b"] and ["a", "b"] must not hash alike.
+    namespace_bytes = b"".join(
+        len(part).to_bytes(4, "little") + part
+        for part in (str(component).encode("utf-8") for component in namespace))
     namespace_array = np.frombuffer(namespace_bytes, dtype=np.uint8).astype(np.int64)
     return namespace_array
 

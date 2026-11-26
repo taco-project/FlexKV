@@ -121,19 +121,21 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
         Example:
             If request has lora_task_id=123, cache_salt_id="session_1",
             namespace_info="tenant_A|user_1", the result will be:
-            ["123", "session_1", "tenant_A", "user_1"]
+            ["lora:123", "salt:session_1", "ns:tenant_A", "ns:user_1"]
+            Each component is tagged with its source, so a cache_salt_id equal
+            to a LoRA task id cannot reach that adapter's blocks.
         """
         namespace_info = []
 
         if hasattr(_request, 'lora_task_id'):
             lora_task_id = getattr(_request, 'lora_task_id', None)
             if lora_task_id is not None:
-                namespace_info.append(str(lora_task_id))
+                namespace_info.append(f"lora:{lora_task_id}")
 
         if hasattr(_request, 'cache_salt_id') and _request.cache_salt_id is not None:
             cache_salt_id = _request.cache_salt_id
             if cache_salt_id is not None:
-                namespace_info.append(str(cache_salt_id))
+                namespace_info.append(f"salt:{cache_salt_id}")
 
         if hasattr(_request, 'namespace_info') and _request.namespace_info is not None:
             user_namespace = _request.namespace_info
@@ -141,9 +143,9 @@ class FlexKVSchedulerConnector(KvCacheConnectorScheduler):
             if isinstance(user_namespace, str):
                 # Split by "|" to support hierarchical namespaces like "tenant_A|user_1"
                 namespace_components = user_namespace.split('|')
-                namespace_info.extend([comp.strip() for comp in namespace_components if comp.strip()])
+                namespace_info.extend([f"ns:{comp.strip()}" for comp in namespace_components if comp.strip()])
             else:
-                namespace_info.append(str(user_namespace))
+                namespace_info.append(f"ns:{user_namespace}")
         
         if len(namespace_info) == 0:
             return None

@@ -377,7 +377,9 @@ class FlexKVSchedulerConnector:
         Extract namespace information from vLLM Request for cache isolation.
 
         Order: lora_request.lora_name → cache_salt → namespace_info (list or single).
-        Returns None if no namespace information is available.
+        Each component is tagged with its source ("lora:", "salt:", "ns:"), so
+        a cache_salt equal to an adapter's name cannot reach that adapter's
+        blocks. Returns None if no namespace information is available.
 
         Hot path: most workloads have none of the three fields set on the
         request, so we read all three with `getattr` (avoids `hasattr` + attribute
@@ -393,14 +395,14 @@ class FlexKVSchedulerConnector:
         if lora_req is not None:
             lora_id = lora_req.lora_name
             if lora_id is not None:
-                namespace_info.append(str(lora_id))
+                namespace_info.append(f"lora:{lora_id}")
         if cache_salt is not None:
-            namespace_info.append(str(cache_salt))
+            namespace_info.append(f"salt:{cache_salt}")
         if user_namespace is not None:
             if isinstance(user_namespace, list):
-                namespace_info.extend(str(item) for item in user_namespace)
+                namespace_info.extend(f"ns:{item}" for item in user_namespace)
             else:
-                namespace_info.append(str(user_namespace))
+                namespace_info.append(f"ns:{user_namespace}")
 
         return namespace_info if namespace_info else None
 
