@@ -23,6 +23,7 @@ def store_method():
         if isinstance(node, ast.arg):
             node.annotation = None
     namespace = dict(np=np, _SGLANG_REQ_ID_UNSET=object(), non_kernel_stack_mode=lambda: False,
+                     put_trace=Mock(ENABLED=False),
                      FlexKVScatterChannel=SimpleNamespace(STORE_START=1))
     exec(compile(ast.Module(body=[method], type_ignores=[]), "connector.py", "exec"), namespace)
     return namespace["store_kv"]

@@ -813,6 +813,8 @@ class CacheConfig:
     prefetch_result_ttl_s: float = 60.0
     # SSD layer granularity: <= 0 means N=1
     layer_granularity: int = -1
+    put_trace: Optional[Dict[str, Any]] = None
+    put_trace_run_id: Optional[str] = None
 
     def __post_init__(self):
         self.enable_kv_sharing = self.enable_p2p_cpu or \
@@ -1047,10 +1049,13 @@ class UserConfig:
     prefetch_max_pinned_bytes: int = 2 * 1024 * 1024 * 1024
     prefetch_result_ttl_s: float = 60.0
     gdr: Dict[str, Any] = field(default_factory=dict)
+    put_trace: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         from flexkv.common.gdr_config import parse_gdr_config
+        from flexkv.transfer.put_trace import parse_config as parse_put_trace_config
         self.gdr = parse_gdr_config(self.gdr)
+        self.put_trace = parse_put_trace_config(self.put_trace)
         if self.cpu_cache_gb <= 0:
             raise ValueError(f"Invalid cpu_cache_gb: {self.cpu_cache_gb}")
         if self.ssd_cache_gb < 0:
@@ -1417,6 +1422,9 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     if user_config.node_ttl_seconds is not None:
         cache_config.node_ttl_seconds = user_config.node_ttl_seconds
 
+    from flexkv.transfer import put_trace
+    cache_config.put_trace = put_trace.configure(user_config.put_trace)
+    cache_config.put_trace_run_id = put_trace.RUN
 
     # Layerwise is env-only so the connector and spawned engine agree.
     # Region batching still permits a config-file default, published to spawn.

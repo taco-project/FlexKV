@@ -5,6 +5,7 @@ import time
 from copy import deepcopy
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.transfer import put_trace
 from flexkv.transfer.gdr_owner import attach_remote_targets, close_leases, wants_gdr
 
 
@@ -94,6 +95,7 @@ def maybe_fence_d2h(worker, transfer_op) -> None:
             and not getattr(worker, "_gdr_producer_error", None)):
         from flexkv.transfer.gdr_owner import wait_remote_producers
         started = time.perf_counter_ns()
+        put_trace.mark("producer_fence_begin")
         try:
             wait_remote_producers(
                 getattr(worker, "_gdr_leases", []),
@@ -104,6 +106,7 @@ def maybe_fence_d2h(worker, transfer_op) -> None:
         except Exception as exc:
             worker._gdr_producer_error = exc
         finally:
+            put_trace.mark("producer_fence_end")
             if cfg.get("diagnostics", {}).get("probe"):
                 probe = worker.__dict__.setdefault("_gdr_probe", {})
                 probe["producer_rpc_ns"] = probe.get("producer_rpc_ns", 0) + time.perf_counter_ns() - started

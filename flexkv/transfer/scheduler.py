@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import OrderedDict, List, Set, Tuple
 
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType
+from flexkv.transfer import put_trace
 
 
 class TransferScheduler:
@@ -24,6 +25,7 @@ class TransferScheduler:
         """Add a new transfer graph to the scheduler"""
         self._transfer_graphs[graph.graph_id] = graph
         self._dirty_graph_ids[graph.graph_id] = None
+        put_trace.graph_event("scheduler_admit", graph)
 
     def fail_graph(self, graph_id: int) -> None:
         """Drop a graph whose transfer failed: none of its remaining ops may be
@@ -76,6 +78,9 @@ class TransferScheduler:
             if graph is not None:
                 for op_id in graph.take_ready_ops():
                     op = graph._op_map[op_id]
+                    if put_trace.ENABLED and getattr(op, "_put_trace", None):
+                        put_trace.emit("op_ready", **op._put_trace, op=op.op_id,
+                                       direction=op.transfer_type.name)
                     if op.transfer_type == TransferType.VIRTUAL:
                         # Self-completing, and that can unblock successors, so
                         # the graph needs another pass before this call returns.

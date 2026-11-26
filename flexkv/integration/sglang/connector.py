@@ -56,6 +56,7 @@ from flexkv.common.config import (
     recompute_cache_block_counts,
 )
 from flexkv.common.platform import non_kernel_stack_mode
+from flexkv.transfer import put_trace
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.integration.config import FlexKVConfig, _is_sglang_dsv4
@@ -1384,6 +1385,7 @@ class FlexKVConnector:
         Returns the FlexKV task id of the in-flight store, or -1 if
         nothing needed to be written.
         """
+        store_created_ns = put_trace.now()
         context = self._new_op_context("store", rid, sglang_req_id)
         with self._store_profile_scope("flexkv.connector.store.tokens_to_numpy"):
             token_ids_np = np.asarray(token_ids, dtype=np.int64)
@@ -1481,6 +1483,9 @@ class FlexKVConnector:
                     unmatched_mask=mask_list,
                 )
                 context.task_id = int(fkv_task_id)
+                if put_trace.ENABLED:
+                    put_trace.emit("store_created", at=store_created_ns,
+                                   task=int(fkv_task_id), rid=str(rid))
                 if unmatched_count > 0:
                     with self._store_profile_scope(
                         "flexkv.connector.store.filter_slot_mapping"
@@ -1650,6 +1655,9 @@ class FlexKVConnector:
             if fk_tid is None:
                 continue
             if self._sync_ctx.is_sync_leader:
+                if put_trace.ENABLED:
+                    put_trace.emit("gpu_unlock_notified", task=int(fk_tid), rid=str(rid),
+                                   status=_status_value(completed_by_rid.get(rid)))
                 context = self._pop_context(
                     "_inflight_store_contexts", rid, "store", fk_tid
                 )
@@ -1707,6 +1715,9 @@ class FlexKVConnector:
             "_inflight_store_contexts", rid, "store", fkv_task_id
         )
         success = status == KVResponseStatus.SUCCESS.value
+        if put_trace.ENABLED:
+            put_trace.emit("gpu_unlock_notified", task=int(fkv_task_id), rid=str(rid),
+                           status=status, source="wait_store")
         self._log_cache_op(
             context,
             "complete",

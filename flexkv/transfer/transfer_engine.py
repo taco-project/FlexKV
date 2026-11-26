@@ -32,7 +32,7 @@ from flexkv.common.storage import StorageHandle
 from flexkv.common.transfer import TransferOp, TransferOpGraph, TransferType, CompletedOp, WorkerKey
 from flexkv.common.transfer import get_nvtx_range_color
 from flexkv.transfer.scheduler import TransferScheduler
-from flexkv.transfer import trace
+from flexkv.transfer import put_trace, trace
 from flexkv.transfer.workers import (
     WorkerHandle,
     CPUSSDDiskTransferWorker,
@@ -148,6 +148,8 @@ class TransferEngine:
         """
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
+        if getattr(cache_config, "put_trace", None) is not None:
+            put_trace.configure(cache_config.put_trace, run_id=cache_config.put_trace_run_id)
 
         first_handles = next(iter(gpu_handles.values()))
         self._num_layers_for_local_pp_stage = first_handles[0].kv_layout.num_layer
@@ -1194,6 +1196,9 @@ class TransferEngine:
     def _finalize_or_discard(self, op: TransferOp, finished_ops: List[TransferOp]) -> None:
         """Route a fully-drained op: discard if any replica of it failed,
         finalize (completion message + successor scheduling) otherwise."""
+        if put_trace.ENABLED and getattr(op, "_put_trace", None):
+            put_trace.emit("op_done", **op._put_trace, op=op.op_id,
+                           status="failed" if op.op_id in self._failed_parent_op_ids else "ok")
         if op.op_id in self._failed_parent_op_ids:
             self._discard_failed_op(op)
         else:
@@ -1491,6 +1496,7 @@ class TransferEngine:
                     layer_granularity=op.layer_granularity,
                 )
                 replica.op_id = next(self._replica_op_id_counter)
+                put_trace.replica(op, replica)
                 register_op_to_buffer(replica, self.pin_buffer)
                 self._child_id_to_child[replica.op_id] = replica
                 self._child_to_parent_op_id[replica.op_id] = op.op_id

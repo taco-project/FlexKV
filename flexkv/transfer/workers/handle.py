@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.transfer import LayerwiseTransferOp, TransferOp
-from flexkv.transfer import trace
+from flexkv.transfer import put_trace, trace
 from flexkv.transfer.worker_op import (
     WorkerLayerwiseTransferOp,
     WorkerTransferOp,
@@ -55,6 +55,9 @@ class WorkerHandle:
             self.worker_id, op_id, error,
         )
         if op_id is not None:
+            if put_trace.ENABLED:
+                put_trace.emit("worker_send_failed", **getattr(payload, "_put_diag", {}),
+                               error=type(error).__name__)
             self.finished_ops_queue.put((op_id, False, None))
 
     def submit_transfer(self, op: Union[TransferOp, LayerwiseTransferOp]) -> None:
@@ -62,6 +65,7 @@ class WorkerHandle:
             worker_op = WorkerLayerwiseTransferOp(op)
         else:
             worker_op = WorkerTransferOp(op)
+        put_trace.submitted(op, worker_op, self.worker_id)
         if trace.timing_enabled():
             submitted_ns = time.perf_counter_ns()
             worker_op.prof_submitted_ns = submitted_ns

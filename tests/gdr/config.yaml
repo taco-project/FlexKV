@@ -43,3 +43,9 @@ gdr:
 # 性能测试可显式启用 diagnostics，并设置 FLEXKV_LOG_LEVEL=INFO。
 # SGLang 正常使用建议保持二者 false，进程环境 FLEXKV_LOG_LEVEL=WARNING、
 # FLEXKV_TRANSFER_TRACE=0；不需要修改 SGLang。
+
+# PUT 生命周期追踪，适用于 CE / GDR；与 gdr.diagnostics 独立。
+# 开启后所有本机 worker 直接追加到此 JSONL 文件，不依赖终端重定向或日志级别。
+put_trace:
+  enabled: false
+  output_file: /tmp/flexkv/put-trace.jsonl

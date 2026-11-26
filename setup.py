@@ -538,6 +538,7 @@ if not debug:
                       "flexkv/_build_info.py",
                       # Keep the CPU-only diagnostic CLI runnable via python -m.
                       "flexkv/transfer/ce_replay.py",
+                      "flexkv/transfer/put_trace.py",
                       # Dynamic store/engine facades + __getattr__ crash under Cython.
                       "flexkv/external/mooncake_parallel_io.py"]
     # Import cython when debug is turned off.

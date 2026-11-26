@@ -43,6 +43,7 @@ from flexkv.transfer.region_batch import (
 from flexkv.transfer.template import compile_gpu_regions, compile_host_regions
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp, WorkerTransferOp
 from flexkv.transfer.workers.runtime import TransferWorkerBase
+from flexkv.transfer import put_trace
 from flexkv.transfer.host_buffer import host_register_align_bytes
 
 # Stand-in for the block ids of a cached layerwise request, which are rebound
@@ -1174,6 +1175,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         # contract of _transfer_impl is unchanged -- it still returns only once
         # the data has landed.
         launch_sync = not self._use_async_launch
+        put_trace.mark("transfer_begin")
 
         if self._use_region_batch():
             # Every region in one fan-out: each rank walks the request list on
@@ -1237,6 +1239,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             )
             if self._use_async_launch:
                 self.tp_transfer_thread_group.wait_all_streams()
+        put_trace.mark("transfer_end")
 
 
     def _compiled_requests(self, has_swa: bool) -> LayerwiseRequests:
@@ -1366,14 +1369,17 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         if not requests and not empty_layers:
             return
 
+        put_trace.mark("layerwise_transfer_begin")
         self.region_batch.submit_layerwise(
             requests, empty_layers, counter_id)
+        put_trace.mark("layerwise_submitted")
         # Launched, not landed. Returning here would let the engine recycle the
         # source blocks while DMA is still reading them -- and we cannot drain
         # inline before the posts, because the consumer is blocked on the very
         # eventfds this transfer still has to write.
         ok, err = self.region_batch.wait_layer_completion(
             self._layerwise_completion_timeout_s)
+        put_trace.mark("layerwise_transfer_end" if ok else "layerwise_transfer_failed")
         if not ok:
             raise RuntimeError(
                 f"[worker {self.worker_id}] layerwise transfer did not "
@@ -1433,6 +1439,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             self._ensure_cuda_device(self._device_ids[0])
             self._pin_op_buffer()
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+        put_trace.mark("ids_ready")
         pool = self._pool_for(transfer_op)
         if self._is_per_group(pool):
             # No compression here: it is sized for the main uniform pool only.

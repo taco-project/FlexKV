@@ -27,6 +27,7 @@ from flexkv.common.transfer import (
     merge_to_batch_graph,
 )
 from flexkv.common.tracer import FlexKVTracer
+from flexkv.transfer import put_trace
 from flexkv.cache.cache_engine import (
     GlobalCacheEngine,
     CacheStrategy,
@@ -287,6 +288,12 @@ class KVTaskManager:
         return "prefetch"
 
     def _log_task_created(self, task: KVTask) -> None:
+        if put_trace.ENABLED and task.graph is not None:
+            if not getattr(task.graph, "_put_trace", None):
+                operation = self._operation_name(task.task_type)
+                created = put_trace.request_created(task.task_id, operation)
+                put_trace.bind_graph(task.graph, task.task_id, created, operation=operation)
+            task._put_trace = task.graph._put_trace
         if not flexkv_logger.is_enabled_for(logging.DEBUG):
             return
         graph_id = task.graph.graph_id if task.graph is not None else -1
@@ -304,6 +311,7 @@ class KVTaskManager:
         )
 
     def _log_task_terminal(self, task: KVTask, status: TaskStatus) -> None:
+        put_trace.task_event("task_terminal", task, status=status.value)
         graph_ops = task.graph.num_ops if task.graph is not None else 0
         if status == TaskStatus.COMPLETED:
             level = logging.INFO if graph_ops else logging.DEBUG
@@ -408,6 +416,7 @@ class KVTaskManager:
                 task_id, prefetch_task, token_ids, slot_mapping, token_mask,
                 dp_client_id, is_fake_slot_mapping)
             return
+        trace_created = put_trace.request_created(task_id, "get")
         graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.get(
             request_id=task_id,
             token_ids=token_ids,
@@ -417,6 +426,7 @@ class KVTaskManager:
             temp_cache_strategy=temp_cache_strategy,
             namespace=namespace,
             swa_aware=swa_aware)
+        put_trace.bind_graph(graph, task_id, trace_created, operation="get")
         self.tasks[task_id] = KVTask(
             task_id=task_id,
             task_type=TaskType.GET,
@@ -445,6 +455,7 @@ class KVTaskManager:
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
+        trace_created = put_trace.request_created(task_id, "put")
         graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.put(
             request_id=task_id,
             token_ids=token_ids,
@@ -452,6 +463,7 @@ class KVTaskManager:
             slot_mapping=slot_mapping,
             dp_client_id=dp_client_id,
             namespace=namespace)
+        put_trace.bind_graph(graph, task_id, trace_created, operation="put")
         self.tasks[task_id] = KVTask(
             task_id=task_id,
             task_type=TaskType.PUT,
@@ -482,6 +494,7 @@ class KVTaskManager:
         temp_cache_strategy = copy.deepcopy(DEFAULT_CACHE_STRATEGY)
         temp_cache_strategy.ignore_gpu = True  # upload to CPU only
         temp_cache_strategy.ignore_gds = True
+        trace_created = put_trace.request_created(task_id, "prefetch")
         graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.get(
             request_id=task_id,
             token_ids=token_ids,
@@ -491,6 +504,7 @@ class KVTaskManager:
             temp_cache_strategy=temp_cache_strategy,
             namespace=namespace,
             swa_aware=swa_aware)
+        put_trace.bind_graph(graph, task_id, trace_created, operation="prefetch")
         prefetch_has_swa_remote = any(
             op.transfer_type == TransferType.REMOTE2H and getattr(op, "is_swa", False)
             for op in graph._op_map.values()
@@ -531,6 +545,7 @@ class KVTaskManager:
         if transfer_graph is None:
             return
         nvtx.mark(f"launch task: task_id={task_id}, graph_id={transfer_graph.graph_id}")
+        put_trace.graph_event("submit_graph", transfer_graph)
         if transfer_graph.num_ops > 0:
             for transfer_handle in self.transfer_handles:
                 # For remote handles: deepcopy graph and clear GPU blocks when
@@ -657,6 +672,8 @@ class KVTaskManager:
                 self._mark_completed(task_id)
             elif completed_op.op_id == task.task_end_op_id:
                 self.tasks[task_id].task_end_op_finished = True
+                put_trace.task_event("data_end_failed" if task.transfer_failed else "gpu_release_eligible",
+                                     task, transfer_failed=task.transfer_failed)
         if getattr(self, "_runtime", None) is None:
             self._reap_completed_tasks()
 
@@ -960,6 +977,7 @@ class KVTaskManager:
                 self._terminal_tasks.pop(task_id, None)
             return
         task = self.tasks[task_id]
+        put_trace.task_event("retired", task, status=task.status.value)
         if task.graph is not None:
             self.graph_to_task.pop(task.graph.graph_id, None)
         if task.prefetch_key is not None and self.prefetch_tasks.get(task.prefetch_key) == task_id:
@@ -1719,6 +1737,14 @@ class KVTaskEngine(KVTaskManager):
             op_callback_dict=op_callback_dict,
         )
         self.graph_to_task[batch_task_graph.graph_id] = batch_id
+        if put_trace.ENABLED:
+            operation = self._operation_name(batch_task_type)
+            created = put_trace.request_created(batch_id, operation)
+            put_trace.bind_graph(
+                batch_task_graph, batch_id, created,
+                [getattr(graph, "_put_trace", {}).get("request") for graph in transfer_graphs],
+                operation=operation)
+            self.tasks[batch_id]._put_trace = batch_task_graph._put_trace
         if flexkv_logger.is_enabled_for(logging.INFO):
             operation = self._operation_name(batch_task_type)
             flexkv_logger.info(
@@ -1836,6 +1862,8 @@ class KVTaskEngine(KVTaskManager):
 
             # After any submit attempt, only normal graph completion may release resources.
             if transfer_graphs:
+                for graph in transfer_graphs:
+                    put_trace.graph_event("submit_graph", graph, batch=True)
                 for transfer_handle in self.transfer_handles:
                     transfer_handle.submit_batch(transfer_graphs)
             return task_ids

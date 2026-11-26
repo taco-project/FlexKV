@@ -53,6 +53,18 @@ use_ce_transfer_d2h: true
 layerwise_notify_mode: polling     # CE-only 通知路径；不依赖 cudaLaunchHostFunc。
 enable_transfer_trace: false
 
+# PUT 全流程追踪：启用后直接追加写入指定 JSONL 文件，自动创建父目录。
+# 不依赖 FLEXKV_LOG_LEVEL，不需要重定向 stdout；每台机器写自己的本地文件。
+# 相对路径相对 FlexKV 仓库根目录，不跟 SGLang 启动时的 cwd。
+# output_file 支持环境变量；启动前需 export SGLANG_HICACHE_DIAG_DIR 为本次诊断目录。
+# 控制事件由 sync leader 记录，D2H 由 TP-group worker 记录整组完成时间，
+# 不会按每个 TP rank 重复输出整条链路；多节点/PP/Full-SWA 的独立 worker 保留各自记录。
+# 记录阶段时间戳、payload 字节数和 block 数；合批数据按 physical ID 去重。
+# 与 enable_transfer_trace、下方 GDR diagnostics 相互独立。
+put_trace:
+  enabled: true            # 设为false即可关掉
+  output_file: "${SGLANG_HICACHE_DIAG_DIR}/put-trace.jsonl"  # 写入本次诊断目录
+
 gdr:
   enabled: true                   # GDR 功能总开关；不代表每次搬运一定走 GDR，仍看各方向 path。
   qp_count: 4                     # 每设备 QP 对数量，1..16。

@@ -435,11 +435,11 @@ def test_shutdown_is_idempotent(monkeypatch):
     release.assert_called_once()
 
 
-def test_no_dependency_on_experimental_diagnostics_or_later_features():
+def test_put_trace_is_allowed_but_later_probes_stay_excluded():
     for name in ("flexkv/transfer/gdr_runtime.py", "flexkv/transfer/workers/runtime.py",
                  "flexkv/transfer/workers/handle.py"):
         source = (ROOT / name).read_text()
-        assert "put_trace" not in source
+        assert "put_trace" in source
         assert "cache_probe" not in source
     runtime = (ROOT / "flexkv/transfer/workers/runtime.py").read_text()
     handle = (ROOT / "flexkv/transfer/workers/handle.py").read_text()

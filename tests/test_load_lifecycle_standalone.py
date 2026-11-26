@@ -28,6 +28,7 @@ def load_method(path, owner, name, **values):
     method = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == name)
     method.decorator_list = []
     namespace = dict(time=time, replace=replace, np=np, logger=logging.getLogger(__name__),
+                     put_trace=Mock(ENABLED=False),
                      flexkv_logger=logging.getLogger(__name__), _SGLANG_REQ_ID_UNSET=object())
     namespace.update(values)
     exec(compile(ast.Module(body=[method], type_ignores=[]), path, "exec",
@@ -331,6 +332,7 @@ def real_task_engine():
     response_status = Enum("ResponseStatus", "NOTFOUND UNREADY SUCCESS FAILED TIMEOUT")
     deps = dict(TaskStatus=task_status, TaskType=task_type, KVTask=task_cls,
                 nvtx=Mock(), flexkv_logger=logger, logging=logging,
+                put_trace=Mock(ENABLED=False),
                 GLOBAL_CONFIG_FROM_ENV=SimpleNamespace(enable_layerwise_transfer=True),
                 KVResponse=SimpleNamespace, KVResponseStatus=response_status,
                 convert_to_response_status=lambda value: response_status.FAILED
