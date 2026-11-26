@@ -1,0 +1,24 @@
+# Qwen3-32B / CE-only / TP1：仅 GPU + Host，不启用 SSD 或 Mooncake Store。
+# 在 import torch、编译、测试或启动服务之前，先 source 自行维护的运行环境脚本。
+# 运行环境的设备枚举、通信和动态库设置由部署方提供，本示例不代设。
+cpu_cache_gb: 16
+ssd_cache_gb: 0
+ssd_cache_dir: /data/flexkv_ssd
+enable_gds: false
+enable_nixl: false
+use_hugepage_cpu_buffer: false
+use_hugepage_tmp_buffer: false
+hugepage_size_bytes: 2097152
+use_mooncake_store_backend: false
+kv_cache_dtype: float16
+
+# 原始 H2D/D2H 路径使用 CE。
+region_batch: true
+use_ce_transfer_h2d: true
+use_ce_transfer_d2h: true
+ce_path_opt: true
+enable_ce_memcpy2d: false
+
+layerwise_notify_mode: polling
+enable_collective_sync: false
+enable_transfer_trace: false

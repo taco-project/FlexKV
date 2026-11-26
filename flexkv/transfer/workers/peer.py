@@ -12,7 +12,7 @@ import time
 from multiprocessing.connection import Connection
 from typing import Dict, List, Optional, Tuple, Union
 
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import torch
 import zmq
 from torch.multiprocessing import Queue as MPQueue
