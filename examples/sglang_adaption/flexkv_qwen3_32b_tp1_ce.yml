@@ -12,7 +12,7 @@ hugepage_size_bytes: 2097152
 use_mooncake_store_backend: false
 kv_cache_dtype: float16
 
-# 原始 H2D/D2H 路径使用 CE。
+# CE 作为 auto/original 路径及 GDR 初始化失败时的回退。
 region_batch: true
 use_ce_transfer_h2d: true
 use_ce_transfer_d2h: true
@@ -22,3 +22,34 @@ enable_ce_memcpy2d: false
 layerwise_notify_mode: polling
 enable_collective_sync: false
 enable_transfer_trace: false
+
+gdr:
+  enabled: true
+  qp_count: 4
+  use_dedicated_gdr_thread: false
+  nic_names: []
+
+  h2d:
+    path: auto
+    selector: avgbytes
+    on_init_failure: original
+    gdr_when_ce_avg_bytes_below: 524288
+    gdr_max_block_fragment_bytes: 131072
+    segment_threshold: 8
+
+  d2h:
+    path: auto
+    selector: avgbytes
+    on_init_failure: original
+    auto_layer_parallel: false
+    read_depth: 16
+    batch_requests: 1
+    max_batch_blocks: 8192
+    gdr_when_ce_avg_bytes_below: 524288
+    gdr_max_block_fragment_bytes: 131072
+    segment_threshold: 8
+
+  diagnostics:
+    summary: false
+    timing: false
+    probe: false

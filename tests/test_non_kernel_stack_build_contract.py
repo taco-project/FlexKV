@@ -187,3 +187,31 @@ def test_worker_factory_only_passes_supported_keywords():
     worker_source = (ROOT / "flexkv/transfer/workers/gpu_cpu.py").read_text()
     for name in ("h2d_layer_holders", "layer_shard_enabled", "owner =", "cp_cache_node_rank"):
         assert name not in worker_source
+
+
+def _cythonized_sources():
+    module = ast.parse((ROOT / "setup.py").read_text())
+    lists = {}
+    for node in ast.walk(module):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in ("python_files", "excluded_files")):
+            lists[node.targets[0].id] = ast.literal_eval(node.value)
+    included = {path for pattern in lists["python_files"] for path in ROOT.glob(pattern)}
+    excluded = {path for pattern in lists["excluded_files"] for path in ROOT.glob(pattern)}
+    return sorted(included - excluded)
+
+
+def test_cythonized_modules_have_no_negative_integer_subscripts():
+    directives = (ROOT / "setup.py").read_text()
+    assert '"wraparound": False' in directives
+    sources = _cythonized_sources()
+    assert any(path.name == "connector.py" for path in sources)
+    assert any(path.name == "kvtask.py" for path in sources)
+    offenders = []
+    for path in sources:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.UnaryOp)
+                    and isinstance(node.slice.op, ast.USub)):
+                offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}: {ast.unparse(node)}")
+    assert offenders == []

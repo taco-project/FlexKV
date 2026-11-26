@@ -33,6 +33,8 @@
 #pragma once
 
 #include "ce_transfer.h"
+#include "gdr/config.h"
+#include <map>
 #include "device_thread_pool.h"
 #include "gtensor_handler.cuh"
 #include "layer_notify.h"
@@ -44,6 +46,7 @@
 #include <vector>
 
 namespace flexkv {
+namespace gdr { class Context; }
 
 // Static geometry of one region.  Registered once at construction; nothing
 // here changes between transfers.
@@ -108,6 +111,7 @@ struct RegionRequest {
   // transfer and layer_parallel on the next.
   RankShareMode rank_share_mode = RankShareMode::SHARDED;
   int designated_rank = 0; // RANK0_ONLY; RANK_ROTATE resolves its own
+  int h2d_rank = -1;
   // Which *original model* layer this request completes, or -1 for "not part
   // of a per-layer milestone".  Only consulted by submit_layerwise(): the
   // notifier posts layer L's eventfd once every request tagged L has landed
@@ -182,6 +186,10 @@ public:
   bool layer_notification_enabled() const { return notifier_.enabled(); }
 
   void wait_all_streams();
+  void configure_gdr(const gdr::Config &config);
+  void close_gdr();
+  gdr::Context &gdr_context();
+  std::map<std::string, uint64_t> gdr_statistics() const;
 
   // Re-point one region's device tensors after a GPU hot remap.  Drains
   // first: the old pointers may still be in flight.
@@ -214,6 +222,8 @@ private:
   prepare(const std::vector<RegionRequest> &requests_in,
           std::vector<RegionRequest> &scratch);
 
+  void launch_request(const RegionRequest &req, int rank);
+  std::unique_ptr<gdr::Context> gdr_;
   std::unique_ptr<DeviceThreadPool> pool_;
   std::vector<RegionState> regions_;
   CETransferConfig ce_config_;

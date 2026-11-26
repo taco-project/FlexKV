@@ -13,7 +13,7 @@ from multiprocessing import Process, Pipe, Event
 from sympy.assumptions.assume import true
 import torch
 import zmq
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import tempfile
 import threading
 import numpy as np
@@ -1120,6 +1120,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         # to the parent as the reason the subprocess is gone, and exiting 0 would
         # make a crashed startup look like a clean shutdown.
         init_failed = False
+        transfer_manager = None
+        sel = None
         try:
             flexkv_logger.debug(f"_process_worker started, pid={os.getpid()}, "
                                f"gpu_register_port={gpu_register_port}")
@@ -1239,14 +1241,14 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                 error_conn.send(message)
         finally:
             # Cleanup selector (only if it was created)
-            if 'sel' in locals():
+            if sel is not None:
                 try:
                     sel.close()
                 except Exception as e:
                     flexkv_logger.error(f"Error closing selector: {e}")
 
             # Gracefully shut down transfer engine and its worker subprocesses
-            if 'transfer_manager' in locals():
+            if transfer_manager is not None:
                 try:
                     flexkv_logger.info("TransferManager process: shutting down transfer engine")
                     transfer_manager.shutdown()

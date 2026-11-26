@@ -79,6 +79,8 @@ def test_server_unregisters_only_the_requesting_client():
     server.client_manager = MagicMock()
     server.kv_task_engine = MagicMock()
     server._running = True
+    server._prefetch_clients = {}
+    server._pending_waits = []
 
     server._handle_unregister_dp_client_request(UnregisterDPClientRequest(3))
 

@@ -26,6 +26,7 @@ Modes:
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import math
@@ -54,6 +55,7 @@ from flexkv.common.config import (
     LayerGroupSpec,
     recompute_cache_block_counts,
 )
+from flexkv.common.platform import non_kernel_stack_mode
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.integration.config import FlexKVConfig, _is_sglang_dsv4
@@ -252,6 +254,8 @@ class FlexKVConnector:
 
         # 1. Resolve FlexKV config from env + sglang server args.
         self.flexkv_config = FlexKVConfig.from_env()
+        from flexkv.common.gdr_config import publish_gdr_config
+        gdr_config = publish_gdr_config(self.flexkv_config.user_config.gdr)
         self.rank_info = self.flexkv_config.post_init_from_sglang_config(
             sglang_config=sgl_model_config,
             server_args=server_args,
@@ -306,6 +310,8 @@ class FlexKVConnector:
                 "(FLEXKV_ENABLE_COLLECTIVE_SYNC=0): "
                 "scatter/barrier/all_reduce are skipped."
             )
+
+        self._agree_cache_geometry(gdr_config, "GDR configuration")
 
         # 3. Align block counts across all ranks (MIN reduce) so each
         # rank's KVManager registers compatible sizes.
@@ -410,13 +416,13 @@ class FlexKVConnector:
             pp_rank=self.rank_info.pp_rank,
             intra_client_id=self.rank_info.intra_client_id,
             device_id=self.rank_info.local_rank,
+            gdr_local_rank=(self.rank_info.intra_client_id
+                            % self.model_config.effective_tp_size_per_node),
         )
         self._register_with_retry(kv_caches, indexer_group)
 
         # 8. Layerwise transfer plumbing.
-        self.enable_layerwise = bool(
-            int(os.environ.get("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "0"))
-        )
+        self.enable_layerwise = bool(GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer)
         self._profile_store_stages = os.getenv(
             "FLEXKV_PROFILE_STORE_STAGES", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -731,11 +737,7 @@ class FlexKVConnector:
             error=str(lookup_error) if lookup_error is not None else None,
         )
 
-        # Decide what to do with the held task. Three cases:
-        #   1. hit_length > 0 and rid given → stash for retrieve_kv later.
-        #   2. hit_length > 0 and rid is None → cancel; caller can't use it.
-        #   3. hit_length == 0 → no work to do; FlexKV already marked the
-        #      empty graph COMPLETED inside get_match, cancel would warn.
+        # Hold usable lookups for restore; otherwise retire their task metadata.
         if hit_length > 0 and rid is not None and fkv_task_id >= 0:
             # SGLang can call match_prefix more than once for the same request
             # before init_load_back consumes the held lookup.  Replacing the
@@ -765,7 +767,7 @@ class FlexKVConnector:
             self._pending_lookup_contexts[rid] = context
             # The held GET has pinned its CPU prefix; transfer the result lease.
             self._release_prefetch_result(rid)
-        elif hit_length > 0 and fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
+        elif fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
             assert self.kv_manager is not None
             self.kv_manager.cancel([fkv_task_id])
 
@@ -838,66 +840,67 @@ class FlexKVConnector:
             self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
 
         n = slot_mapping_cpu.numel()
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+        result = {"error": None, "loaded": n, "unresolved": False}
+        if self._sync_ctx.is_sync_leader:
+            tracked = self._launched_load_tids
+            tracked.append(fkv_task_id)
+            self._launched_load_contexts[fkv_task_id] = context
+            launched_ids = None
             try:
-                self.kv_manager.launch(
+                launched_ids = self.kv_manager.launch(
                     task_ids=[fkv_task_id],
                     slot_mappings=[slot_mapping_cpu],
                     swa_slot_mappings=[swa_slot_mapping],
-                    as_batch=True,
+                    as_batch=False,
                     layerwise_transfer=False,
-                )
-            except Exception as exc:  # noqa: BLE001
-                self._log_cache_op(
-                    context,
-                    "complete",
-                    "failed",
-                    start_ns=load_start_ns,
-                    direction="H2D",
-                    transfer_mode="no-layerwise",
-                    stage="launch",
-                    error=str(exc),
-                )
-                raise
-            self._log_cache_op(
-                context,
-                "launch",
-                "running",
-                direction="H2D",
-                transfer_mode="no-layerwise",
-                slots=n,
-                swa_slots=swa_slots,
-            )
-            try:
-                resp = self.kv_manager.wait([fkv_task_id], timeout=30.0) or {}
-            except Exception as exc:  # noqa: BLE001
-                self._log_cache_op(
-                    context,
-                    "complete",
-                    "failed",
-                    start_ns=load_start_ns,
-                    direction="H2D",
-                    transfer_mode="no-layerwise",
-                    error=str(exc),
-                )
-                raise
-            status = _status_value(resp.get(fkv_task_id))
-            success = status == KVResponseStatus.SUCCESS.value
-            self._log_cache_op(
-                context,
-                "complete",
-                status,
-                start_ns=load_start_ns,
-                direction="H2D",
-                transfer_mode="no-layerwise",
-                slots=n,
-                swa_slots=swa_slots,
-            )
-            if not success:
-                n = 0
+                ) or [fkv_task_id]
+                tracked.remove(fkv_task_id)
+                self._launched_load_contexts.pop(fkv_task_id, None)
+                tracked.extend(launched_ids)
+                for tid in launched_ids:
+                    self._launched_load_contexts[tid] = replace(context, task_id=tid)
+                self._log_cache_op(context, "launch", "running", direction="H2D",
+                                   transfer_mode="no-layerwise", slots=n, swa_slots=swa_slots)
+                responses = self.kv_manager.wait(
+                    launched_ids, timeout=30.0, completely=True
+                ) or {}
+                failed = []
+                for tid in launched_ids:
+                    status = _status_value(responses.get(tid))
+                    if status in {"success", "failed"}:
+                        tracked.remove(tid)
+                        self._launched_load_contexts.pop(tid, None)
+                    if status != "success":
+                        failed.append((tid, status))
+                if failed:
+                    raise RuntimeError(f"retrieve_kv tasks are not safely restored: {failed}")
+                self._log_cache_op(context, "complete", "success", start_ns=load_start_ns,
+                                   direction="H2D", transfer_mode="no-layerwise", slots=n)
+            except Exception as exc:
+                actual_ids = getattr(exc, "launched_task_ids", None)
+                if launched_ids is None and actual_ids:
+                    if fkv_task_id in tracked:
+                        tracked.remove(fkv_task_id)
+                    self._launched_load_contexts.pop(fkv_task_id, None)
+                    for tid in actual_ids:
+                        if tid not in tracked:
+                            tracked.append(tid)
+                        self._launched_load_contexts[tid] = replace(context, task_id=tid)
+                elif launched_ids is None:
+                    self._layerwise_batch_launch_error = str(exc) or type(exc).__name__
+                result = {"error": str(exc) or type(exc).__name__, "loaded": 0,
+                          "unresolved": launched_ids is None and not actual_ids}
+                self._log_cache_op(context, "complete", "failed", start_ns=load_start_ns,
+                                   direction="H2D", transfer_mode="no-layerwise", error=result["error"])
         if self._sync_ctx.needs_sync:
-            self._sync_ctx.barrier()
-        return n
+            result = self._sync_ctx.scatter(
+                result, channel=FlexKVScatterChannel.LOAD_COMPLETION, blocking=True
+            )
+        if result.get("unresolved"):
+            self._layerwise_batch_launch_error = result["error"]
+        if result["error"]:
+            raise RuntimeError(f"FlexKV synchronous restore failed: {result['error']}")
+        return int(result["loaded"])
 
     def start_load_kv_layerwise(
         self,
@@ -1128,9 +1131,17 @@ class FlexKVConnector:
             )
             return n, producer_id
 
-        if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+        result = {"error": None, "task_ids": []}
+        self._layerwise_batch_launch_error = "Immediate layerwise launch is unresolved"
+        if not hasattr(self, "_prepared_layerwise_loads"):
+            self._prepared_layerwise_loads = {}
+        self._prepared_layerwise_loads[rid] = _PreparedLayerwiseLoad(
+            fkv_task_id, producer_id, slot_mapping_cpu, swa_slot_mapping,
+            context, load_start_ns,
+        )
+        if self._sync_ctx.is_sync_leader:
             try:
-                launched_task_ids = self.kv_manager.launch(
+                result["task_ids"] = self.kv_manager.launch(
                     task_ids=[fkv_task_id],
                     slot_mappings=[slot_mapping_cpu],
                     swa_slot_mappings=[swa_slot_mapping],
@@ -1138,40 +1149,30 @@ class FlexKVConnector:
                     layerwise_transfer=True,
                     counter_id=producer_id,
                 )
-            except Exception as exc:  # noqa: BLE001
-                self._log_cache_op(
-                    context,
-                    "complete",
-                    "failed",
-                    start_ns=load_start_ns,
-                    direction="H2D",
-                    transfer_mode="layerwise",
-                    stage="launch",
-                    error=str(exc),
+                if not result["task_ids"]:
+                    raise RuntimeError("Layerwise launch did not return a drainable batch ID")
+            except Exception as exc:
+                result["error"] = str(exc) or type(exc).__name__
+                result["task_ids"] = list(getattr(exc, "launched_task_ids", ()) or ())
+            self._launched_load_tids.extend(result["task_ids"])
+            for tid in result["task_ids"]:
+                self._launched_load_contexts[tid] = replace(
+                    context, task_id=tid, start_ns=load_start_ns,
                 )
-                raise
-            # A layerwise launch is always merged into a batch task. Track the
-            # IDs returned by launch(), not the lookup task ID that the merge
-            # removes from FlexKV's task table.
-            self._launched_load_tids.extend(launched_task_ids)
-            for launched_task_id in launched_task_ids:
-                self._launched_load_contexts[launched_task_id] = replace(
-                    context,
-                    task_id=launched_task_id,
-                    start_ns=load_start_ns,
-                )
-            self._log_cache_op(
-                context,
-                "launch",
-                "running",
-                direction="H2D",
-                flexkv_batch_task_ids=launched_task_ids,
-                transfer_mode="layerwise",
-                slots=n,
-                swa_slots=swa_slots,
-                producer_id=producer_id,
+        if self._sync_ctx.needs_sync:
+            result = self._sync_ctx.scatter(
+                result, channel=FlexKVScatterChannel.LAYERWISE_BATCH, blocking=True
             )
-
+        if result["error"]:
+            self._layerwise_batch_launch_error = result["error"]
+            raise RuntimeError(f"Immediate layerwise launch failed: {result['error']}")
+        self._layerwise_batch_launch_error = None
+        self._prepared_layerwise_loads.pop(rid, None)
+        self._log_cache_op(
+            context, "launch", "running", direction="H2D",
+            flexkv_batch_task_ids=result["task_ids"], transfer_mode="layerwise",
+            slots=n, swa_slots=swa_slots, producer_id=producer_id,
+        )
         return n, producer_id
 
     def flush_layerwise_loads(self, request_ids: List[str]) -> None:
@@ -1306,9 +1307,10 @@ class FlexKVConnector:
                 error=str(exc),
             )
             return
+        drained_statuses = {"success", "failed"}
         for task_id, response in responses.items():
             status = _status_value(response)
-            if not _is_terminal_status(status):
+            if status not in drained_statuses:
                 continue
             context = self._pop_context(
                 "_launched_load_contexts", task_id, "load", task_id
@@ -1324,8 +1326,11 @@ class FlexKVConnector:
             task_id
             for task_id in task_ids
             if task_id not in responses
-            or not _is_terminal_status(_status_value(responses[task_id]))
+            or _status_value(responses[task_id]) not in drained_statuses
         ]
+        failed = [tid for tid in task_ids if _status_value(responses.get(tid)) == "failed"]
+        if failed:
+            raise RuntimeError(f"FlexKV restore failed: {failed}")
 
     # ------------------------------------------------------------------
     # Public API — store
@@ -1367,6 +1372,7 @@ class FlexKVConnector:
         kv_indices: torch.Tensor,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
+        *, prefix_length: Optional[int] = None,
     ) -> int:
         """Schedule a write back from GPU into FlexKV.
 
@@ -1388,9 +1394,23 @@ class FlexKVConnector:
                 f"has {len(kv_indices)} entries"
             )
 
+        if prefix_length is not None:
+            if type(prefix_length) is not int or not 0 <= prefix_length <= n:
+                raise ValueError("store_kv: prefix_length must be an integer in [0, len(token_ids)]")
+            if self._swa_kv_pool is not None and prefix_length < n:
+                raise ValueError(
+                    "Prefix-only store cannot reuse a later SWA state snapshot; "
+                    "use the full committed boundary")
+        if non_kernel_stack_mode() and isinstance(kv_indices, torch.Tensor) and kv_indices.is_cuda:
+            kv_indices = self._to_cpu_int64(kv_indices)
+        if prefix_length is not None and prefix_length < n:
+            token_ids_np = token_ids_np[:prefix_length]
+            kv_indices = self._to_cpu_int64(kv_indices)[:prefix_length]
+            n = prefix_length
+
         # Page-align inputs *before* put_match so the FlexKV allocator
         # only reserves slots that line up with the slot_mapping we send.
-        if self.page_size > 1:
+        if self.page_size > 1 or n == 0:
             aligned_len = (n // self.page_size) * self.page_size
             if aligned_len == 0:
                 self._log_cache_op(
@@ -1476,6 +1496,8 @@ class FlexKVConnector:
                         if swa_slot_mapping is None
                         else int(swa_slot_mapping.numel())
                     )
+                    self._inflight_stores[rid] = int(fkv_task_id)
+                    self._inflight_store_contexts[rid] = context
                     try:
                         with self._store_profile_scope(
                             "flexkv.connector.store.kvmanager_launch"
@@ -1511,6 +1533,11 @@ class FlexKVConnector:
                             swa_slots=swa_slots,
                         )
                 else:
+                    store_start["task_id"] = -1
+                    try:
+                        self.kv_manager.cancel([int(fkv_task_id)])
+                    except Exception as exc:
+                        store_start["error"] = str(exc) or type(exc).__name__
                     self._log_cache_op(
                         context,
                         "complete",
@@ -1526,6 +1553,11 @@ class FlexKVConnector:
                     store_start,
                     channel=FlexKVScatterChannel.STORE_START,
                 )
+        if (int(store_start.get("task_id", -1)) >= 0
+                and (store_start.get("active") or store_start.get("error"))):
+            context.task_id = int(store_start["task_id"])
+            self._inflight_stores[rid] = context.task_id
+            self._inflight_store_contexts[rid] = context
         if store_start.get("rid") != rid:
             raise RuntimeError(
                 "[FlexKV] store-start rid mismatch: "
@@ -2142,6 +2174,9 @@ class FlexKVConnector:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] remote process shutdown: %s", exc)
             self._remote_process = None
+        tp_client = getattr(self, "tp_client", None)
+        if tp_client is not None:
+            tp_client.retire_gdr_owners()
         logger.info("[FlexKV] connector shutdown done %s", self._label)
 
     # ------------------------------------------------------------------
@@ -2696,7 +2731,10 @@ class FlexKVConnector:
             return None
         unmapped = (~mapped).nonzero(as_tuple=False)
         if unmapped.numel() > 0:
-            swa_indices = swa_indices[int(unmapped[-1].item()) + 1 :]
+            # Release builds cythonize with wraparound=False, under which
+            # ``unmapped[-1]`` is not wrapped; index the last row explicitly.
+            last = unmapped[unmapped.shape[0] - 1]
+            swa_indices = swa_indices[int(last.item()) + 1 :]
         if swa_indices.numel() == 0:
             return None
         if not bool((swa_indices > 0).all()):
@@ -2716,6 +2754,17 @@ class FlexKVConnector:
         if tensor.is_cuda:
             tensor = tensor.cpu()
         return tensor.to(torch.int64)
+
+    def _agree_cache_geometry(self, geometry: Any, label: str) -> str:
+        fingerprint = hashlib.sha256(
+            json.dumps(geometry, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        ).hexdigest()
+        value = int(fingerprint[:15], 16)
+        low = self._sync_ctx.all_reduce_min(value)
+        high = -self._sync_ctx.all_reduce_min(-value)
+        if low != high:
+            raise ValueError(f"FlexKV {label} differs across cache ranks")
+        return fingerprint
 
     def _store_profile_scope(self, name: str):
         if not getattr(self, "_profile_store_stages", False):

@@ -6,6 +6,7 @@ worker each; ``op.pool_id`` selects which. Layerwise (per-layer eventfd)
 delivery is a completion contract on this worker, not a separate class.
 """
 
+import os
 import time
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
@@ -217,6 +218,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                  layerwise_eventfd_socket: Optional[str] = None):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        from flexkv.common.gdr_config import worker_gdr_config
+        self._gdr_config = worker_gdr_config()
+        self._gdr_tensors = []
+        self._gdr_leases = []
+        self._gdr_producer_error = None
+        self._gdr_need_producer_fence = True
+        self._gdr_fence_ns = 0
         assert len(gpu_blocks) == tp_group_size
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         if completion is None:
@@ -370,8 +378,10 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             self._pools[PoolId.SWA] = swa_pool
 
         self._build_region_batch(cpu_kv_layout)
-
         self._compressor = compressor or NullCompressionStrategy()
+        if self._gdr_config["enabled"]:
+            from flexkv.transfer.gdr_runtime import configure_worker_gdr
+            configure_worker_gdr(self)
         # Before attach(): a compressor that transfers through the thread group
         # reads ``worker.tp_transfer_thread_group`` in attach() itself.
         self._materialize_thread_groups()
@@ -379,6 +389,20 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         self._init_completion(completion, layerwise_eventfd_socket,
                               tp_group_size)
         self._compressor.attach(self)
+
+    def _import_tensor_handles(self, handles):
+        tensors = super()._import_tensor_handles(handles)
+        if getattr(self, "_gdr_config", {}).get("enabled"):
+            self._gdr_tensors.extend(tensors)
+        return tensors
+
+    def shutdown(self) -> None:
+        if getattr(self, "_gdr_config", {}).get("enabled"):
+            from flexkv.transfer.gdr_runtime import close_worker_gdr
+            if not close_worker_gdr(self):
+                return
+            self._gdr_tensors.clear()
+        super().shutdown()
 
     def _ordered_pools(self) -> List["_Pool"]:
         """This worker's pools in PoolId order.
@@ -555,7 +579,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 range(len(specs), len(specs) + len(pool.regions)))
             specs.extend(pool.regions)
 
-        if not (GLOBAL_CONFIG_FROM_ENV.region_batch and region_batch_available()):
+        if not ((GLOBAL_CONFIG_FROM_ENV.region_batch or self._gdr_config["enabled"])
+                and region_batch_available()):
             return
         # Parsed once: the string -> enum mapping (and its degrade-to-sharded
         # warning) belongs at init, not on every transfer.
@@ -1000,6 +1025,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             thread_group.update_gpu_block_ptrs(gpu_block_ptrs_flat)
 
     def _control_suspend_gpu(self, payload: Any) -> int:
+        if getattr(self, "_gdr_config", {}).get("enabled"):
+            raise NotImplementedError("GPU hot remap is unsupported while GDR is enabled")
         if self.tp_group_transfer_groups is not None:
             raise NotImplementedError(
                 "GPU hot remap does not support multi-group KV layouts"
@@ -1035,6 +1062,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
     def _control_resume_gpu(
         self, gpu_blocks: List[List[TensorSharedHandle]]
     ) -> int:
+        if getattr(self, "_gdr_config", {}).get("enabled"):
+            raise NotImplementedError("GPU hot remap is unsupported while GDR is enabled")
         if self.gpu_blocks:
             raise RuntimeError("GPU blocks are already registered")
         counts = [len(handles) for handles in gpu_blocks]
@@ -1097,6 +1126,14 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 f"worker has no {pool_id.name} pool registered")
         return pool
 
+    def _whole_region_requests(self, pool, gpu_block_ids, cpu_block_ids,
+                               is_h2d, transfer_num_cta, use_ce_transfer):
+        return make_requests(
+            self.region_batch.num_regions, gpu_block_ids, cpu_block_ids, is_h2d,
+            transfer_num_cta=transfer_num_cta, use_ce_transfer=use_ce_transfer,
+            share_mode=self._rank_share_mode, region_indices=pool.region_indices,
+        )
+
     def _transfer_impl(self,
                        src_block_ids: torch.Tensor,
                        dst_block_ids: torch.Tensor,
@@ -1142,19 +1179,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             # block ids are read against the pool they belong to. share_mode is
             # what used to be TPTransferThreadGroup's job: with it carried per
             # request, the single-KV-head case no longer has to fall back.
-            self.region_batch.submit(
-                make_requests(
-                    self.region_batch.num_regions,
-                    gpu_block_id_list,
-                    cpu_block_id_list,
-                    transfer_type == TransferType.H2D,
-                    transfer_num_cta=transfer_num_cta,
-                    use_ce_transfer=use_ce_transfer,
-                    share_mode=self._rank_share_mode,
-                    region_indices=pool.region_indices,
-                ),
-                launch_sync,
+            requests = self._whole_region_requests(
+                pool, gpu_block_id_list, cpu_block_id_list,
+                transfer_type == TransferType.H2D, transfer_num_cta, use_ce_transfer,
             )
+            self.region_batch.submit(requests, launch_sync)
             if self._use_async_launch:
                 self.region_batch.wait_all_streams()
         elif self._is_per_group(pool):
@@ -1313,9 +1342,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         }
         start = int(layer_id or 0)
         if layer_granularity is None or int(layer_granularity) < 0:
-            end = self.num_layers
+            end = self._num_original_layers
         else:
-            end = min(start + int(layer_granularity), self.num_layers)
+            end = min(start + int(layer_granularity), self._num_original_layers)
         requests = []
         # strict: the two lists are built in lockstep, and a silent truncation
         # here would drop requests and hang the consumer on an unposted fd.
@@ -1377,7 +1406,19 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             transfer_op, transfer_size, start_time, end_time)
         return True
 
+    def _gdr_submit_regions(self, requests):
+        self.region_batch.submit(requests, True)
+
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        if getattr(self, "_gdr_config", {}).get("enabled"):
+            from flexkv.transfer.gdr_runtime import run_gdr_transfer
+            return run_gdr_transfer(self, transfer_op, self._launch_transfer_unbatched)
+        return self._launch_transfer_unbatched(transfer_op)
+
+    def _launch_transfer_unbatched(self, transfer_op: WorkerTransferOp) -> bool:
+        if getattr(self, "_gdr_config", {}).get("enabled"):
+            from flexkv.transfer.gdr_runtime import fence_worker_producers
+            fence_worker_producers(self, transfer_op)
         if isinstance(transfer_op, WorkerLayerwiseTransferOp):
             return self._launch_layerwise(transfer_op)
         # Keep the unified worker safe if a whole-op transfer is sent to a

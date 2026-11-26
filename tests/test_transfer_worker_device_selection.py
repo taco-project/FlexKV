@@ -27,7 +27,7 @@ def stop_at_first_host_registration(monkeypatch, events):
         lambda device: events.append(("set_device", device)),
     )
 
-    def register(_tensor):
+    def register(_tensor, align_bytes=0):
         events.append(("register", None))
         raise RegistrationStopped
 

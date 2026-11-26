@@ -22,7 +22,7 @@ import os
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import contextlib
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import numpy as np
 import torch
 
@@ -451,6 +451,12 @@ class TransferEngine:
         }
         for _pool in _gpu_cpu_pools:
             self._register_worker(_pool, TransferType.D2H, self.d2h_workers)
+        if _enable_layerwise:
+            # Synchronous (non-batch) GETs still emit plain H2D ops; serve them
+            # on the WHOLE-completion D2H worker instead of spawning another.
+            self.h2d_workers = self.d2h_workers
+            for _pool in _gpu_cpu_pools:
+                self._register_worker(_pool, TransferType.H2D, self.h2d_workers)
 
         if self._ssd_handle is not None and self._cpu_handle is not None:
             # GPU register may copy a Recsys identity group onto model_config.
@@ -801,8 +807,8 @@ class TransferEngine:
 
         # Startup assertions: verify layerwise mode worker map consistency
         if _enable_layerwise:
-            assert TransferType.H2D not in self._worker_map, \
-                "H2D worker should not exist in layerwise mode (fused into layerwise worker)"
+            assert self.h2d_workers is self.d2h_workers, \
+                "Synchronous H2D must reuse the existing WHOLE-completion GPU/CPU worker"
             # DISK2H deliberately *is* registered under layerwise: the SSD read
             # is hoisted out of the LAYERWISE op (see merge_to_batch_graph)
             # because the PER_LAYER worker has no SSD binding to fuse it into,

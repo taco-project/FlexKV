@@ -11,7 +11,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
-#include <nvtx3/nvToolsExt.h>
+#include "flexkv_nvtx.h"
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -44,6 +44,7 @@
 #include "dist/redis_meta_channel.h"
 #endif
 #include "monitoring/metrics_manager.h"
+#include "gdr/bindings.h"
 #include <deque>
 
 namespace py = pybind11;
@@ -661,7 +662,8 @@ PYBIND11_MODULE(c_ext, m) {
       .value("COPY_ENGINE", flexkv::TransferBackendKind::COPY_ENGINE)
       .value("GDS", flexkv::TransferBackendKind::GDS)
       .value("NIXL", flexkv::TransferBackendKind::NIXL)
-      .value("MOONCAKE", flexkv::TransferBackendKind::MOONCAKE);
+      .value("MOONCAKE", flexkv::TransferBackendKind::MOONCAKE)
+      .value("GDR", flexkv::TransferBackendKind::GDR);
 
   py::class_<flexkv::RegionDesc>(m, "RegionDesc")
       .def(py::init<>())
@@ -725,10 +727,11 @@ PYBIND11_MODULE(c_ext, m) {
                      &flexkv::RegionRequest::rank_share_mode)
       .def_readwrite("designated_rank",
                      &flexkv::RegionRequest::designated_rank)
+      .def_readwrite("h2d_rank", &flexkv::RegionRequest::h2d_rank)
       .def_readwrite("milestone_layer",
                      &flexkv::RegionRequest::milestone_layer);
 
-  py::class_<flexkv::RegionBatchGroup>(m, "RegionBatchGroup")
+  flexkv::gdr::bind(m)
       .def(py::init([](const std::vector<int64_t> &gpu_device_ids,
                        const std::vector<flexkv::RegionDesc> &regions,
                        int64_t ce_segment_threshold, bool ce_path_opt,

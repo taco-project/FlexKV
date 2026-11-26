@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable
 import multiprocessing as mp
 import copy
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import numpy as np
 
 from flexkv.prefetch.types import PrefetchCapabilities, PrefetchHandle, PrefetchOptions, PrefetchSnapshot
@@ -677,7 +677,8 @@ class KVTaskManager:
         if true_idx.size == 0:
             return
         start = int(true_idx[0])
-        orig_end = int(true_idx[-1]) + 1
+        # Explicit last index: release builds cythonize with wraparound=False.
+        orig_end = int(true_idx[true_idx.size - 1]) + 1
         tpb = self.cache_config.tokens_per_block
         end = min(start + num_success_blocks * tpb, orig_end, mask.shape[0])
         new_mask = np.zeros_like(mask, dtype=np.bool_)
@@ -1516,7 +1517,17 @@ class KVTaskEngine(KVTaskManager):
         self._update_tasks(timeout=0)
         if token_mask is None:
             token_mask = np.ones_like(token_ids, dtype=bool)
-        fake_slot_mapping = np.zeros_like(token_ids[token_mask])
+        if (
+            os.environ.get("FLEXKV_EXEC_EFFICIENCY_OPT", "1").strip().lower()
+            not in ("0", "false", "no", "off")
+            and getattr(token_mask, "ndim", 0) == 1
+            and token_mask.dtype == np.bool_
+            and token_ids.ndim == 1
+            and token_mask.shape == token_ids.shape
+        ):
+            fake_slot_mapping = np.zeros(np.count_nonzero(token_mask), dtype=token_ids.dtype)
+        else:
+            fake_slot_mapping = np.zeros_like(token_ids[token_mask])
         result_task_id, return_mask = self._get_match_impl(token_ids,
                                                            fake_slot_mapping,
                                                            is_fake_slot_mapping=True,
@@ -1730,6 +1741,35 @@ class KVTaskEngine(KVTaskManager):
         return batch_task_graph
 
     @on_runtime
+    def reject_launch(self, task_ids: List[int], batch_id: int, error: str) -> None:
+        """Publish pre-submit rejection without terminating an active writer."""
+        candidates = [batch_id] if batch_id >= 0 and batch_id in self.tasks else list(task_ids)
+        for task_id in candidates:
+            task = self.tasks.get(task_id)
+            if task is None or task.status not in (TaskStatus.UNREADY, TaskStatus.READY):
+                continue
+            flexkv_logger.error(f"[KVTaskEngine] launch of task {task_id} rejected: {error}")
+            if task.graph is None:
+                task.status = TaskStatus.FAILED
+                task.transfer_failed = True
+                task.shed_heavy_resources()
+                if hasattr(self, "_terminal_tasks"):
+                    self._terminal_tasks[task_id] = time.monotonic()
+                continue
+            task.transfer_failed = True
+            self._fail_task(task_id)
+        if (batch_id >= 0 and batch_id not in self.tasks and task_ids
+                and all(tid in self.tasks and self.tasks[tid].is_completed() for tid in task_ids)):
+            self.tasks[batch_id] = KVTask(
+                task_id=batch_id, task_type=TaskType.BATCH_GET,
+                task_end_op_id=-1, task_end_op_finished=True, status=TaskStatus.FAILED,
+                token_ids=None, slot_mapping=None, token_mask=None, graph=None,
+                return_mask=None, callback=None, op_callback_dict={}, transfer_failed=True,
+            )
+            if hasattr(self, "_terminal_tasks"):
+                self._terminal_tasks[batch_id] = time.monotonic()
+
+    @on_runtime
     def launch_tasks(self,
                     task_ids: List[int],
                     slot_mappings: List[np.ndarray],
@@ -1738,47 +1778,69 @@ class KVTaskEngine(KVTaskManager):
                     batch_id: int = -1,
                     layerwise_transfer: bool = False,
                     counter_id: int = 0) -> List[int]:
-        assert isinstance(slot_mappings[0], np.ndarray)
-        # trace launch tasks
+        if (not task_ids or len(slot_mappings) != len(task_ids)
+                or (swa_slot_mappings is not None and len(swa_slot_mappings) != len(task_ids))):
+            raise ValueError("Every launch task requires a corresponding slot mapping")
+        if len(set(task_ids)) != len(task_ids):
+            raise ValueError("Duplicate launch task IDs")
+        if not all(isinstance(mapping, np.ndarray) for mapping in slot_mappings):
+            raise TypeError("Launch slot mappings must be numpy arrays")
+        if batch_id >= 0 and batch_id in self.tasks:
+            raise ValueError("Launch batch ID already exists")
         self.tracer.trace_launch_tasks(task_ids, slot_mappings, as_batch)
         self.set_slot_mappings(task_ids, slot_mappings, swa_slot_mappings)
+        for tid in task_ids:
+            task = self.tasks[tid]
+            if not task.is_completed() and task.status != TaskStatus.READY:
+                raise ValueError(f"Task {tid} status is {task.status}, cannot launch")
 
-        # Batch optimization: collect all transfer graphs first
         nvtx_range = nvtx.start_range(message=f"KVTaskEngine.launch_tasks batch={len(task_ids)}", color="blue")
+        ready_tasks = {tid: self.tasks[tid] for tid in task_ids if self.tasks[tid].status == TaskStatus.READY}
+        try:
+            try:
+                all_get = all(self.tasks[tid].task_type == TaskType.GET for tid in task_ids)
+                all_put = all(self.tasks[tid].task_type == TaskType.PUT for tid in task_ids)
+                if (len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put):
+                    if batch_id == -1:
+                        batch_id = self._gen_task_id()
+                    if layerwise_transfer:
+                        if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+                            flexkv_logger.warning("layerwise transfer is not enabled")
+                            layerwise_transfer = False
+                        elif not all_get:
+                            flexkv_logger.warning("only support layerwise get")
+                            layerwise_transfer = False
+                    batch_task_type = TaskType.BATCH_GET if all_get else TaskType.BATCH_PUT
+                    batch_task_graph = self.merge_to_batch_kvtask(
+                        batch_id, task_ids, batch_task_type, layerwise_transfer, counter_id
+                    )
+                    transfer_graphs = [batch_task_graph]
+                    self.tasks[batch_id].status = TaskStatus.RUNNING
+                    task_ids = [batch_id]
+                else:
+                    transfer_graphs = []
+                    for task_id in task_ids:
+                        transfer_graph = self.check_task_ready(task_id)
+                        if transfer_graph is not None and transfer_graph.num_ops > 0:
+                            transfer_graphs.append(transfer_graph)
+            except Exception:
+                # No handle has received a graph yet. Undo only readiness transitions.
+                for tid, task in ready_tasks.items():
+                    if self.tasks.get(tid) is task and task.status == TaskStatus.RUNNING:
+                        task.status = TaskStatus.READY
+                if batch_id >= 0 and batch_id in self.tasks:
+                    task = self.tasks[batch_id]
+                    if task.status == TaskStatus.RUNNING:
+                        task.status = TaskStatus.READY
+                raise
 
-        all_get = all(self.tasks[tid].task_type == TaskType.GET for tid in task_ids)
-        all_put = all(self.tasks[tid].task_type == TaskType.PUT for tid in task_ids)
-        if (len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put):
-            if batch_id == -1:
-                batch_id = self._gen_task_id()
-            if layerwise_transfer:
-                if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
-                    flexkv_logger.warning("layerwise transfer is not enabled")
-                    layerwise_transfer = False
-                elif not all_get:
-                    flexkv_logger.warning("only support layerwise get")
-                    layerwise_transfer = False
-            batch_task_type = TaskType.BATCH_GET if all_get else TaskType.BATCH_PUT
-            batch_task_graph = self.merge_to_batch_kvtask(
-                batch_id, task_ids, batch_task_type, layerwise_transfer, counter_id
-            )
-            transfer_graphs = [batch_task_graph]
-            self.tasks[batch_id].status = TaskStatus.RUNNING
-            task_ids = [batch_id]
-        else:
-            transfer_graphs = []
-            for task_id in task_ids:
-                transfer_graph = self.check_task_ready(task_id)
-                if transfer_graph is not None and transfer_graph.num_ops > 0:
-                    transfer_graphs.append(transfer_graph)
-
-        # Submit all graphs in batch to reduce IPC overhead
-        if transfer_graphs:
-            for transfer_handle in self.transfer_handles:
-                transfer_handle.submit_batch(transfer_graphs)
-
-        nvtx.end_range(nvtx_range)
-        return task_ids
+            # After any submit attempt, only normal graph completion may release resources.
+            if transfer_graphs:
+                for transfer_handle in self.transfer_handles:
+                    transfer_handle.submit_batch(transfer_graphs)
+            return task_ids
+        finally:
+            nvtx.end_range(nvtx_range)
 
     @on_runtime
     def cancel_tasks(self, task_ids: Union[int, List[int]]) -> None:

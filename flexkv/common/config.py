@@ -13,6 +13,7 @@ import torch
 from flexkv.common.storage import (
     KVCacheLayout, KVCacheLayoutType, align_host_block_bytes)
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.platform import apply_non_kernel_stack_env_presets
 
 
 def assert_mooncake_prefetch_ready(cache_config, prefetch_enabled: bool) -> None:
@@ -849,6 +850,8 @@ class CacheConfig:
             f", num_ssd_blocks={self.num_ssd_blocks})"
         )
 
+apply_non_kernel_stack_env_presets()
+
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
     instance_num=int(os.getenv('FLEXKV_INSTANCE_NUM', 1)),
@@ -1043,8 +1046,11 @@ class UserConfig:
     prefetch_max_reserved_bytes: int = 512 * 1024 * 1024
     prefetch_max_pinned_bytes: int = 2 * 1024 * 1024 * 1024
     prefetch_result_ttl_s: float = 60.0
+    gdr: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        from flexkv.common.gdr_config import parse_gdr_config
+        self.gdr = parse_gdr_config(self.gdr)
         if self.cpu_cache_gb <= 0:
             raise ValueError(f"Invalid cpu_cache_gb: {self.cpu_cache_gb}")
         if self.ssd_cache_gb < 0:
@@ -1103,6 +1109,7 @@ def load_user_config_from_file(config_file: str) -> UserConfig:
 def load_user_config_from_env() -> UserConfig:
     swa_multi_group_env = os.getenv('FLEXKV_SWA_MULTI_GROUP')
     return UserConfig(
+        gdr=json.loads(os.getenv('FLEXKV_GDR_CONFIG', '{}')),
         enable_chunked_prefetch=bool(int(os.getenv('FLEXKV_ENABLE_CHUNKED_PREFETCH', 0))),
         prefetch_options=json.loads(os.getenv('FLEXKV_PREFETCH_OPTIONS', '{}')),
         prefetch_max_sessions=int(os.getenv('FLEXKV_PREFETCH_MAX_SESSIONS', 128)),
@@ -1410,6 +1417,19 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     if user_config.node_ttl_seconds is not None:
         cache_config.node_ttl_seconds = user_config.node_ttl_seconds
 
+    # These switches must agree across process boundaries: the connector runs
+    # here, but TransferEngine lives in a spawned TransferManager/server process
+    # whose GLOBAL_CONFIG_FROM_ENV is rebuilt from the environment alone, and
+    # SGLang reads FLEXKV_ENABLE_LAYERWISE_TRANSFER directly. A config-file value
+    # is therefore written back to the environment; an explicitly set
+    # environment variable stays authoritative.
+    env_synced_switches = {
+        'enable_layerwise_transfer': (
+            'FLEXKV_ENABLE_LAYERWISE_TRANSFER', lambda raw: bool(int(raw))),
+        'region_batch': (
+            'FLEXKV_REGION_BATCH', lambda raw: raw not in ('0', 'false', 'False')),
+    }
+
     global_config_attrs = set(vars(GLOBAL_CONFIG_FROM_ENV).keys())
     for attr_name in dir(user_config):
         if attr_name.startswith('override_'):
@@ -1436,6 +1456,20 @@ def update_default_config_from_user_config(rank_info: RankInfo,
                 except (ValueError, TypeError) as e:
                     raise ValueError(f"Cannot convert config value '{attr_value}' to type {original_type.__name__} "
                                     f"for config '{global_attr_name}': {e}") from e
+
+                if global_attr_name in env_synced_switches:
+                    env_name, parse_env = env_synced_switches[global_attr_name]
+                    env_raw = os.environ.get(env_name)
+                    if env_raw is not None:
+                        env_value = parse_env(env_raw)
+                        setattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name, env_value)
+                        if env_value != attr_value:
+                            flexkv_logger.warning(
+                                f"Config file sets '{global_attr_name}'={attr_value!r} but "
+                                f"{env_name}={env_raw!r} is explicitly set; using the "
+                                f"environment value {env_value!r}.")
+                        continue
+                    os.environ[env_name] = '1' if attr_value else '0'
 
                 setattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name, attr_value)
                 flexkv_logger.info(f"Override environment variable: {'FLEXKV_' + global_attr_name.upper()} "

@@ -23,7 +23,7 @@ from abc import ABC, abstractmethod
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import torch
 from torch.multiprocessing import Queue as MPQueue
 
@@ -684,6 +684,15 @@ class TransferWorkerBase(ABC):
                     if not isinstance(op, dict):
                         op._received_ns = time.perf_counter_ns()
                     batch_ops.append(op)
+                if getattr(self, "_gdr_config", {}).get("enabled"):
+                    # Re-arm here: one owner producer fence then covers every
+                    # op of this drained batch (see gdr_runtime.maybe_fence_d2h).
+                    self._gdr_need_producer_fence = True
+                    from flexkv.transfer.gdr_batch import prepare_batch
+                    try:
+                        prepare_batch(self, batch_ops)
+                    except Exception:
+                        flexkv_logger.warning("GDR coalescing unavailable before DMA", exc_info=True)
                 for op in batch_ops:
                     if isinstance(op, dict) and op.get("type") == "control":
                         self._reply_control(op)

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 import threading
 import time
 from functools import partial, wraps
@@ -22,7 +23,7 @@ from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field, replace
 
 import numpy as np
-import nvtx
+from flexkv.common import nvtx_compat as nvtx
 import torch
 from flexkv.c_ext import CRadixNode, CRadixTreeIndex, CMatchResult
 from flexkv.cache.hie_cache_engine import HierarchyLRCacheEngine
@@ -1402,7 +1403,7 @@ class GlobalCacheEngine:
             dp_client_id=dp_client_id,
             staged_predecessors=skip_ops,
         )
-        return transfer_graph, h2d_ops[-1].op_id, cpu_blocks
+        return transfer_graph, h2d_ops[len(h2d_ops) - 1].op_id, cpu_blocks
 
     @staticmethod
     def _build_get_h2d_ops(transfer_graph: TransferOpGraph,
@@ -1570,11 +1571,11 @@ class GlobalCacheEngine:
 
         fragment123_gpu_blocks = gpu_block_ids[:fragment123_num_blocks]
         fragment123_cpu_blocks = cpu_matched_blocks
-        fragment2_ssd_blocks = ssd_matched_blocks[-fragment2_num_blocks:]
-        fragment3_remote_blocks = remote_matched_blocks[-fragment3_num_blocks:]
+        fragment2_ssd_blocks = ssd_matched_blocks[len(ssd_matched_blocks) - fragment2_num_blocks:]
+        fragment3_remote_blocks = remote_matched_blocks[len(remote_matched_blocks) - fragment3_num_blocks:]
         fragment3_remote_file_nodeids = None
         if shared_pcfs_read:
-            fragment3_remote_file_nodeids = remote_file_nodeids[-fragment3_num_blocks:]
+            fragment3_remote_file_nodeids = remote_file_nodeids[len(remote_file_nodeids) - fragment3_num_blocks:]
         # Matched nodes are the sources of this graph's reads; pin them for the
         # lifetime of the plan so eviction cannot recycle blocks under it.
         cpu_node_to_unlock = cpu_matched_result.last_node
@@ -1653,7 +1654,7 @@ class GlobalCacheEngine:
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.REMOTE2H,
                 src_block_ids = fragment3_remote_blocks,
-                dst_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
+                dst_block_ids = fragment123_cpu_blocks[len(fragment123_cpu_blocks) - fragment3_num_blocks:],
                 src_block_node_ids = fragment3_remote_file_nodeids,
                 dp_client_id = dp_client_id,
                 mooncake_store_block_hashes = mooncake_block_hashes,
@@ -1680,7 +1681,7 @@ class GlobalCacheEngine:
                 op_h2disk = TransferOp(
                     graph_id = transfer_graph.graph_id,
                     transfer_type = TransferType.H2DISK,
-                    src_block_ids = fragment123_cpu_blocks[-fragment3_num_blocks:],
+                    src_block_ids = fragment123_cpu_blocks[len(fragment123_cpu_blocks) - fragment3_num_blocks:],
                     dst_block_ids = fragment3_ssd_blocks,
                     dp_client_id = dp_client_id,
                 )
@@ -1951,7 +1952,7 @@ class GlobalCacheEngine:
         deferred_inserts: List[DeferredCacheInsert] = []
 
         fragment12_gpu_blocks = gpu_block_ids[:fragment12_num_blocks]
-        fragment2_ssd_blocks = ssd_matched_blocks[-fragment2_num_blocks:]
+        fragment2_ssd_blocks = ssd_matched_blocks[len(ssd_matched_blocks) - fragment2_num_blocks:]
         fragment1_cpu_blocks = cpu_matched_blocks[:fragment1_num_blocks]
 
         # Matched nodes are this graph's read sources; pin them for its lifetime.
@@ -2006,7 +2007,7 @@ class GlobalCacheEngine:
                 self._metrics_collector.record_cache_miss(miss_blocks)
 
         if cpu_matched_result.matched_pos == "remote" and fragment1_num_blocks > 0:
-            fragment1_cpu_blocks_local = allocated_cpu_blocks[-fragment1_num_blocks:]
+            fragment1_cpu_blocks_local = allocated_cpu_blocks[len(allocated_cpu_blocks) - fragment1_num_blocks:]
             op_peerh2h = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.PEERH2H,
@@ -2042,7 +2043,7 @@ class GlobalCacheEngine:
                     graph_id = transfer_graph.graph_id,
                     transfer_type = TransferType.DISK2D,
                     src_block_ids = fragment2_ssd_blocks,
-                    dst_block_ids = fragment12_gpu_blocks[-fragment2_num_blocks:],
+                    dst_block_ids = fragment12_gpu_blocks[len(fragment12_gpu_blocks) - fragment2_num_blocks:],
                     dp_client_id = dp_client_id,
                 )
                 transfer_graph.add_transfer_op(op_gds_transfer)
@@ -2413,10 +2414,10 @@ class GlobalCacheEngine:
         if put_to_ssd:
             if len(fragment12_cpu_blocks) < fragment2_num_blocks:
                 num_needed_from_cpu_matched = fragment2_num_blocks - len(fragment12_cpu_blocks)
-                fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[-num_needed_from_cpu_matched:], \
+                fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[len(cpu_matched_blocks) - num_needed_from_cpu_matched:], \
                     fragment12_cpu_blocks])
             else:
-                fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
+                fragment2_cpu_blocks = fragment12_cpu_blocks[len(fragment12_cpu_blocks) - fragment2_num_blocks:]
             op_h2disk = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2DISK,
@@ -2433,10 +2434,11 @@ class GlobalCacheEngine:
         if put_to_remote:
             if fragment3_num_blocks > fragment12_num_blocks:
                 extra_num_cpu_blocks = fragment3_num_blocks - fragment12_num_blocks
-                fragment3_cpu_blocks = np.concatenate([cpu_matched_blocks[-extra_num_cpu_blocks:],
-                                                       fragment12_cpu_blocks])
+                fragment3_cpu_blocks = np.concatenate([
+                    cpu_matched_blocks[len(cpu_matched_blocks) - extra_num_cpu_blocks:],
+                    fragment12_cpu_blocks])
             else:
-                fragment3_cpu_blocks = fragment12_cpu_blocks[-fragment3_num_blocks:]
+                fragment3_cpu_blocks = fragment12_cpu_blocks[len(fragment12_cpu_blocks) - fragment3_num_blocks:]
             mooncake_block_hashes = None
             if self.use_mooncake_store_backend:
                 mooncake_block_hashes = sequence_meta.block_hashes[
@@ -2729,10 +2731,10 @@ class GlobalCacheEngine:
                                       f"cpu match blocks are bigger than SSD match blocks number. "
                                       f"This should not often happen if CPU cache size is smaller than SSD cache size.")
                 num_needed_from_cpu_matched = fragment2_num_blocks - len(fragment12_cpu_blocks)
-                fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[-num_needed_from_cpu_matched:], \
+                fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[len(cpu_matched_blocks) - num_needed_from_cpu_matched:], \
                     fragment12_cpu_blocks])
             else:
-                fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
+                fragment2_cpu_blocks = fragment12_cpu_blocks[len(fragment12_cpu_blocks) - fragment2_num_blocks:]
             op_h2disk = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2DISK,
@@ -3665,9 +3667,20 @@ class GlobalCacheEngine:
 
     def _get_block_range(self,
                          token_mask: np.ndarray) -> Tuple[int, int]:
+        if (
+            os.environ.get("FLEXKV_EXEC_EFFICIENCY_OPT", "1").strip().lower()
+            not in ("0", "false", "no", "off")
+            and token_mask.dtype == np.bool_
+            and token_mask.ndim == 1
+            and token_mask.size >= 1024
+            and token_mask.flags.c_contiguous
+            and token_mask[token_mask.size - 1]
+        ):
+            start_idx = int(np.argmax(token_mask)) // self.tokens_per_block
+            return start_idx, (token_mask.size - 1) // self.tokens_per_block + 1
         mask_idx = np.where(token_mask)[0]
         if len(mask_idx) == 0:
             return 0, 0
         start_idx = mask_idx[0].item() // self.tokens_per_block
-        end_idx = mask_idx[-1].item() // self.tokens_per_block
+        end_idx = mask_idx[len(mask_idx) - 1].item() // self.tokens_per_block
         return start_idx, end_idx + 1
