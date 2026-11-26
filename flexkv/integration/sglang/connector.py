@@ -2636,12 +2636,33 @@ class FlexKVConnector:
             )
         return specs
 
+    def _standard_kv_geometry(
+        self, kv_caches: List[torch.Tensor]
+    ) -> Tuple[int, int, int]:
+        tensor = kv_caches[0]
+        if tensor.ndim == 3:
+            num_tokens, num_heads, head_size = tensor.shape
+            return num_tokens // self.page_size, num_heads, head_size
+        if tensor.ndim != 4:
+            raise ValueError(
+                f"Expected 3D token-major or 4D page-major KV cache, got {tuple(tensor.shape)}"
+            )
+        num_pages, num_heads, page_size, head_size = tensor.shape
+        if page_size != self.page_size:
+            raise ValueError(
+                f"4D KV page axis {page_size} does not match page_size={self.page_size}"
+            )
+        for buffer in kv_caches:
+            if buffer.shape != tensor.shape or not buffer.is_contiguous():
+                raise ValueError("4D KV buffers must have identical shapes and be contiguous")
+        return num_pages, num_heads, head_size
+
     def _build_indexer_layer_group_specs(
         self,
         kv_caches: List[torch.Tensor],
         indexer_group: _IndexerBufferGroup,
     ) -> List[LayerGroupSpec]:
-        _, num_kv_heads, head_size = kv_caches[0].shape
+        _, num_kv_heads, head_size = self._standard_kv_geometry(kv_caches)
         if indexer_group.logical_layer_count != self.rank_info.num_layers_per_pp_stage:
             raise RuntimeError(
                 "FlexKV indexer logical layer count mismatch: "
@@ -2830,12 +2851,8 @@ class FlexKVConnector:
         kv_caches: List[torch.Tensor],
         indexer_group: Optional[_IndexerBufferGroup] = None,
     ) -> None:
-        assert (
-            kv_caches[0].ndim == 3
-        ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
-
         kv_dim = self.model_config.kv_dim
-        num_blocks, physical_num_kv_heads, head_size = kv_caches[0].shape
+        num_blocks, physical_num_kv_heads, head_size = self._standard_kv_geometry(kv_caches)
         global_num_kv_heads = self.model_config.num_kv_heads
         # FlexKV uses num_kv_heads == 1 for KV shared across all TP ranks.
         # TODO: represent partial KV-head replication when 1 < global heads < TP.
@@ -2843,7 +2860,7 @@ class FlexKVConnector:
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
             num_layer=self.rank_info.num_layers_per_pp_stage,
-            num_block=num_blocks // self.page_size,
+            num_block=num_blocks,
             tokens_per_block=self.page_size,
             num_head=physical_num_kv_heads,
             head_size=head_size,
