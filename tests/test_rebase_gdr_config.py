@@ -750,16 +750,16 @@ def _apply_overrides():
 SWITCH_ENV = ("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "FLEXKV_REGION_BATCH")
 
 
-def test_config_file_switches_are_written_back_for_spawned_processes(monkeypatch):
+def test_only_region_config_is_written_back_for_spawned_processes(monkeypatch):
     import os
     for name in (*SWITCH_ENV, "FLEXKV_USE_CE_TRANSFER_H2D"):
         monkeypatch.delenv(name, raising=False)
     apply, global_config, logger = _apply_overrides()
     apply(SimpleNamespace(override_enable_layerwise_transfer=True, override_region_batch=False,
                           override_use_ce_transfer_h2d=True))
-    assert global_config.enable_layerwise_transfer is True
+    assert global_config.enable_layerwise_transfer is False
     assert global_config.region_batch is False
-    assert os.environ["FLEXKV_ENABLE_LAYERWISE_TRANSFER"] == "1"
+    assert "FLEXKV_ENABLE_LAYERWISE_TRANSFER" not in os.environ
     assert os.environ["FLEXKV_REGION_BATCH"] == "0"
     # Other overrides keep the original in-process-only behaviour.
     assert global_config.use_ce_transfer_h2d is True
@@ -785,9 +785,10 @@ def test_explicit_env_wins_over_conflicting_config_file_with_warning(
     assert os.environ["FLEXKV_ENABLE_LAYERWISE_TRANSFER"] == env_layerwise
     assert os.environ["FLEXKV_REGION_BATCH"] == env_region
     messages = [call.args[0] for call in logger.warning.call_args_list]
-    assert len(messages) == 2
-    assert any("FLEXKV_ENABLE_LAYERWISE_TRANSFER" in m for m in messages)
-    assert any("FLEXKV_REGION_BATCH" in m for m in messages)
+    assert len(messages) == 1
+    assert "FLEXKV_REGION_BATCH" in messages[0]
+    assert any("controlled solely by FLEXKV_ENABLE_LAYERWISE_TRANSFER" in call.args[0]
+               for call in logger.info.call_args_list)
 
 
 def test_explicit_env_matching_config_file_is_silent(monkeypatch):
@@ -798,3 +799,17 @@ def test_explicit_env_matching_config_file_is_silent(monkeypatch):
     assert global_config.enable_layerwise_transfer is True
     assert global_config.region_batch is False
     logger.warning.assert_not_called()
+
+
+@pytest.mark.parametrize("env_value", [None, "0", "1"])
+@pytest.mark.parametrize("file_value", [True, False, "invalid", object()])
+def test_layerwise_is_env_only_even_for_invalid_file_values(monkeypatch, env_value, file_value):
+    import os
+    if env_value is None:
+        monkeypatch.delenv("FLEXKV_ENABLE_LAYERWISE_TRANSFER", raising=False)
+    else:
+        monkeypatch.setenv("FLEXKV_ENABLE_LAYERWISE_TRANSFER", env_value)
+    apply, global_config, logger = _apply_overrides()
+    apply(SimpleNamespace(override_enable_layerwise_transfer=file_value))
+    assert global_config.enable_layerwise_transfer is (env_value == "1")
+    assert os.environ.get("FLEXKV_ENABLE_LAYERWISE_TRANSFER") == env_value

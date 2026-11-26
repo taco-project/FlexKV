@@ -27,8 +27,8 @@
 #   强制 CE 对比：将两方向 path 改为 ce。
 # CE-only 构建不支持 kernel；本示例不使用 kernel 路径。
 
-cpu_cache_gb: 280                  # 示例 Host KV 容量；按模型和机器内存调整。
-mooncake_max_mr_size_bytes: 68719476736  # 单次 Mooncake MR 注册上限设为 64 GiB，避免 280 GiB 单块超大 MR。
+cpu_cache_gb: 480                  # 示例 Host KV 容量；按模型和机器内存调整。
+mooncake_max_mr_size_bytes: 68719476736  # 单次 Mooncake MR 注册上限设为 64 GiB，避免 480 GiB 单块超大 MR。
 mooncake_mr_split_policy: block_boundary # 按完整 KV Block 边界切分多个 MR，防止单个块跨 MR 边界报错。
 # region_batch：把一次搬运涉及的多个 KV region（如主 KV、SWA、indexer）
 # 统一交给 C++ RegionBatchGroup 调度，减少 Python 逐组调用和重复 rank 分发。

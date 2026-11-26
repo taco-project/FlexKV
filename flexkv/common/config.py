@@ -1417,12 +1417,9 @@ def update_default_config_from_user_config(rank_info: RankInfo,
     if user_config.node_ttl_seconds is not None:
         cache_config.node_ttl_seconds = user_config.node_ttl_seconds
 
-    # These switches must agree across process boundaries: the connector runs
-    # here, but TransferEngine lives in a spawned TransferManager/server process
-    # whose GLOBAL_CONFIG_FROM_ENV is rebuilt from the environment alone, and
-    # SGLang reads FLEXKV_ENABLE_LAYERWISE_TRANSFER directly. A config-file value
-    # is therefore written back to the environment; an explicitly set
-    # environment variable stays authoritative.
+
+    # Layerwise is env-only so the connector and spawned engine agree.
+    # Region batching still permits a config-file default, published to spawn.
     env_synced_switches = {
         'enable_layerwise_transfer': (
             'FLEXKV_ENABLE_LAYERWISE_TRANSFER', lambda raw: bool(int(raw))),
@@ -1436,6 +1433,14 @@ def update_default_config_from_user_config(rank_info: RankInfo,
             global_attr_name = attr_name[9:]  # len('override_') = 9
             if global_attr_name in global_config_attrs:
                 attr_value = getattr(user_config, attr_name)
+                if global_attr_name == 'enable_layerwise_transfer':
+                    env_name, parse_env = env_synced_switches[global_attr_name]
+                    env_value = parse_env(os.environ.get(env_name, '0'))
+                    setattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name, env_value)
+                    flexkv_logger.info(
+                        f"Ignoring config-file value for '{global_attr_name}' "
+                        f"({attr_value!r}); controlled solely by {env_name} (={env_value!r}).")
+                    continue
                 original_value = getattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name)
 
                 original_type = type(original_value)

@@ -173,6 +173,20 @@ def test_allocator_config_is_kept_and_expandable_segments_warns(
     assert bool([r for r in caplog.records if "expandable_segments" in r.getMessage()]) == warns
 
 
+def test_layerwise_switch_is_env_only_and_cp_stays_excluded():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    config = (root / "flexkv/common/config.py").read_text()
+    connector = (root / "flexkv/integration/sglang/connector.py").read_text()
+    assert "'FLEXKV_ENABLE_LAYERWISE_TRANSFER', lambda raw: bool(int(raw))" in config
+    assert config.index("if global_attr_name in env_synced_switches") < config.index(
+        "setattr(GLOBAL_CONFIG_FROM_ENV, global_attr_name, attr_value)")
+    assert "self.enable_layerwise = bool(GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer)" in connector
+    assert connector.count("self._agree_cache_geometry(") == 1
+    for parameter in ("layer_split_plan", "indexer_layer_ids", "draft_kvcache"):
+        assert parameter not in connector
+
+
 @pytest.mark.parametrize("kernel_transfer,nvtx_flag,expected", [(True, None, True), (False, None, False),
                                                       (True, "0", False), (False, "1", True)])
 def test_nvtx_preserves_default_api_and_explicit_overrides(monkeypatch, kernel_transfer, nvtx_flag, expected):
