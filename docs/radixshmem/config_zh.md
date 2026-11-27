@@ -79,7 +79,7 @@ server 的规划：`swa_slots = floor(swa_ratio × data_bytes / swa_stride)`，`
 radixshmem 的安装与传输后端（NIXL / Mooncake）构建见 radixshmem 仓库 `README.md`：
 
 ```bash
-cd radixshmem/python && pip install -e .
+cd radixshmem && pip install -e .
 ```
 
 每个节点运行一个 `radix-server`，它管理 `--data-bytes` 字节的主机内存，slot 大小由 FlexKV 交给它的几何决定。

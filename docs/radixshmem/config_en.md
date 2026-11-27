@@ -75,7 +75,7 @@ Follow the radixshmem repository for installation and building Mooncake or NIXL
 backends. For an editable Python installation:
 
 ```bash
-cd radixshmem/python && pip install -e .
+cd radixshmem && pip install -e .
 ```
 
 Start one `radix-server` on each node. Supply `--name` explicitly: radix-server's

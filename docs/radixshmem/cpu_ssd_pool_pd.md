@@ -66,8 +66,10 @@ Use the same NIXL / Mooncake / UCX versions on all nodes.
   (`FLEXKV_PEER_SSD_MANIFEST_DIR`), e.g. on NFS. Each node writes small JSON files there at startup and peers read
   them to find its SSD files and NIXL endpoint. Without a shared filesystem, sync the directory between nodes.
 - Clocks synchronized (NTP): NIXL requests carry deadlines.
-- Build radixshmem (`cd radixshmem/python && pip install -e .`, see its README for RDMA, gRPC and Mooncake
-  dependencies) and FlexKV (`pip install -e .` in this repo; it needs a C++20 compiler).
+- Build radixshmem (`pip install -e .` at its repository root, see its README for RDMA, gRPC and Mooncake
+  dependencies) and FlexKV (`pip install -e .` in this repo; it needs a C++20 compiler). For KV events to the dynamo
+  router (4.7), install radixshmem with `pip install -e ".[kv-events]"` (adds pyzmq and msgpack): a radix-server
+  started with `--kv-events-endpoint` fails at start-up without them.
 
 ## 4. Deployment
 
@@ -205,7 +207,7 @@ DP ranks on every node. Each rank serves its own NIXL peer-SSD endpoint: rank k 
 `python -m dynamo.frontend`.
 
 ```bash
-# CPU-pool radix-server with --kv-events-endpoint 'tcp://*:5691' (4.2)
+# CPU-pool radix-server with --kv-events-endpoint 'tcp://*:5691' (4.2); radixshmem installed with the [kv-events] extra (pyzmq, msgpack; section 3)
 
 # environment of every dynamo.sglang worker
 export FLEXKV_HASH_SCHEME=sglang-sha256-i64-v1                  # FlexKV names blocks by SGLang's page hashes, which the router recomputes

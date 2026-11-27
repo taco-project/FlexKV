@@ -61,8 +61,9 @@ FlexKV 日志里的传输类型：`H2D`/`D2H`（GPU 与本地 CPU）、`H2DISK`/
   每个节点启动时在里面写几个小 JSON 文件，对端靠它们找到本节点的 SSD 文件和 NIXL 端点。没有共享文件系统时，需要在节点
   之间同步这个目录。
 - 时钟同步（NTP）：NIXL 请求带截止时间。
-- 编译 radixshmem（`cd radixshmem/python && pip install -e .`，RDMA、gRPC、Mooncake 依赖见其 README）和 FlexKV
-  （本仓库 `pip install -e .`，需要 C++20 编译器）。
+- 编译 radixshmem（在仓库根目录 `pip install -e .`，RDMA、gRPC、Mooncake 依赖见其 README）和 FlexKV
+  （本仓库 `pip install -e .`，需要 C++20 编译器）。要给 dynamo 路由上报 KV 事件（4.7）时，radixshmem 改装
+  `pip install -e ".[kv-events]"`（带上 pyzmq 和 msgpack）：radix-server 带 `--kv-events-endpoint` 时缺这两个包会在启动时直接报错。
 
 ## 4. 部署
 
@@ -196,7 +197,7 @@ python3 -m sglang.launch_server --model-path /models/DeepSeek-V4.1 --trust-remot
 **KV 事件路由**：需要 dynamo 分支，用 `python -m dynamo.sglang` 起 worker、`python -m dynamo.frontend` 起路由。
 
 ```bash
-# CPU 池 radix-server 加 --kv-events-endpoint 'tcp://*:5691'（4.2）
+# CPU 池 radix-server 加 --kv-events-endpoint 'tcp://*:5691'（4.2）；radixshmem 需装 [kv-events] extra（pyzmq、msgpack，第 3 节）
 
 # 每个 dynamo.sglang worker 的环境变量
 export FLEXKV_HASH_SCHEME=sglang-sha256-i64-v1                  # FlexKV 用 SGLang 的页哈希给块命名，路由才能算出同样的 key
