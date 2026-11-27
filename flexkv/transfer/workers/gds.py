@@ -309,7 +309,8 @@ class GDSTransferWorker(TransferWorkerBase):
                     grp_tensors = [h.get_tensor() for h in grp_handles]
                     self._multi_group_gpu_blocks_keepalive.append(grp_tensors)
                     tensors_per_device.append(
-                        grp_tensors[0] if len(grp_tensors) > 1 else None)
+                        grp_tensors[0]
+                        if len(grp_tensors) > 1 or g.num_layers == 1 else None)
                     for t in grp_tensors:
                         gpu_ptrs_flat.append(t.data_ptr())
                     if num_tensors is None:

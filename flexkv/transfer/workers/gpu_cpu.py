@@ -778,14 +778,16 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
             # Per-group GPU strides: compute from the actual tensor to handle
             # different attention backend layouts (flash_attn vs
-            # triton/flashinfer).  A GPU that exposes a single tensor carries no
-            # recoverable per-layer dim, so its stride is left to the layout.
+            # triton/flashinfer).  A GPU that exposes a single tensor for a
+            # multi-layer group carries no recoverable per-layer dim, so its
+            # stride is left to the layout.
             group_gpu_layouts = gpu_layouts_per_group[gi]  # one layout per GPU
             gpu_regions = compile_gpu_regions(
                 [g], [group_gpu_layouts], tpb, self.kv_dim, dtype,
                 tensors_per_group_device=[[
                     (imported_group_blocks[i][0]
-                     if len(imported_group_blocks[i]) > 1 else None)
+                     if len(imported_group_blocks[i]) > 1 or g.num_layers == 1
+                     else None)
                     for i in range(len(group_gpu_layouts))
                 ]],
             )
@@ -911,10 +913,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 # stretch at rank*cpu_tp_stride"; ==1 means "every rank holds
                 # identical bytes, so the rank-share modes get to divide the
                 # write up". Which one is right is decided by how the CPU block
-                # was allocated, and KVCacheLayout._compute_kv_shape multiplies
-                # the summed group spans by tp_size for *every* group -- so a
-                # 1-head indexer or state sidecar still has one private slot per
-                # rank. Passing g.num_kv_heads here would send those groups down
+                # was allocated, and when the pool's KV heads are split across
+                # ranks KVCacheLayout._compute_kv_shape multiplies the summed
+                # group spans by tp_size for *every* group (host_rank_copies) -- so
+                # a 1-head indexer or state sidecar still has one private slot
+                # per rank. Passing g.num_kv_heads here would send those groups down
                 # the rank-shared branch and make ranks overwrite each other:
                 # measured at TP=2 and TP=4, it corrupts the sidecar under all
                 # three share modes (sharded/all_write/rank0_only) while the

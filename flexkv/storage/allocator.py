@@ -1,11 +1,12 @@
 import ctypes
+import fcntl
 import math
 import mmap
 import os
 import weakref
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from typing import Tuple, List, Union, Dict, Any
+from typing import Tuple, List, Union, Dict, Any, Optional
 try:
     from flexkv.c_ext import Pcfs
 except ImportError:
@@ -807,6 +808,21 @@ class HugePageAllocator(BaseStorageAllocator):
         )
 
 
+@contextlib.contextmanager
+def shared_ssd_files_lock(marker: Optional[str]):
+    """Serialize the FlexKVs of a node that create or claim the shared SSD files
+    whose marker is ``marker`` (no lock when None)."""
+    if marker is None:
+        yield
+        return
+    fd = os.open(f"{marker}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 class SSDAllocator(BaseStorageAllocator):
     @classmethod
     def allocate(cls,
@@ -816,6 +832,9 @@ class SSDAllocator(BaseStorageAllocator):
         cache_dir = kwargs.get("cache_dir")
         file_prefix = kwargs.get("file_prefix", "flexkv_ssd_cache")
         cfg_max_file_size_gb = kwargs.get("max_file_size_gb", -1)
+        # Files every FlexKV of the node maps (radixshmem SSD tier): the path of
+        # the marker that says which SSD index describes them.
+        marker = kwargs.get("marker")
         cfg_max_blocks_per_file = int(1e9)
 
         if cache_dir is None:
@@ -844,10 +863,29 @@ class SSDAllocator(BaseStorageAllocator):
             # when we don't set max_file_size_gb, we will create a file, size is exactly the required capacity
             cfg_max_blocks_per_file = total_blocks_per_device
 
+        with shared_ssd_files_lock(marker):
+            return cls._allocate_files(layout, dtype, cache_dir, file_prefix, block_size,
+                                       total_blocks_per_device, cfg_max_blocks_per_file, marker)
+
+    @classmethod
+    def _allocate_files(cls, layout: KVCacheLayout, dtype: torch.dtype, cache_dir: List[str],
+                        file_prefix: str, block_size: int, total_blocks_per_device: int,
+                        cfg_max_blocks_per_file: int, marker: Optional[str]) -> StorageHandle:
+        num_ssd_devices = len(cache_dir)
         # Files from a previous run are reused, so the space they hold counts as free.
         free_bytes = cls.get_file_size_limit(cache_dir[0]) + cls._reusable_bytes(cache_dir[0], f"{file_prefix}_0_")
-        fsys_max_blocks_per_file = free_bytes // block_size
-        num_blocks_per_file = min(fsys_max_blocks_per_file, cfg_max_blocks_per_file, total_blocks_per_device)
+        if marker is not None:
+            # Shared files are sized from the configuration alone, so every
+            # FlexKV of the node lays them out the same way.
+            num_blocks_per_file = min(cfg_max_blocks_per_file, total_blocks_per_device)
+            need = -(-total_blocks_per_device // max(1, num_blocks_per_file)) * num_blocks_per_file * block_size
+            if free_bytes < need:
+                raise RuntimeError(
+                    f"SSD directory {cache_dir[0]} has {free_bytes} bytes free (counting the "
+                    f"files it reuses), {need} needed")
+        else:
+            fsys_max_blocks_per_file = free_bytes // block_size
+            num_blocks_per_file = min(fsys_max_blocks_per_file, cfg_max_blocks_per_file, total_blocks_per_device)
         if num_blocks_per_file < 1:
             raise RuntimeError(
                 f"SSD directory {cache_dir[0]} has {free_bytes} bytes free, "
@@ -865,11 +903,12 @@ class SSDAllocator(BaseStorageAllocator):
                            f"each file {real_file_size/1024/1024/1024:.2f} GB, "
                            f"total {real_total_size/1024/1024/1024:.2f} GB")
         file_count = 0
+        changed = False
         for i in range(num_ssd_devices):
             ssd_files[i] = []
             for j in range(num_files_per_device):
                 file_path = os.path.join(cache_dir[i], f"{file_prefix}_{i}_{j}.bin")
-                cls._create_file(file_path, real_file_size)
+                changed |= cls._create_file(file_path, real_file_size)
                 ssd_files[i].append(file_path)
                 file_count += 1
                 if file_count % max(1, total_num_files // 10) == 0 or file_count == total_num_files:
@@ -881,6 +920,10 @@ class SSDAllocator(BaseStorageAllocator):
             f"SSD allocator done: {total_num_files} files in {cache_dir}, "
             f"each file has {real_file_size/1024/1024/1024:.2f} GB, total size {real_total_size/1024/1024/1024:.2f} GB"
         )
+        if changed and marker is not None:
+            # What the SSD index names is no longer in these files.
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(marker)
         return StorageHandle(
             handle_type=AccessHandleType.FILE,
             data=ssd_files,
@@ -890,14 +933,17 @@ class SSDAllocator(BaseStorageAllocator):
         )
 
     @classmethod
-    def _create_file(cls, file_path: str, total_size_per_file: int) -> None:
+    def _create_file(cls, file_path: str, total_size_per_file: int) -> bool:
+        """Returns whether the file was created or resized."""
         # Keep a file left by a previous run instead of truncating it: blocks already
         # written there are overwritten in place, while the first write into a hole (or
         # an unwritten extent) allocates under the inode lock and is serialized on ext4.
-        # Its old contents are never read: the SSD index starts empty.
+        # Its old contents are read only while the radixshmem SSD index still describes
+        # them (see shm_radix_bootstrap.claim_ssd_files); otherwise the index starts empty.
         fd = os.open(file_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            if os.fstat(fd).st_size != total_size_per_file:
+            changed = os.fstat(fd).st_size != total_size_per_file
+            if changed:
                 os.ftruncate(fd, total_size_per_file)
             # Reserve the blocks up front (a no-op for ranges a reused file already
             # holds). Without fallocate support or enough space, stay sparse.
@@ -910,6 +956,7 @@ class SSDAllocator(BaseStorageAllocator):
             raise RuntimeError(f"Failed to initialize file: {e}") from e
         finally:
             os.close(fd)
+        return changed
 
     @staticmethod
     def _reusable_bytes(cache_dir: str, name_prefix: str) -> int:

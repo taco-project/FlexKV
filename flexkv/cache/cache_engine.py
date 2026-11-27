@@ -926,8 +926,12 @@ class CacheStrategy:
     ignore_remote: bool = False
     # if True, will not use GDS
     ignore_gds: bool = False
+    # if True, a PUT stores Full KV only (no SWA/state snapshot): an
+    # intermediate store whose window would never be resumed from
+    ignore_swa: bool = False
 
 DEFAULT_CACHE_STRATEGY = CacheStrategy()
+FULL_ONLY_PUT_STRATEGY = CacheStrategy(ignore_swa=True)
 
 CPUONLY_CACHE_STRATEGY = CacheStrategy(ignore_gpu=False, ignore_ssd=True, ignore_remote=True, ignore_gds=True)
 
@@ -1015,37 +1019,7 @@ class GlobalCacheEngine:
             self.cpu_cache_engine = self._build_cpu_cache_engine(cache_config, event_collector)
             self.cache_engines[DeviceType.CPU] = self.cpu_cache_engine
         if cache_config.enable_ssd:
-            if cache_config.enable_p2p_ssd:
-                self.ssd_cache_engine = HierarchyLRCacheEngine.from_cache_config(
-                    cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta)
-            elif self.index_accel:
-                self.ssd_cache_engine = CacheEngineAccel(
-                    device_type=DeviceType.SSD,
-                    num_total_blocks=cache_config.num_ssd_blocks,
-                    tokens_per_block=cache_config.tokens_per_block,
-                    evict_ratio=self.evict_ratio,
-                    hit_reward_seconds=self.hit_reward_seconds,
-                    evict_start_threshold=self.evict_start_threshold,
-                    eviction_policy=self.eviction_policy,
-                    event_collector=event_collector,
-                    metrics_collector=self._metrics_collector,
-                    protected_threshold=self.protected_threshold,
-                    swa_config=cache_config.swa,
-                )
-            else:
-                self.ssd_cache_engine = CacheEngine(
-                    device_type=DeviceType.SSD,
-                    num_total_blocks=cache_config.num_ssd_blocks,
-                    tokens_per_block=cache_config.tokens_per_block,
-                    evict_ratio=self.evict_ratio,
-                    hit_reward_seconds=self.hit_reward_seconds,
-                    evict_start_threshold=self.evict_start_threshold,
-                    eviction_policy=self.eviction_policy,
-                    event_collector=event_collector,
-                    metrics_collector=self._metrics_collector,
-                    protected_threshold=self.protected_threshold,
-                    swa_config=cache_config.swa,
-                )
+            self.ssd_cache_engine = self._build_ssd_cache_engine(cache_config, event_collector)
             self.cache_engines[DeviceType.SSD] = self.ssd_cache_engine
         if cache_config.enable_remote:
             if self.use_mooncake_store_backend:
@@ -1101,6 +1075,43 @@ class GlobalCacheEngine:
 
         # Update initial mempool stats
         self._update_mempool_metrics()
+
+    def _build_ssd_cache_engine(self,
+                                cache_config: CacheConfig,
+                                event_collector: Optional[KVEventCollector]):
+        """Pick the index engine of the SSD tier (a subclass may override it,
+        like ``_build_cpu_cache_engine``)."""
+        if cache_config.enable_p2p_ssd:
+            return HierarchyLRCacheEngine.from_cache_config(
+                cache_config, self.node_id, DeviceType.SSD, meta=self.redis_meta)
+        elif self.index_accel:
+            return CacheEngineAccel(
+                device_type=DeviceType.SSD,
+                num_total_blocks=cache_config.num_ssd_blocks,
+                tokens_per_block=cache_config.tokens_per_block,
+                evict_ratio=self.evict_ratio,
+                hit_reward_seconds=self.hit_reward_seconds,
+                evict_start_threshold=self.evict_start_threshold,
+                eviction_policy=self.eviction_policy,
+                event_collector=event_collector,
+                metrics_collector=self._metrics_collector,
+                protected_threshold=self.protected_threshold,
+                swa_config=cache_config.swa,
+            )
+        else:
+            return CacheEngine(
+                device_type=DeviceType.SSD,
+                num_total_blocks=cache_config.num_ssd_blocks,
+                tokens_per_block=cache_config.tokens_per_block,
+                evict_ratio=self.evict_ratio,
+                hit_reward_seconds=self.hit_reward_seconds,
+                evict_start_threshold=self.evict_start_threshold,
+                eviction_policy=self.eviction_policy,
+                event_collector=event_collector,
+                metrics_collector=self._metrics_collector,
+                protected_threshold=self.protected_threshold,
+                swa_config=cache_config.swa,
+            )
 
     def _build_cpu_cache_engine(self,
                                 cache_config: CacheConfig,
@@ -1180,9 +1191,11 @@ class GlobalCacheEngine:
             dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None,
-            swa_aware: bool = False) \
+            swa_aware: bool = False,
+            block_hashes: Optional[np.ndarray] = None) \
                  -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
-        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace,
+                                   block_hashes=block_hashes)
         if req.block_end_idx == 0:
             transfer_graph = TransferOpGraph.create_empty_graph()
             return_mask = np.zeros_like(token_mask, dtype=np.bool_)
@@ -2162,9 +2175,11 @@ class GlobalCacheEngine:
             slot_mapping: np.ndarray,
             dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
-            namespace: Optional[List[str]] = None) \
+            namespace: Optional[List[str]] = None,
+            block_hashes: Optional[np.ndarray] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
-        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
+        req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace,
+                                   block_hashes=block_hashes)
         block_start_idx, block_end_idx = req.block_start_idx, req.block_end_idx
         # the mask should has a prefix of True
         assert block_start_idx == 0
@@ -2352,7 +2367,7 @@ class GlobalCacheEngine:
         remote_swa_slot = -1
         mooncake_swa_tail_hash: Optional[str] = None
 
-        if self.swa_op_constructor.enabled:
+        if self.swa_op_constructor.enabled and not temp_cache_strategy.ignore_swa:
             cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
                 cpu_matched_result.last_node)
             if cpu_swa_slot >= 0 and put_to_ssd:
@@ -2682,7 +2697,7 @@ class GlobalCacheEngine:
         cpu_swa_slot = -1
         ssd_swa_slot = -1
 
-        if self.swa_op_constructor.enabled:
+        if self.swa_op_constructor.enabled and not temp_cache_strategy.ignore_swa:
             cpu_swa_slot = self.cpu_cache_engine._alloc_swa_slot(
                 cpu_matched_result.last_node)
             if cpu_swa_slot >= 0 and fragment2_num_blocks > 0:
@@ -3611,7 +3626,8 @@ class GlobalCacheEngine:
                          token_ids: np.ndarray,
                          token_mask: np.ndarray,
                          slot_mapping: np.ndarray,
-                         namespace: Optional[List[str]]) -> RequestWindow:
+                         namespace: Optional[List[str]],
+                         block_hashes: Optional[np.ndarray] = None) -> RequestWindow:
         """Shared GET/PUT prologue.
 
         Validates the arrays, drops the trailing partial block (``token_mask``
@@ -3635,7 +3651,8 @@ class GlobalCacheEngine:
             slot_mapping, self.tokens_per_block)[:block_end_idx - block_start_idx]
         sequence_meta = SequenceMeta(token_ids=aligned_token_ids,
                                      tokens_per_block=self.cache_config.tokens_per_block,
-                                     namespace=namespace)
+                                     namespace=namespace,
+                                     block_hashes=block_hashes)
         return RequestWindow(block_start_idx, block_end_idx, gpu_block_ids, sequence_meta)
 
     def _check_input(self,

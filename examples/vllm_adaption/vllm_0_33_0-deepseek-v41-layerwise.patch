@@ -1,0 +1,44 @@
+diff --git a/vllm/models/deepseek_v41/attention.py b/vllm/models/deepseek_v41/attention.py
+index 1e663c9..3f853d9 100644
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -54,6 +54,11 @@ from vllm.config import (
+ )
+ from vllm.config.cache import CacheDType
+ from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
++from vllm.distributed.kv_transfer import (
++    get_kv_transfer_group,
++    has_kv_transfer_group,
++    is_v1_kv_transfer_group,
++)
+ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+@@ -1043,6 +1048,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         positions: torch.Tensor,
+         out: torch.Tensor,
+     ) -> None:
++        self._wait_for_kv_layer_load()
+         if self.indexer is not None and index_q is not None:
+             assert index_weights is not None
+             q_quant = (index_q, index_q_scale) if index_q_scale is not None else index_q
+@@ -1057,6 +1063,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         # ([num_tokens, padded_heads, head_dim]).
+         self.forward_mqa(q, kv, positions, out)
+ 
++    def _wait_for_kv_layer_load(self) -> None:
++        """Wait for a KV connector's layer-wise load of the compressed KV and
++        index K this layer reads, which its kv-source layer owns."""
++        if (
++            self.compressed_cache_prefix is None
++            or not has_kv_transfer_group()
++            or not is_v1_kv_transfer_group()
++        ):
++            return
++        connector = get_kv_transfer_group()
++        if connector.has_connector_metadata():
++            connector.wait_for_layer_load(self.compressed_cache_prefix)
++
+     def _fused_qnorm_rope_kv_insert(
+         self,
+         q: torch.Tensor,

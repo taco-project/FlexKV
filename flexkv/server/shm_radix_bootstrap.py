@@ -33,6 +33,8 @@ strides of a plain tensor.
 from __future__ import annotations
 
 import dataclasses
+import json
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,7 +43,7 @@ import torch
 from flexkv.common.config import (GLOBAL_CONFIG_FROM_ENV, CacheConfig, LayerGroupSpec,
                                   ModelConfig, SWAPoolConfig)
 from flexkv.common.debug import flexkv_logger
-from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
+from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType, StorageHandle
 
 try:
     import radixshmem
@@ -53,6 +55,9 @@ _MAX_SLOT_ALIGN = 4096
 
 DEFAULT_SERVER_NAME = "/flexkv"
 READY_TIMEOUT_S = 600.0
+SSD_READY_TIMEOUT_S = float(os.getenv("FLEXKV_RADIXSHMEM_SSD_READY_TIMEOUT_S", "3600"))
+# Name of the SSD files every FlexKV of a node shares (the SWA pool adds "_swa").
+SSD_FILE_PREFIX = "flexkv_rsm_ssd"
 PREFETCH_TIMEOUT_MS = 5000
 PREFETCH_MAX_INFLIGHT = 128
 MAX_OUTSTANDING = 256
@@ -67,6 +72,149 @@ def radix_server_name() -> str:
             f"FLEXKV_RADIXSHMEM_SERVER_NAME={name!r} must be a shm name that starts with '/' "
             f"(the radix-server's --name, e.g. '/flexkv')")
     return name
+
+
+def radix_ssd_server_name() -> Optional[str]:
+    """The ``--name`` of this node's index-only SSD radix-server
+    (``FLEXKV_RADIXSHMEM_SSD_SERVER_NAME``), or None when the SSD tier is not
+    indexed by radixshmem."""
+    name = str(GLOBAL_CONFIG_FROM_ENV.radixshmem_ssd_server_name or "")
+    if not name:
+        return None
+    if not name.startswith("/") or len(name) < 2 or any(c.isspace() for c in name):
+        raise ValueError(
+            f"FLEXKV_RADIXSHMEM_SSD_SERVER_NAME={name!r} must be a shm name that starts with '/'")
+    if name == radix_server_name():
+        raise ValueError(
+            f"FLEXKV_RADIXSHMEM_SSD_SERVER_NAME={name!r} is the CPU tier's radix-server; the SSD "
+            f"tier needs its own index-only server")
+    return name
+
+
+def ssd_index_geometry(cache_config: CacheConfig) -> "radixshmem.Geometry":
+    """Geometry of the index-only SSD server: slot id == FlexKV SSD block id, so
+    the counts are FlexKV's SSD block / SWA slot counts and the bytes are 0 (the
+    data lives in FlexKV's SSD files)."""
+    _ensure_radixshmem()
+    swa = swa_pool_config(cache_config)
+    swa_slots = int(swa.num_ssd_slots) if swa is not None else 0
+    return radixshmem.Geometry(
+        block_size=int(cache_config.tokens_per_block),
+        full_slots=int(cache_config.num_ssd_blocks),
+        swa_slots=swa_slots,
+        swa_window_blocks=int(swa.window_blocks) if swa_slots > 0 else 0,
+    )
+
+
+def attach_ssd_index_client(cache_config: CacheConfig,
+                            *,
+                            attach_index: bool = True,
+                            label: str = "radixshmem-ssd") -> "radixshmem.RadixClient":
+    """A ready client on this node's index-only SSD radix-server, configured with
+    FlexKV's SSD counts. Fails closed when the server has a data plane (its
+    slots would not be FlexKV's SSD blocks) or published other counts (another
+    FlexKV configured it with a different SSD size)."""
+    name = radix_ssd_server_name()
+    if name is None:
+        raise ValueError(f"{label}: FLEXKV_RADIXSHMEM_SSD_SERVER_NAME is not set")
+    geometry = ssd_index_geometry(cache_config)
+    # An index-only server joins its cluster only once this node's FlexKV
+    # configured it, and waits for every peer's FlexKV to do the same: allow
+    # for nodes that come up far apart (a slow model load on another node).
+    client = attach_radix_client(name, geometry=geometry, attach_index=attach_index,
+                                 timeout_s=SSD_READY_TIMEOUT_S, label=label)
+    try:
+        if client.info.data_plane:
+            raise ValueError(
+                f"{label}: radix-server {name} has a data plane (--data-bytes); the SSD tier "
+                f"needs an index-only server (slot ids are FlexKV's SSD blocks)")
+        pools = _published_geometry(client, label)["pools"]
+        diffs = []
+        if int(pools["full"]["num_slots"]) != int(cache_config.num_ssd_blocks):
+            diffs.append(f"FULL slots server={pools['full']['num_slots']} "
+                         f"flexkv={cache_config.num_ssd_blocks}")
+        want_swa = int(geometry.swa_slots)
+        have_swa = int((pools.get("swa") or {}).get("num_slots", 0))
+        if want_swa != have_swa:
+            diffs.append(f"SWA slots server={have_swa} flexkv={want_swa}")
+        if diffs:
+            raise ValueError(
+                f"{label}: radix-server {name} indexes another SSD layout: " + "; ".join(diffs))
+    except BaseException:
+        client.close()
+        raise
+    return client
+
+
+def ssd_marker_path(cache_dir) -> str:
+    """The marker next to the node's shared SSD files: ``{"index_id", "layout"}``
+    of the SSD index that last described them."""
+    first = cache_dir if isinstance(cache_dir, str) else cache_dir[0]
+    return os.path.join(first, f"{SSD_FILE_PREFIX}.json")
+
+
+def _ssd_files_entry(handle: StorageHandle) -> Dict[str, Any]:
+    return {"files": {str(k): list(v) for k, v in handle.get_file_list().items()},
+            "blocks_per_file": int(handle.num_blocks_per_file),
+            "num_blocks": int(handle.kv_layout.num_block),
+            "block_bytes": int(handle.kv_layout.get_elements_per_block() * handle.dtype.itemsize)}
+
+
+def claim_ssd_files(cache_config: CacheConfig, handles: Dict[str, Optional[StorageHandle]],
+                    label: str = "TransferManager-SSD") -> None:
+    """Make the SSD index describe what this node's SSD files hold before the TE
+    serves.
+
+    Every FlexKV of the node (FLEXKV_DP_DIRECT ranks, FLEXKV_INSTANCE_NUM > 1, a
+    restarted one) maps the same files, and the index-only SSD radix-server
+    outlives them. The marker next to the files names the index
+    (``NodeInfo.index_id``, new for each region and each reset) that last
+    described them and their layout. When both match, the index is kept;
+    otherwise its blocks were written under another layout, into files created
+    since (creating or resizing a file drops the marker), or the index started
+    over, so it is cleared and the marker rewritten. ``handles`` maps "full" /
+    "swa" to the SSD storage handles."""
+    from flexkv.storage.allocator import shared_ssd_files_lock
+
+    layout = {kind: _ssd_files_entry(h) for kind, h in handles.items() if h is not None}
+    path = ssd_marker_path(cache_config.ssd_cache_dir)
+    with shared_ssd_files_lock(path):
+        client = attach_ssd_index_client(cache_config, label=label)
+        try:
+            index_id = str(getattr(client.status(), "index_id", "") or "")
+            if not index_id:
+                raise RuntimeError(
+                    f"{label}: SSD radix-server {client.name} does not report an index id; "
+                    f"FlexKV's shared SSD files need a radixshmem with NodeInfo.index_id")
+            try:
+                with open(path) as f:
+                    marker = json.load(f)
+            except (FileNotFoundError, ValueError):
+                marker = None
+            if marker == {"index_id": index_id, "layout": layout}:
+                flexkv_logger.info(f"{label}: SSD index {client.name} ({index_id}) still describes "
+                                   f"the SSD files; keeping its {int(client.total_blocks())} blocks")
+                return
+            if marker is None:
+                why = "the SSD files are new or carry no marker"
+            elif marker.get("layout") != layout:
+                why = "the SSD files were laid out differently"
+            else:
+                why = f"the index started over since ({marker.get('index_id')} -> {index_id})"
+            stale = int(client.total_blocks())
+            if stale > 0:
+                flexkv_logger.warning(f"{label}: clearing {stale} blocks of SSD index {client.name}: {why}")
+            client.reset()
+            index_id = str(client.status().index_id)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump({"index_id": index_id, "layout": layout}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            flexkv_logger.info(f"{label}: SSD files claimed for index {client.name} ({index_id}): {why}")
+        finally:
+            client.close()
 
 
 def cpu_sizing_notice(cache_config: CacheConfig, server_name: str) -> Tuple[str, str]:
@@ -206,6 +354,9 @@ class RadixGeometry:
     swa_slot_bytes: int = 0
     swa_window_blocks: int = 0
     register_chunk_tokens: int = 0
+    # How blocks are named ("" = radixshmem's own XXH64 scheme); every client
+    # of a node and every node of a cluster must agree.
+    hash_scheme: str = ""
 
     @property
     def has_swa(self) -> bool:
@@ -226,6 +377,7 @@ class RadixGeometry:
             swa_window_blocks=int(self.swa_window_blocks) if self.has_swa else 0,
             slot_align=int(self.slot_align),
             register_chunk_tokens=int(self.register_chunk_tokens),
+            **({"hash_scheme": self.hash_scheme} if self.hash_scheme else {}),
         )
 
     def describe(self) -> str:
@@ -233,6 +385,8 @@ class RadixGeometry:
         if self.has_swa:
             s += f", SWA slot {self.swa_slot_bytes} B (window {self.swa_window_blocks})"
         s += f", slot_align={self.slot_align}"
+        if self.hash_scheme:
+            s += f", hash_scheme={self.hash_scheme}"
         if self.register_chunk_tokens:
             s += f", register_chunk_tokens={self.register_chunk_tokens}"
         return s
@@ -256,6 +410,7 @@ def expected_geometry(model_config: ModelConfig, cache_config: CacheConfig) -> R
     geo = RadixGeometry(
         tokens_per_block=int(cache_config.tokens_per_block),
         full_slot_bytes=cpu_block_bytes(model_config, cache_config),
+        hash_scheme=GLOBAL_CONFIG_FROM_ENV.hash_scheme,
     )
     swa = swa_pool_config(cache_config)
     if swa is not None:
@@ -447,6 +602,9 @@ def check_geometry(client: "radixshmem.RadixClient", expected: RadixGeometry,
             f"{label}: radix-server {client.name}'s register_chunk_tokens={chunk_tokens} is not a "
             f"multiple of tokens_per_block={expected.tokens_per_block}; the RHT registration "
             f"chunk is {register_chunk_blocks(chunk_tokens, expected.tokens_per_block)} blocks")
+    served_scheme = str(g.get("hash_scheme") or "xxh64-v1")
+    if served_scheme != (expected.hash_scheme or "xxh64-v1"):
+        diffs.append(f"hash_scheme server={served_scheme} flexkv={expected.hash_scheme or 'xxh64-v1'}")
     full = pools["full"]
     if int(full["slot_bytes"]) != expected.full_slot_bytes:
         diffs.append(f"FULL slot_bytes server={full['slot_bytes']} flexkv={expected.full_slot_bytes}")

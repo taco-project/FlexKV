@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import itertools
 import queue
 import threading
@@ -41,6 +42,7 @@ from flexkv.transfer.workers import (
     GDSTransferWorker,
     PEER2CPUTransferWorker,
 )
+from flexkv.transfer.workers.peer_ssd import PeerSSDReadWorker
 # NIXL / PCFS / mooncake-store are I/O *engines*, not edges: each plugs into
 # the worker that already owns its edge. See flexkv/transfer/backends.py.
 from flexkv.transfer.backends import (
@@ -169,6 +171,10 @@ class TransferEngine:
         self.gpu_handle_groups = gpu_handles  # WorkerKey -> list of GPU handles for that TP group
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
+        # radixshmem SSD index: a peer's SSD blocks reach this CPU as PEERSSD2H.
+        self._radix_ssd_server = (
+            GLOBAL_CONFIG_FROM_ENV.radixshmem_ssd_server_name
+            if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and ssd_handle is not None else "")
         self._remote_handle = remote_handle
         self._gpu_blocks_per_group = gpu_blocks_per_group
         self._gpu_layouts_per_group = gpu_layouts_per_group
@@ -231,6 +237,17 @@ class TransferEngine:
         # Ops with at least one failed replica: must be discarded, not
         # finalized, when their pending_count drains to zero.
         self._failed_parent_op_ids: Set[int] = set()
+        # Worker each dispatched op (or replica) went to, until it reports back,
+        # so a worker process that dies fails its ops instead of hanging them.
+        self._op_worker: Dict[int, Any] = {}
+        self._dead_workers: Set[int] = set()
+        self._next_liveness_check = 0.0
+        # Workers started again when their process dies (id(handle) -> factory),
+        # and replacements ready for the scheduler thread to swap in.
+        self._respawn_factories: Dict[int, Any] = {}
+        self._respawned: "queue.Queue[Tuple[Any, Any, Any]]" = queue.Queue()
+        self._respawns_pending = 0
+        self._respawns_left = 8
         # GET inherit: skip-io DISK2H waits for prefetch DISK2H (graph_id, op_id).
         self._completed_op_keys: Set[Tuple[int, int]] = set()
         self._parked_skip_io: Dict[int, TransferOp] = {}
@@ -511,6 +528,32 @@ class TransferEngine:
                 layer_groups=ssd_layer_groups,
             )
             self._register_worker(PoolId.FULL_KV, TransferType.H2DISK, self.cpussd_write_worker)
+
+            if self._radix_ssd_server:
+                # A peer's SSD -> this CPU (radixshmem SSD index cluster).
+                peer_factory = functools.partial(
+                    PeerSSDReadWorker.create_worker,
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                    ssd_files=self._ssd_handle.get_file_list(),
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    ssd_kv_layout=self._ssd_handle.kv_layout,
+                    dtype=self._cpu_handle.dtype,
+                    num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                    cache_config=self._cache_config,
+                    tp_group_size=self.model_config.effective_tp_size_per_node,
+                    layer_groups=ssd_layer_groups,
+                    pool_id=PoolId.FULL_KV,
+                    ssd_server_name=self._radix_ssd_server,
+                )
+                self.peer_ssd_read_worker: WorkerHandle = peer_factory()
+                self._respawn_factories[id(self.peer_ssd_read_worker)] = peer_factory
+                self._register_worker(PoolId.FULL_KV, TransferType.PEERSSD2H,
+                                      self.peer_ssd_read_worker)
+                self._register_worker(PoolId.FULL_KV, TransferType.H2PEERSSD,
+                                      self.peer_ssd_read_worker)
         if self._remote_handle is not None and self._cpu_handle is not None:
             self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
                 mp_ctx=self.mp_ctx,
@@ -687,6 +730,28 @@ class TransferEngine:
                     layer_groups=self._swa_layer_groups,
                 )
                 self._register_worker(PoolId.SWA, TransferType.DISK2H, swa_disk2h_worker)
+                if self._radix_ssd_server:
+                    swa_peer_factory = functools.partial(
+                        PeerSSDReadWorker.create_worker,
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
+                        ssd_files=self._swa_ssd_handle.get_file_list(),
+                        cpu_kv_layout=self._swa_cpu_handle.kv_layout,
+                        ssd_kv_layout=self._swa_ssd_handle.kv_layout,
+                        dtype=self._swa_cpu_handle.dtype,
+                        num_blocks_per_file=self._swa_ssd_handle.num_blocks_per_file,
+                        cache_config=self._cache_config,
+                        tp_group_size=self.model_config.effective_tp_size_per_node,
+                        layer_groups=self._swa_layer_groups,
+                        pool_id=PoolId.SWA,
+                        ssd_server_name=self._radix_ssd_server,
+                    )
+                    swa_peer_ssd_worker = swa_peer_factory()
+                    self._respawn_factories[id(swa_peer_ssd_worker)] = swa_peer_factory
+                    self._register_worker(PoolId.SWA, TransferType.PEERSSD2H, swa_peer_ssd_worker)
+                    self._register_worker(PoolId.SWA, TransferType.H2PEERSSD, swa_peer_ssd_worker)
                 flexkv_logger.info("TransferEngine: swa CPU<->SSD workers initialized")
 
 
@@ -969,12 +1034,22 @@ class TransferEngine:
         sel.register(self.shutdown_read_fd, selectors.EVENT_READ, data="shutdown")
 
         flexkv_logger.info("TransferEngine scheduler loop started with ZERO-LATENCY selector (timeout=None)")
+        # Dead-worker bookkeeping (see _submit_to); harness engines skip __init__.
+        self.__dict__.setdefault("_op_worker", {})
+        self.__dict__.setdefault("_dead_workers", set())
+        self.__dict__.setdefault("_next_liveness_check", 0.0)
+        self.__dict__.setdefault("_respawn_factories", {})
+        self.__dict__.setdefault("_respawned", queue.Queue())
+        self.__dict__.setdefault("_respawns_pending", 0)
+        self.__dict__.setdefault("_respawns_left", 0)
 
         while self._running:
             try:
                 # Complete blocking with NO TIMEOUT for zero latency!
                 # Shutdown via pipe signal instead of timeout
-                events = sel.select(timeout=None)
+                # Ops in flight: wake up now and then to notice a dead worker.
+                events = sel.select(
+                    timeout=1.0 if self._op_worker or self._respawns_pending else None)
 
                 new_graphs_num = 0
                 finished_ops: List[TransferOp] = []
@@ -1035,6 +1110,7 @@ class TransferEngine:
                                         op_id = first
                                 else:
                                     op_id = payload
+                                self._op_worker.pop(op_id, None)
                                 if not op_succeeded:
                                     # Keep trace state consistent even on failure.
                                     trace.dec_inflight()
@@ -1080,6 +1156,12 @@ class TransferEngine:
                 # Exit loop if shutdown requested
                 if should_shutdown:
                     break
+
+                if self._op_worker and time.monotonic() >= self._next_liveness_check:
+                    self._next_liveness_check = time.monotonic() + 1.0
+                    self._fail_ops_of_dead_workers()
+                if self._respawns_pending:
+                    self._swap_in_respawned_workers()
 
                 # End NVTX ranges for finished ops
                 for op in finished_ops:
@@ -1493,7 +1575,7 @@ class TransferEngine:
                     f"graph_id: {replica.graph_id}, worker_key={wk}",
                     color=get_nvtx_range_color(replica.graph_id))
                 op.pending_count += 1
-                worker[wk].submit_transfer(replica)
+                self._submit_to(worker[wk], replica)
                 flexkv_logger.debug(
                     f"[TransferEngine] {label} fan-out: "
                     f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
@@ -1508,7 +1590,88 @@ class TransferEngine:
                 color=get_nvtx_range_color(op.graph_id),
             )
             op.pending_count += 1
-            worker.submit_transfer(op)
+            self._submit_to(worker, op)
+
+    def _submit_to(self, worker: Any, op: TransferOp) -> None:
+        """Hand ``op`` to ``worker``; a worker that is gone fails it at once."""
+        # setdefault: harness engines are built without __init__.
+        dead = self.__dict__.setdefault("_dead_workers", set())
+        in_flight = self.__dict__.setdefault("_op_worker", {})
+        if id(worker) not in dead:
+            in_flight[op.op_id] = worker
+            try:
+                worker.submit_transfer(op)
+                return
+            except (BrokenPipeError, EOFError, ConnectionError, OSError) as e:
+                in_flight.pop(op.op_id, None)
+                self._mark_worker_dead(worker, repr(e))
+        self._handle_failed_op(op.op_id)
+
+    def _mark_worker_dead(self, worker: Any, why: str) -> None:
+        if id(worker) in self._dead_workers:
+            return
+        self._dead_workers.add(id(worker))
+        process = getattr(worker, "process", None)
+        if process is not None:
+            process.join(timeout=1.0)  # let a dying process report how it ended
+        flexkv_logger.error(
+            f"[TransferEngine] transfer worker {getattr(worker, 'kind', '')} "
+            f"{getattr(worker, 'worker_id', '?')} (pid {getattr(process, 'pid', None)}) is gone "
+            f"(exitcode={getattr(process, 'exitcode', None)}, {why}); its in-flight and "
+            f"future ops fail")
+        factory = self.__dict__.get("_respawn_factories", {}).pop(id(worker), None)
+        if factory is not None and self.__dict__.get("_respawns_left", 0) > 0:
+            self._respawns_left -= 1
+            self._respawns_pending += 1
+            threading.Thread(target=self._respawn_worker, args=(worker, factory),
+                             name="flexkv-worker-respawn", daemon=True).start()
+
+    def _respawn_worker(self, old: Any, factory: Any) -> None:
+        """Start a replacement for a worker whose process died (off the
+        scheduler thread: it takes as long as the worker's init)."""
+        new = None
+        try:
+            new = factory()
+            deadline = time.monotonic() + 900
+            while not new.ready_event.wait(timeout=5.0):
+                if not new.process.is_alive() or time.monotonic() > deadline:
+                    raise RuntimeError(f"replacement not ready (exitcode={new.process.exitcode})")
+        except Exception as e:  # noqa: BLE001
+            flexkv_logger.error(f"[TransferEngine] restarting {getattr(old, 'kind', '')} "
+                                f"{getattr(old, 'worker_id', '?')} failed: {e!r}")
+            new = None
+        self._respawned.put((old, new, factory))
+
+    def _swap_in_respawned_workers(self) -> None:
+        while True:
+            try:
+                old, new, factory = self._respawned.get_nowait()
+            except queue.Empty:
+                return
+            self._respawns_pending -= 1
+            if new is None:
+                continue
+            for worker_map in self._workers.values():
+                for key, handle in list(worker_map.items()):
+                    if handle is old:
+                        worker_map[key] = new
+            self._respawn_factories[id(new)] = factory
+            flexkv_logger.warning(
+                f"[TransferEngine] {getattr(new, 'kind', '')} worker restarted "
+                f"(pid {getattr(new.process, 'pid', None)}) in place of dead worker "
+                f"{getattr(old, 'worker_id', '?')}")
+
+    def _fail_ops_of_dead_workers(self) -> None:
+        dead = {}
+        for op_id, worker in list(self._op_worker.items()):
+            process = getattr(worker, "process", None)
+            if id(worker) in self._dead_workers or (process is not None and not process.is_alive()):
+                dead.setdefault(id(worker), (worker, []))[1].append(op_id)
+        for worker, op_ids in dead.values():
+            self._mark_worker_dead(worker, "process exited")
+            for op_id in op_ids:
+                self._op_worker.pop(op_id, None)
+                self._handle_failed_op(op_id)
 
     def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:
         """Submit a transfer graph for execution"""

@@ -1,14 +1,23 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from vllm.v1.engine import FinishReason
 
+from flexkv.common.config import RankInfo
+from flexkv.integration.config import FlexKVConfig
+from flexkv.integration.vllm import vllm_v1_adapter
 from flexkv.integration.vllm.vllm_v1_adapter import FlexKVSchedulerConnector
 
 
 def _connector() -> FlexKVSchedulerConnector:
-    connector = object.__new__(FlexKVSchedulerConnector)
-    connector.req_id_to_task_dict = {}
+    # Built by its constructor, so it holds all the state request_finished reads.
+    manager = Mock()
+    manager.is_ready.return_value = True
+    config = FlexKVConfig()
+    with patch.object(vllm_v1_adapter, "KVManager", Mock(return_value=manager)):
+        connector = FlexKVSchedulerConnector(
+            config, RankInfo(model_config=config.model_config),
+            enable_layerwise_transfer=False)
     connector.maybe_skip_put = False
     connector.block_size = 16
     connector.flexkv_stats = Mock()

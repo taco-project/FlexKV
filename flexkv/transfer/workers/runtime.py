@@ -324,10 +324,12 @@ class TransferWorkerBase(ABC):
         )
         process.start()
 
-        return WorkerHandle(
+        handle = WorkerHandle(
             worker_id, parent_conn, process, ready_event, finished_ops_queue,
             isolate_remote=bool(getattr(cls, "_is_remote_worker", False)),
         )
+        handle.kind = cls.__name__
+        return handle
 
     @classmethod
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
@@ -363,6 +365,11 @@ class TransferWorkerBase(ABC):
 
         try:
             worker = cls.__new__(cls)
+            default_device = os.getenv("FLEXKV_DEFAULT_CUDA_DEVICE", "")
+            if default_device:
+                # A worker that touches only host memory still makes a CUDA context
+                # (host register, streams): keep it off GPU 0 when the TE has its own GPU.
+                worker._ensure_cuda_device(int(default_device))
             worker.__init__(
                 worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor, *args, **kwargs
             )
@@ -717,7 +724,7 @@ class TransferWorkerBase(ABC):
                             "layerwise" if is_layerwise else "no-layerwise",
                             (time.perf_counter_ns() - transfer_start_ns) / 1e9,
                             str(e),
-                            exc_info=True,
+                            exc_info=not getattr(e, "quiet", False),
                         )
                     finally:
                         if nvtx_pushed:

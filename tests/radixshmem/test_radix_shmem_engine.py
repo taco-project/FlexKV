@@ -1447,3 +1447,31 @@ def test_planner_uses_configured_window_blocks():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_caller_hashes_reach_the_radix_match_and_insert():
+    """With the engine's own page hashes, the radixshmem match and the deferred
+    insert both key on them, not on FlexKV's token hash: that is what lets a
+    router recompute the key from a request's tokens."""
+    from flexkv.cache.cache_engine import DEFAULT_CACHE_STRATEGY
+    engine = _global_cache_engine()
+    seen = []
+    _force_radixshmem(engine, _local_match([]))
+    engine._match_cpu = (  # type: ignore[method-assign]
+        lambda sequence_meta, *a, **k: seen.append(sequence_meta.block_hashes.copy())
+        or _local_match([]))
+    token_ids, token_mask, slot_mapping = _fake_request(3)
+    given = np.array([-5, 6, 7], dtype=np.int64)
+    engine.get(request_id=1, token_ids=token_ids, token_mask=token_mask.copy(),
+               slot_mapping=slot_mapping, dp_client_id=0,
+               temp_cache_strategy=copy.deepcopy(DEFAULT_CACHE_STRATEGY), block_hashes=given)
+    np.testing.assert_array_equal(seen[-1].view(np.int64), given)
+
+    inserted_meta = []
+    engine.cpu_cache_engine.insert = (  # type: ignore[method-assign]
+        lambda sequence_meta, *a, **k: inserted_meta.append(sequence_meta.block_hashes.copy()))
+    graph, _mask, callback, _cbs, _end = engine.put(
+        request_id=2, token_ids=token_ids, token_mask=token_mask.copy(),
+        slot_mapping=slot_mapping, dp_client_id=0, block_hashes=given)
+    callback()
+    np.testing.assert_array_equal(inserted_meta[-1].view(np.int64), given)

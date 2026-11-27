@@ -1,6 +1,6 @@
 import time
-from dataclasses import dataclass
-from collections import deque
+from dataclasses import dataclass, field
+from collections import Counter, deque
 
 from flexkv.common.debug import flexkv_logger
 
@@ -23,7 +23,11 @@ class FlexKVStats:
     num_put_unmatched_tokens: int = 0
     
     num_failed_requests: int = 0
-        
+
+    # The counts recorded since take_counts() last ran, whatever the log
+    # window above has cleared since.
+    untaken_counts: Counter = field(default_factory=Counter)
+
     @property
     def tatal_num_requests(self) -> int:
         return self.num_get_requests + self.num_put_requests
@@ -52,10 +56,10 @@ class FlexKVStats:
         num_gpu_matched_tokens: int,
         num_flexkv_matched_tokens: int,
     ):
-        self.num_get_requests += 1
-        self.num_get_query_tokens += num_prompt_tokens
-        self.num_gpu_matched_tokens += num_gpu_matched_tokens
-        self.num_flexkv_matched_tokens += num_flexkv_matched_tokens
+        self._add(num_get_requests=1,
+                  num_get_query_tokens=num_prompt_tokens,
+                  num_gpu_matched_tokens=num_gpu_matched_tokens,
+                  num_flexkv_matched_tokens=num_flexkv_matched_tokens)
         if self.num_get_requests == self.num_log_interval_requests:
             self.log()
             self.clear()
@@ -65,16 +69,28 @@ class FlexKVStats:
         num_all_tokens: int,
         num_unmatched_tokens: int,
     ):
-        self.num_put_requests += 1
-        self.num_put_query_tokens += num_all_tokens
-        self.num_put_unmatched_tokens += num_unmatched_tokens
-        
+        self._add(num_put_requests=1,
+                  num_put_query_tokens=num_all_tokens,
+                  num_put_unmatched_tokens=num_unmatched_tokens)
+
     def record_faild(
         self,
         num_failed_requests: int
     ):
-        self.num_failed_requests += num_failed_requests
-        
+        self._add(num_failed_requests=num_failed_requests)
+
+    def _add(self, **counts: int) -> None:
+        for name, count in counts.items():
+            setattr(self, name, getattr(self, name) + count)
+        self.untaken_counts.update(counts)
+
+    def take_counts(self) -> dict:
+        """The counts recorded since the last call, each handed out once: vLLM
+        sums the per-step reports it gets."""
+        counts = dict(self.untaken_counts)
+        self.untaken_counts.clear()
+        return counts
+
     def clear(self):
         self.num_get_requests = 0
         self.num_get_query_tokens = 0

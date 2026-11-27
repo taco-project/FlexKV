@@ -15,8 +15,9 @@ from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.request import KVResponseStatus
 from flexkv.common.debug import flexkv_logger
 from flexkv.integration.stats import FlexKVStats
-from flexkv.integration.config import FlexKVConfig
+from flexkv.integration.config import FlexKVConfig, VllmKVGroup
 from flexkv.integration.dynamo.collector import KVEventCollector
+from flexkv.server.shm_radix_bootstrap import radix_server_is_distributed
 from flexkv.integration.vllm.layerwise_sync import (
     LayerwiseCounterPool,
     LayerwiseLoadMetadata,
@@ -31,44 +32,44 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.v1.engine import FinishReason
 
+# KVConnectorTransferResults: lets a worker report a failed load per request,
+# the one report vLLM 0.33 takes once a model has several KV cache groups
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorTransferResults)
+except ImportError:
+    KVConnectorTransferResults = None  # type: ignore[misc,assignment]
+
 # KVConnectorStats: available since v0.11.0
 try:
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 
     class _FlexKVConnectorStats(KVConnectorStats):
-        """Serializable vLLM stats snapshot for the FlexKV scheduler side."""
-
-        _RATIO_KEYS = {"get_gpu_match_ratio", "get_flexkv_match_ratio"}
+        """FlexKV's counts (FlexKVStats) over an interval. vLLM sums the
+        scheduler side's per-step reports and logs them with their ratios."""
 
         def reset(self):
-            for key in self.data:
-                self.data[key] = 0
+            self.data = {}
 
         def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
-            if other.is_empty():
-                return self
             for key, value in other.data.items():
-                if key not in self._RATIO_KEYS:
-                    self.data[key] = self.data.get(key, 0) + value
-            query_tokens = self.data.get("num_get_query_tokens", 0)
-            self.data["get_gpu_match_ratio"] = (
-                self.data.get("num_gpu_matched_tokens", 0) / query_tokens
-                if query_tokens else 0.0
-            )
-            self.data["get_flexkv_match_ratio"] = (
-                self.data.get("num_flexkv_matched_tokens", 0) / query_tokens
-                if query_tokens else 0.0
-            )
+                self.data[key] = self.data.get(key, 0) + value
             return self
 
         def reduce(self) -> dict[str, int | float]:
-            return dict(self.data)
+            query_tokens = self.data.get("num_get_query_tokens", 0)
+
+            def ratio(key: str) -> float:
+                return self.data.get(key, 0) / query_tokens if query_tokens else 0.0
+
+            return {
+                **self.data,
+                "get_gpu_match_ratio": ratio("num_gpu_matched_tokens"),
+                "get_flexkv_match_ratio": ratio("num_flexkv_matched_tokens"),
+            }
 
         def is_empty(self) -> bool:
-            return not any(
-                value for key, value in self.data.items()
-                if key not in self._RATIO_KEYS
-            )
+            return not any(self.data.values())
 
     class _FlexKVWorkerSentinelStats(KVConnectorStats):
         """Sentinel stats returned from the worker side so that
@@ -119,6 +120,22 @@ if TYPE_CHECKING:
 
 logger = flexkv_logger
 
+# FLEXKV_HASH_SCHEME for blocks named by vLLM's own block hashes: a router
+# recomputes those from the tokens for sha256_cbor without lookahead tokens.
+VLLM_SHA256_CBOR_I64 = "vllm-sha256-cbor-i64-v1"
+
+
+def _check_hash_scheme(vllm_config: "VllmConfig") -> None:
+    scheme = GLOBAL_CONFIG_FROM_ENV.hash_scheme
+    algo = vllm_config.cache_config.prefix_caching_hash_algo
+    lookahead = vllm_config.num_hash_lookahead_tokens
+    if scheme != VLLM_SHA256_CBOR_I64 or algo != "sha256_cbor" or lookahead:
+        raise ValueError(
+            f"FLEXKV_HASH_SCHEME={scheme!r}: the vLLM connector names blocks by vLLM's "
+            f"block hashes as {VLLM_SHA256_CBOR_I64!r}, which needs "
+            f"--prefix-caching-hash-algo sha256_cbor and no lookahead block hashes "
+            f"(got {algo!r}, {lookahead} lookahead tokens)")
+
 
 def _assert_token_major(kv_cache: torch.Tensor, token_dim: int,
                         head_dim: int) -> None:
@@ -153,6 +170,28 @@ def _assert_token_major(kv_cache: torch.Tensor, token_dim: int,
         )
 
 
+def _attention_waits_for_layers(forward_context: Optional[dict],
+                                layer_names: Iterable[str]) -> bool:
+    """Whether vLLM's attention calls ``wait_for_layer_load`` before it reads
+    each of these layers: Attention and MLAAttention do through their custom
+    ops (MLAAttention's direct call skips it); DeepSeek-V4.1's own attention
+    does with examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch."""
+    if forward_context is None:
+        return True
+    try:
+        from vllm.model_executor.layers.attention.attention import Attention
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    except ImportError:  # vLLM before 0.33: only its generic attention layers
+        return True
+
+    def waits(layer) -> bool:
+        if isinstance(layer, MLAAttention):
+            return not layer.use_direct_call
+        return isinstance(layer, Attention) or hasattr(layer, "_wait_for_kv_layer_load")
+
+    return all(waits(forward_context.get(name)) for name in layer_names)
+
+
 @dataclass
 class FlexKVResponse:
     task_id: int
@@ -167,6 +206,9 @@ class FlexKVConnectorMetadata(KVConnectorMetadata):
 
     layerwise: LayerwiseLoadMetadata = field(
         default_factory=LayerwiseLoadMetadata)
+    # Requests whose async GET failed, for the workers to report: vLLM takes a
+    # failed load only from them (FlexKVConnectorV1Impl.get_transfer_results).
+    failed_recving: frozenset[str] = frozenset()
 
 
 @dataclass(slots=True)
@@ -253,6 +295,9 @@ class FlexKVSchedulerConnector:
         self.block_size = flexkv_config.cache_config.tokens_per_block
         self.cache_config = flexkv_config.cache_config
         self.rank_info = rank_info
+        # The vLLM KV cache group whose blocks FlexKV stores.
+        self.group_id = (flexkv_config.vllm_kv_group.group_id
+                         if flexkv_config.vllm_kv_group is not None else 0)
 
         if os.getenv('DYNAMO_USE_FLEXKV', '0') == '1':
             self.collector = KVEventCollector()
@@ -262,6 +307,7 @@ class FlexKVSchedulerConnector:
                                         cache_config=flexkv_config.cache_config,
                                         dp_client_id=self.rank_info.dp_client_id,
                                         server_recv_port=flexkv_config.server_recv_port,
+                                        gpu_register_port=flexkv_config.gpu_register_port,
                                         event_collector=self.collector)
         self.flexkv_manager.start()
         # self.dp_client = KVDPClient(self.server_recv_port, self.model_config)
@@ -283,9 +329,24 @@ class FlexKVSchedulerConnector:
         ] = {}
 
         self.flexkv_stats = FlexKVStats(int(os.getenv('FLEXKV_NUM_LOG_INTERVAL_REQUESTS', '200')))
-        self.failed_block_ids: set[int] = set()
+        self.hash_scheme = GLOBAL_CONFIG_FROM_ENV.hash_scheme
+        # Requests whose async GET failed. vLLM takes a failed load only from a
+        # worker (FlexKVConnectorV1Impl.get_transfer_results), and FlexKV sees
+        # a GET end only after vLLM has read the step's worker reports, so a
+        # failed request goes to the workers in the next step's metadata
+        # (take_failed_loads), its finished_recving held back until they
+        # report it (failed_loads_reported). vLLM then recomputes the request,
+        # which is not loaded again. A vLLM without KVConnectorTransferResults
+        # cannot take the report: there a failed GET is reported as finished.
+        self.report_failed_loads = KVConnectorTransferResults is not None
+        self.failed_loads_to_send: set[str] = set()
+        self.failed_loads_unreported: set[str] = set()
+        self.failed_load_req_ids: set[str] = set()
 
         self.maybe_skip_put = os.getenv('FLEXKV_MAYBE_SKIP_PUT', '0') == '1'
+        # How long vLLM may wait for a PUT to free its blocks rather than
+        # preempt a request (has_pending_block_frees); 0 never waits.
+        self.pending_free_wait_s = float(os.getenv('FLEXKV_PENDING_FREE_WAIT_S', '5'))
         self.enable_layerwise_transfer = (
             bool(int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', '0')))
             if enable_layerwise_transfer is None
@@ -303,7 +364,18 @@ class FlexKVSchedulerConnector:
             logger.info("Waiting for flexkv init...")
             time.sleep(5)
 
-        logger.info("Finish init FlexKVSchedulerConnector")
+        # A radixshmem GET reads only the local tiers: a peer's CPU or SSD
+        # blocks reach a request through a prefetch into the local CPU tier,
+        # started while it waits (as the SGLang connector does).
+        self.enable_prefetch = bool(GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and (
+            self.cache_config.enable_ssd or radix_server_is_distributed(
+                rank_info.model_config, self.cache_config,
+                label="FlexKVSchedulerConnector")))
+        # request_id -> prefetch task id, from the request's arrival
+        # (on_new_request) until a scheduling attempt sees it finished
+        self.prefetch_tasks: dict[str, int] = {}
+
+        logger.info(f"Finish init FlexKVSchedulerConnector, prefetch={self.enable_prefetch}")
 
     def is_ready(
         self,
@@ -321,22 +393,14 @@ class FlexKVSchedulerConnector:
         tier, so KV computed against stale weights can no longer be matched.
 
         Invoked from vLLM's scheduler via reset_prefix_cache(reset_connector=True)
-        after a weight update. Safety relies only on the radix tree being
-        cleared (get_match can no longer hit stale KV); in-flight transfers need
-        not be drained.
-
-        We also clear this connector's own per-request bookkeeping. These dicts
-        map vLLM request_id -> flexkv task_id for requests currently in flight;
-        after a reset those task_ids reference dropped cache, so we clear them to
-        avoid dangling references (they are normally empty at a reset boundary).
+        after a weight update. FlexKV cannot recycle blocks that a transfer still
+        uses, so like vLLM's own prefix cache reset this returns False while any
+        request has a task in flight; the caller retries once the scheduler has
+        reported their completions and freed their GPU blocks.
         """
+        if self.req_id_to_task_dict or self.prefetch_tasks:
+            return False
         self.flexkv_manager.reset()
-        self.req_id_to_task_dict.clear()
-        self.get_tasks.clear()
-        self.put_tasks.clear()
-        self.tasks_to_launch.clear()
-        self.tasks_to_cancel.clear()
-        self.failed_block_ids.clear()
         return True
 
     ####################
@@ -347,7 +411,7 @@ class FlexKVSchedulerConnector:
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[Optional[int], bool]:
         """
         Args:
             request: Request to get.
@@ -355,10 +419,16 @@ class FlexKVSchedulerConnector:
                                 which means not need to transfer from flexkv.
 
         Returns:
-            tuple[int, bool]: A tuple containing an integer and a bool representing the
-                            number of new matched tokens and whether it is necessary
-                            to get the new matched blocks from flexkv, respectively.
+            tuple[Optional[int], bool]: The number of new matched tokens (None
+                            while the request's prefetch runs: vLLM asks again)
+                            and whether it is necessary to get the new matched
+                            blocks from flexkv.
         """
+        if request.request_id in self.failed_load_req_ids:
+            # vLLM recomputes a request whose load failed.
+            return 0, False
+        if not self._prefetch_done(request):
+            return None, False
         task_id, num_new_matched_tokens = self._get_match(request=request,
                                                           num_computed_tokens=num_computed_tokens)
         self.flexkv_stats.record_get(num_prompt_tokens=request.num_tokens,
@@ -371,6 +441,75 @@ class FlexKVSchedulerConnector:
             return 0, False
 
         return num_new_matched_tokens, True
+
+    def on_new_request(self, request: "Request") -> None:
+        """Start the prefetch of an arriving request's prompt (peer CPU, local
+        and peer SSD into the local CPU tier) while it waits in vLLM's queue;
+        get_num_new_matched_tokens waits for it. Its local GPU hit is not known
+        yet, so the prefetch covers all of the prompt's full blocks."""
+        if not self.enable_prefetch:
+            return
+        num_tokens = request.num_tokens // self.block_size * self.block_size
+        if num_tokens == 0:
+            return
+        try:
+            task_id = self.flexkv_manager.prefetch_async(
+                token_ids=np.asarray(request.all_token_ids[:num_tokens], dtype=np.int64),
+                namespace=self._extract_namespace(request),
+                **self._block_hashes(request, num_tokens))
+        except Exception as e:  # noqa: BLE001 - serve from the local tiers
+            logger.warning(f"FlexKV prefetch of {request.request_id} failed: {e}")
+            return
+        if task_id is not None and task_id >= 0:
+            self.prefetch_tasks[request.request_id] = task_id
+
+    def _prefetch_done(self, request: "Request") -> bool:
+        """Whether the prefetch on_new_request started for a waiting request has
+        finished, so that the GET reads what it brought. A request without one
+        (no full block, or a vLLM that does not call on_new_request) has none
+        to wait for."""
+        task_id = self.prefetch_tasks.get(request.request_id)
+        if task_id is None:
+            return True
+        if task_id not in self.flexkv_manager.try_wait([task_id]):
+            return False
+        del self.prefetch_tasks[request.request_id]
+        return True
+
+    def _forget_prefetch(self, req_id: str) -> None:
+        task_id = self.prefetch_tasks.pop(req_id, None)
+        if task_id is not None:
+            # A running prefetch keeps its blocks until its graph drains.
+            self.flexkv_manager.cancel(task_ids=[task_id])
+
+    def has_pending_work(self) -> bool:
+        """Whether vLLM must keep stepping with no request left: a returned
+        task's graph (a PUT's SSD write) completes only when polled."""
+        return self.flexkv_manager.has_running_graphs()
+
+    def has_pending_block_frees(self) -> bool:
+        """Whether a PUT will soon free a finished request's blocks, so that
+        vLLM, short of blocks, can wait for them instead of preempting a
+        request. Not once the oldest PUT has run for pending_free_wait_s: one
+        that hangs must not keep vLLM from preempting for good."""
+        if self.pending_free_wait_s <= 0:
+            return False
+        launched = [task.task_launch_time
+                    for tasks in self.put_tasks.values() for task in tasks]
+        if launched:
+            return time.perf_counter() - min(launched) < self.pending_free_wait_s
+        return any(isinstance(task, FlexKVPutTask)
+                   for task in self.tasks_to_launch.values())
+
+    def _block_hashes(self, request: "Request", num_tokens: int) -> dict:
+        """``block_hashes`` under FLEXKV_HASH_SCHEME: vLLM's own hashes of the
+        request's first ``num_tokens`` tokens (they carry its LoRA, cache salt
+        and multimodal keys), first 8 bytes as a big-endian int64."""
+        if not self.hash_scheme:
+            return {}
+        hashes = request.block_hashes[:num_tokens // self.block_size]
+        return {"block_hashes": np.frombuffer(
+            b"".join(h[:8] for h in hashes), dtype=">i8").astype(np.int64)}
 
     def _extract_namespace(self, request: "Request") -> Optional[List[str]]:
         """
@@ -420,7 +559,10 @@ class FlexKVSchedulerConnector:
                             the task_id and number of new matched tokens.
         """
         match_start_time = time.perf_counter()
-        num_tokens_to_get = (request.num_tokens//self.block_size)*self.block_size
+        # A layer-wise load is synchronous, so its hit must leave vLLM a token
+        # to compute in the same step.
+        num_tokens = request.num_tokens - int(self.enable_layerwise_transfer)
+        num_tokens_to_get = (num_tokens // self.block_size) * self.block_size
         token_ids = request.all_token_ids[:num_tokens_to_get]
 
         assert num_computed_tokens <= num_tokens_to_get, (
@@ -439,6 +581,7 @@ class FlexKVSchedulerConnector:
             token_ids=np_token_ids,
             token_mask=np_token_mask,
             namespace=namespace,
+            **self._block_hashes(request, num_tokens_to_get),
         )
         num_new_matched_tokens = int(np.count_nonzero(matched_mask))
 
@@ -500,7 +643,7 @@ class FlexKVSchedulerConnector:
         # compute slot_mapping
         num_computed_blocks = task.num_computed_tokens // self.block_size
         num_blocks_to_get = num_new_matched_tokens // self.block_size
-        all_block_ids = blocks.get_block_ids()[0]
+        all_block_ids = blocks.get_block_ids()[self.group_id]
         block_ids_to_get = all_block_ids[num_computed_blocks:num_computed_blocks+num_blocks_to_get]
         task.block_ids = block_ids_to_get
         task.slot_mapping = np.array(block_ids_to_get).repeat(self.block_size)*self.block_size
@@ -533,6 +676,12 @@ class FlexKVSchedulerConnector:
             True if a FlexKV transfer still needs the request's blocks and
             vLLM must defer freeing them; False if the blocks can be freed.
         """
+        self._forget_prefetch(request.request_id)
+        self.failed_load_req_ids.discard(request.request_id)
+        if request.request_id in self.failed_loads_unreported:
+            # Its blocks hold no KV; vLLM frees them once the failed load's
+            # report arrives.
+            return False
         # A GET task still owns the blocks until its graph completion callback
         # runs. In layer-wise mode this is normally only a short tail after the
         # final eventfd; query_finished_task() will return this finished request
@@ -636,6 +785,7 @@ class FlexKVSchedulerConnector:
         task_id, unmatched_mask = self.flexkv_manager.put_match(
             token_ids=np_token_ids,
             namespace=namespace,
+            **self._block_hashes(request, num_tokens_to_put),
         )
 
         num_unmatched_tokens = int(np.count_nonzero(unmatched_mask))
@@ -695,6 +845,36 @@ class FlexKVSchedulerConnector:
             logger.info(f"FlexKV Cancel task: {task}")
         self.flexkv_manager.cancel(task_ids=list(self.tasks_to_cancel.keys()))
         self.tasks_to_cancel.clear()
+
+    def keep_loads_from_zeroing(self, scheduler_output: "SchedulerOutput") -> None:
+        """Take the blocks this step's layer-wise GETs write out of vLLM's zeroing.
+
+        vLLM zeroes a step's new blocks in the worker when the cache mixes
+        precisions (e.g. DeepSeek-V4.1), while the GET's H2D launched here is
+        already writing them. ``KVConnectorBase_V1.build_connector_meta`` lets
+        a synchronous reader keep the blocks it overwrites whole out of
+        ``new_block_ids_to_zero`` if it completes those loads before they are
+        read and fails the step when a load fails. A GET writes every page of
+        its blocks; every layer waits for its load before reading them
+        (``use_layerwise`` refuses an attention that does not); and a layer is
+        signalled only once its H2D has landed, so a GET that fails leaves the
+        layers it did not land unsignalled: the first wait on one raises after
+        ``FLEXKV_LAYERWISE_WAIT_TIMEOUT_S`` and fails the step, instead of
+        letting it compute on blocks that were neither loaded nor zeroed.
+        """
+        zero = getattr(scheduler_output, "new_block_ids_to_zero", None)
+        if not zero or not self.enable_layerwise_transfer:
+            return
+        loaded = {
+            block_id
+            for task in self.tasks_to_launch.values()
+            if isinstance(task, FlexKVGetTask)
+            for block_id in task.block_ids
+        }
+        if loaded:
+            scheduler_output.new_block_ids_to_zero = [
+                block_id for block_id in zero if block_id not in loaded
+            ]
 
     def launch_tasks(self) -> LayerwiseLoadMetadata:
         """
@@ -772,6 +952,8 @@ class FlexKVSchedulerConnector:
             list[FlexKVResponse]: Responses of finished tasks.
         """
         if len(self.req_id_to_task_dict) == 0:
+            if self.flexkv_manager.has_running_graphs():
+                self.flexkv_manager.try_wait([])
             return set(), set()
         # logger.debug(f"unfinished task: {self.req_id_to_task_dict}")
         task_ids = list(self.get_tasks.keys()) + list(self.put_tasks.keys())
@@ -786,8 +968,13 @@ class FlexKVSchedulerConnector:
             if task_id in self.get_tasks:
                 tasks = self.get_tasks.pop(task_id)
                 if not self.enable_layerwise_transfer:
-                    finished_recving.update(
-                        task.request.request_id for task in tasks)
+                    req_ids = {task.request.request_id for task in tasks}
+                    if success or not self.report_failed_loads:
+                        finished_recving |= req_ids
+                    else:
+                        self.failed_loads_to_send |= req_ids
+                        self.failed_loads_unreported |= req_ids
+                        self.failed_load_req_ids |= req_ids
             else:
                 tasks = self.put_tasks.pop(task_id)
                 finished_sending.update(task.request.request_id for task in tasks)
@@ -797,8 +984,6 @@ class FlexKVSchedulerConnector:
                 if not success:
                     logger.error(f"{task} failed, status: {response.status}.")
                     num_failed_tasks += 1
-                    if isinstance(task, FlexKVGetTask):
-                        self.failed_block_ids.update(task.block_ids)
                 # responses_to_return.append(FlexKVResponse(task_id=task_id, task_type=task.task_type,
                 #                                             request=task.request, success=success))
                 deferred = self.deferred_layerwise_puts.pop(
@@ -813,10 +998,16 @@ class FlexKVSchedulerConnector:
         self.flexkv_stats.record_faild(num_failed_requests=num_failed_tasks)
         return finished_sending, finished_recving
 
-    def get_and_clear_failed_block_ids(self) -> set[int]:
-        failed = self.failed_block_ids
-        self.failed_block_ids = set()
+    def take_failed_loads(self) -> frozenset[str]:
+        """The failed loads for this step's connector metadata, each sent once:
+        vLLM fails on a request reported received twice."""
+        failed = frozenset(self.failed_loads_to_send)
+        self.failed_loads_to_send.clear()
         return failed
+
+    def failed_loads_reported(self, req_ids: set[str]) -> None:
+        """The workers reported these failed loads to vLLM."""
+        self.failed_loads_unreported -= req_ids
 
     def handle_preemptions(self, preempted_req_ids: set[str]):
         """
@@ -872,9 +1063,12 @@ class FlexKVWorkerConnector:
         flexkv_config: FlexKVConfig,
         rank_info: "RankInfo",
         enable_layerwise_transfer: Optional[bool] = None,
+        forward_context: Optional[dict] = None,
     ):
         from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 
+        # vLLM's layers by name, to check that attention waits per layer
+        self._forward_context = forward_context
 
         # Determine if server_client_mode (same logic as KVManager)
         server_client_mode = (GLOBAL_CONFIG_FROM_ENV.instance_num > 1 or
@@ -918,6 +1112,21 @@ class FlexKVWorkerConnector:
         self, kv_caches: dict[str, torch.Tensor], *, resume: bool = False
     ):
         logger.info("Start register kv_caches")
+
+        group = self.flexkv_config.vllm_kv_group
+        if group is not None and group.layer_names:
+            self._register_layer_groups(kv_caches, group, resume)
+            logger.info("Finish register kv_caches")
+            self._registered_kv_caches = dict(kv_caches)
+            return
+        if group is not None:
+            # Under vLLM's hybrid KV cache manager the caches of every group
+            # arrive here; FlexKV stores one of them.
+            names = set(group.cache_layer_names)
+            kv_caches = {
+                name: tensor for name, tensor in kv_caches.items()
+                if name in names
+            }
 
         # Separate main KV caches from indexer caches by layer name.
         main_kv_caches: dict[str, torch.Tensor] = {}
@@ -1072,6 +1281,71 @@ class FlexKVWorkerConnector:
         logger.info("Finish register kv_caches")
         self._registered_kv_caches = dict(kv_caches)
 
+    def _register_layer_groups(
+        self, kv_caches: dict[str, torch.Tensor], group: VllmKVGroup,
+        resume: bool,
+    ) -> None:
+        """Register the GPU caches of a vLLM KV cache group with mixed page sizes
+        (e.g. DeepSeek-V4.1) by ``model_config.layer_groups``: layer group
+        ``g`` gets ``group.group_layer_names[g]``, one tensor per layer.
+
+        FlexKV moves each page as opaque bytes, padding included: block ``b``
+        of a cache is the page at ``data_ptr() + b * stride(0)``, where vLLM's
+        ``[B, H, N, C]`` view makes ``stride(0)`` the whole packed block in
+        BLHNC and one page in LBHNC. A view vLLM split into kernel blocks has
+        several rows per block, back to back, so a block is still one page.
+        """
+        model_config = self.flexkv_config.model_config
+        if self.enable_layerwise_transfer:
+            self._start_layerwise_eventfd_sender(group.layer_names)
+
+        gpu_layouts, handles_per_group = [], []
+        for spec, names in zip(model_config.layer_groups,
+                               group.group_layer_names, strict=True):
+            tensors = [kv_caches[name] for name in names]
+            for name, tensor in zip(names, tensors):
+                rows, rest = divmod(tensor.shape[0], group.num_blocks)
+                block_stride = tensor.stride(0) * tensor.element_size() * rows
+                if (rest or not rows or block_stride < spec.head_size
+                        or (rows > 1 and block_stride != spec.head_size)):
+                    raise ValueError(
+                        f"KV cache {name}: shape={tuple(tensor.shape)} with a "
+                        f"{block_stride} B block stride does not hold "
+                        f"{group.num_blocks} blocks of {spec.head_size} B")
+            heads = tensors[0].shape[1]
+            # One head when padding keeps the page from splitting into H heads.
+            num_head = heads if spec.head_size % heads == 0 else 1
+            gpu_layouts.append(KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=len(names),
+                num_block=group.num_blocks,
+                tokens_per_block=1,
+                num_head=num_head,
+                head_size=spec.head_size // num_head,
+                kv_dim=model_config.kv_dim,
+                num_kv_heads=(1 if group.kv_shared_across_ranks
+                              else num_head * model_config.tp_size),
+            ))
+            handles_per_group.append(tensors)
+
+        self.tp_client.register_to_server(
+            kv_caches=[t for tensors in handles_per_group for t in tensors],
+            kv_layout=KVCacheLayout(
+                type=KVCacheLayoutType.LAYERFIRST,
+                num_layer=model_config.num_layers,
+                num_block=group.num_blocks,
+                tokens_per_block=1,
+                num_head=gpu_layouts[0].num_head,
+                head_size=model_config.head_size // gpu_layouts[0].num_head,
+                kv_dim=model_config.kv_dim,
+                num_kv_heads=gpu_layouts[0].num_kv_heads,
+            ),
+            layer_groups=model_config.layer_groups,
+            gpu_layouts=gpu_layouts,
+            handles_per_group=handles_per_group,
+            resume=resume,
+        )
+
     def before_device_sleep(self) -> int:
         return self.tp_client.suspend_gpu_mappings()
 
@@ -1098,6 +1372,13 @@ class FlexKVWorkerConnector:
                 )
             return
 
+        if not _attention_waits_for_layers(self._forward_context, layer_names):
+            raise NotImplementedError(
+                "use_layerwise needs a model whose attention waits for every "
+                "layer it reads (wait_for_layer_load); this one does not. For "
+                "DeepSeek-V4.1 on vLLM 0.33.0 apply "
+                "examples/vllm_adaption/vllm_0_33_0-deepseek-v41-layerwise.patch, "
+                "otherwise set use_layerwise to false")
         pool = LayerwiseCounterPool(layer_names)
         self.layerwise_counter_pool = pool
         socket_path = build_layerwise_eventfd_socket_path(
@@ -1193,8 +1474,10 @@ class FlexKVWorkerConnector:
         self.layerwise_counter_pool.bind(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        if self.layerwise_counter_pool is not None:
-            self.layerwise_counter_pool.wait(layer_name)
+        pool = self.layerwise_counter_pool
+        # A layer FlexKV loads nothing for (another KV cache group) has no wait.
+        if pool is not None and layer_name in pool.layer_to_index:
+            pool.wait(layer_name)
 
     def shutdown(self) -> None:
         if self.layerwise_counter_pool is not None:
@@ -1285,6 +1568,8 @@ class FlexKVConnectorV1Impl:
         self._bound_metadata: Optional[FlexKVConnectorMetadata] = None
 
         if role == KVConnectorRole.SCHEDULER:
+            if GLOBAL_CONFIG_FROM_ENV.hash_scheme:
+                _check_hash_scheme(vllm_config)
             self.connector = FlexKVSchedulerConnector(
                 flexkv_config, rank_info, self.enable_layerwise_transfer)
             # Track scheduled requests to detect preemptions in build_connector_meta
@@ -1303,7 +1588,8 @@ class FlexKVConnectorV1Impl:
                     f"{_e}. device_id will collide across workers and GPU "
                     f"registration will hang at 1/N.")
             self.connector = FlexKVWorkerConnector(
-                flexkv_config, rank_info, self.enable_layerwise_transfer)
+                flexkv_config, rank_info, self.enable_layerwise_transfer,
+                forward_context=vllm_config.compilation_config.static_forward_context)
         else:
             raise ValueError(f"Unrecognized KVConnectorRole: {role}.")
 
@@ -1349,13 +1635,7 @@ class FlexKVConnectorV1Impl:
             return
         metadata = kwargs.get("connector_metadata")
         if metadata is None:
-            metadata = self._bound_metadata
-        if metadata is None:
-            # vLLM binds metadata on the outer FlexKVConnectorV1 wrapper before
-            # delegating this hook to the installed FlexKV implementation.
-            from vllm.distributed.kv_transfer import get_kv_transfer_group
-            outer_connector = get_kv_transfer_group()
-            metadata = outer_connector._get_connector_metadata()
+            metadata = self._step_metadata()
         if not isinstance(metadata, FlexKVConnectorMetadata):
             raise TypeError(
                 "expected FlexKVConnectorMetadata, got "
@@ -1416,8 +1696,46 @@ class FlexKVConnectorV1Impl:
             tuple of (sending/saving ids, recving/loading ids).
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
+
+        The scheduler side reports every other finished transfer. The failed
+        loads this step's metadata carries are reported here as received, so
+        that a vLLM wrapper not forwarding get_transfer_results still releases
+        them, if only as received.
         """
-        return None, None
+        return None, (self._failed_loads() or None)
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> "KVConnectorTransferResults":
+        """Report the failed loads this step's metadata carries as received
+        and failed.
+
+        vLLM takes a failed load only from a worker, and per request once a
+        model has several KV cache groups. FlexKV sees a GET end on the
+        scheduler side, after vLLM has read the step's worker reports, so the
+        scheduler side passes the failure here a step later.
+        """
+        failed = self._failed_loads()
+        return KVConnectorTransferResults(
+            finished_recving=failed, failed_recving=failed)
+
+    def _failed_loads(self) -> set[str]:
+        """The failed loads this step's metadata carries, on a worker."""
+        if self.role != KVConnectorRole.WORKER:
+            return set()
+        metadata = self._step_metadata()
+        return set(metadata.failed_recving) if metadata is not None else set()
+
+    def _step_metadata(self) -> Optional[FlexKVConnectorMetadata]:
+        """This step's connector metadata. A vLLM wrapper that does not forward
+        bind_connector_metadata binds it on itself before delegating."""
+        if self._bound_metadata is not None:
+            return self._bound_metadata
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+        outer_connector = get_kv_transfer_group()
+        if not outer_connector.has_connector_metadata():
+            return None
+        return outer_connector._get_connector_metadata()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
@@ -1429,11 +1747,14 @@ class FlexKVConnectorV1Impl:
         """
         self.connector.register_to_server(kv_caches)
 
-    def before_device_sleep(self) -> None:
+    def unregister_kv_caches(self) -> None:
+        """Release the transfer engine's mappings of the KV caches before
+        vLLM sleeps and frees them."""
         if self.role == KVConnectorRole.WORKER:
             self.connector.before_device_sleep()
 
-    def after_device_wake(self) -> None:
+    def restore_kv_caches(self) -> None:
+        """Register the KV caches again after vLLM wakes up."""
         if self.role == KVConnectorRole.WORKER:
             self.connector.after_device_wake()
 
@@ -1444,7 +1765,7 @@ class FlexKVConnectorV1Impl:
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[Optional[int], bool]:
         """
         Get number of new tokens that can be loaded from the
         external KV cache beyond the num_computed_tokens.
@@ -1456,7 +1777,8 @@ class FlexKVConnectorV1Impl:
 
         Returns:
             the number of tokens that can be loaded from the
-            external KV cache beyond what is already computed.
+            external KV cache beyond what is already computed, or None
+            while the request's prefetch is still running.
         """
         matched_tokens, needs_load = self.connector.get_num_new_matched_tokens(
             request, num_computed_tokens)
@@ -1476,12 +1798,19 @@ class FlexKVConnectorV1Impl:
         """
         self.connector.update_state_after_alloc(request, blocks, num_external_tokens)
 
+    def on_new_request(self, request: "Request") -> None:
+        """Start FlexKV's prefetch of a request as it arrives."""
+        if self.role == KVConnectorRole.SCHEDULER:
+            self.connector.on_new_request(request)
+
     def build_connector_meta(
             self, scheduler_output: "SchedulerOutput") -> "KVConnectorMetadata":
         """
         Build the connector metadata for this step.
 
-        This function should NOT modify fields in the scheduler_output.
+        This function modifies no field of the scheduler_output but
+        new_block_ids_to_zero, which vLLM lets a synchronous reader trim (see
+        FlexKVSchedulerConnector.keep_loads_from_zeroing).
         Also, calling this function will reset the state of the connector.
 
         Args:
@@ -1511,6 +1840,7 @@ class FlexKVConnectorV1Impl:
             self.connector.handle_preemptions(preempted_req_ids)
 
         self.connector.cancel_tasks()
+        self.connector.keep_loads_from_zeroing(scheduler_output)
         layerwise_metadata = self.connector.launch_tasks()
 
         # Optional: Synchronous wait for get tasks to ensure data consistency.
@@ -1519,7 +1849,9 @@ class FlexKVConnectorV1Impl:
         if os.getenv('FLEXKV_SYNC_GET', '0') == '1':
             self.connector.wait_for_all_get_tasks()
 
-        return FlexKVConnectorMetadata(layerwise=layerwise_metadata)
+        return FlexKVConnectorMetadata(
+            layerwise=layerwise_metadata,
+            failed_recving=self.connector.take_failed_loads())
 
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
         """
@@ -1534,8 +1866,12 @@ class FlexKVConnectorV1Impl:
             return
 
         finished_sending, finished_recving = self.connector.query_finished_task()
+        # What the workers report as received are the failed loads of an
+        # earlier step's metadata (get_transfer_results).
+        reported = set(connector_output.finished_recving or ())
+        self.connector.failed_loads_reported(reported)
         connector_output.finished_sending = finished_sending
-        connector_output.finished_recving = finished_recving
+        connector_output.finished_recving = finished_recving | reported
 
 
     def request_finished(
@@ -1554,6 +1890,33 @@ class FlexKVConnectorV1Impl:
             returned by the engine.
         """
         return self.connector.request_finished(request, block_ids), None
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """``request_finished`` under vLLM's hybrid KV cache manager: one block
+        id list per KV cache group, of which FlexKV stores one."""
+        return self.request_finished(request, block_ids[self.connector.group_id])
+
+    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
+        """The KV cache group a FlexKV load restores: the one FlexKV stores.
+        vLLM keeps an async load's blocks of it out of zeroing, and replays
+        the sliding window of any group a hit does not restore."""
+        return (self.connector.group_id,)
+
+    def has_pending_push_work(self) -> bool:
+        """Keep vLLM stepping while a FlexKV graph completes only when polled."""
+        if self.role != KVConnectorRole.SCHEDULER:
+            return False
+        return self.connector.has_pending_work()
+
+    def has_pending_block_frees(self) -> bool:
+        """Let vLLM wait for a FlexKV PUT to free blocks instead of preempting."""
+        if self.role != KVConnectorRole.SCHEDULER:
+            return False
+        return self.connector.has_pending_block_frees()
 
     def take_events(self) -> Iterable['KVCacheEvent']:
         '''
@@ -1582,22 +1945,22 @@ class FlexKVConnectorV1Impl:
             # scheduler's stats, avoiding NotImplementedError.
             return _FlexKVWorkerSentinelStats(data={})
 
-        stats = self.connector.flexkv_stats
-        data = {
-            "num_get_requests": stats.num_get_requests,
-            "num_get_query_tokens": stats.num_get_query_tokens,
-            "num_gpu_matched_tokens": stats.num_gpu_matched_tokens,
-            "num_flexkv_matched_tokens": stats.num_flexkv_matched_tokens,
-            "num_put_requests": stats.num_put_requests,
-            "num_put_query_tokens": stats.num_put_query_tokens,
-            "num_put_unmatched_tokens": stats.num_put_unmatched_tokens,
-            "num_failed_requests": stats.num_failed_requests,
-            "get_gpu_match_ratio": stats.get_gpu_match_ratio,
-            "get_flexkv_match_ratio": stats.get_flexkv_match_ratio,
-        }
-        return _FlexKVConnectorStats(data=data)
+        # The counts since the previous step's report: vLLM sums them.
+        return _FlexKVConnectorStats(
+            data=self.connector.flexkv_stats.take_counts())
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: Optional[dict[str, Any]] = None
+    ) -> Optional["KVConnectorStats"]:
+        """FlexKV's stats from the payload vLLM passes the process that logs
+        them (see get_kv_connector_stats)."""
+        if _FlexKVConnectorStats is None:
+            return None
+        return _FlexKVConnectorStats(data=dict(data or {}))
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        if self.role == KVConnectorRole.SCHEDULER:
-            return self.connector.get_and_clear_failed_block_ids()
+        """None: FlexKV reports a failed load per request
+        (get_transfer_results), as vLLM refuses block ids once a model has
+        several KV cache groups."""
         return set()

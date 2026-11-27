@@ -22,6 +22,7 @@ from flexkv.common.transfer import (
     DeviceType,
     TransferOpGraph,
     TransferType,
+    batch_mergeable,
     get_nvtx_default_color,
     invoke_op_callback,
     merge_to_batch_graph,
@@ -31,6 +32,7 @@ from flexkv.cache.cache_engine import (
     GlobalCacheEngine,
     CacheStrategy,
     DEFAULT_CACHE_STRATEGY,
+    FULL_ONLY_PUT_STRATEGY,
     CPUONLY_CACHE_STRATEGY,
 )
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
@@ -105,6 +107,9 @@ class KVTask:
     prefetch_job: Optional[Any] = None
     prefetch_local_hit_blocks: int = 0
     prefetch_planned_hit_blocks: int = 0
+    # A prefetch carrying both a peer pull job and a graph (radixshmem SSD
+    # reads) completes once both are done; set when the graph finished first.
+    prefetch_graph_done: bool = False
     cancel_requested: bool = False
     prefetch_key: Optional[int] = None
 
@@ -334,6 +339,8 @@ class KVTaskManager:
             token_ids: np.ndarray,
             namespace: Optional[List[str]] = None,
     ) -> Optional[KVTask]:
+        if not getattr(self.cache_engine, "supports_prefetch_inherit", True):
+            return None
         prefetch_id = self.prefetch_tasks.get(
             self._gen_prefetch_key(token_ids, namespace), None)
         if prefetch_id is None:
@@ -398,6 +405,7 @@ class KVTaskManager:
                         temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
                         namespace: Optional[List[str]] = None,
                         swa_aware: bool = False,
+                        block_hashes: Optional[np.ndarray] = None,
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
@@ -416,6 +424,7 @@ class KVTaskManager:
             dp_client_id=dp_client_id,
             temp_cache_strategy=temp_cache_strategy,
             namespace=namespace,
+            block_hashes=block_hashes,
             swa_aware=swa_aware)
         self.tasks[task_id] = KVTask(
             task_id=task_id,
@@ -442,6 +451,8 @@ class KVTaskManager:
                         token_mask: Optional[np.ndarray] = None,
                         is_fake_slot_mapping: bool = False,
                         namespace: Optional[List[str]] = None,
+                        temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
+                        block_hashes: Optional[np.ndarray] = None,
                         ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
@@ -451,7 +462,9 @@ class KVTaskManager:
             token_mask=token_mask,
             slot_mapping=slot_mapping,
             dp_client_id=dp_client_id,
-            namespace=namespace)
+            temp_cache_strategy=temp_cache_strategy,
+            namespace=namespace,
+            block_hashes=block_hashes)
         self.tasks[task_id] = KVTask(
             task_id=task_id,
             task_type=TaskType.PUT,
@@ -474,6 +487,7 @@ class KVTaskManager:
                             dp_client_id: int,
                             namespace: Optional[List[str]] = None,
                             swa_aware: bool = False,
+                            block_hashes: Optional[np.ndarray] = None,
                             ) -> None:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
@@ -490,6 +504,7 @@ class KVTaskManager:
             dp_client_id=dp_client_id,
             temp_cache_strategy=temp_cache_strategy,
             namespace=namespace,
+            block_hashes=block_hashes,
             swa_aware=swa_aware)
         prefetch_has_swa_remote = any(
             op.transfer_type == TransferType.REMOTE2H and getattr(op, "is_swa", False)
@@ -548,6 +563,12 @@ class KVTaskManager:
                         transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
                 else:
                     transfer_handle.submit(transfer_graph, task_end_op_id=self.tasks[task_id].task_end_op_id)
+
+    def has_running_graphs(self) -> bool:
+        """Whether a submitted graph still runs; its completion (e.g. a PUT's
+        SSD insert after the task was returned) happens only when polled."""
+        return any(self.tasks[tid].status == TaskStatus.RUNNING
+                   for tid in self.graph_to_task.values())
 
     def _update_tasks(self, timeout: float = 0.001) -> None:
         self._poll_prefetch_jobs()
@@ -651,6 +672,8 @@ class KVTaskManager:
                         exc_info=True,
                     )
             if completed_op.is_graph_completed():
+                if self._prefetch_job_pending(task_id):
+                    continue
                 # _mark_completed runs deferred commit first, then (for
                 # prefetch) finalizes return_mask from the Full REMOTE2H
                 # success bitmap — report "how much remote this task pulled".
@@ -1026,11 +1049,29 @@ class KVTaskManager:
                 return
             self._mark_completed(task_id)
 
+    def _prefetch_job_pending(self, task_id: int) -> bool:
+        """The graph of a job-backed prefetch completed. Its staged SSD reads
+        are published at completion, after the peer pull's run (the insert
+        needs that prefix), so the task finishes with the job: now if it is
+        done, else from `_poll_prefetch_jobs`. False for any other task."""
+        job = getattr(self, "prefetch_jobs", {}).get(task_id)
+        if job is None:
+            return False
+        self.tasks[task_id].prefetch_graph_done = True
+        if job.done():
+            self._complete_prefetch_job(task_id)
+        return True
+
     def _poll_prefetch_jobs(self) -> None:
         jobs = getattr(self, "prefetch_jobs", None)
         if not jobs:
             return
         for task_id in [tid for tid, job in jobs.items() if job.done()]:
+            task = self.tasks.get(task_id)
+            if (task is not None and not task.is_completed()
+                    and task.graph is not None and task.graph.num_ops > 0
+                    and not task.prefetch_graph_done):
+                continue  # its SSD reads are still running
             self._complete_prefetch_job(task_id)
 
     def _complete_prefetch_job(self, task_id: int) -> None:
@@ -1059,9 +1100,15 @@ class KVTaskManager:
                 hi = min(int(result.common_hit), task.prefetch_planned_hit_blocks) * tpb
                 if hi > lo:
                     mask[lo:hi] = True
+        # Completion publishes this prefetch's staged SSD reads (radixshmem):
+        # read how far they landed off the plan handle before the task sheds it.
+        handle = task.callback
         if result is not None:
             result.finalize()   # lock=False job: nothing pinned, harmless
-            planned = task.prefetch_planned_hit_blocks - task.prefetch_local_hit_blocks
+            # The pull's own plan: a radixshmem prefetch also stages an SSD tail
+            # past it, which the task's planned hit includes.
+            planned = int(getattr(job, "planned_hit", task.prefetch_planned_hit_blocks)) \
+                - int(getattr(job, "local_hit", task.prefetch_local_hit_blocks))
             flexkv_logger.info(
                 "[FlexKV-IO] operation=prefetch act=peer_pull status=%s "
                 "flexkv_task_id=%d job=%d source_rank=%d planned_blocks=%d "
@@ -1075,6 +1122,10 @@ class KVTaskManager:
                     TransferType.PEERH2H.value, int(result.remote_blocks),
                     int(result.remote_bytes), "get")
         self._mark_completed(task_id)
+        ssd_end = getattr(handle, "prefetch_ssd_end", lambda: 0)()
+        if ssd_end > 0 and isinstance(mask, np.ndarray):
+            lo = task.prefetch_local_hit_blocks * tpb
+            mask[lo:min(ssd_end * tpb, mask.shape[0])] = True
 
     def _get_completed_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         results = []
@@ -1248,8 +1299,7 @@ class KVTaskEngine(KVTaskManager):
     def _next_runtime_wakeup(self, poll_s):
         # Held GET plans have no submitted I/O. Only RUNNING graphs require
         # completion polling, including async PUT tails after request return.
-        if any(self.tasks[tid].status == TaskStatus.RUNNING
-               for tid in self.graph_to_task.values()):
+        if self.has_running_graphs():
             return poll_s
         delay = self._prefetch.next_wakeup(poll_s)
         if self._terminal_tasks:
@@ -1268,11 +1318,13 @@ class KVTaskEngine(KVTaskManager):
     def start_prefetch(
         self, token_ids: np.ndarray, options: Optional[PrefetchOptions] = None,
         namespace: Optional[List[str]] = None, dp_client_id: int = 0,
+        block_hashes: Optional[np.ndarray] = None,
     ) -> PrefetchHandle:
         self.prefetch_capabilities()
         if self._runtime is None:
             raise RuntimeError("start the task engine before submitting prefetch")
-        return self._prefetch.start(token_ids, options or self._prefetch_options, namespace, dp_client_id)
+        return self._prefetch.start(token_ids, options or self._prefetch_options, namespace, dp_client_id,
+                                    block_hashes=block_hashes)
 
     @on_runtime
     def progress_prefetch(
@@ -1337,7 +1389,8 @@ class KVTaskEngine(KVTaskManager):
                   dp_client_id: int = 0,
                   token_mask: Optional[np.ndarray] = None,
                   task_id: int = -1,
-                  namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                  namespace: Optional[List[str]] = None,
+                  block_hashes: Optional[np.ndarray] = None) -> Tuple[int, np.ndarray]:
         # self._sync_prefetch(token_ids, namespace)
         task_id, return_mask = self._get_match_impl(token_ids,
                                                     slot_mapping,
@@ -1345,7 +1398,8 @@ class KVTaskEngine(KVTaskManager):
                                                     token_mask=token_mask,
                                                     dp_client_id=dp_client_id,
                                                     task_id=task_id,
-                                                    namespace=namespace)
+                                                    namespace=namespace,
+                                                    block_hashes=block_hashes)
         # trace get request
         self.tracer.trace_request(
             request_type="GET",
@@ -1365,14 +1419,16 @@ class KVTaskEngine(KVTaskManager):
                   dp_client_id: int = 0,
                   token_mask: Optional[np.ndarray] = None,
                   task_id: int = -1,
-                  namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                  namespace: Optional[List[str]] = None,
+                  block_hashes: Optional[np.ndarray] = None) -> Tuple[int, np.ndarray]:
         task_id, return_mask = self._put_match_impl(token_ids,
                                                     slot_mapping,
                                                     is_fake_slot_mapping=False,
                                                     token_mask=token_mask,
                                                     dp_client_id=dp_client_id,
                                                     task_id=task_id,
-                                                    namespace=namespace)
+                                                    namespace=namespace,
+                                                    block_hashes=block_hashes)
         # trace put request
         self.tracer.trace_request(
             request_type="PUT",
@@ -1496,7 +1552,8 @@ class KVTaskEngine(KVTaskManager):
                   cpu_only: bool = False,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None,
-                  swa_aware: bool = False) -> Tuple[int, np.ndarray]:
+                  swa_aware: bool = False,
+                  block_hashes: Optional[np.ndarray] = None) -> Tuple[int, np.ndarray]:
         """Match a prefix and build the load graph; return (task_id, return_mask).
 
         With ``swa_aware=True`` the Full-KV transfer is clamped to the reusable
@@ -1525,6 +1582,7 @@ class KVTaskEngine(KVTaskManager):
                                                            cpu_only=cpu_only,
                                                            task_id=task_id,
                                                            namespace=namespace,
+                                                           block_hashes=block_hashes,
                                                            swa_aware=swa_aware)
         # trace get match request
         self.tracer.trace_request(
@@ -1547,7 +1605,8 @@ class KVTaskEngine(KVTaskManager):
                   cpu_only: bool = False,
                   task_id: int = -1,
                   namespace: Optional[List[str]] = None,
-                  swa_aware: bool = False) -> Tuple[int, np.ndarray]:
+                  swa_aware: bool = False,
+                  block_hashes: Optional[np.ndarray] = None) -> Tuple[int, np.ndarray]:
         if token_mask is None:
             token_mask = np.ones_like(token_ids)
         if task_id == -1:
@@ -1564,6 +1623,7 @@ class KVTaskEngine(KVTaskManager):
                              is_fake_slot_mapping=is_fake_slot_mapping,
                              temp_cache_strategy=temp_cache_strategy,
                              namespace=namespace,
+                             block_hashes=block_hashes,
                              swa_aware=swa_aware)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
@@ -1575,7 +1635,10 @@ class KVTaskEngine(KVTaskManager):
                   dp_client_id: int = 0,
                   token_mask: Optional[np.ndarray] = None,
                   task_id: int = -1,
-                  namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                  namespace: Optional[List[str]] = None,
+                  swa: bool = True,
+                  block_hashes: Optional[np.ndarray] = None) -> Tuple[int, np.ndarray]:
+        """``swa=False`` stores Full KV only (no SWA/state snapshot)."""
         self._update_tasks(timeout=0)
         fake_slot_mapping = np.zeros_like(token_ids)
         result_task_id, return_mask = self._put_match_impl(token_ids,
@@ -1584,7 +1647,9 @@ class KVTaskEngine(KVTaskManager):
                                                            token_mask=token_mask,
                                                            dp_client_id=dp_client_id,
                                                            task_id=task_id,
-                                                           namespace=namespace)
+                                                           namespace=namespace,
+                                                           swa=swa,
+                                                           block_hashes=block_hashes)
         # trace put match request
         self.tracer.trace_request(
             request_type="PUT_MATCH",
@@ -1603,7 +1668,9 @@ class KVTaskEngine(KVTaskManager):
                         is_fake_slot_mapping: bool = False,
                         token_mask: Optional[np.ndarray] = None,
                         task_id: int = -1,
-                        namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                        namespace: Optional[List[str]] = None,
+                        swa: bool = True,
+                        block_hashes: Optional[np.ndarray] = None) -> Tuple[int, np.ndarray]:
         if token_mask is None:
             token_mask = np.ones_like(token_ids)
         if task_id == -1:
@@ -1615,7 +1682,10 @@ class KVTaskEngine(KVTaskManager):
                              dp_client_id=dp_client_id,
                              token_mask=token_mask,
                              is_fake_slot_mapping=is_fake_slot_mapping,
-                             namespace=namespace)
+                             namespace=namespace,
+                             temp_cache_strategy=(DEFAULT_CACHE_STRATEGY if swa
+                                                  else FULL_ONLY_PUT_STRATEGY),
+                             block_hashes=block_hashes)
         self._process_empty_graph(task_id)
         nvtx.pop_range()
         return task_id, self.tasks[task_id].return_mask
@@ -1626,7 +1696,8 @@ class KVTaskEngine(KVTaskManager):
                        dp_client_id: int = 0,
                        task_id: int = -1,
                        namespace: Optional[List[str]] = None,
-                       swa_aware: bool = False) -> int:
+                       swa_aware: bool = False,
+                       block_hashes: Optional[np.ndarray] = None) -> int:
         """Launch a prefetch task; return its task_id.
 
         The launch call is fire-and-forget: it publishes the plan and hands the
@@ -1644,7 +1715,7 @@ class KVTaskEngine(KVTaskManager):
             task_id = self._gen_task_id()
         nvtx.push_range(f"prefetch match: task_id={task_id}", color=get_nvtx_default_color())
         self.create_prefetch_task(
-            task_id, token_ids, dp_client_id=dp_client_id, namespace=namespace, swa_aware=swa_aware
+            task_id, token_ids, dp_client_id=dp_client_id, namespace=namespace, block_hashes=block_hashes, swa_aware=swa_aware
         )
         self._process_empty_graph(task_id)
         nvtx.pop_range()
@@ -1748,7 +1819,12 @@ class KVTaskEngine(KVTaskManager):
 
         all_get = all(self.tasks[tid].task_type == TaskType.GET for tid in task_ids)
         all_put = all(self.tasks[tid].task_type == TaskType.PUT for tid in task_ids)
-        if (len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put):
+        # A graph with ops the merge cannot fuse (a global-dedup PUT's
+        # H2PEERSSD) goes out on its own, in the same submit.
+        mergeable = layerwise_transfer or all(
+            batch_mergeable(self.tasks[tid].graph) for tid in task_ids)
+        if ((len(task_ids) > 1 or layerwise_transfer) and as_batch and (all_get or all_put)
+                and mergeable):
             if batch_id == -1:
                 batch_id = self._gen_task_id()
             if layerwise_transfer:

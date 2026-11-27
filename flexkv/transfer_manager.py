@@ -51,6 +51,10 @@ class TransferManager:
         self.instance_num = self.model_config.instance_num
         # Calculate total expected GPUs on this node across all instances
         self.expected_gpus = self.instance_num * self.model_config.gpus_per_node
+        if GLOBAL_CONFIG_FROM_ENV.dp_direct:
+            # Each DP rank owns its TransferEngine: only that rank's TP x PP x CP GPUs register.
+            local_dp = max(1, self.model_config.dp_size // max(1, self.model_config.nnodes))
+            self.expected_gpus = max(1, self.model_config.gpus_per_node // local_dp)
 
         self.all_gpu_layouts: Dict[RegistrationKey, KVCacheLayout] = {}
         self.all_gpu_blocks: Dict[RegistrationKey, List[TensorSharedHandle]] = {}
@@ -416,6 +420,12 @@ class TransferManager:
     def initialize_transfer_engine(self) -> None:
         flexkv_logger.info("Initializing TransferEngine...")
         self._register_gpu_blocks_via_socket()
+        if GLOBAL_CONFIG_FROM_ENV.dp_direct:
+            # One TE per DP rank: its contexts (and its workers') go on the rank's own GPU
+            # instead of all ranks' TEs piling onto GPU 0.
+            device = min(self.gpu_device_id_mapping.values())
+            torch.cuda.set_device(device)
+            os.environ["FLEXKV_DEFAULT_CUDA_DEVICE"] = str(device)
 
         assert len(self.all_gpu_layouts) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU layouts, got {len(self.all_gpu_layouts)}"
@@ -549,6 +559,14 @@ class TransferManager:
          if self.storage_engine.has_storage_handle(DeviceType.REMOTE, pool_id=PoolId.SWA)
          else None
          )
+        if (GLOBAL_CONFIG_FROM_ENV.enable_radixshmem and ssd_handle is not None
+                and GLOBAL_CONFIG_FROM_ENV.radixshmem_ssd_server_name):
+            from flexkv.server.shm_radix_bootstrap import claim_ssd_files
+            claim_ssd_files(self.cache_config, {"full": ssd_handle, "swa": swa_ssd_handle})
+            # Peers read this node's SSD blocks by the radixshmem SSD index:
+            # tell them where the files are.
+            from flexkv.transfer.workers.peer_ssd import publish_ssd_manifest
+            publish_ssd_manifest(self.cache_config, ssd_handle, swa_ssd_handle)
 
         self.transfer_engine = TransferEngine(
             gpu_handles=grouped_gpu_handles,
@@ -1089,6 +1107,13 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         ready_event,
                         start_event,
                         error_conn) -> None:
+        # The bound target ships this handle, the parent's ends of the pipes
+        # included. Holding them, this process would never see the command
+        # pipe close when the parent dies, and would outlive it.
+        self.command_parent_conn.close()
+        self.result_parent_conn.close()
+        self.error_parent_conn.close()
+
         # This process allocates the shared CPU KV pool for all GPUs and spawns
         # the transfer workers; drop the launcher's (GPU0) NUMA binding first.
         reset_inherited_numa_binding("TransferManager")

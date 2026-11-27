@@ -240,6 +240,7 @@ def compile_gpu_regions(
         chunk = group_chunk_bytes(g, tokens_per_block, default_dtype)
         for d, layout in enumerate(gpu_layouts_per_group[gi]):
             measured = None
+            t = None
             if tensors_per_group_device is not None:
                 t = tensors_per_group_device[gi][d]
                 if t is not None:
@@ -250,6 +251,12 @@ def compile_gpu_regions(
                 kv_s = layout.get_kv_stride() * dtype_size
                 blk_s = layout.get_block_stride() * dtype_size
                 layer_s = layout.get_layer_stride() * dtype_size
+                if (t is not None and kv_dim == 1 and t.ndim >= 2
+                        and t.shape[0] == layout.num_block):
+                    # A single-region cache led by its block dim: blocks sit
+                    # where the framework put them, e.g. vLLM's block-outermost
+                    # layouts pack every layer's page of a block together.
+                    blk_s = t.stride(0) * t.element_size()
             regions.append(GpuRegion(
                 group_index=gi,
                 device_index=d,
