@@ -173,3 +173,36 @@ class TestNamespace:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _hashes(namespace):
+    token_ids = np.arange(1, 9, dtype=np.int64)
+    return SequenceMeta(token_ids=token_ids, tokens_per_block=4,
+                        namespace=namespace).block_hashes
+
+
+def test_namespace_component_boundaries_are_unambiguous():
+    assert not np.array_equal(_hashes(["a\x00b"]), _hashes(["a", "b"]))
+    assert not np.array_equal(_hashes(["ab", ""]), _hashes(["a", "b"]))
+
+
+def _vllm_request(lora_name=None, cache_salt=None, namespace_info=None):
+    from types import SimpleNamespace
+    lora = SimpleNamespace(lora_name=lora_name) if lora_name is not None else None
+    return SimpleNamespace(lora_request=lora, cache_salt=cache_salt,
+                           namespace_info=namespace_info)
+
+
+def test_vllm_cache_salt_cannot_reach_a_lora_adapters_blocks():
+    pytest.importorskip("vllm")
+    from flexkv.integration.vllm.vllm_v1_adapter import FlexKVSchedulerConnector
+    connector = object.__new__(FlexKVSchedulerConnector)
+
+    adapter = connector._extract_namespace(_vllm_request(lora_name="X"))
+    salted = connector._extract_namespace(_vllm_request(cache_salt="X"))
+    user = connector._extract_namespace(_vllm_request(namespace_info="X"))
+    assert len({tuple(adapter), tuple(salted), tuple(user)}) == 3
+    assert not np.array_equal(_hashes(adapter), _hashes(salted))
+    assert not np.array_equal(_hashes(adapter), _hashes(user))
+    assert not np.array_equal(_hashes(salted), _hashes(user))
+    assert connector._extract_namespace(_vllm_request()) is None
